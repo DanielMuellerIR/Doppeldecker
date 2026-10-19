@@ -1134,8 +1134,14 @@ wait_for_group_ready() {
   managed_pid=$1
   ready_file=$2
   label=$3
+  ready_attempt_limit=200
+  # Im Timeout-Selbsttest muss die Frist vor dem zeitlich begrenzten Starter enden,
+  # auch wenn macOS die kurzen Sleeps bündelt. Der normale Serverstart behält 200.
+  if [ "${DOPPELDECKER_SFTP_E2E_TEST_HOLD:-}" = "$label-ready-timeout" ]; then
+    ready_attempt_limit=20
+  fi
   attempts=0
-  while [ "$attempts" -lt 200 ]; do
+  while [ "$attempts" -lt "$ready_attempt_limit" ]; do
     if ready_file_matches_pid "$managed_pid" "$ready_file"; then
       return 0
     fi

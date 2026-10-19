@@ -1828,7 +1828,9 @@ class SftpE2eSignalTests(unittest.TestCase):
                         int((state / name).read_text(encoding="utf-8"))
                         for name in ("agent.pid", "agent-child.pid")
                     )
-                stdout, stderr = process.communicate(timeout=8)
+                # Die Socket-Frist zählt kurze Sleeps; macOS kann sie bündeln.
+                # Diese äußere Notbremse darf den geprüften Cleanup nicht überholen.
+                stdout, stderr = process.communicate(timeout=25)
                 self.assertEqual(
                     process.returncode,
                     expected,

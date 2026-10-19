@@ -59,6 +59,10 @@ class SmbRunnerRequiresExactlyOneTestTests(unittest.TestCase):
             smbd.chmod(0o755)
 
             umgebung = dict(os.environ)
+            # Ein echter Rustup-Import darf den Cargo-Stub nicht aus dem PATH drängen.
+            home = Path(tmp) / "home"
+            home.mkdir()
+            umgebung["HOME"] = str(home)
             umgebung["PATH"] = f"{bin_dir}:{umgebung['PATH']}"
             umgebung["STUB_LISTING"] = listing
             umgebung["DOPPELDECKER_SMBD"] = str(smbd)

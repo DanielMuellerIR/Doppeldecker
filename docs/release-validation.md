@@ -9,6 +9,8 @@ Node-Installation, Werkzeugtests, Rust-Core-, CLI- und App-Tests, Clippy,
 Fuzz-Übersetzung mit gesperrtem Lockfile sowie die Browser-Suite aus.
 Die GitHub-CI verwendet macOS 15 und Ubuntu 24.04. Einzelne native Sondertests
 bleiben ausdrücklich ignoriert; ein grünes Headless-Gate ersetzt keinen GUI-Test.
+Für reproduzierbare Gates sind die beim Paketbau geprüften Rust-Versionen
+festgelegt: 1.95.0 auf macOS und 1.96.1 auf Linux.
 
 Die Browser-Suite arbeitet mit einer kontrollierten Tauri-Brücke und künstlichen
 Datei-/Providerantworten. Sie prüft Oberfläche, IPC-Verträge, Fehler und
