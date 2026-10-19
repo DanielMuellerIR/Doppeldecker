@@ -1,0 +1,38 @@
+# Cargo-Workspace: drei Crates.
+#  - core      = reine, GUI-freie Datei-/Sync-Logik (headless auf macOS UND Linux testbar)
+#  - src-tauri = dünne Tauri-App (Fenster + Web-UI), hängt nur von core ab
+#  - cli       = Headless-Einstieg, nutzt dieselben Realmodus-Permits aus core
+[workspace]
+resolver = "2"
+members = ["core", "src-tauri", "cli"]
+exclude = ["vendor/smb2", "fuzz"]
+
+# smb2 0.13.0 lässt im SMB-3.1.1-NEGOTIATE das Encryption-Capability-Bit aus.
+# Samba verweigert dann eine vorgeschriebene verschlüsselte Session. Die vendorte
+# Protokollpatch ergänzt gezielt dieses Bit; weitere lokale Vendoranpassungen
+# dokumentiert vendor/smb2/DOPPELDECKER-PATCH.md.
+[patch.crates-io]
+smb2 = { path = "vendor/smb2" }
+
+# Gemeinsame Metadaten, damit Version/Edition an einer Stelle stehen.
+[workspace.package]
+version = "0.1.124"
+edition = "2021"
+license = "MIT"
+
+# Automatische Testläufe brauchen Dateiname und Zeile für verständliche Backtraces,
+# aber keine vollständigen Variablen- und Typinformationen für einen Debugger.
+# Inkrementelle Testartefakte würden bei den vielen Integrationstests sehr groß und
+# nach einem Versionswechsel nicht mehr wiederverwendet; normale Dev-Builds behalten
+# dagegen ihre vollständigen Debugdaten und inkrementelle Kompilierung.
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
+# Release-Builds klein und schnell halten (relevant für die spätere Auslieferung
+# auf beiden Plattformen).
+[profile.release]
+opt-level = "s"   # auf Größe optimieren (kleine Binaries wie bei Tauri üblich)
+lto = true
+codegen-units = 1
+strip = true

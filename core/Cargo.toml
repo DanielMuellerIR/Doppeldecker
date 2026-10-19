@@ -1,0 +1,44 @@
+# Datei-/Sync-Logik und Provider ohne GUI. Dieses Crate bleibt auf macOS und
+# Linux ohne Desktop-Bibliotheken baubar und headless testbar.
+[package]
+name = "doppeldecker-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }   # Serialisierung der DTOs für die UI
+serde_json = "1"
+filetime = "0.2"                                     # mtime plattformübergreifend setzen
+blake3 = "1"                                         # kopierte Temp-Dateien vor dem atomaren Commit verifizieren
+getrandom = "0.3"                                    # nicht vorhersagbare Realmodus-Nonces und Probeinhalte
+rustix = { version = "1.1.4", features = ["fs", "process"] } # openat/renameat/unlinkat + echte Nutzer-ID fuer sichere Trash-Rechte
+libc = "0.2"                                          # Dateityp-Bits und lokale XDG-Loeschzeit auf macOS/Linux
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] } # synchrone VFS-Brücke zum asynchronen Remote-Transport
+russh = { version = "0.62.2", default-features = false, features = ["ring", "rsa"] } # SSH mit expliziter Hostkey-Prüfung, ohne OpenSSL-Systemabhängigkeit
+russh-sftp = "2.3.0"                                  # SFTP-v3-Streams und vollständige Verzeichnisauflistung
+zeroize = "1"                                         # kurzlebige Passwort-/Passphrasenwerte beim Drop überschreiben
+suppaftp = { version = "10.0.0", default-features = false, features = ["rustls-ring"] } # explizites FTPS mit privaten Datenkanälen
+rustls = { version = "0.23.35", default-features = false, features = ["ring", "std", "tls12"] } # Zertifikatspin und TLS-Signaturprüfung
+webpki-roots = "1"                                    # öffentliche Vertrauenskette für FTPS-Modus „WebPKI plus Pin"
+sha2 = "0.10"                                         # normierter SHA-256-Fingerabdruck des FTPS-Zertifikats
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls-no-provider", "stream"] } # WebDAV-HTTP mit eigener Ring-TLS-Konfiguration
+quick-xml = "0.41"                                    # strikte, begrenzte WebDAV-Multi-Status-Auswertung
+url = "2"                                             # kanonische Origin- und Collection-URLs ohne Stringverkettung
+httpdate = "1"                                        # RFC-konforme getlastmodified-Zeit aus PROPFIND
+time = { version = "0.3", features = ["parsing"] }    # RFC-3339 creationdate aus WebDAV-PROPFIND
+percent-encoding = "2"                                # bytegenaue DAV-href-Namen ohne Slash-/Traversal-Verwechslung
+unicode-normalization = "0.1"                         # konservative Namensäquivalenz (NFC) gegen stilles Ersetzen auf normalisierenden Servern
+smb2 = "0.13.0"                                       # reiner Rust-SMB3-Client mit Signing, Verschlüsselung, Paging und FLUSH
+plist = "1"                                           # Finder-Seitenleisten-Favoriten (NSKeyedArchiver-Binär-Plist) lesen
+
+[dev-dependencies]
+tempfile = "3"                                        # temporäre Verzeichnisse für die Sync-Tests
+proptest = "1"                                        # generative Invarianten für Plan, Ausführung und Idempotenz
+libunftp = { version = "0.23.0", default-features = false, features = ["ring", "experimental"] } # isolierter FTPS-Gegenserver
+unftp-sbe-fs = "0.4.0"                                # Gegenserver speichert nur im temporären Testroot
+rcgen = "0.14"                                        # kurzlebiges selbstsigniertes Testzertifikat
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

@@ -1,0 +1,32 @@
+#!/bin/zsh
+# Baut eine Developer-ID-signierte und notarisierte Doppeldecker.app und legt sie
+# doppelklickbar in den Projekt-Root.
+#
+# Warum nicht Ad-hoc: macOS bindet erteilte Berechtigungen (TCC, z. B. Ordner-
+# zugriffe) an eine stabile Codesignatur. Ad-hoc-Signaturen wechseln mit jedem
+# Build — die App verliert dann ihre Berechtigungen. Developer-ID + Notarisierung
+# halten sie stabil und Gatekeeper bleibt still.
+#
+# Zugangsdaten: ausschließlich das notarytool-Schlüsselbundprofil. Der Profilname ist
+# kein Geheimnis, aber intern und steht deshalb NICHT im Repo. Er wird public-safe
+# aufgelöst (siehe tools/build-release.py resolve_notary_profile):
+#   1. Umgebungsvariable NOTARY_PROFILE — projektübergreifend am besten einmal je Mac
+#      in ~/.zshenv gesetzt (`export NOTARY_PROFILE=<profil>`), gilt dann für alle Apps.
+#   2. sonst clone-lokal aus `.git/config` (git config --local doppeldecker.notaryProfile).
+#   3. sonst einmalige interaktive Abfrage; das Skript kann das Profil auch anlegen.
+# Die frühere, unversionierte .notary-profile.local wird als optionaler Fallback noch
+# eingelesen, ist aber nicht mehr nötig.
+set -euo pipefail
+cd "${0:a:h}"
+
+if [[ -z "${NOTARY_PROFILE:-}" && -f .notary-profile.local ]]; then
+  source .notary-profile.local
+  export NOTARY_PROFILE
+fi
+
+python3 tools/check-release.py
+python3 tools/build-release.py macos-install
+python3 tools/verify-release-privacy.py
+
+version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Doppeldecker.app/Contents/Info.plist)
+echo "Fertig: $(pwd)/Doppeldecker.app (Version ${version}, Developer-ID-signiert und notarisiert)"

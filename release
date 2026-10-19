@@ -1,0 +1,54 @@
+#!/bin/zsh
+# release — baut das Verteil-DMG: App bauen, notarisieren, DMG packen, DMG
+# notarisieren. Installiert NIE.
+#
+# Die drei Einstiegspunkte des Projekts trennen bewusst:
+#   ./build-app   baut die App in den Projekt-Root
+#   ./install     baut und ersetzt die App in /Applications
+#   ./release     baut, notarisiert und packt das DMG — installiert nie
+#
+# Doppeldecker weicht bei „build" bewusst vom projektweiten Schema ab: Auch der
+# reine Build ist Developer-ID-signiert und notarisiert. Grund steht in
+# ./build-app — macOS bindet erteilte Berechtigungen an eine stabile Signatur,
+# Ad-hoc-Signaturen wechseln bei jedem Build und verlieren sie.
+#
+# Zugangsdaten: ausschließlich das notarytool-Schlüsselbundprofil (Name aus
+# NOTARY_PROFILE oder `git config doppeldecker.notaryProfile`). Auch der kompatible
+# Alias `tools/build-release.py macos-public` benutzt genau diesen Weg; keiner der
+# beiden benötigt APPLE_PASSWORD in der Umgebung.
+#
+# Aufruf:
+#   ./release                     # vollständiger Lauf
+#   ./release --no-finder-layout  # ohne Finder-Fensterlayout (headless)
+#
+# Letzte Zeile bei Erfolg: RELEASE OK: <pfad-zum-dmg> (<version>)
+set -euo pipefail
+cd "${0:a:h}"
+
+if [[ -z "${NOTARY_PROFILE:-}" && -f .notary-profile.local ]]; then
+  source .notary-profile.local
+  export NOTARY_PROFILE
+fi
+
+python3 tools/check-release.py
+python3 tools/build-release.py macos-release "$@"
+python3 tools/verify-release-privacy.py
+# Vollständiger macOS-Artefaktprüfer VOR der Erfolgsmeldung: App-Signatur,
+# CLI-Sidecar, Bundle-Identität, Bytegleichheit der App im fertigen DMG sowie
+# Ticket-/Gatekeeper-Belege. Ohne diesen Lauf könnte ein RELEASE OK erscheinen,
+# obwohl die im DMG eingebettete App beschädigt ist oder der Sidecar fehlt.
+sh tools/verify-macos-release.sh
+
+version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Doppeldecker.app/Contents/Info.plist)
+dmg=(target/release/bundle/dmg/Doppeldecker_${version}_*.dmg)
+if (( ${#dmg} != 1 )) || [[ ! -f ${dmg[1]} ]]; then
+  echo "FEHLER: Genau ein DMG für Version ${version} wurde erwartet." >&2
+  exit 1
+fi
+
+# Erst nach dem Kopieren prüfen ist zu spät — hier wird belegt, dass das
+# ausgelieferte Image wirklich ein Ticket trägt.
+xcrun stapler validate "${dmg[1]}"
+spctl -a -t open --context context:primary-signature -v "${dmg[1]}" 2>&1 | tail -2
+
+echo "RELEASE OK: $(pwd)/${dmg[1]} (${version})"

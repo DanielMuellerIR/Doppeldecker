@@ -1,0 +1,562 @@
+# Changelog
+
+All notable changes to smb2 will be documented in this file.
+
+The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
+[Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.13.0] - 2026-07-09
+
+### Added
+
+- **Server-side copy (`FSCTL_SRV_COPYCHUNK`): copy byte ranges between two files on the server without the data crossing the wire.** This is the mechanism Windows Explorer uses for same-share copies — the server copies the bytes between two of its own open files, so a multi-gigabyte copy moves only a handful of small control messages instead of the whole file twice (down and back up). Two tiers, both on `Tree` with `SmbClient` wrappers:
+  - **Convenience:** `server_side_copy_file(source, dest)` copies a whole file (truncating the destination); `server_side_copy_file_range(source, source_offset, dest, dest_offset, length)` copies a byte range to a chosen destination offset without truncating. Both open source (read) and destination (read+write), fetch a resume key, batch the copy within the server's limits, flush and close both handles, and never leak a handle on an error path. They return the number of bytes copied.
+  - **Primitives:** `request_resume_key` (turn an open source handle into an opaque `ResumeKey`), `copy_chunks` (one copychunk IOCTL against an open read+write destination, returning a typed `CopyChunkOutcome`), and `server_side_copy_range` (batch a range over already-open handles). New public types: `ResumeKey`, `CopyChunk`, `CopyChunkResult`, `CopyChunkOutcome`, `ServerSideCopyLimits`.
+  - **Limits are negotiated transparently.** A server that receives a request exceeding its per-request limits doesn't fail — it returns `STATUS_INVALID_PARAMETER` carrying a `SRV_COPYCHUNK_RESPONSE` that advertises the limits (MS-SMB2 3.2.5.14.3). The batched methods start at a conservative 16 × 1 MiB / 16 MiB per request (the common Windows/Samba minimum) and re-batch within the advertised limits if rejected; `copy_chunks` surfaces this as `Ok(CopyChunkOutcome::Rejected { limits })` rather than an error.
+  - **Unsupported servers are typed, not string-matched.** Older Samba builds and some NAS firmware lack copychunk and return `STATUS_NOT_SUPPORTED` / `STATUS_INVALID_DEVICE_REQUEST`; these now classify as the new `ErrorKind::Unsupported`, so a consumer can branch on it and fall back to a read-then-write copy. The `server_side_copy` example shows the fallback.
+  - Pinned by unit tests (copychunk wire round-trips including the limits-negotiation path; batching across chunk and per-request limits; renegotiation; the full open→copy→close choreography; chunk offsets) and three Docker tests against real Samba: a whole-file copy verified to move <10% of the file size on the wire (proving the data stays server-side), a 20 MiB copy that spans multiple copychunk requests and byte-matches, and a range-copy-then-positioned-append round-trip.
+- **Positioned `FileWriter`: `create_file_writer_at(path, offset)`.** Opens a file without truncating (`FileOpenIf`) and starts writing at an arbitrary offset — the write analog of `FileReader`'s positioned reads. The natural way to append after a server-side-copied prefix (the archive tail-rewrite shape) or to patch a known region of an existing file. Available as `open_file_writer_at` (free fn), `Tree::create_file_writer_at`, and `SmbClient::create_file_writer_at`.
+- **`Tree::open_file_readwrite` and public `Tree::close_handle`.** A read+write open (needed as a server-side copy destination) and a public close for the raw handles that `open_file` / `open_file_readwrite` / `request_resume_key` hand back — completing the raw-handle open/close pair for advanced callers.
+- **`ErrorKind::Unsupported`** (and the `STATUS_NOT_SUPPORTED` NTSTATUS): the typed classification for "the server doesn't implement this operation". `ErrorKind` is `#[non_exhaustive]`, so adding it is non-breaking; `STATUS_NOT_IMPLEMENTED` now classifies here too (previously `Other`).
+- **`ErrorKind::TooLarge`** and `Error::FileTooLargeForSingleRead { size, max_read }`: the typed signal that a single-read path was asked for a file bigger than the server's per-READ maximum (see the behavior change below).
+
+### Changed
+
+- **Behavior change: `read_file` / `read_file_compound` now error on files larger than one READ instead of silently truncating.** These paths issue a single CREATE+READ+CLOSE compound, so a file larger than the server's negotiated `MaxReadSize` (commonly 8 MiB, but as small as 64 KiB on some servers) came back as just the first chunk — a silent short read that looked like success and could corrupt whatever consumed the "file". They now return the new typed `Error::FileTooLargeForSingleRead { size, max_read }` (classified `ErrorKind::TooLarge`), whose message and rustdoc steer the caller to `read_file_pipelined`, which reads any size in a sliding window of chunked READs. Callers that only ever read small files (config, metadata, text) are unaffected; callers that might hit large files should branch on the error (or use `read_file_pipelined` unconditionally). Detected via the CREATE response's end-of-file size, so it costs no extra round-trip. Pinned by a unit test (a file past the negotiated cap errors rather than returning short) and a Docker test against the 64 KiB-`MaxReadSize` Samba fixture (a 128 KiB file errors from `read_file`, while `read_file_pipelined` returns it whole).
+
+### Notes
+
+- Minor bump per the crate's pre-1.0 SemVer (minor = potentially breaking). Most of the release is additive (server-side copy, positioned writer, the read+write/close handle methods, `ErrorKind::Unsupported`/`TooLarge`), and no existing signatures changed. Two things are technically breaking and land in this minor deliberately: `read_file` / `read_file_compound` now return an error instead of a truncated buffer for oversized files (see Changed), and `Error` gains the `FileTooLargeForSingleRead` variant (a non-wildcard `match` on `Error` must add an arm).
+
+## [0.12.1] - 2026-07-09
+
+### Changed
+
+- **RustCrypto dependencies relaxed from release-candidate pins to stable.** `aes` (`=0.9.0-rc.4` → `0.9.1`), `aes-gcm` (`=0.11.0-rc.3` → `0.11.0`), `cmac` (`=0.8.0-rc.5` → `0.8.0`), and `pbkdf2` (`=0.13.0-rc.10` → `0.13.0`) now track the stable releases. These crates had been hard-pinned to specific pre-releases because a stable `aes 0.9` didn't exist yet; now that it does, the exact `=` pins were forcing every downstream that also wants a RustCrypto crate onto the same rc, causing unresolvable version conflicts. In particular this unblocks Cmdr from enabling `zip`'s `aes-crypto` and `sevenz-rust2`'s `aes256` features, both of which require stable `aes ^0.9`. No API or behavior change — the rc-to-stable transition of these crates carried no public-API drift, so smb2's own surface is unchanged; verified by a clean `--all-features` build, the full check suite, both Docker suites, and real-hardware AES-CMAC/GMAC signing against a QNAP NAS. `ccm` stays pinned at `=0.6.0-rc.3` because it has no stable 0.6 release yet; it unifies cleanly with the stable `aes`/`aes-gcm`/`aead`/`cipher` versions in one lockfile with no duplicate crates. Revisit and unpin `ccm` when its stable ships.
+
+## [0.12.0] - 2026-07-06
+
+### Added
+
+- **`FileReader`: random-access positioned reads over one open handle.** Opens a file once and serves any number of `read_at(offset, len)` calls — the SMB analog of `pread` — at arbitrary offsets, then an explicit `close()`. It's the primitive for a consumer that parses a file's structure by jumping around it (a media container's index, a database page, a zip's end-of-central-directory then its central directory then member data) rather than streaming front-to-back, where the previous public read paths (`FileDownload` sequential, `read_file` whole-file) forced a reopen-and-leak per read. Same owned-`Connection` + `Arc<Tree>` shape as `FileWriter`, so it's `'static`; `read_at` takes `&self` (no shared cursor), so concurrent positioned reads pipeline over the single SMB session. A range larger than the negotiated `MaxReadSize` splits into consecutive wire READs and reassembles; reads clamp to the size seen at open, so a read at or past EOF returns empty and a straddling read is short, never an error. `close()` consumes `self` (read-after-close is a compile error); like the other stream handles, `Drop` can't CLOSE (no async drop) and only logs a debug warning, so close explicitly. Build one via `open_file_reader(tree, conn, path)` (free fn), `Tree::open_file_reader`, or `SmbClient::open_file_reader`. Exported at the crate root. Pinned by the `stream.rs` `file_reader_*` mock tests (one CREATE, N READs, one CLOSE; EOF clamping; range splitting; drop-sends-no-close proving the no-leak contract) and the `guest_file_reader_positioned_reads` Docker test against real Samba.
+
+## [0.11.4] - 2026-06-28
+
+### Changed
+
+- **Per-frame protocol logging moved from DEBUG to TRACE.** Per-message signing (`signing: signed …`), per-request dispatch (`execute …`, `execute_cap …`, `execute_compound …`), per-response success routing (`recv: routed …`), and per-listing directory ops (`tree: list_directory …`) now log at TRACE instead of DEBUG. These fire once per SMB frame, so on a high-throughput operation — a recursive directory scan walking millions of dirs — they flooded a consumer logging at DEBUG (one report: ~170 MB of logs in 25 min, ~90% of it this plumbing, so a rotating buffer held only minutes of history). Lifecycle (connect, negotiate, session, tree connect), credit changes, per-operation mutations (rename/delete/write), and the low-volume error/orphan/late-arrival routing diagnostics stay at DEBUG; routing error and orphan frames stay visible. No behavior change beyond log levels. Get the per-frame detail back with `RUST_LOG=smb2=trace`. The AGENTS.md logging table is updated to match (per-frame request/response is TRACE, not DEBUG).
+
+## [0.11.3] - 2026-06-01
+
+### Fixed
+
+- **Share enumeration on servers that fragment the srvsvc reply.** `list_shares` (and `SmbClient::list_shares`) now reassembles a `NetShareEnum` response that the server splits across multiple DCE/RPC fragments — `PFC_LAST_FRAG` set only on the last (MS-RPCE 2.2.2.6) — and follows `STATUS_BUFFER_OVERFLOW` on pipe reads (MS-SMB2 3.3.5.10) instead of treating it as a fatal error. Previously a listing larger than one 4280-byte RPC fragment or one 64 KiB pipe read came back as an error or a truncated list against older Samba builds and some NAS firmware (many shares and/or long comments). New `parse_response_fragment` reports the last-fragment flag; the read loop stitches fragments before NDR-decoding. Pinned by unit tests on both seams plus the `smb-manyshares` Docker fixture (200 long-comment shares — real Samba fragments the reply into 26 RPC fragments, all reassembled).
+
+## [0.11.2] - 2026-05-28
+
+### Added
+
+- **Exclusive-create file writers.** `Tree::create_file_writer_exclusive` and `SmbClient::create_file_writer_exclusive` mirror their `create_file_writer` siblings but issue the underlying CREATE with `FileCreate` disposition instead of `FileOverwriteIf`. If the file already exists the server returns `STATUS_OBJECT_NAME_COLLISION`, which maps to `ErrorKind::AlreadyExists`. Use this for race-free "create only if absent" writes (file managers' "New File" actions, ID-claim files, etc.) where silently truncating an existing file is unsafe. Pinned by `client::tree::tests::open_file_for_exclusive_create_*` and the Docker integration `guest_create_file_writer_exclusive_fails_on_existing`.
+
+## [0.11.1] - 2026-05-28
+
+### Changed
+
+- **`receiver_loop` log levels.** Idle teardowns (transport error with no in-flight waiters — the routine "server or OS reaped a quiet session" case) drop from WARN to DEBUG. The decrypt / decompress / malformed-frame teardowns stay at WARN since those are protocol corruption regardless of how many waiters were affected, and transport teardowns *with* pending waiters also stay at WARN since they surface real disconnects to callers. No behavior change beyond log levels — cuts a meaningful amount of false-positive noise in long-running clients (cmdr was logging 6 WARNs per session on idle SMB connections).
+
+## [0.11.0] - 2026-05-21
+
+### Added
+
+- **In-process diagnostics.** `SmbClient::diagnostics()` and `Connection::diagnostics()` return a `Diagnostics` / `ConnectionDiagnostics` snapshot of the client's current state — negotiated dialect, credits + in-flight count + next `MessageId`, signing/encryption/compression status, RTT estimate, DFS cache, the per-connection session, and a `MetricsSnapshot` of 17 monotonic `AtomicU64` counters (requests sent, wire bytes sent/received, the four disjoint routing outcomes — `responses_routed_ok`, `responses_routed_err`, `responses_late_after_drop`, `responses_stray` — plus `status_pending_loops`, `unsolicited_notifications_received`, `signature_failures`, `decrypt_failures`, `decompress_failures`, `malformed_frames`, `session_expired_events`, `compound_requests_sent`, `explicit_cancels_sent`, `requests_returned_err`). Counters survive connection teardown; per-connection counters reset on `SmbClient::reconnect`, client-level counters (`reconnects`, `dfs_referrals_resolved`, `dfs_cache_hits`) survive. A `Display` impl renders a compact terminal view. See [`docs/specs/diagnostics-plan.md`](docs/specs/diagnostics-plan.md).
+- **Optional `serde` feature** (off by default): `Serialize` impls on every diagnostics type plus the protocol enums they embed (`Dialect`, `Cipher`, `SigningAlgorithm`, `Capabilities`, `Guid`, `SessionId`, `TreeId`, `MessageId`). For consumers building MCP tools, dashboards, or any structured exporter. JSON form is the in-memory shape (newtypes are `transparent`, `Capabilities` is the raw `u32` bits).
+- **`examples/diagnostics.rs`**: connect, run a couple of ops, dump the snapshot via `Display` — or `--json` when built with `--features serde`.
+
+### Fixed
+
+- **Stale `src/client/CLAUDE.md` gotcha** about silent frame discard on decrypt/decompress/malformed-header errors. Phase 3 P3.4 fixed this — the receiver task tears down the connection on those paths and fans `Err(Disconnected)` to every pending waiter. Note now matches the code, and the diagnostics counters above attribute each tear-down to its trigger.
+
+## [0.10.0] - 2026-05-19
+
+### Changed
+
+- **Breaking: `Watcher` owns its `Connection` and `Tree` instead of borrowing them.** The lifetime parameter is gone; `Watcher` is now `'static`. `Tree::watch` and `SmbClient::watch` lose their `'a` parameter and return `Watcher` instead of `Watcher<'a>`. Existing call sites that wrote `let mut w = client.watch(&tree, "path", true).await?;` keep compiling unchanged — only code that explicitly named the type as `Watcher<'_>` needs the `<'_>` removed. The connection clone is cheap (`Arc::clone`, multiplexes over the same SMB session), so the caller is free to keep using their `Connection` for other ops while a watcher runs. The previous "use a separate `SmbClient` to perform operations while watching" workaround is no longer needed.
+
+### Fixed
+
+- **CHANGE_NOTIFY consumer-side loss window closed.** `Watcher::next_events` now keeps one CHANGE_NOTIFY request continuously outstanding on the wire by pre-issuing the next request before awaiting the current response. Without this, server-side events that arrived during the consumer's response-processing window were dropped silently by strict servers (older Samba builds, NAS firmware) that don't queue events between consecutive CHANGE_NOTIFY requests. Reproduced in the field as 9 file copies → 4 watcher events delivered. Confirmed against Docker Samba, QNAP TS-464, and Windows-shape servers via `tests/integration.rs::nas_accepts_stacked_change_notify` and the new unit test in `src/client/watcher.rs::loss_window_tests`.
+
+### Added
+
+- `Connection::dispatch` / `Connection::dispatch_with_credits` (crate-internal): variant of `execute` that returns once `transport.send().await` completes, handing back the response `oneshot::Receiver` for the caller to await separately. Enables pipelining patterns where the next request must be on the wire before the previous one's response is processed.
+
+### Notes
+
+- **Server compatibility check**: the fix relies on the server accepting two simultaneous CHANGE_NOTIFY requests on the same `FileId`. MS-SMB2 allows it; Windows, modern Samba (Docker fixtures), and QNAP TS-464 firmware all confirmed-good. Servers that reject would surface `Err(Error::Protocol { status: ..., command: ChangeNotify })` on the second `next_events()` call. If you hit this on a particular NAS, please file an issue with the NTSTATUS — a config-flag fallback to depth-0 (pre-issue off) is straightforward to add but hasn't been needed yet.
+
+## [0.9.1] - 2026-05-17
+
+### Added
+
+- New consumer-class fixture `smb-consumer-maxreadsize` (port 10494, env `SMB_CONSUMER_MAXREADSIZE_PORT`)
+  with `smb2 max read = smb2 max write = 65536`. Mirrors the internal-fixture
+  `smb-maxreadsize` so consumer apps can guard against streaming-fallback regressions
+  (every transfer >64 KB is chunked, exercising the same code path that hung pre-0.9.0)
+  without standing up smb2's `internal/` fixtures. Exposed via `smb2::testing::maxreadsize_port()`
+  and shipped through `write_compose_files`.
+
+## [0.9.0] - 2026-05-17
+
+### Changed
+
+- **Breaking: `FileWriter` owns its `Connection` and `Arc<Tree>` instead of borrowing `&'a mut Connection`.** The
+  lifetime parameter is gone; `FileWriter` is now `'static`. Multiple writers built from clones of the same
+  `Connection` pipeline their WRITEs over one SMB session, multiplexed by `MessageId` in the receiver task — no
+  external locking needed.
+- **Breaking: `Tree::create_file_writer` signature changed** from `(&self, conn: &mut Connection, path)` to
+  `(self: &Arc<Self>, conn: Connection, path)`. Callers that previously held an owned `Tree` need
+  `Arc::new(tree)` once; callers using `SmbClient::create_file_writer` are unaffected at the call site (the
+  client wraps the cloning internally).
+- **Breaking: `SmbClient::create_file_writer` takes `&self` instead of `&mut self`** and returns
+  `FileWriter` (no lifetime) instead of `FileWriter<'_>`. The previous `&mut self` requirement was the root cause
+  of a deadlock in the cmdr SMB volume's `write_from_stream` under sustained concurrent pressure on QNAP — the
+  consumer had to hold its session mutex for the entire streaming upload.
+- **Breaking: `Tree` is now `#[derive(Clone)]`.** Lets convenience constructors wrap a `Tree` in `Arc` without
+  reconstructing field-by-field. Cloning a `Tree` is cheap (one `TreeId`, three short `String`s, two bools).
+
+### Added
+
+- `client::stream::open_file_writer(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileWriter>` — free
+  function for building a `FileWriter` when you already hold a cloned `Connection` and an `Arc<Tree>` and don't
+  want the convenience-wrapper indirection. `Tree::create_file_writer` and `SmbClient::create_file_writer` both
+  delegate to it.
+
+### Notes
+
+- Internal callers in `Tree::write_file_pipelined` and `Tree::write_file_streamed` were not touched: they use
+  their own per-chunk `execute_with_credits` loop and never built a `FileWriter`.
+
+## [0.8.0] - 2026-05-08
+
+### Changed
+
+- **Breaking: `ErrorKind` is now `#[non_exhaustive]`.** Match expressions over `ErrorKind` must include a `_` arm.
+  Adding a new variant in a future release is now a non-breaking change. Consumers that already use a `_` fallback
+  (the pattern recommended by the doc example) need no update.
+
+### Added
+
+- `ErrorKind::AlreadyExists` — `STATUS_OBJECT_NAME_COLLISION` (returned by `Create` when a file or directory of the
+  same name exists) now classifies as `AlreadyExists` instead of falling through to `Other`. Lets callers handle
+  "merge into existing directory" or surface a friendly "name taken" message without substring-matching the error
+  text.
+- `ErrorKind::IsADirectory` — `STATUS_FILE_IS_A_DIRECTORY` now classifies as `IsADirectory`. Useful for
+  delete-fast-path callers that try `delete_file` first and fall back to `delete_directory` on this kind.
+- `ErrorKind::NotADirectory` — `STATUS_NOT_A_DIRECTORY` now classifies as `NotADirectory` (e.g., `list_directory` on
+  a file).
+- `error::tests::classify_status_contract`: a single table-driven test that documents the full `NtStatus → ErrorKind`
+  mapping, including statuses intentionally left as `Other`. Replaces the per-arm classification tests so the contract
+  lives in one auditable place; adding a new `NtStatus` should also add a row here.
+
+### Notes
+
+- `STATUS_OBJECT_NAME_INVALID`, `STATUS_DELETE_PENDING`, `STATUS_INSUFFICIENT_RESOURCES`, and
+  `STATUS_INSUFF_SERVER_RESOURCES` deliberately still classify as `ErrorKind::Other` — no current consumer needs to
+  branch on them. Promoting any of these to its own variant is non-breaking under the `#[non_exhaustive]` policy.
+
+## [0.7.2] - 2026-04-21
+
+### Fixed
+
+- DFS referral response parser (`msg::dfs::RespGetDfsReferral::unpack`): a V2 entry whose server-declared `entry_size`
+  was small enough to pass the initial `entry_size < 4` guard but short enough to truncate the fixed body would
+  trigger a panic (out-of-bounds) on the final `network_address_offset` read. The V2 body is 18 bytes after the
+  4-byte version/size prefix, not 16. Found by fuzzing; regression covered by
+  `msg::dfs::tests::resp_parse_v2_short_entry_returns_clean_error`.
+
+### Added
+
+- `fuzz/` crate using `cargo-fuzz` with 12 fuzz targets across the parse entry points: top-level SMB2 header,
+  TRANSFORM/COMPRESSION transform headers, compound-frame splitter, full frame + sub-frame body parse, Negotiate
+  request/response (negotiate contexts), Create request/response (create contexts), QueryInfo response, and DFS
+  referral response. Seed corpus generator at `tests/fuzz_seeds.rs` (run with
+  `cargo test --test fuzz_seeds -- --ignored`). Targets are feature-gated behind `fuzzing`; the feature exposes
+  parse entry points via `smb2::fuzzing` and is not meant for application use.
+- `.github/workflows/fuzz.yml`: weekly 5-minute-per-target fuzz run on schedule + manual dispatch.
+
+## [0.7.1] - 2026-04-21
+
+### Added
+
+- `Tree::download` for streaming reads driven by a borrowed `Connection`, mirroring the existing `SmbClient::download`
+  but unlocking concurrent downloads on a single SMB session (via `Connection::clone`).
+
+### Changed
+
+- `Tree::open_file` and `FileDownload::new` are now `pub` (were `pub(crate)`), so callers can build custom chunk loops
+  or reuse a handle across multiple readers.
+- `SmbClient::download` now delegates to `Tree::download` — zero behavior change.
+
+## [0.7.0] - 2026-04-21
+
+First public release on crates.io. Bundles the FileWriter streaming write API with the Phase 3 Connection actor
+refactor (breaking API change).
+
+### Changed
+
+- **Breaking: `Connection`'s send/receive API collapsed into `execute` / `execute_compound`** (Phase 3 of the
+  actor refactor). The legacy `send_request`, `send_request_with_credits`, `send_compound`,
+  `receive_response`, `receive_compound`, and `receive_compound_expected` are gone; callers use a single
+  awaitable call per op. `Connection::execute(command, body, tree_id)` returns `Result<Frame>` where
+  `Frame = { header, body, raw }`. `Connection::execute_compound(&[CompoundOp])` returns
+  `Result<Vec<Result<Frame>>>` — the outer `Result` is "did the compound hit the wire", the inner one is
+  per-sub-op so partial-failure handling (for example, `CREATE` ok, `READ` fails, issue standalone `CLOSE`
+  with the returned `FileId`) is straightforward. `Connection: Clone`; clones share the receiver task so
+  concurrent `execute` calls from different tasks/clones multiplex over the same SMB session. Cancelling
+  (dropping) a future mid-flight is safe by construction — the matching late-arriving frame is discarded.
+- `Connection` now uses a background receiver task with per-request `oneshot::Sender` routing (Phase 2 of
+  the actor refactor). See `docs/specs/connection-actor.md`. A caller's dropped future (for example,
+  `tokio::task::JoinHandle::abort()` in a downstream consumer) now correctly discards the corresponding
+  late-arriving response instead of letting it pollute the next operation's receive. Credits still tick on
+  dropped-caller frames so throughput stays correct under cancellation churn.
+- `tokio` is formalized as a hard runtime requirement; added `"rt"` to the tokio feature set. The library
+  spawns a receiver task per `Connection`.
+- `MockTransport::receive()` now awaits via `tokio::sync::Notify` when the queue is empty instead of
+  returning `Err(Disconnected)` immediately. Added `MockTransport::close()` to signal end-of-stream. This
+  lets the background receiver task stay alive across a test's interleaved `queue_response` calls. External
+  consumers writing tests with `MockTransport` directly need to call `close()` to get the old behavior.
+- `MockTransport::enable_auto_rewrite_msg_id()` — opt-in test-mode shim that rewrites each zero-msg_id
+  sub-frame of a queued response to match the next pending sent msg_id in FIFO order, so canned
+  `build_*_response` helpers that hardcode `MessageId(0)` route through the Phase 3 receiver task without
+  needing to predict the caller's allocated msg_ids. Replaces the pre-Phase-3
+  `Connection::set_orphan_filter_enabled(false)` escape hatch.
+
+### Migration guide (pre-Phase-3 → Phase 3)
+
+Single request:
+```rust
+// Before
+conn.send_request(Command::Create, &req, Some(tree_id)).await?;
+let (header, body, _raw) = conn.receive_response().await?;
+// After
+let frame = conn.execute(Command::Create, &req, Some(tree_id)).await?;
+// frame.header, frame.body, frame.raw
+```
+
+Compound request:
+```rust
+// Before
+let ops = vec![(Command::Create, &create_req, CreditCharge(1)), /*...*/];
+conn.send_compound(tree_id, &ops).await?;
+let responses = conn.receive_compound_expected(3).await?;
+// responses: Vec<(Header, Vec<u8>)>
+// After
+let ops = [
+    CompoundOp { command: Command::Create, body: &create_req, tree_id: Some(tree_id), credit_charge: CreditCharge(1) },
+    // ...
+];
+let frames = conn.execute_compound(&ops).await?;
+// frames: Vec<Result<Frame>> — each entry may independently be Err (session expired, signature
+// verify failure, etc.). Sub-op status codes (OBJECT_NAME_NOT_FOUND and friends) ride in
+// frames[i].as_ref()?.header.status, NOT in the inner Result.
+```
+
+Pipelined sliding-window reads/writes: use `futures_util::stream::FuturesUnordered` of boxed
+`execute_with_credits` futures across `conn.clone()`s — see `src/client/tree.rs::read_pipelined_loop` for
+the canonical pattern. `MAX_PIPELINE_WINDOW` and `conn.credits()`-based pacing stay on the caller side.
+
+### Added
+
+- `FileWriter` — push-based streaming write API with pipelined I/O. Consumer drives the loop, pushing chunks via
+  `write_chunk()` with automatic backpressure (sliding window, credit-aware). Complement to `FileDownload` for reads.
+  Created via `SmbClient::create_file_writer()`.
+- `FileWriter::abort()` — fast-cancel companion to `finish()`. Discards any unsent data, drains in-flight
+  WRITE responses to keep credits and message IDs in sync, skips the server-side FLUSH (fsync), and does a
+  best-effort CLOSE. Errors during drain/close are swallowed so callers can exit quickly. Use on
+  cancellation or error paths where the partial remote file is going to be deleted anyway — it saves the
+  fsync round-trip vs. calling `finish()`. The caller is responsible for deleting the partial file.
+- `Connection::receive_compound_expected(n)` — gathers exactly `n` compound sub-responses, transparently
+  reading additional transport frames when the server splits the chain. All compound-using methods
+  (`read_file_compound`, `write_file_compound`, `fs_info`, `stat`, `rename`, `delete_file`/`delete_directory`,
+  and the batch `delete_files`/`rename_files`/`stat_files`) now use it.
+- 13 new Docker integration tests for `FileWriter`: basic, large (5 MB), empty, single byte, overwrite,
+  equivalence with `write_file_pipelined`, binary data integrity, 64 KB max-write-size, signing, encryption,
+  read-only rejection, 100 MB stress (guest), 100 MB stress (200ms latency)
+- 10 new unit tests for `FileWriter` pipelining, backpressure, chunk splitting, error handling
+
+### Fixed
+
+- Unrecoverable frame errors (decrypt auth-tag mismatch, decompression failure, malformed sub-frame
+  header after compound splitting) no longer hang pending waiters indefinitely. Previously the
+  receiver task log-at-WARN'd and `continue`d, which left any waiter matching the discarded frame's
+  `MessageId` stuck on `rx.await` forever — the `msg_id` isn't recoverable from an unparseable frame,
+  so no targeted error could be delivered. Per decision E6 in the Phase 3 design, the receiver task
+  now tears the connection down on these conditions: fans `Err(Disconnected)` to every pending
+  waiter and exits. Callers see the error promptly and can reconnect. Sub-frame signature-verification
+  failures and `STATUS_NETWORK_SESSION_EXPIRED` stay targeted (delivered only to the matching waiter)
+  because the `msg_id` is known.
+- Caller futures that get dropped mid-flight (for example, a cancelled listing task in a consuming
+  application) no longer leave in-flight SMB requests on the wire that corrupt subsequent operations.
+  The receiver task discards late-arriving frames whose waiter's `oneshot::Receiver` has been dropped.
+  Reproduces and fixes the cmdr `listing_task.abort()` regression.
+- Compound requests no longer error with `invalid_data: expected N compound responses, got M` when the
+  server sends responses as separate frames instead of one compounded frame. Per MS-SMB2 3.3.4.1.3 the
+  server SHOULD compound but MAY split, and Samba (including QNAP NAS firmware built on Samba) splits
+  in some scenarios. Hit in the wild via `fs_info` against a QNAP NAS.
+
+## [0.6.0] - 2026-04-15
+
+### Added
+
+- `write_file_streamed` — write files from a streaming callback source with pipelined I/O, bounded memory usage
+  (sliding window, not full file), automatic chunk splitting at `MaxWriteSize`, works with signing and encryption
+  ([f5ade78](https://github.com/vdavid/smb2/commit/f5ade78))
+- 14 new tests: 3 unit (basic, empty, callback error), 9 Docker integration (guest, small, large 10 MB, empty, early
+  stop, 64 KB max-write-size, mandatory signing, mandatory encryption, read-only rejection), 2 NAS integration
+  (write + verify, performance comparison vs `write_file_pipelined`)
+
+### Fixed
+
+- Bumped `rand` 0.9.2 → 0.9.4 (RUSTSEC-2026-0097)
+
+## [0.5.0] - 2026-04-10
+
+### Added
+
+- DFS (Distributed File System) support — resolve `\\domain\dfs-namespace\path` transparently, follow referrals across
+  servers, multi-target failover, TTL-based referral cache
+  ([d353490](https://github.com/vdavid/smb2/commit/d353490),
+  [bfd8557](https://github.com/vdavid/smb2/commit/bfd8557),
+  [03c4c2a](https://github.com/vdavid/smb2/commit/03c4c2a),
+  [87a7d78](https://github.com/vdavid/smb2/commit/87a7d78))
+- Compound delete (1 RTT instead of 2), compound rename (1 RTT instead of 3), compound stat (1 RTT instead of 4)
+  ([33938591](https://github.com/vdavid/smb2/commit/33938591),
+  [5e0f7a5](https://github.com/vdavid/smb2/commit/5e0f7a5),
+  [4dc8fb8](https://github.com/vdavid/smb2/commit/4dc8fb8))
+- `read_file_with_progress` for pipelined reads with progress callback and cancellation
+  ([37e3370](https://github.com/vdavid/smb2/commit/37e3370))
+- Batch operations — `delete_files`, `rename_files`, `stat_files` send all compound requests before waiting for
+  responses, partial failures are independent ([afe4395](https://github.com/vdavid/smb2/commit/afe4395))
+- DFS wire format types: `ReqGetDfsReferral`, `RespGetDfsReferral` with V2/V3/V4 referral entries
+  ([e9e5bf9](https://github.com/vdavid/smb2/commit/e9e5bf9))
+- Auto-set `SMB2_FLAGS_DFS_OPERATIONS` based on tree capabilities
+  ([f254e96](https://github.com/vdavid/smb2/commit/f254e96))
+- Connection pool for DFS cross-server routing, `ClientConfig.dfs_enabled` and `dfs_target_overrides`
+  ([03c4c2a](https://github.com/vdavid/smb2/commit/03c4c2a),
+  [edcf730](https://github.com/vdavid/smb2/commit/edcf730))
+- Docker DFS test containers (smb-dfs-root:10456, smb-dfs-target:10457) with 4 integration tests
+  ([edcf730](https://github.com/vdavid/smb2/commit/edcf730))
+
+### Fixed
+
+- IOCTL `InputOffset` double-counted `Header::SIZE`, causing `STATUS_INVALID_PARAMETER` on DFS referral requests
+  ([edcf730](https://github.com/vdavid/smb2/commit/edcf730))
+- DFS paths missing `server\share` prefix in `Tree::format_path`
+  ([edcf730](https://github.com/vdavid/smb2/commit/edcf730))
+- Cross-server routing matched hostname-only instead of addr:port
+  ([edcf730](https://github.com/vdavid/smb2/commit/edcf730))
+
+## [0.4.0] - 2026-04-09
+
+### Added
+
+- Kerberos authentication — full AS + TGS + AP-REQ flow with pre-auth, tested end-to-end against Windows Server 2022
+  with Active Directory Domain Services
+  ([9b40b00](https://github.com/vdavid/smb2/commit/9b40b00))
+- Kerberos credential cache (ccache) support — read MIT Kerberos ccache files (v3 and v4) for password-less auth from
+  `kinit` tickets, `Session::setup_kerberos_from_ccache()`
+  ([2344f15](https://github.com/vdavid/smb2/commit/2344f15))
+- AP-REP mutual authentication — server sub-session key extraction for cryptographic server identity proof
+  ([b966d2c](https://github.com/vdavid/smb2/commit/b966d2c))
+- SPNEGO token wrapping — hand-rolled ASN.1/DER encoding for NegTokenInit/NegTokenResp (RFC 4178 / MS-SPNG), no external
+  ASN.1 dependency ([c27c88f](https://github.com/vdavid/smb2/commit/c27c88f))
+- Kerberos crypto: AES-CTS (RFC 3962), RC4-HMAC (RFC 4757), PBKDF2 string-to-key, n-fold, HMAC-SHA1-96 checksums
+  ([e23b851](https://github.com/vdavid/smb2/commit/e23b851))
+- Kerberos ASN.1 messages: AS-REQ, TGS-REQ, AP-REQ, Authenticator, KDC-REP parsing — all hand-rolled DER
+  ([97b57a5](https://github.com/vdavid/smb2/commit/97b57a5))
+- KDC client: UDP primary with TCP fallback on `KRB_ERR_RESPONSE_TOO_BIG`, exponential backoff retries
+  ([97b57a5](https://github.com/vdavid/smb2/commit/97b57a5))
+- `Session::setup_kerberos()` and `Session::setup_kerberos_from_ccache()` public API
+  ([3a63337](https://github.com/vdavid/smb2/commit/3a63337),
+  [2344f15](https://github.com/vdavid/smb2/commit/2344f15))
+- Support for AES-256, AES-128, and RC4-HMAC encryption types, with AES-256 preferred
+  ([01ad252](https://github.com/vdavid/smb2/commit/01ad252))
+
+### Fixed
+
+- KDC-REP field tags: pvno is `[0]` not `[1]` per RFC 4120
+  ([3a63337](https://github.com/vdavid/smb2/commit/3a63337))
+- AES-CTS key derivation: Ki constant is 0x55 (encrypt/decrypt integrity), not 0x99 (standalone checksum)
+  ([661a245](https://github.com/vdavid/smb2/commit/661a245))
+- TGS-REQ AP-REQ Authenticator was missing body checksum over KDC-REQ-BODY (RFC 4120 section 7.2.2, key usage 6)
+  ([661a245](https://github.com/vdavid/smb2/commit/661a245))
+
+### Key implementation details
+
+Hard-won lessons from testing against Windows AD (documented in `src/auth/CLAUDE.md`):
+
+- MS Kerberos OID (`1.2.840.48018.1.2.2`) required as primary SPNEGO mechanism for Windows
+- Key usage 11 (not 7) for AP-REQ Authenticator encryption in SPNEGO exchanges
+- GSS-API wrapping of AP-REQ inside SPNEGO mechToken
+- Raw ticket byte pass-through (re-encoding corrupts the encrypted ticket)
+- Session key etype detection from TGS-REP (may differ from ticket encryption type)
+
+## [0.3.0] - 2026-04-08
+
+### Added
+
+- Compound requests — CREATE+READ+CLOSE (3-way) and CREATE+WRITE+FLUSH+CLOSE (4-way) as single transport frames,
+  reducing round-trips from 3-4 to 1 per file operation
+  ([a9293b6](https://github.com/vdavid/smb2/commit/a9293b6),
+  [cb022bc](https://github.com/vdavid/smb2/commit/cb022bc))
+- `read_file()` and `write_file()` auto-select compound (small) or pipelined (large) — callers don't choose
+  ([25b2f68](https://github.com/vdavid/smb2/commit/25b2f68),
+  [cb022bc](https://github.com/vdavid/smb2/commit/cb022bc))
+- Streaming upload with `FileUpload` — compound for small files, chunked for large, same caller API either way
+  ([8b2283a](https://github.com/vdavid/smb2/commit/8b2283a))
+- Streaming download with `FileDownload`, progress reporting with `ControlFlow`-based cancellation
+  ([c11f5f3](https://github.com/vdavid/smb2/commit/c11f5f3))
+- Sliding window pipeline — each response immediately triggers the next chunk, keeping the TCP pipe full
+  ([dd36181](https://github.com/vdavid/smb2/commit/dd36181))
+- SMB 3.x encryption wired into client layer — TRANSFORM_HEADER wrapping, sign-then-compress-then-encrypt send path,
+  AES-128/256-CCM/GCM ([101d22d](https://github.com/vdavid/smb2/commit/101d22d))
+- LZ4 compression wired into connection layer — negotiated during handshake, applied per-message when it reduces size
+  ([e2921f9](https://github.com/vdavid/smb2/commit/e2921f9))
+- File watching via `CHANGE_NOTIFY` — `Watcher` struct with `next_events()` long-poll, recursive watching support
+  ([75b281d](https://github.com/vdavid/smb2/commit/75b281d))
+- Disk space query (`fs_info`) via compound CREATE+QUERY_INFO+CLOSE
+  ([6d3a05c](https://github.com/vdavid/smb2/commit/6d3a05c))
+- `ErrorKind` for high-level error classification — `NotFound`, `AccessDenied`, `ConnectionLost`, etc. instead of raw
+  NTSTATUS codes ([58aead2](https://github.com/vdavid/smb2/commit/58aead2))
+- Oplock break notification handling — detected by MessageId `0xFFFF...`, logged and skipped without crashing
+  ([371b984](https://github.com/vdavid/smb2/commit/371b984))
+- `STATUS_BUFFER_OVERFLOW` accepted as partial success in QueryInfo responses
+  ([4122d16](https://github.com/vdavid/smb2/commit/4122d16))
+- CANCEL requests and session expiry detection with `Error::SessionExpired`
+  ([4924a2a](https://github.com/vdavid/smb2/commit/4924a2a))
+- Docker test infrastructure — 12 Samba containers covering guest, auth, signing, readonly, ancient (SMB1), flaky, slow,
+  encryption (GCM + CCM), 50 shares, max read size, with 43 integration tests
+  ([8edf837](https://github.com/vdavid/smb2/commit/8edf837),
+  [7ee088f](https://github.com/vdavid/smb2/commit/7ee088f),
+  [812ad39](https://github.com/vdavid/smb2/commit/812ad39))
+- Docker tests in CI — builds containers and runs 43 tests on every PR
+  ([488e1d0](https://github.com/vdavid/smb2/commit/488e1d0))
+- 7 runnable examples: `list_shares`, `list_directory`, `read_file`, `streaming_download`, `disk_space`,
+  `watch_directory`, `write_file` ([7203bdb](https://github.com/vdavid/smb2/commit/7203bdb))
+- `Send + Sync` bounds on `Pack` trait for async callers
+  ([4538205](https://github.com/vdavid/smb2/commit/4538205))
+- GitHub Actions CI: fmt, clippy, test, doc, MSRV 1.85
+  ([f0b00cd](https://github.com/vdavid/smb2/commit/f0b00cd))
+
+### Fixed
+
+- `STATUS_PENDING` handling — `receive_response()` now loops past interim responses instead of treating them as errors
+  ([8edf837](https://github.com/vdavid/smb2/commit/8edf837))
+- Multi-credit charges — streaming download/upload and `write_file_with_progress` were sending `credit_charge=1` for
+  MB-sized payloads, Samba rejects with `STATUS_INVALID_PARAMETER`
+  ([8edf837](https://github.com/vdavid/smb2/commit/8edf837))
+- Cipher fallback — fall back to AES-128-CCM when server omits encryption negotiate context
+  ([812ad39](https://github.com/vdavid/smb2/commit/812ad39))
+
+### Improved
+
+- Smart read selection — sequential for files < MaxReadSize (1 RTT), pipelined only when beneficial
+  ([3f0cd77](https://github.com/vdavid/smb2/commit/3f0cd77))
+- Credit request bumped from 32 to 256 per request, credits grow rapidly
+  ([dd36181](https://github.com/vdavid/smb2/commit/dd36181))
+- Pipeline uses server-negotiated MaxReadSize/MaxWriteSize with correct multi-credit CreditCharge
+  ([b0cacdd](https://github.com/vdavid/smb2/commit/b0cacdd))
+- `trivial_message!` and `nt_status_codes!` macros to reduce boilerplate
+  ([fb4b9e4](https://github.com/vdavid/smb2/commit/fb4b9e4))
+- CLAUDE.md files for all 8 modules, agent docs colocated with code
+  ([2d884d0](https://github.com/vdavid/smb2/commit/2d884d0))
+
+## [0.2.0] - 2026-04-08
+
+### Added
+
+- Concurrent pipelined read and write — send multiple READ/WRITE requests by filling the credit window, reassemble
+  responses in offset order, handles out-of-order responses
+  ([7f3068a](https://github.com/vdavid/smb2/commit/7f3068a))
+- Share enumeration — IPC$ + srvsvc RPC flow, QNAP returns 8 disk shares, Pi returns 1
+  ([cbed0ab](https://github.com/vdavid/smb2/commit/cbed0ab))
+- `SmbClient` high-level API — `connect()`, `list_shares()`, `connect_share()`, `reconnect()`, stored credentials
+  ([cbed0ab](https://github.com/vdavid/smb2/commit/cbed0ab))
+- Convenience `smb2::client::connect("host:445", "user", "pass")` one-liner
+  ([cbed0ab](https://github.com/vdavid/smb2/commit/cbed0ab))
+- File operations: `write_file`, `delete_file`, `stat`, `rename`, `create_directory`, `delete_directory`
+  ([c80f126](https://github.com/vdavid/smb2/commit/c80f126))
+- Clean re-exports from `lib.rs` — `use smb2::{SmbClient, Tree}` instead of reaching into submodules
+  ([cdb203e](https://github.com/vdavid/smb2/commit/cdb203e))
+- 4 runnable examples: `list_shares`, `list_directory`, `read_file`, `write_file`
+  ([cdb203e](https://github.com/vdavid/smb2/commit/cdb203e))
+- Benchmarks against native macOS SMB and `smb` crate:
+  small files 2-3x faster, medium files match native on upload, 8.5x faster than `smb` on download
+  ([031d52b](https://github.com/vdavid/smb2/commit/031d52b),
+  [4cbc961](https://github.com/vdavid/smb2/commit/4cbc961))
+- Integration tests against QNAP NAS (SMB 3.1.1, NTLM, AES-GMAC) and Raspberry Pi 4 (SMB 3.1.1, guest)
+  ([c80f126](https://github.com/vdavid/smb2/commit/c80f126))
+
+### Fixed
+
+- Preauth hash: exclude final SESSION_SETUP success response from hash — including it produces wrong keys for SMB 3.1.1
+  ([32f0f30](https://github.com/vdavid/smb2/commit/32f0f30))
+- QueryDirectory: cap `OutputBufferLength` to 65536, always send `"*"` pattern (empty filename rejected by QNAP + Samba)
+  ([b9d49f7](https://github.com/vdavid/smb2/commit/b9d49f7))
+- GMAC uses AES-128-GCM (16-byte key), not AES-256-GCM
+  ([dc91351](https://github.com/vdavid/smb2/commit/dc91351))
+- GMAC nonce needs server role bit for response verification
+  ([dc91351](https://github.com/vdavid/smb2/commit/dc91351))
+- Only verify signature when `SMB2_FLAGS_SIGNED` is set (skip STATUS_PENDING and oplock breaks)
+  ([dc91351](https://github.com/vdavid/smb2/commit/dc91351))
+
+## [0.1.0] - 2026-04-07
+
+### Added
+
+- SMB 2.0.2, 2.1, 3.0, 3.0.2, 3.1.1 dialect support — negotiate with all five dialects, preauth integrity, encryption,
+  compression, and signing negotiate contexts
+  ([c3a2e43](https://github.com/vdavid/smb2/commit/c3a2e43),
+  [36428728](https://github.com/vdavid/smb2/commit/36428728))
+- NTLM authentication (NTLMv2 with MIC) — full NEGOTIATE/CHALLENGE/AUTHENTICATE flow, session key exchange, known-answer
+  test vectors from MS-NLMP section 4.2.4
+  ([60c4163](https://github.com/vdavid/smb2/commit/60c4163))
+- Wire format pack/unpack for all 19 SMB2 commands — header, negotiate, session setup, tree connect, create, close,
+  read, write, flush, lock, ioctl, query directory, change notify, query info, set info, echo, cancel, logoff, oplock
+  break, transform header, compression header
+  ([c3a2e43](https://github.com/vdavid/smb2/commit/c3a2e43))
+- Binary serialization primitives — `ReadCursor`/`WriteCursor` with LE primitives, UTF-16LE, alignment, backpatching,
+  `Pack`/`Unpack` traits, `Guid` with mixed-endian layout, `FileTime` with Windows epoch conversion
+  ([8be0549](https://github.com/vdavid/smb2/commit/8be0549))
+- Newtypes for all protocol IDs: `SessionId`, `MessageId`, `TreeId`, `CreditCharge`, `FileId` with sentinel constants
+  ([8be0549](https://github.com/vdavid/smb2/commit/8be0549))
+- TCP transport with split send/receive traits (avoids deadlock in pipeline's `select!` loop), correct framing (0x00 +
+  3-byte BE length), 16 MB max frame, Nagle disabled
+  ([5ae8027](https://github.com/vdavid/smb2/commit/5ae8027))
+- MockTransport for TDD — FIFO response queue, message recording, assertion helpers
+  ([5ae8027](https://github.com/vdavid/smb2/commit/5ae8027))
+- SMB 3.x signing: HMAC-SHA256 (2.0.2/2.1), AES-128-CMAC (3.0/3.0.2), AES-256-GMAC (3.1.1)
+  ([a7080f3](https://github.com/vdavid/smb2/commit/a7080f3))
+- SMB 3.x encryption: AES-128/256-CCM and AES-128/256-GCM with monotonic nonce generator
+  ([a7080f3](https://github.com/vdavid/smb2/commit/a7080f3))
+- SP800-108 key derivation for SMB 3.0/3.0.2 (legacy labels) and 3.1.1 (preauth hash context)
+  ([a7080f3](https://github.com/vdavid/smb2/commit/a7080f3))
+- LZ4 compression via `lz4_flex` (pure Rust, zero C deps)
+  ([a7080f3](https://github.com/vdavid/smb2/commit/a7080f3))
+- Connection layer: negotiate, credit management, message ID sequencing, preauth hash tracking, signing integration
+  ([36428728](https://github.com/vdavid/smb2/commit/36428728))
+- Session layer: multi-round-trip SESSION_SETUP with NTLM, key derivation per dialect, signing activation
+  ([36428728](https://github.com/vdavid/smb2/commit/36428728))
+- Tree layer: TREE_CONNECT with UNC path, directory listing, file reading
+  ([36428728](https://github.com/vdavid/smb2/commit/36428728))
+- RPC module: DCE/RPC PDU encoding, NDR encoding for `NetShareEnumAll`
+  ([36428728](https://github.com/vdavid/smb2/commit/36428728))
+- Structured logging via `log` crate — info for lifecycle, debug for protocol, trace for bytes, never logs secrets
+  ([1d7273a](https://github.com/vdavid/smb2/commit/1d7273a))
+- Error types with `is_retryable()`, `status()`, `Auth`, `Timeout`, `Disconnected`, `SessionExpired` variants
+  ([5ae8027](https://github.com/vdavid/smb2/commit/5ae8027))
+- `MAX_UNPACK_BUFFER` (16 MB) allocation cap to prevent OOM from malicious packets
+  ([073452c](https://github.com/vdavid/smb2/commit/073452c))
+- 512 unit tests, 10 integration tests against real hardware, zero clippy warnings

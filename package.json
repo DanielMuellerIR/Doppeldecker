@@ -1,0 +1,24 @@
+{
+  "name": "doppeldecker-ui-tests",
+  "private": true,
+  "version": "0.1.124",
+  "type": "module",
+  "scripts": {
+    "test:ui": "node --test tools/tests/test-pane-tabs.mjs && node tools/test-mock-ui.mjs",
+    "tauri": "tauri",
+    "release:check": "python3 tools/check-release.py",
+    "bundle:macos": "python3 tools/check-release.py && python3 tools/build-release.py macos && python3 tools/verify-release-privacy.py && sh tools/verify-macos-release.sh --allow-adhoc && python3 tools/write-release-checksums.py",
+    "bundle:macos:public": "python3 tools/check-release.py && python3 tools/build-release.py macos-public && python3 tools/verify-release-privacy.py && sh tools/verify-macos-release.sh && python3 tools/write-release-checksums.py",
+    "verify:macos:public": "sh tools/verify-macos-release.sh",
+    "bundle:linux": "python3 tools/check-release.py && python3 tools/build-release.py linux && python3 tools/verify-release-privacy.py && python3 tools/verify-linux-release.py && python3 tools/write-release-checksums.py",
+    "release:update-manifest": "python3 tools/write-update-manifest.py && python3 tools/write-release-checksums.py"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "playwright": "1.61.1",
+    "yaml": "2.9.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

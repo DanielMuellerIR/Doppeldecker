@@ -1,0 +1,404 @@
+# smb2
+
+[![Crates.io](https://img.shields.io/crates/v/smb2)](https://crates.io/crates/smb2)
+[![docs.rs](https://img.shields.io/docsrs/smb2)](https://docs.rs/smb2)
+[![CI](https://github.com/vdavid/smb2/actions/workflows/ci.yml/badge.svg)](https://github.com/vdavid/smb2/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/smb2)](LICENSE-MIT)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
+
+A pure-Rust SMB2/3 client library with pipelined I/O. No C dependencies, no FFI. Faster than native macOS SMB in all
+operations: 1.3-5x faster on uploads, downloads, listings, and deletes.
+
+I built this because I needed fast SMB access for [Cmdr](https://github.com/vdavid/cmdr) (my file manager), and the
+existing Rust SMB options weren't good enough. The `smb` crate works fine for listing files but downloads are painfully
+slow because it sends one read at a time. Native OS SMB clients pipeline their reads, and so does this library, and here
+we have more control to reach even better speeds.
+
+**Why this matters:**
+
+- Cross-compile without system lib headaches (no `libsmbclient`, no `-sys` crates)
+- Pipelined I/O by default, not as an afterthought
+- Async and runtime-agnostic (uses `futures` traits)
+- Works anywhere Rust compiles
+
+## What it does
+
+- Connect to SMB2/3 shares using NTLM or Kerberos authentication
+- List directories, read files, write files, delete, rename, stat, create directories
+- Compound requests (CREATE+READ+CLOSE in 1 round-trip, 4-way write compounds, compound delete/rename/stat)
+- Batch operations (delete, rename, stat multiple files -- all requests sent before waiting for responses)
+- Pipelined I/O with sliding window for large file transfers
+- SMB 2.x (HMAC-SHA256) and 3.x (AES-CMAC, AES-GMAC) signing, and encryption (AES-128/256-CCM/GCM)
+- LZ4 compression
+- Share enumeration (list shares on a server via IPC$ + srvsvc RPC)
+- Streaming downloads and uploads with progress reporting and cancellation
+- File watching (CHANGE_NOTIFY for live directory updates)
+- Disk space queries (total, free, used)
+- DFS path resolution (standalone DFS with transparent referral follow-through)
+- Reconnection after network failures
+- Auto-flush on writes (data safety for family photos and company docs)
+
+## Limitations
+
+Not yet supported:
+
+- **Domain-based DFS**: standalone DFS links work; AD domain-based namespaces aren't supported yet
+- **DFS target failback**: uses the first reachable target; no automatic failback to preferred targets
+- **Multi-channel**: single TCP connection per client
+- **QUIC/RDMA transport**: TCP only (covers ~99% of use cases)
+
+If you need multi-channel or QUIC, check the [`smb`](https://crates.io/crates/smb) crate.
+
+Not planned:
+
+- Server implementation (this is a client library)
+- SMB1 (deprecated, insecure)
+- LZNT1 compression (LZ4 is supported; LZNT1 is legacy)
+
+## Quick start
+
+```rust
+#[tokio::main]
+async fn main() -> Result<(), smb2::Error> {
+    let mut client = smb2::connect("192.168.1.100:445", "user", "pass").await?;
+
+    // List shares
+    let shares = client.list_shares().await?;
+    for share in &shares {
+        println!("{} - {}", share.name, share.comment);
+    }
+
+    // Connect to a share
+    let mut share = client.connect_share("Documents").await?;
+
+    // List files
+    let entries = client.list_directory(&mut share, "projects/").await?;
+    for entry in &entries {
+        println!("{} ({} bytes)", entry.name, entry.size);
+    }
+
+    // Read a file
+    let data = client.read_file(&mut share, "report.pdf").await?;
+    std::fs::write("report.pdf", data)?;
+
+    // Write a file
+    let content = std::fs::read("local_file.txt")?;
+    client.write_file(&mut share, "remote_file.txt", &content).await?;
+
+    // Clean up
+    client.disconnect_share(&share).await?;
+
+    Ok(())
+}
+```
+
+## Pipeline API
+
+The pipeline is the core feature. It lets you batch multiple operations and execute them together:
+
+```rust
+use smb2::{Pipeline, Op, OpResult};
+
+# async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
+    let mut pipeline = Pipeline::new(client.connection_mut(), &share);
+
+    let results = pipeline.execute(vec![
+        Op::ReadFile("a.txt".into()),
+        Op::ReadFile("b.txt".into()),
+        Op::ListDirectory("docs/".into()),
+        Op::Delete("temp.txt".into()),
+    ]).await;
+
+    for result in results {
+        match result {
+            OpResult::FileData { path, data } => println!("{}: {} bytes", path, data.len()),
+            OpResult::DirEntries { path, entries } => println!("{}: {} entries", path, entries.len()),
+            OpResult::Deleted { path } => println!("deleted {}", path),
+            OpResult::Error { path, error } => eprintln!("{}: {}", path, error),
+            other => println!("{:?}", other),
+        }
+    }
+    # Ok(())
+    #
+}
+```
+
+For large file I/O, use the pipelined variants which fill the credit window:
+
+```rust
+# async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
+    // Pipelined I/O with sliding window for large files
+    let data = client.read_file_pipelined(&mut share, "big_file.iso").await?;
+    client.write_file_pipelined(&mut share, "copy.iso", &data).await?;
+    # Ok(())
+    #
+}
+```
+
+## Streaming I/O
+
+For large files that don't fit in memory, use the streaming API. It downloads one chunk at a time and supports progress
+reporting and cancellation.
+
+### Streaming download
+
+```rust
+use tokio::io::AsyncWriteExt;
+
+# async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+    let mut download = client.download(&share, "big_video.mp4").await?;
+    println!("Downloading {} bytes...", download.size());
+
+    let mut file = tokio::fs::File::create("big_video.mp4").await?;
+    while let Some(chunk) = download.next_chunk().await {
+        let bytes = chunk?;
+        file.write_all(&bytes).await?;
+        println!("{:.1}%", download.progress().percent());
+    }
+    # Ok(())
+    #
+}
+```
+
+### Write with progress and cancellation
+
+```rust
+use std::ops::ControlFlow;
+
+# async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
+    let data = std::fs::read("big_file.bin")?;
+    client.write_file_with_progress(&mut share, "remote.bin", &data, |progress| {
+        println!("{:.1}%", progress.percent());
+        ControlFlow::Continue(()) // return ControlFlow::Break(()) to cancel
+    }).await?;
+    # Ok(())
+    #
+}
+```
+
+All write methods (`write_file`, `write_file_pipelined`, `write_file_with_progress`) flush data to persistent storage
+before closing the file handle.
+
+### Server-side copy
+
+When source and destination live on the same share, the server can copy the bytes between its own files directly — the
+data never crosses the wire, so even a multi-gigabyte copy finishes in moments. Not every server supports it (older
+Samba builds, some NAS firmware), so branch on `ErrorKind::Unsupported` to fall back to a read-then-write copy:
+
+```rust
+use smb2::ErrorKind;
+
+# async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
+match client.server_side_copy_file(share, "movie.mkv", "movie-backup.mkv").await {
+    Ok(bytes) => println!("copied {bytes} bytes without touching the network"),
+    Err(e) if e.kind() == ErrorKind::Unsupported => {
+        let data = client.read_file(share, "movie.mkv").await?;
+        client.write_file(share, "movie-backup.mkv", &data).await?;
+    }
+    Err(e) => return Err(e),
+}
+# Ok(())
+# }
+```
+
+`server_side_copy_file_range` copies a byte range to a chosen destination offset (pair it with
+`create_file_writer_at` to append after a copied prefix), and `request_resume_key` / `copy_chunks` are the low-level
+primitives. See the runnable `server_side_copy` example.
+
+## Diagnostics
+
+`SmbClient::diagnostics()` captures a snapshot of the client's state for dashboards, MCP tools, log dumps, and tests
+that want to assert on counter ticks rather than scrape logs.
+
+The state captured:
+
+- negotiated dialect
+- credits
+- in-flight requests,
+- per-connection counters (bytes sent/received
+- request outcomes
+- protocol events)
+- DFS cache
+- sessions
+
+```rust
+# async fn example(client: &mut smb2::SmbClient) -> Result<(), smb2::Error> {
+let diag = client.diagnostics();
+println!("{}", diag);                                  // compact terminal view
+assert!(diag.primary.metrics.responses_routed_ok > 0); // typed assertions
+
+// Optional: with `--features serde`:
+#[cfg(feature = "serde")]
+println!("{}", serde_json::to_string_pretty(&diag).unwrap());
+# Ok(())
+# }
+```
+
+The snapshot is eventually consistent (each field is loaded independently), survives connection teardown, and is
+cheap (a handful of atomic loads + short critical sections). Counter semantics and the four-way routing partition are
+documented on `smb2::MetricsSnapshot`. See [`docs/specs/diagnostics-plan.md`](docs/specs/diagnostics-plan.md) for the
+design.
+
+Two runnable examples to see it in action:
+
+```sh
+# One-shot: connect, list a directory, dump the snapshot.
+SMB2_PASS=secret cargo run --example diagnostics
+SMB2_PASS=secret cargo run --example diagnostics --features serde -- --json
+
+# Live: download N files in parallel, tail the snapshot every interval ms.
+SMB2_PASS=secret SMB2_FILE=big.bin \
+  cargo run --example diagnostics_live -- --parallel 7 --interval 200
+```
+
+Env vars used by both: `SMB2_HOST` (`host:port`), `SMB2_USER`, `SMB2_PASS`, `SMB2_SHARE`. The live example also takes
+`SMB2_FILE`. Useful pairings: `RUST_LOG=smb2=info` for the lib's own log lines on top, or the slow Docker container
+(`SMB2_HOST=127.0.0.1:10451`, see [tests/CLAUDE.md](tests/CLAUDE.md)) to watch the dumper tick while the wire is busy.
+
+To consumers wanting live charts, MCP tools, or Prometheus integration build on top of `Diagnostics` / `MetricsSnapshot`
+in their own crates: smb2 is a protocol library and it'll stay so. Presentation belongs to your app.
+
+## Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+smb2 = "0.13"
+```
+
+You'll also need an async runtime. The library is runtime-agnostic, but [tokio](https://github.com/tokio-rs/tokio) is
+the most common choice:
+
+```toml
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+## API overview
+
+### High-level API
+
+For when you want to do one thing and get the result:
+
+- `smb2::connect()`: Connect and authenticate (shorthand)
+- `SmbClient::connect()`: Connect with full config
+- `client.list_shares()`: List available shares
+- `client.connect_share()`: Connect to a share
+- `client.list_directory(&mut share, path)`: List a directory
+- `client.read_file(&mut share, path)`: Download a file
+- `client.write_file(&mut share, path, data)`: Upload a file
+- `client.delete_file(&mut share, path)`: Delete a file
+- `client.delete_files(&mut share, &paths)`: Batch delete (all requests sent before waiting)
+- `client.stat(&mut share, path)`: Get file metadata
+- `client.stat_files(&mut share, &paths)`: Batch stat
+- `client.rename(&mut share, from, to)`: Rename a file
+- `client.rename_files(&mut share, &renames)`: Batch rename
+- `client.create_directory(&mut share, path)`: Create a directory
+- `client.delete_directory(&mut share, path)`: Remove a directory
+- `client.download(&share, path)`: Streaming download with progress (memory-efficient)
+- `client.upload(&share, path, data)`: Streaming upload with progress
+- `client.write_file_streamed(&mut share, path, callback)`: Write from a streaming source (memory-efficient, pipelined)
+- `client.watch(&share, path, recursive)`: Watch for file changes (CHANGE_NOTIFY)
+- `client.fs_info(&mut share)`: Disk space (total, free, used)
+- `client.reconnect()`: Reconnect after network failure
+- `client.credits()`: Current available credits
+- `client.estimated_rtt()`: Round-trip time from negotiate
+- `client.disconnect_share(&share)`: Disconnect from a share
+
+### Pipeline API
+
+For when you have many operations and want them fast:
+
+- `Pipeline::new(conn, &share)`: Create a pipeline
+- `pipeline.execute(ops)`: Run a batch of operations
+
+### Low-level API
+
+For advanced use cases, the underlying types are available:
+
+- `Connection`: Message exchange, credit tracking
+- `Session`: NTLM authentication, key derivation
+- `Tree`: Share-level file operations (take `&mut Connection`)
+- `NegotiatedParams`: Protocol parameters from negotiate
+
+## Performance
+
+Benchmarked against native macOS SMB (with F_NOCACHE to disable kernel page cache) and the `smb` crate on a QNAP NAS
+over Gigabit LAN, SMB 3.1.1:
+
+### Small files (100 × 100 KB)
+
+| Operation | native | smb2  | Speedup         |
+|-----------|--------|-------|-----------------|
+| Upload    | 3.69s  | 1.91s | **1.9x faster** |
+| List      | 47ms   | 21ms  | **2.2x faster** |
+| Download  | 3.10s  | 617ms | **5.0x faster** |
+| Delete    | 3.08s  | 1.03s | **3.0x faster** |
+
+### Medium files (10 × 10 MB)
+
+| Operation | native | smb2  | Speedup         |
+|-----------|--------|-------|-----------------|
+| Upload    | 1.66s  | 1.23s | **1.3x faster** |
+| List      | 27ms   | 19ms  | **1.4x faster** |
+| Download  | 4.00s  | 2.93s | **1.4x faster** |
+| Delete    | 301ms  | 128ms | **2.4x faster** |
+
+### Large files (3 × 50 MB)
+
+| Operation | native | smb2  | Speedup         |
+|-----------|--------|-------|-----------------|
+| Upload    | 1.69s  | 1.56s | ~parity         |
+| List      | 27ms   | 18ms  | **1.5x faster** |
+| Download  | 5.62s  | 1.11s | **5.1x faster** |
+| Delete    | 117ms  | 54ms  | **2.1x faster** |
+
+Key optimizations: compound requests (CREATE+READ+CLOSE in 1 round-trip), pipelined I/O with sliding window and adaptive
+chunk sizing, and 256-credit request for wide pipeline windows.
+
+**Note:** Native macOS download benchmarks use F_NOCACHE to bypass the kernel page cache. Without this, cached native
+reads appear ~20x faster because they skip the network entirely. F_NOCACHE gives a fair comparison of actual network I/O
+performance.
+
+The benchmark tool is included at `benchmarks/smb/`. Run with `cargo run -p smb-benchmark --release`.
+
+## Comparison with existing libraries
+
+### vs `smb` crate
+
+The [`smb`](https://crates.io/crates/smb) crate supports multi-channel, QUIC, and RDMA transport. If you need those, use
+it. For everything else, `smb2` is a better fit:
+
+- **Compound + pipelined I/O**: `smb` sends one request at a time; smb2 uses compound requests and pipelined reads with
+  sliding window
+- **Auto-reconnect with durable handles**: survives Wi-Fi drops without restarting transfers
+- **Comprehensive test suite**: `smb` has almost no tests
+- **MIT OR Apache-2.0**: `smb` is MIT-only
+
+I initially considered forking `smb`, but the architecture didn't support pipelining well, and adding it would have been
+a near-complete rewrite anyway.
+
+### vs `pavao`
+
+[`pavao`](https://crates.io/crates/pavao) wraps `libsmbclient` via FFI. It works, but you need `libsmbclient` installed,
+which means system package management, cross-compilation headaches, and all the fun that comes with C dependencies.
+
+`smb2` is pure Rust. `cargo build` and done.
+
+## Implementation notes
+
+- I used Claude extensively for this implementation. The code has a comprehensive test suite (unit tests with mock
+  transport, property tests with proptest, integration tests against Docker Samba), and it works for my use case in
+  Cmdr. If you distrust AI-generated code, that's fair, but please check the tests and decide for yourself.
+- The protocol implementation is based on
+  Microsoft's [MS-SMB2 spec](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/). I converted the
+  relevant sections to Markdown so AI agents could work from them effectively. The spec files live in `docs/specs/`.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## License
+
+MIT OR Apache-2.0, at your option.

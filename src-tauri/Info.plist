@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Doppeldecker sendet auf ausdrücklich abschaltbare Weise drei feste
+       Bonjour-Abfragen, um SMB-, SFTP- und WebDAV-Ziele in der Seitenleiste zu
+       zeigen. Die Verbindung selbst bleibt danach eine getrennte Nutzeraktion. -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Doppeldecker durchsucht das lokale Netzwerk nach SMB-, SFTP- und WebDAV-Freigaben, die du anschließend bewusst verbinden kannst.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_smb._tcp</string>
+    <string>_sftp-ssh._tcp</string>
+    <string>_webdav._tcp</string>
+  </array>
+</dict>
+</plist>

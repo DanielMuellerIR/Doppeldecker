@@ -1,0 +1,50 @@
+<!-- Frühere App-Icon-Quelle, als bearbeitbare Vektorreferenz bewahrt. Die aktive
+     Quelle ist `icon-source.png`; `tools/make-icons.sh` erzeugt daraus
+     `icon.png` und `icon.icns`. -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a3548"/>
+      <stop offset="1" stop-color="#131a26"/>
+    </linearGradient>
+    <linearGradient id="w1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7db8ff"/>
+      <stop offset="1" stop-color="#3d8bff"/>
+    </linearGradient>
+    <linearGradient id="w2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#c4dcff"/>
+      <stop offset="1" stop-color="#8fbcff"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.47" r="0.55">
+      <stop offset="0" stop-color="#3d8bff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#3d8bff" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="sq"><rect x="100" y="100" width="824" height="824" rx="185"/></clipPath>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <g clip-path="url(#sq)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#glow)"/>
+    <!-- dezente obere Innenkante für Tiefe -->
+    <rect x="104" y="104" width="816" height="816" rx="181" fill="none" stroke="#ffffff" stroke-opacity="0.07" stroke-width="8"/>
+  </g>
+
+  <!-- Frontal-Doppeldecker: zwei Tragflächen = zwei Panes -->
+  <!-- obere Tragfläche -->
+  <rect x="212" y="356" width="600" height="96" rx="48" fill="url(#w1)"/>
+  <!-- untere Tragfläche -->
+  <rect x="268" y="556" width="488" height="96" rx="48" fill="url(#w2)"/>
+
+  <!-- Streben -->
+  <line x1="330" y1="452" x2="330" y2="556" stroke="#9dbfe8" stroke-width="20" stroke-linecap="round"/>
+  <line x1="694" y1="452" x2="694" y2="556" stroke="#9dbfe8" stroke-width="20" stroke-linecap="round"/>
+
+  <!-- Rumpf mittig -->
+  <circle cx="512" cy="504" r="86" fill="#eef4ff"/>
+  <circle cx="512" cy="504" r="56" fill="#1c2433"/>
+  <!-- Propeller -->
+  <line x1="512" y1="504" x2="512" y2="392" stroke="#eef4ff" stroke-width="26" stroke-linecap="round"/>
+  <line x1="512" y1="504" x2="415" y2="560" stroke="#eef4ff" stroke-width="26" stroke-linecap="round"/>
+  <line x1="512" y1="504" x2="609" y2="560" stroke="#eef4ff" stroke-width="26" stroke-linecap="round"/>
+  <circle cx="512" cy="504" r="26" fill="#eef4ff"/>
+</svg>

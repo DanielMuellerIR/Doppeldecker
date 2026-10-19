@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Doppeldecker</title>
+    <!-- Theme und Plattform vor dem ersten Paint setzen (eigene Datei statt
+         Inline-Script wegen der strikten CSP; Details in theme-boot.js). -->
+    <script src="theme-boot.js"></script>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- Dauerhafte Kennzeichnung realer, aber auf einen markierten Wegwerfbereich
+           begrenzter Testläufe. Außerhalb davon bleibt Sync immer reine Simulation. -->
+      <div class="test-mode-banner" id="test-mode-banner" hidden></div>
+      <!-- Ein echter Datenlauf ist technisch vom Testmodus getrennt. Während
+           Vorbereitung und Ausführung bleibt diese rote Kennzeichnung sichtbar. -->
+      <div class="real-mode-banner" id="real-mode-banner" hidden></div>
+
+      <!-- Arbeitsbereich nach Fastra-Vorbild: flache Seitenleiste in voller Höhe,
+           daneben ein ziehbarer Splitter; rechts nutzen die Panes die volle
+           Fensterhöhe. Der einzige schlanke Kopf trägt Version und Queue. -->
+      <div class="workspace">
+      <!-- Seitenleiste: Marke oben (unter den macOS-Ampelknöpfen), darunter
+           Schnellzugriff-Favoriten (Klick navigiert die aktive Pane). Ordner lassen
+           sich per Drag & Drop aus den Panes ablegen und umsortieren. Verbindungen
+           aller Protokolle teilen sich eine Liste; das Protokoll ist am farbigen
+           Icon erkennbar. -->
+      <aside class="sidebar">
+        <!-- Schlanker Fensterkopf: unter macOS nutzt er den Freiraum neben den
+             nativen Ampelknöpfen, unter Linux sitzt er unter der Titelleiste.
+             Version und Queue bleiben dadurch immer erreichbar. Er bleibt Zieh-Fläche
+             des rahmenlosen Fensters — Tauri startet das Ziehen nur, wenn das direkt
+             getroffene Element data-tauri-drag-region selbst trägt; der Queue-Knopf
+             ist absichtlich keine Zieh-Fläche. -->
+        <div class="side-brand" data-tauri-drag-region>
+          <span class="side-version" id="side-version" data-tauri-drag-region></span>
+          <button class="header-queue-toggle" id="btn-queue" type="button"
+                  aria-label="Operations-Queue öffnen" aria-expanded="false"
+                  aria-controls="queue-popover" title="Operations-Queue anzeigen, pausieren und ordnen">
+            <span class="queue-icon" aria-hidden="true"></span>
+            <span class="quarantine-count" id="queue-count">0</span>
+          </button>
+        </div>
+        <!-- Die drei Hauptkategorien teilen sich einen Scrollbereich. Eigene
+             Container geben ihnen bereits eine stabile Identität; G4.3 ergänzt
+             darauf die umsortierbare Reihenfolge. -->
+        <div class="side-scroll" id="sidebar-sections">
+          <section class="side-section" data-sidebar-section="devices" aria-labelledby="side-devices-title">
+            <div class="side-head">
+              <button class="side-section-handle" type="button" draggable="true" aria-grabbed="false"
+                      aria-label="Geräte umsortieren" title="Kategorie ziehen oder mit Pfeiltasten verschieben"><span aria-hidden="true"></span></button>
+              <span class="side-title" id="side-devices-title">Geräte</span>
+            </div>
+            <ul class="device-list" id="device-list"></ul>
+          </section>
+          <section class="side-section" data-sidebar-section="shares" aria-labelledby="side-shares-title">
+            <div class="side-head">
+              <button class="side-section-handle" type="button" draggable="true" aria-grabbed="false"
+                      aria-label="Freigaben umsortieren" title="Kategorie ziehen oder mit Pfeiltasten verschieben"><span aria-hidden="true"></span></button>
+              <span class="side-title" id="side-shares-title">Freigaben</span>
+            </div>
+            <ul class="share-list" id="share-list"></ul>
+            <div class="side-subhead network-discovery-head">
+              <span class="side-subtitle">Im Netzwerk</span>
+              <span class="network-discovery-controls">
+                <label class="network-discovery-toggle" title="Aktive LAN-Suche über mDNS/Bonjour ein- oder ausschalten">
+                  <input id="network-discovery-enabled" type="checkbox" />
+                  <span>Suche</span>
+                </label>
+                <button class="icon-btn" id="network-discovery-refresh" type="button"
+                        aria-label="LAN erneut durchsuchen" title="LAN erneut durchsuchen">↻</button>
+              </span>
+            </div>
+            <ul class="network-service-list" id="network-service-list"></ul>
+          </section>
+          <section class="side-section" data-sidebar-section="favorites" aria-labelledby="side-favorites-title">
+            <div class="side-head">
+              <button class="side-section-handle" type="button" draggable="true" aria-grabbed="false"
+                      aria-label="Favoriten umsortieren" title="Kategorie ziehen oder mit Pfeiltasten verschieben"><span aria-hidden="true"></span></button>
+              <span class="side-title" id="side-favorites-title">Favoriten</span>
+              <button class="icon-btn" id="fav-add" title="Aktuellen Ordner der aktiven Pane zu den Favoriten hinzufügen — oder Ordner einfach hierher ziehen">+</button>
+            </div>
+            <ul class="fav-list" id="fav-list"></ul>
+            <div class="side-subhead">
+              <span class="side-subtitle">Gespeicherte Verbindungen</span>
+              <button class="icon-btn" id="conn-add" title="Server-Verbindung hinzufügen (SFTP, FTP/FTPS, WebDAV oder SMB)">+</button>
+            </div>
+            <ul class="connection-list" id="connection-list"></ul>
+          </section>
+        </div>
+        <button class="quarantine-shortcut" id="btn-quarantine" title="Quarantäneläufe anzeigen und wiederherstellen">
+          <span class="quarantine-icon" aria-hidden="true"></span>
+          <span>Quarantäne</span>
+          <span class="quarantine-count" id="quarantine-count">0</span>
+        </button>
+      </aside>
+
+      <!-- Splitter: per Maus ziehbar, per Pfeiltasten bedienbar; die Breite wird
+           lokal gemerkt. Doppelklick setzt auf die Standardbreite zurück. -->
+      <div class="splitter" id="splitter" role="separator" aria-orientation="vertical"
+           aria-label="Breite der Seitenleiste anpassen" tabindex="0"></div>
+
+      <!-- Die beiden Dateiansichten bleiben neutral links und rechts. Quelle und Ziel
+           werden nur in der bewusst betretenen Sync-Ansicht fachlich benannt. -->
+      <main class="panes">
+        <section class="pane active" data-side="left">
+          <div class="pane-head">
+            <button class="icon-btn nav-back" title="Zurück (⌘[)">‹</button>
+            <button class="icon-btn nav-fwd" title="Vor (⌘])">›</button>
+            <button class="icon-btn up" title="Übergeordneter Ordner (⌘↑)">↑</button>
+            <input class="path" spellcheck="false" autocomplete="off" />
+            <button class="icon-btn view-options-toggle" type="button"
+                    title="Darstellungsoptionen für diesen Ordner"
+                    aria-label="Darstellungsoptionen für die linke Pane"
+                    aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true"></span></button>
+            <!-- Tauri erkennt die Ziehfläche nur am direkt getroffenen Element.
+                 Die Fläche bleibt deshalb leer; Knöpfe und Pfadeingabe bleiben
+                 außerhalb davon ganz normale Bedienelemente. -->
+            <div class="pane-drag-region" data-tauri-drag-region aria-hidden="true"></div>
+          </div>
+          <!-- Spaltenkopf: Klick sortiert, die Trenner dazwischen ziehen die Breite.
+               Größe und Datum wachsen nach links; Doppelklick auf einen Trenner passt
+               die Spalte einmalig an den Inhalt an (siehe column-layout.js). -->
+          <div class="pane-tabs" role="tablist" aria-label="Linke Pane-Tabs"></div>
+          <div class="pane-content" id="pane-panel-left" role="tabpanel">
+          <div class="list-header">
+            <span class="col col-icon"></span>
+            <span class="col col-name" data-sort="name" role="button" tabindex="0">Name</span>
+            <span class="col-resize" data-col="size" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Größe anpassen"></span>
+            <span class="col col-size" data-sort="size" role="button" tabindex="0">Größe</span>
+            <span class="col-resize" data-col="kind" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Art anpassen"></span>
+            <span class="col col-kind" data-sort="kind" role="button" tabindex="0">Art</span>
+            <span class="col-resize" data-col="date" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Geändert anpassen"></span>
+            <span class="col col-date" data-sort="modified" role="button" tabindex="0">Geändert</span>
+            <span class="col-resize" data-col="created" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Erstellt anpassen"></span>
+            <span class="col col-created" data-sort="created" role="button" tabindex="0">Erstellt</span>
+            <span class="col-resize" data-col="owner" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Eigentümer anpassen"></span>
+            <span class="col col-owner" data-sort="owner" role="button" tabindex="0">Eigentümer</span>
+            <span class="col-resize" data-col="group" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Gruppe anpassen"></span>
+            <span class="col col-group" data-sort="group" role="button" tabindex="0">Gruppe</span>
+            <span class="col-resize" data-col="permissions" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Berechtigungen anpassen"></span>
+            <span class="col col-permissions" data-sort="permissions" role="button" tabindex="0">Berechtigungen</span>
+          </div>
+          <div class="listing" tabindex="0" role="listbox" aria-label="Linke Dateiliste" aria-multiselectable="true"></div>
+          <div class="pane-foot">
+            <span class="count"></span>
+            <button class="btn ghost small listing-omissions-toggle" type="button" aria-expanded="false" hidden></button>
+            <textarea class="listing-omissions-text" aria-label="Ausgelassene Einträge" readonly hidden></textarea>
+          </div>
+          </div>
+        </section>
+
+        <section class="pane" data-side="right">
+          <div class="pane-head">
+            <button class="icon-btn nav-back" title="Zurück (⌘[)">‹</button>
+            <button class="icon-btn nav-fwd" title="Vor (⌘])">›</button>
+            <button class="icon-btn up" title="Übergeordneter Ordner (⌘↑)">↑</button>
+            <input class="path" spellcheck="false" autocomplete="off" />
+            <button class="icon-btn view-options-toggle" type="button"
+                    title="Darstellungsoptionen für diesen Ordner"
+                    aria-label="Darstellungsoptionen für die rechte Pane"
+                    aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true"></span></button>
+            <div class="pane-drag-region" data-tauri-drag-region aria-hidden="true"></div>
+          </div>
+          <div class="pane-tabs" role="tablist" aria-label="Rechte Pane-Tabs"></div>
+          <div class="pane-content" id="pane-panel-right" role="tabpanel">
+          <div class="list-header">
+            <span class="col col-icon"></span>
+            <span class="col col-name" data-sort="name" role="button" tabindex="0">Name</span>
+            <span class="col-resize" data-col="size" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Größe anpassen"></span>
+            <span class="col col-size" data-sort="size" role="button" tabindex="0">Größe</span>
+            <span class="col-resize" data-col="kind" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Art anpassen"></span>
+            <span class="col col-kind" data-sort="kind" role="button" tabindex="0">Art</span>
+            <span class="col-resize" data-col="date" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Geändert anpassen"></span>
+            <span class="col col-date" data-sort="modified" role="button" tabindex="0">Geändert</span>
+            <span class="col-resize" data-col="created" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Erstellt anpassen"></span>
+            <span class="col col-created" data-sort="created" role="button" tabindex="0">Erstellt</span>
+            <span class="col-resize" data-col="owner" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Eigentümer anpassen"></span>
+            <span class="col col-owner" data-sort="owner" role="button" tabindex="0">Eigentümer</span>
+            <span class="col-resize" data-col="group" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Gruppe anpassen"></span>
+            <span class="col col-group" data-sort="group" role="button" tabindex="0">Gruppe</span>
+            <span class="col-resize" data-col="permissions" role="separator" aria-orientation="vertical"
+                  tabindex="0" aria-label="Breite der Spalte Berechtigungen anpassen"></span>
+            <span class="col col-permissions" data-sort="permissions" role="button" tabindex="0">Berechtigungen</span>
+          </div>
+          <div class="listing" tabindex="0" role="listbox" aria-label="Rechte Dateiliste" aria-multiselectable="true"></div>
+          <div class="pane-foot">
+            <span class="count"></span>
+            <button class="btn ghost small listing-omissions-toggle" type="button" aria-expanded="false" hidden></button>
+            <textarea class="listing-omissions-text" aria-label="Ausgelassene Einträge" readonly hidden></textarea>
+          </div>
+          </div>
+        </section>
+      </main>
+
+      <!-- Eigenständiger Sync-Modus: bewusst über Menü/Kürzel betreten,
+           ersetzt die Pane-Ansicht durch die Plan-Vorschau. Das Frontend zeigt hier
+           ausschließlich, was der Kern geplant hat; alle Gates bleiben im Backend. -->
+      <section class="sync-view" id="sync-view" hidden aria-label="Synchronisieren">
+        <div class="sync-main">
+          <div class="sync-chips">
+            <div class="sync-chip">
+              <span class="sync-chip-role" id="sync-source-role">Quelle</span>
+              <span class="sync-chip-path" id="sync-source-path"></span>
+              <span class="sync-chip-proto" id="sync-source-proto"></span>
+            </div>
+            <span class="sync-arrow" id="sync-arrow" aria-hidden="true">→</span>
+            <div class="sync-chip">
+              <span class="sync-chip-role" id="sync-target-role">Ziel</span>
+              <span class="sync-chip-path" id="sync-target-path"></span>
+              <span class="sync-chip-proto" id="sync-target-proto"></span>
+            </div>
+          </div>
+          <div class="sync-plan">
+            <div class="sync-hint" id="sync-hint" hidden>
+              <p id="sync-hint-text"></p>
+              <button class="btn ghost small" id="sync-preview-remote" hidden>Vorschau laden</button>
+            </div>
+            <section class="sync-comparison" id="sync-comparison" hidden aria-label="Planvergleich">
+              <div class="sync-comparison-head" aria-hidden="true">
+                <span>Quelle · aktueller Bestand</span>
+                <span>Ziel · aktueller Bestand</span>
+              </div>
+              <div class="sync-comparison-categories" id="sync-comparison-categories"></div>
+              <div class="sync-comparison-list" id="sync-comparison-list" tabindex="0"
+                role="listbox" aria-label="Geänderte Einträge im Planvergleich"></div>
+            </section>
+            <!-- Fallback für ältere persistierte Queue-Pläne, die noch kein
+                 Vergleichs-DTO enthalten. Neue Vorschauen verwenden die listbox. -->
+            <ul class="actions-list sync-actions" id="sync-actions"></ul>
+          </div>
+          <div class="sync-footer">
+            <div class="sync-summary" id="sync-summary" aria-live="polite"></div>
+            <div class="sync-buttons">
+              <span id="sync-execution-note" class="sync-execution-note">Vorschau und Bestätigung folgen vor der echten Ausführung.</span>
+              <button class="btn ghost" id="btn-sync-simulate">Testlauf simulieren</button>
+              <button class="btn danger" id="btn-real" title="Einmaligen lokalen Realmodus sicher vorbereiten">Realmodus …</button>
+              <button class="btn ghost" id="btn-sync-close">Schließen</button>
+              <button class="btn primary" id="btn-sync">Sync-Ausführung vorbereiten</button>
+            </div>
+          </div>
+        </div>
+        <!-- Optionen wirken nur auf die nächste Planung; der Kern validiert Modus,
+             Vergleich und Profil unabhängig von dieser sichtbaren Auswahl erneut. -->
+        <aside class="sync-options" aria-label="Synchronisierungsoptionen">
+          <fieldset class="sync-group" id="sync-direction-group" title="Welche Seite ist die Quelle? „In beide Richtungen" gleicht beide Panes gegen eine dauerhafte Baseline ab.">
+            <legend>Richtung</legend>
+            <label><input type="radio" name="sync-direction" value="lr" checked /><span>Von links nach rechts</span></label>
+            <label><input type="radio" name="sync-direction" value="rl" /><span>Von rechts nach links</span></label>
+            <label><input type="radio" name="sync-direction" value="both" /><span>In beide Richtungen</span></label>
+          </fieldset>
+          <fieldset class="sync-group" id="sync-effects-group" title="Ergänzen verändert Vorhandenes nie; Aktualisieren ersetzt ältere Dateien; Verwaiste wandern nie direkt in den Müll, sondern wiederherstellbar in die Quarantäne.">
+            <legend>Wirkung</legend>
+            <label><input type="checkbox" id="sync-add" checked disabled /><span>Fehlendes hinzufügen</span></label>
+            <label><input type="checkbox" id="sync-update" /><span>Vorhandenes aktualisieren</span></label>
+            <label><input type="checkbox" id="sync-mirror" /><span>Verwaiste in Quarantäne verschieben</span></label>
+          </fieldset>
+          <fieldset class="sync-group" id="sync-compare-group" title="Schnell vergleicht Größe und Datum; Inhalt liest beide Dateien vollständig per BLAKE3.">
+            <legend>Vergleich</legend>
+            <label><input type="radio" name="sync-compare" value="SizeAndTime" checked /><span>Schnell (Größe und Datum)</span></label>
+            <label><input type="radio" name="sync-compare" value="ContentHash" /><span>Inhalt (BLAKE3)</span></label>
+          </fieldset>
+          <fieldset class="sync-group" id="sync-metadata-group" title="Portable überträgt Daten, mtime und normale Rechte. Native Profile prüfen zusätzlich alle unterstützten Metadatenklassen.">
+            <legend>Metadaten</legend>
+            <label><input type="radio" name="sync-metadata" value="Portable" checked /><span>Portable</span></label>
+            <label><input type="radio" name="sync-metadata" value="NativeBestEffort" /><span>Nativ (Best Effort)</span></label>
+            <label><input type="radio" name="sync-metadata" value="NativeStrict" /><span>Strikt</span></label>
+          </fieldset>
+          <!-- Klartext statt Dauerwarnung (früher „Noch kein Vollbackup" in der
+               Seitenleiste): Die erste Zeile folgt der Profilwahl und benennt, was
+               ein Lauf wirklich überträgt; die zweite erinnert genau dort, wo
+               gesynct wird, dass ein Sync kein Backup mit Versionsständen ist. -->
+          <div class="sync-metadata-note" id="sync-metadata-note">
+            <strong id="sync-metadata-note-title"></strong>
+            <small>Ein Sync ersetzt kein Backup: Er überträgt nur den aktuellen Stand, ohne Versionsgeschichte.</small>
+          </div>
+        </aside>
+      </section>
+      </div>
+
+      <!-- Das Queue-Popover liegt außerhalb der Seitenleiste, damit deren
+           Overflow-Grenze es bei schmalen Fenstern nicht abschneidet. Der laufende
+           Eintrag bleibt in einem eigenen, nicht scrollenden Bereich angeheftet. -->
+      <section class="queue-popover" id="queue-popover" role="dialog"
+               aria-labelledby="queue-popover-title" hidden>
+        <div class="queue-popover-head">
+          <div>
+            <strong id="queue-popover-title">Operations-Queue</strong>
+            <small id="queue-popover-state"></small>
+          </div>
+          <button class="icon-btn" id="queue-popover-close" type="button"
+                  aria-label="Queue-Popover schließen">×</button>
+        </div>
+        <p class="queue-popover-note">Genau eine Operation läuft. Pause startet keine neue Operation; ein laufender Transfer endet sicher oder wird über „Abbrechen“ gestoppt.</p>
+        <div class="queue-popover-controls">
+          <button class="btn ghost small" id="queue-toggle-pause" type="button"></button>
+          <button class="btn ghost small" id="queue-toggle-stop" type="button"></button>
+        </div>
+        <div class="queue-popover-pinned" id="queue-popover-pinned" hidden>
+          <small class="queue-popover-section-title">Läuft gerade</small>
+          <div id="queue-popover-running"></div>
+        </div>
+        <div class="queue-popover-list" id="queue-popover-list"></div>
+      </section>
+
+      <!-- Unten: Plan-Vorschau bzw. Fortschritt -->
+      <footer class="dock" id="dock" hidden>
+        <div class="dock-row">
+          <div class="dock-summary" id="dock-summary"></div>
+          <div class="dock-actions">
+            <button class="btn ghost small" id="btn-toggle-list" hidden>Details</button>
+            <button class="btn danger small" id="btn-cancel" hidden>Abbrechen</button>
+            <button class="icon-btn" id="btn-dock-close" title="Schließen" aria-label="Schließen">×</button>
+          </div>
+        </div>
+        <div class="progress" id="progress" hidden>
+          <div class="bar"><div class="fill" id="bar-fill"></div></div>
+          <div class="prog-text" id="prog-text"></div>
+        </div>
+        <ul class="actions-list" id="actions-list" hidden></ul>
+      </footer>
+    </div>
+
+    <!-- Universeller Dialog: Bestätigung, Konflikt-Abfrage oder Text-Eingabe.
+         Titel/Text/Knöpfe füllt das Frontend je nach Anlass dynamisch (siehe main.js:
+         confirmModal / choiceModal / promptModal). -->
+    <div class="modal-backdrop" id="modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabindex="-1">
+        <div class="modal-title" id="modal-title"></div>
+        <div class="modal-body" id="modal-body"></div>
+        <div class="modal-buttons"></div>
+      </div>
+    </div>
+
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,46 @@
+# Dünne Tauri-Desktop-App. Enthält KEINE Sync-Logik — die steckt vollständig im
+# GUI-freien `doppeldecker-core`. Hier nur: Fenster, Web-UI-Auslieferung und die
+# Tauri-Commands, die das Frontend mit dem Kern verbinden.
+[package]
+name = "doppeldecker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Eleganter, plattformübergreifender Dual-Pane-Dateimanager (macOS + Linux)"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+doppeldecker-core = { path = "../core" }
+keyring = "4.1.4" # Passwörter ausschließlich im nativen System-Schlüsselbund speichern
+zeroize = "1" # kurzlebige Secret-Strings nach dem Schlüsselbundzugriff überschreiben
+libc = "0.2" # O_NOFOLLOW für geheimnisfreies lokales Fehlerlog
+getrandom = "0.3" # kryptografische Einmal-IDs für Secrets und Schlüsselbundreferenzen
+url = "2" # native Datei-URIs der Systemzwischenablage
+tokio = { version = "1", features = ["time"] } # Ablauf nativer Secret-Einmalwerte ohne Blockierthread
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+# AppKit setzt das Laufzeiticon und das dauerhafte Finder-/Dockicon am Bundle.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+  "std", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSResponder",
+  "NSSecureTextField", "NSTextField", "NSView", "NSImage", "NSWorkspace", "NSPasteboard", "NSPasteboardItem"
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std", "NSGeometry", "NSObject", "NSString", "NSData", "NSBundle", "NSArray", "NSURL"
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18.2"
+# Nur Linux setzt ein Fenstericon über `tauri::image`; macOS setzt das Dockicon
+# direkt über AppKit und zieht den PNG-Decoder deshalb nicht in das App-Binary.
+tauri = { version = "2", features = ["image-png"] }
+
+[dev-dependencies]
+tempfile = "3" # isolierte Tests der markierten Sandbox-Pfadprüfung
+plist = "1" # macOS-Info.plist samt LAN-Deklaration strukturell prüfen

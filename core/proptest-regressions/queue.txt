@@ -1,0 +1,15 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# Diese Seeds erhalten historische Generatorpfade als zusätzliche Zufallsdiversität.
+# Proptest-Seeds binden keine konkrete Folge, sobald sich der Generator ändert; die
+# vier früher minimierten Folgen stehen deshalb zusätzlich als deterministischer
+# Tabellentest in queue.rs.
+cc 78c4a9fff3c77e3d4be197bef827fba4fbeb0bca6e149c222ad8cb668c4c9e6c
+cc 21b5bb7217c39c8c63614fd43e1c1f249d381a0a891d1a771b277496f30976b7
+cc 5f0fed9b322d4bdb9d6010480fd17d197598424bfaf4cab67cfa0f8a57d34207
+cc bc348d2f767f7f93ddba8b4284146e42f4efc61c63715df2037440a7503949ae

@@ -1,0 +1,46 @@
+[package]
+name = "doppeldecker-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde = "1"
+serde_json = "1"
+tempfile = "3"
+doppeldecker-core = { path = "../core" }
+
+[patch.crates-io]
+smb2 = { path = "../vendor/smb2" }
+
+[[bin]]
+name = "bidirectional_baseline"
+path = "fuzz_targets/bidirectional_baseline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bidirectional_run_journal"
+path = "fuzz_targets/bidirectional_run_journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_manifest"
+path = "fuzz_targets/metadata_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "finder_favorites"
+path = "fuzz_targets/finder_favorites.rs"
+test = false
+doc = false
+bench = false

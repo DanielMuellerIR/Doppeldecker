@@ -1,0 +1,21 @@
+# Cargo-Konfiguration dieses Arbeitsbaums.
+#
+# `[env]` setzt Umgebungsvariablen für alle Prozesse, die Cargo aus diesem Repo heraus
+# startet — auch für die Testbinaries und damit für jeden CLI-Prozess, den ein Test
+# selbst startet.
+#
+# Warum die Sperre hier steht und nicht nur im Testcode: Ohne `--config-dir` benutzt
+# `doppeldecker-cli` den echten Konfigurationsordner der Desktop-App und öffnet dort das
+# echte Queue-Journal. Am 2026-08-02 hat genau das ein Testlauf getan und Daniels
+# Journal auf eine neuere Version migriert. Mit dieser Variable weist die CLI einen
+# fehlenden `--config-dir` beziehungsweise `--audit` sichtbar ab, statt still auf fremde
+# Nutzerdaten zu wirken — und zwar auch dann, wenn ein neuer Test den gemeinsamen
+# Testhelfer umgeht.
+#
+# Wirkung auf die Handarbeit: `cargo run -p doppeldecker-cli -- …` verlangt dadurch
+# ebenfalls einen ausdrücklichen Ordner. Wer die CLI bewusst gegen die echte
+# Desktop-Konfiguration fahren will, ruft das gebaute Binary direkt auf
+# (`./target/debug/doppeldecker-cli …`) oder übergibt den Ordner ausdrücklich.
+# Ein geerbtes leeres oder 0 gesetztes Flag darf die Testabsicherung nicht abschalten.
+[env]
+DOPPELDECKER_NO_DEFAULT_USER_PATHS = { value = "1", force = true }

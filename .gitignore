@@ -1,0 +1,33 @@
+# Rust / Cargo
+/target
+**/target
+fuzz/corpus/
+fuzz/artifacts/
+# Cargo.lock wird eingecheckt (Doppeldecker ist eine Anwendung → reproduzierbare Builds)
+
+# Tauri-Build-Artefakte
+/src-tauri/gen
+/src-tauri/target
+# Doppelklickbare App, die build-release.py nach dem macOS-Build in den Root legt
+/Doppeldecker.app
+
+# Lokaler notarytool-Profilname (intern, pro Mac; nur Platzhalter gehört ins Repo)
+/.notary-profile.local
+
+# Lokale Commit-Koordination paralleler Agentensitzungen
+/.commit-lock
+
+# Node (Frontend-Tooling, falls später Vite dazukommt)
+node_modules
+dist
+
+# Lokale Python-Prüfartefakte der Entwicklungswerkzeuge
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code lokale Konfig
+.claude/

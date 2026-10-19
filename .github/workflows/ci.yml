@@ -1,0 +1,79 @@
+name: Headless gates
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: headless-gates-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS 15
+            runner: macos-15
+          - name: Ubuntu 24.04
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+
+    steps:
+      - name: Quellstand auschecken
+        uses: actions/checkout@v6
+
+      - name: Node.js einrichten
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: pnpm einrichten
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.34.5 --activate
+
+      - name: Stabile Rust-Toolchain aktualisieren
+        run: rustup update stable --no-self-update
+
+      - name: Tauri-Systemabhängigkeiten installieren
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            build-essential \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            wget
+
+      - name: Node-Abhängigkeiten installieren
+        run: pnpm install --frozen-lockfile
+
+      - name: Chromium samt Linux-Systemabhängigkeiten installieren
+        if: runner.os == 'Linux'
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Chromium auf macOS installieren
+        if: runner.os == 'macOS'
+        run: pnpm exec playwright install chromium
+
+      - name: Alle headless Gates ausführen
+        run: python3 tools/check-gates.py --json
+
+      - name: Gate-Logs bei Fehlern sichern
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gate-logs-${{ matrix.runner }}
+          path: target/gate-logs/
+          if-no-files-found: ignore

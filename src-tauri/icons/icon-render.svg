@@ -1,0 +1,7 @@
+<svg width="1254" height="1254" viewBox="0 0 1254 1254"
+     xmlns="http://www.w3.org/2000/svg">
+  <!-- Die gesamte sichtbare Fläche stammt aus dem Bild. Nur die Ecken werden
+       ausgeschnitten; es gibt weder eine Unterlage noch einen farbigen Rahmen. -->
+  <defs><clipPath id="squircle"><rect width="1254" height="1254" rx="280"/></clipPath></defs>
+  <image href="icon-source.png" width="1254" height="1254" clip-path="url(#squircle)"/>
+</svg>

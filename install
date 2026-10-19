@@ -1,0 +1,282 @@
+#!/bin/zsh
+# install — baut die notarisierte Doppeldecker.app (./build-app) und ersetzt
+# anschließend die Kopie in /Applications.
+#
+# Die drei Einstiegspunkte des Projekts trennen bewusst:
+#   ./build-app   baut die App in den Projekt-Root
+#   ./install     baut und ersetzt die App in /Applications
+#   ./release     baut, notarisiert und packt das DMG — installiert nie
+#
+# `ditto` kopiert Signatur, xattrs und Resource Forks in einen exklusiven Ordner
+# neben dem Ziel. Erst nach dessen Prüfung tauscht Swift die Bundles atomar aus.
+# Der Altstand bleibt bis zur vollständigen Abschlussprüfung erhalten. Bei Fehler
+# oder Signal wird er zurückgetauscht; ein fremd geänderter Bestand bleibt mit
+# sichtbarem Recoverypfad unangetastet. Harte Prozessabbrüche behalten den Ordner.
+#
+# Für Tests lässt sich das Ziel mit DOPPELDECKER_INSTALL_DIR umbiegen.
+#
+# Letzte Zeile bei Erfolg: INSTALL OK: <pfad> (<version>)
+set -euo pipefail
+cd "${0:a:h}"
+./build-app
+install_dir="${DOPPELDECKER_INSTALL_DIR:-/Applications}"
+target="${install_dir}/Doppeldecker.app"
+
+# Diese drei Prüfungen stehen vor dem ersten Schreiben im Installationsverzeichnis.
+xcrun stapler validate Doppeldecker.app
+codesign --verify --deep --strict Doppeldecker.app
+spctl -a -t exec -vv Doppeldecker.app 2>&1 | tail -2
+if pgrep -x doppeldecker >/dev/null 2>&1; then
+  echo "Doppeldecker läuft noch — bitte beenden, dann ./install erneut ausführen." >&2
+  exit 1
+fi
+if [[ -L "$target" || ( -e "$target" && ! -d "$target" ) ]]; then
+  echo "Installationsziel ist kein reguläres App-Verzeichnis: $target" >&2
+  exit 1
+fi
+old_id=absent
+if [[ -d "$target" ]]; then old_id=$(stat -f '%d:%i' "$target"); fi
+
+# Der Helfercode stammt aus diesem Skript, nicht aus dem austauschbaren Wrapperpfad.
+# `exec` ersetzt beim Hintergrund-Commit dessen Shell; finish nutzt eine Subshell.
+transaction_helper() {
+  exec /usr/bin/swift - "$@" <<'SWIFT'
+import Foundation
+import Darwin
+
+let args = CommandLine.arguments
+let phase = args[1], staged = args[2], target = args[3]
+let newID = args[4], oldID = args[5], transactionID = args[6]
+let transaction = (staged as NSString).deletingLastPathComponent
+let stageName = (staged as NSString).lastPathComponent
+let transactionName = (transaction as NSString).lastPathComponent
+let targetParent = (target as NSString).deletingLastPathComponent
+let targetName = (target as NSString).lastPathComponent
+func posixError() -> NSError {
+    NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+}
+func fail(_ detail: String) -> NSError {
+    NSError(domain: detail, code: 1)
+}
+func identifier(_ value: stat) -> String {
+    "\(value.st_dev):\(value.st_ino)"
+}
+func descriptorStat(_ fd: Int32) throws -> stat {
+    var value = stat()
+    guard fstat(fd, &value) == 0 else { throw posixError() }
+    return value
+}
+func directoryIdentity(_ fd: Int32, _ name: String) throws -> String {
+    var value = stat()
+    if fstatat(fd, name, &value, AT_SYMLINK_NOFOLLOW) != 0 {
+        if errno == ENOENT { return "absent" }
+        throw posixError()
+    }
+    guard value.st_mode & S_IFMT == S_IFDIR else {
+        throw fail("Installationspfad ist kein reguläres Verzeichnis")
+    }
+    return identifier(value)
+}
+func checkPrivate(_ fd: Int32, _ value: stat) throws {
+    guard value.st_uid == geteuid(), value.st_mode & 0o777 == 0o700 else {
+        throw fail("Transaktionsordner ist nicht exklusiv mit Modus 0700 gebunden")
+    }
+    guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else {
+        if errno == ENOENT { return }
+        throw posixError()
+    }
+    defer { acl_free(UnsafeMutableRawPointer(acl)) }
+    var entry: acl_entry_t? = nil
+    var selector = Int32(ACL_FIRST_ENTRY.rawValue)
+    while true {
+        if acl_get_entry(acl, selector, &entry) != 0 {
+            if errno == EINVAL { return }
+            throw posixError()
+        }
+        selector = Int32(ACL_NEXT_ENTRY.rawValue)
+        var tag: acl_tag_t = ACL_UNDEFINED_TAG
+        guard acl_get_tag_type(entry, &tag) == 0 else { throw posixError() }
+        guard tag == ACL_EXTENDED_DENY else {
+            throw fail("Transaktionsordner hat eine nicht exklusiv belegte ACL")
+        }
+    }
+}
+func renameBound(_ fromFD: Int32, _ from: String, _ toFD: Int32, _ to: String, _ flags: UInt32) throws {
+    guard renameatx_np(fromFD, from, toFD, to, flags) == 0 else { throw posixError() }
+}
+func removeContents(_ fd: Int32, _ device: dev_t) throws {
+    let iteratorFD = dup(fd)
+    guard iteratorFD >= 0 else { throw posixError() }
+    guard let directory = fdopendir(iteratorFD) else {
+        let error = posixError()
+        close(iteratorFD)
+        throw error
+    }
+    defer { closedir(directory) }
+    while true {
+        errno = 0
+        guard let entry = readdir(directory) else {
+            if errno != 0 { throw posixError() }
+            break
+        }
+        let name = withUnsafePointer(to: entry.pointee.d_name) { tuple in
+            tuple.withMemoryRebound(to: CChar.self, capacity: Int(entry.pointee.d_namlen) + 1) {
+                String(validatingUTF8: $0)
+            }
+        }
+        guard let name else { throw fail("Cleanup erhält einen nicht UTF-8-kodierbaren Namen") }
+        if name == "." || name == ".." { continue }
+        var value = stat()
+        guard fstatat(fd, name, &value, AT_SYMLINK_NOFOLLOW) == 0 else { throw posixError() }
+        guard value.st_dev == device else { throw fail("Cleanup überschreitet die Transaktions-Volumegrenze") }
+        if value.st_mode & S_IFMT == S_IFDIR {
+            let child = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard child >= 0 else { throw posixError() }
+            do {
+                defer { close(child) }
+                let bound = try descriptorStat(child)
+                guard identifier(bound) == identifier(value) else {
+                    throw fail("Cleanup-Verzeichnis änderte sich beim Öffnen")
+                }
+                try removeContents(child, device)
+                guard try directoryIdentity(fd, name) == identifier(bound) else {
+                    throw fail("Cleanup-Verzeichnisname wurde ausgetauscht")
+                }
+                guard unlinkat(fd, name, AT_REMOVEDIR) == 0 else { throw posixError() }
+            }
+        } else {
+            // Finale Symlinks werden nur als Eintrag entfernt, niemals verfolgt.
+            guard unlinkat(fd, name, 0) == 0 else { throw posixError() }
+        }
+    }
+}
+do {
+    // Dieser Deskriptor wird vor der Abschlussprüfung gehalten. Ein späterer
+    // Austausch des Wrappernamens kann den Cleanup nicht auf einen Ersatz umlenken.
+    let rootFD = open(transaction, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard rootFD >= 0 else { throw posixError() }
+    defer { close(rootFD) }
+    let root = try descriptorStat(rootFD)
+    guard identifier(root) == transactionID else { throw fail("Transaktionsordner wurde ausgetauscht") }
+    try checkPrivate(rootFD, root)
+    let parentFD = open(targetParent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard parentFD >= 0 else { throw posixError() }
+    defer { close(parentFD) }
+    if phase != "cleanup" {
+        let sourceID = try directoryIdentity(rootFD, stageName)
+        let targetID = try directoryIdentity(parentFD, targetName)
+        if phase == "commit" {
+            guard sourceID == newID && targetID == oldID else {
+                throw fail("Installationsbestand hat sich vor Austausch geändert")
+            }
+            try renameBound(rootFD, stageName, parentFD, targetName,
+                oldID == "absent" ? UInt32(RENAME_EXCL) : UInt32(RENAME_SWAP))
+        } else if phase == "finalize" {
+            guard targetID == newID && sourceID == oldID else {
+                throw fail("Installationsbestand hat sich vor Abschluss geändert")
+            }
+        } else if phase == "rollback" {
+            if targetID == oldID && sourceID == newID {
+                // Der Austausch wurde nicht ausgeführt; nur der eigene neue Stand liegt bereit.
+            } else if oldID == "absent" && targetID == newID && sourceID == "absent" {
+                try renameBound(parentFD, targetName, rootFD, stageName, UInt32(RENAME_EXCL))
+            } else if oldID != "absent" && targetID == newID && sourceID == oldID {
+                try renameBound(rootFD, stageName, parentFD, targetName, UInt32(RENAME_SWAP))
+            } else if oldID != "absent" && targetID == "absent" && sourceID == oldID {
+                try renameBound(rootFD, stageName, parentFD, targetName, UInt32(RENAME_EXCL))
+            } else {
+                throw fail("Recovery verweigert einen fremd geänderten Installationsbestand")
+            }
+        } else { throw fail("Unbekannte Transaktionsphase") }
+    }
+    if phase != "commit" {
+        try removeContents(rootFD, root.st_dev)
+        guard try directoryIdentity(parentFD, transactionName) == transactionID else {
+            throw fail("Cleanup hat nur den gebundenen Ordner geleert; Wrappername wurde ausgetauscht")
+        }
+        // Ein Austausch nach diesem Check kann höchstens einen leeren Wrapper
+        // treffen: AT_REMOVEDIR löscht keine Inhalte des fremden Nachfolgers.
+        guard unlinkat(parentFD, transactionName, AT_REMOVEDIR) == 0 else { throw posixError() }
+    }
+} catch {
+    fputs("\(error)\n", stderr)
+    exit(1)
+}
+SWIFT
+}
+
+# mktemp beansprucht einen neuen Namen exklusiv; fremde Installationsreste bleiben stehen.
+transaction=$(mktemp -d "${install_dir}/.Doppeldecker.install.XXXXXX")
+staged="${transaction}/Doppeldecker.app"
+prepared=false
+committed=false
+transaction_id=
+new_id=absent
+swap_pid=
+swap_starting=false
+interrupted=0
+finish() {
+  local exit_code=$1
+  trap - EXIT
+  trap '' HUP INT TERM PIPE
+  local phase=cleanup
+  if [[ "$prepared" = true ]]; then
+    phase=rollback
+    [[ "$committed" = true ]] && phase=finalize
+  fi
+  if ! (transaction_helper "$phase" "$staged" "$target" "$new_id" "$old_id" "$transaction_id"); then
+    echo "Installation braucht manuelle Recovery; eigener Transaktionspfad: $transaction (Device:Inode: $transaction_id)" >&2
+    return 1
+  fi
+  return "$exit_code"
+}
+request_interrupt() {
+  interrupted=$1
+  # Ein bereits gestarteter atomarer Austausch muss zuerst beendet sein; andernfalls
+  # könnte sein späterer Commit mit dem Rollback konkurrieren.
+  [[ "$swap_starting" = true || -n "$swap_pid" ]] || exit "$interrupted"
+}
+trap 'finish $?' EXIT
+trap 'request_interrupt 129' HUP
+trap 'request_interrupt 130' INT
+trap 'request_interrupt 143' TERM
+trap 'request_interrupt 141' PIPE
+transaction_id=$(stat -f '%d:%i' "$transaction")
+
+ditto Doppeldecker.app "$staged"
+xcrun stapler validate "$staged"
+codesign --verify --deep --strict "$staged"
+spctl -a -t exec -vv "$staged" 2>&1 | tail -2
+
+new_id=$(stat -f '%d:%i' "$staged")
+# Auch ein nicht fangbarer Prozessabbruch hinterlässt die Identitäten bei den Bundles.
+printf 'Ziel: %s\nNeuer Stand (Device:Inode): %s\nAltstand (Device:Inode): %s\n' \
+  "$target" "$new_id" "$old_id" > "$transaction/recovery.txt"
+printf 'Transaktionsordner (Device:Inode): %s\n' "$transaction_id" >> "$transaction/recovery.txt"
+prepared=true
+swap_starting=true
+transaction_helper commit "$staged" "$target" "$new_id" "$old_id" "$transaction_id" &
+swap_pid=$!
+swap_starting=false
+swap_rc=0
+while true; do
+  if wait "$swap_pid"; then
+    swap_rc=0
+    break
+  else
+    swap_rc=$?
+    kill -0 "$swap_pid" 2>/dev/null || break
+  fi
+done
+swap_pid=
+[[ "$interrupted" -eq 0 ]] || exit "$interrupted"
+[[ "$swap_rc" -eq 0 ]] || exit "$swap_rc"
+
+xcrun stapler validate "$target"
+codesign --verify --deep --strict "$target"
+spctl -a -t exec -vv "$target" 2>&1 | tail -2
+version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$target/Contents/Info.plist")
+committed=true
+trap - EXIT
+finish 0
+echo "INSTALL OK: $target (${version})"

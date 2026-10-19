@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Basisrechte aller Dual-Pane-Fenster: Kern-APIs inkl. Event-Listen (für gezielte Fortschritts-Events). Eigene App-Commands sind ohnehin erlaubt. start-dragging fehlt in core:window:default und muss explizit erlaubt sein, sonst lehnt die ACL das Fensterziehen über data-tauri-drag-region ab.",
+  "windows": ["main", "window-*"],
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
+}
