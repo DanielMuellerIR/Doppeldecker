@@ -119,6 +119,7 @@ pub enum ExecutionMode {
     DryRun,
     TestSandbox(TestSandboxPermit),
     Real(Box<RealRunPermit>),
+    ContentSync(Box<crate::content_sync::ContentSyncPermit>),
     #[cfg(debug_assertions)]
     HeadlessTest(HeadlessTestPermit),
 }
@@ -214,9 +215,29 @@ impl Safety {
         Self {
             execution: ExecutionMode::Real(Box::new(permit)),
             quarantine: Some(quarantine),
-            max_delete_entries: Some(50),
-            max_delete_fraction: Some(0.05),
-            allow_empty_source_mirror: false,
+            // Das nicht serialisierbare Permit bindet die bereits bestätigten
+            // Mengen und die vollständig gescannte, gegebenenfalls leere Quelle.
+            // Optionale Limits bleiben für andere Aufrufer weiterhin verfügbar.
+            max_delete_entries: None,
+            max_delete_fraction: None,
+            allow_empty_source_mirror: true,
+        }
+    }
+
+    pub(crate) fn content_sync(permit: crate::content_sync::ContentSyncPermit) -> Self {
+        Self {
+            quarantine: permit.quarantine_run(),
+            execution: ExecutionMode::ContentSync(Box::new(permit)),
+            max_delete_entries: None,
+            max_delete_fraction: None,
+            allow_empty_source_mirror: true,
+        }
+    }
+
+    pub(super) fn content_sync_permit(&self) -> Option<&crate::content_sync::ContentSyncPermit> {
+        match &self.execution {
+            ExecutionMode::ContentSync(permit) => Some(permit.as_ref()),
+            _ => None,
         }
     }
 
@@ -227,7 +248,7 @@ impl Safety {
     pub(super) fn sandbox(&self) -> Option<&Path> {
         match &self.execution {
             ExecutionMode::TestSandbox(permit) => Some(&permit.root),
-            ExecutionMode::Real(_) => None,
+            ExecutionMode::Real(_) | ExecutionMode::ContentSync(_) => None,
             ExecutionMode::DryRun => None,
             #[cfg(debug_assertions)]
             ExecutionMode::HeadlessTest(_) => None,
@@ -237,7 +258,7 @@ impl Safety {
     fn sandbox_identity(&self) -> Option<(u64, u64)> {
         match &self.execution {
             ExecutionMode::TestSandbox(permit) => Some(permit.identity),
-            ExecutionMode::Real(_) => None,
+            ExecutionMode::Real(_) | ExecutionMode::ContentSync(_) => None,
             ExecutionMode::DryRun => None,
             #[cfg(debug_assertions)]
             ExecutionMode::HeadlessTest(_) => None,
@@ -252,12 +273,38 @@ impl Safety {
     }
 
     pub(super) fn local_execution(&self) -> Option<&crate::real_mode::LocalSyncExecution> {
-        self.real_permit().and_then(RealRunPermit::local_execution)
+        self.real_permit()
+            .and_then(RealRunPermit::local_execution)
+            .or_else(|| {
+                self.content_sync_permit()
+                    .and_then(crate::content_sync::ContentSyncPermit::local_execution)
+            })
+    }
+
+    pub(super) fn mtime_omission_reason<'a>(
+        &self,
+        error: &'a io::Error,
+    ) -> Option<&'a crate::content_sync::KnownMtimeOmission> {
+        self.content_sync_permit()?.mtime_omission(error)
+    }
+
+    pub(super) fn normal_mode_omission_reason<'a>(&self, error: &'a io::Error) -> Option<&'a str> {
+        self.content_sync_permit()
+            .filter(|permit| permit.allows_metadata_omission())?;
+        crate::content_sync::normal_mode_omission_reason(error)
+    }
+
+    pub(super) fn allows_windows_dacl_omission(&self) -> bool {
+        self.content_sync_permit()
+            .is_some_and(crate::content_sync::ContentSyncPermit::allows_metadata_omission)
     }
 
     pub(super) fn irreversible_replacements(&self) -> bool {
-        self.local_execution()
-            .is_some_and(|p| p.irreversible_replacements > 0)
+        self.content_sync_permit()
+            .is_some_and(crate::content_sync::ContentSyncPermit::irreversible_replacements)
+            || self
+                .local_execution()
+                .is_some_and(|p| p.irreversible_replacements > 0)
     }
 
     #[cfg(test)]
@@ -278,6 +325,9 @@ pub(super) fn validate_safety(
     plan: &SyncPlan,
     safety: &Safety,
 ) -> io::Result<()> {
+    if let Some(permit) = safety.content_sync_permit() {
+        permit.consume(src, src_root, dst, dst_root, plan)?;
+    }
     if let Some(permit) = safety.real_permit() {
         permit.consume_and_validate(src, src_root, dst, dst_root, plan)?;
         if safety.quarantine.is_none() {
@@ -339,7 +389,10 @@ pub(super) fn validate_safety(
             "Leere Quelle würde Zielobjekte entfernen — reale Ausführung gesperrt",
         ));
     }
-    if plan.skip_count > 0 {
+    // Der versiegelte ContentSync-Plan hat echte Konflikte und unvollständige
+    // Bestände bereits vor der Bestätigung aus sämtlichen Entfernungen genommen.
+    // Seine ausdrücklich technischen Einzel-Skips sperren unabhängige Blätter nicht.
+    if plan.skip_count > 0 && safety.content_sync_permit().is_none() {
         return Err(crate::error::coded_error(
             io::ErrorKind::PermissionDenied,
             crate::error::ErrorCode::MirrorBlocked,
@@ -392,6 +445,9 @@ pub(super) fn validate_anchor_identity(
     dst: &dyn Vfs,
     safety: &Safety,
 ) -> io::Result<()> {
+    if let Some(permit) = safety.content_sync_permit() {
+        return permit.validate_roots(src, dst);
+    }
     if let Some(permit) = safety.real_permit() {
         return permit.validate_roots(src, dst);
     }

@@ -472,7 +472,15 @@ fn xdg_rohbytes_werden_prozentkodiert_und_mountinfo_bleibt_relativ() {
     std::fs::rename(&fixture.source, &raw).unwrap();
     let mut run = ClaimRun::prepare(fixture.layout.clone(), std::slice::from_ref(&raw)).unwrap();
     run.claim(0).unwrap();
-    let mount = RootHandle::open_nofollow(Path::new("/")).unwrap();
+    let mut mount = RootHandle::open_nofollow(&fixture.root).unwrap();
+    let identity = mount.current_mount_identity().unwrap();
+    for ancestor in fixture.root.ancestors().skip(1) {
+        let candidate = RootHandle::open_nofollow(ancestor).unwrap();
+        if candidate.current_mount_identity().unwrap() != identity {
+            break;
+        }
+        mount = candidate;
+    }
     assert!(matches!(
         run.transfer(0, Some(&mount)).unwrap(),
         TransferOutcome::Durable

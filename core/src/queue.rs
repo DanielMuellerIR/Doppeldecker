@@ -33,18 +33,19 @@ use crate::{
     OpStats, OverwritePolicy, Progress, Safety, SyncOptions, SyncPlan, SyncStats, Vfs,
 };
 use crate::{
-    prepare_ftps_download, prepare_ftps_upload, prepare_provider_transfer, prepare_sftp_download,
-    prepare_sftp_upload, prepare_smb_download, prepare_smb_upload, prepare_webdav_download,
-    prepare_webdav_upload, FtpsConnectionConfig, FtpsVfs, PreparedSftpRealRun, SecretResolver,
-    SftpConnectionConfig, SftpVfs, SmbConnectionConfig, SmbVfs, WebDavConnectionConfig, WebDavVfs,
-};
-use crate::{
-    prepare_local_bidirectional_with_decisions, prepare_provider_bidirectional_with_decisions,
     ConflictResolution, LocalBidirectionalStats, PairId, PreparedLocalBidirectionalRun,
     ProviderEndpoint,
 };
+use crate::{
+    FtpsConnectionConfig, FtpsVfs, PreparedSftpRealRun, SecretResolver, SftpConnectionConfig,
+    SftpVfs, SmbConnectionConfig, SmbVfs, WebDavConnectionConfig, WebDavVfs,
+};
 
-pub const QUEUE_JOURNAL_VERSION: u32 = 27;
+#[path = "queue/forward.rs"]
+mod forward;
+pub use forward::*;
+
+pub const QUEUE_JOURNAL_VERSION: u32 = 40;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 const LEGACY_UNBOUND_WEBDAV_ETAG: &str = "__doppeldecker_legacy_unbound__";
 const LEGACY_WEBDAV_REPLAN_ERROR: &str = "Dieser ältere WebDAV-Löschplan besitzt keine eindeutig gebundene Server- oder Root-Identität. Er wurde nicht ausgeführt und darf nicht wiederholt werden; Zielzustand neu laden und die Auswahl neu bestätigen.";
@@ -187,6 +188,23 @@ impl BidirectionalQueueEndpoint {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum QueueOperation {
+    /// Rein manuelle Recovery eines entfernten Namenstauschs; nie ausführbar.
+    RenameCycleRecovery {
+        record: Box<crate::remote_rename_cycle::RenameCycleRecord>,
+    },
+    ArchiveUpload {
+        generation: Box<crate::archive_upload::ArchiveGeneration>,
+        workspace: crate::generated_source::GeneratedWorkspaceReference,
+        target: Box<BidirectionalQueueEndpoint>,
+    },
+    ArchiveExtract {
+        request: Box<crate::archive_extract::ArchiveExtractRequest>,
+        expected: Box<crate::archive_extract::ArchiveExtractBinding>,
+    },
+    ArchivePack {
+        request: Box<crate::archive_pack::ArchivePackRequest>,
+        expected: Box<crate::archive_pack::ArchivePackBinding>,
+    },
     /// Ausschließlich manuelle Prüfung eines dauerhaft erhaltenen FTPS-Intents.
     /// Dieser Eintrag besitzt keinen Executor und kann keine Mutation wiederholen.
     FtpsRecovery {
@@ -321,6 +339,27 @@ pub enum QueueOperation {
         options: SyncOptions,
         expected_plan: Box<SyncPlan>,
     },
+    /// Gewöhnlicher Inhaltssync. Eine gespeicherte Absicht ersetzt niemals die
+    /// frische, ausdrücklich bestätigte RAM-Vorbereitung dieser Ausführungsklasse.
+    ContentSync {
+        source: Box<BidirectionalQueueEndpoint>,
+        target: Box<BidirectionalQueueEndpoint>,
+        options: SyncOptions,
+        expected_plan: Box<SyncPlan>,
+        binding_digest: [u8; 32],
+    },
+    BidirectionalForward {
+        pair_id: PairId,
+        pair_name: String,
+        left: Box<BidirectionalQueueEndpoint>,
+        right: Box<BidirectionalQueueEndpoint>,
+        baseline_path: String,
+        resolutions: Vec<ConflictResolution>,
+        expected_baseline_digest: Option<[u8; 32]>,
+        expected_plan_digest: [u8; 32],
+        expected_unresolved_digest: [u8; 32],
+        expected_preview_digest: [u8; 32],
+    },
     Bidirectional {
         pair_id: PairId,
         pair_name: String,
@@ -356,6 +395,16 @@ impl QueueState {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum QueueAttention {
+    ArchiveExtractChanged {
+        reason: String,
+        confirmation: String,
+        current: Box<crate::archive_extract::ArchiveExtractBinding>,
+    },
+    ArchivePackChanged {
+        reason: String,
+        confirmation: String,
+        current: Box<crate::archive_pack::ArchivePackBinding>,
+    },
     SourceTreeChanged {
         reason: String,
         confirmation: String,
@@ -415,6 +464,38 @@ pub enum QueueAttention {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueueEntry {
+    /// Versiegelte lokale Ergebnisquelle; Konfliktentscheidungen verändern sie nicht.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_source: Option<crate::generated_source::GeneratedSourceReference>,
+    /// Bestätigte und unklare permanente Verzeichnisstreamwirkungen dieses Laufs.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::directory_streams::DirectoryStreamReport::is_empty"
+    )]
+    pub directory_stream_report: crate::directory_streams::DirectoryStreamReport,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::directory_dacl::DirectoryDaclReport::is_empty"
+    )]
+    pub directory_dacl_report: crate::directory_dacl::DirectoryDaclReport,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::file_dacl::FileDaclReport::is_empty"
+    )]
+    pub file_dacl_report: crate::file_dacl::FileDaclReport,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::created_directory_dacl::CreatedDirectoryDaclReport::is_empty"
+    )]
+    pub created_directory_dacl_report: crate::created_directory_dacl::CreatedDirectoryDaclReport,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub directory_dacl_recovery: bool,
+    #[serde(default)]
+    pub file_dacl_recovery: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_directory_dacl_recovery: bool,
+    #[serde(default)]
+    pub archive_extract_report: Option<crate::archive_extract::ArchiveExtractReport>,
     pub operation_id: String,
     pub operation: QueueOperation,
     /// Geheimnisfreie Profilstände, aus denen die persistierte Operation entstand.
@@ -440,6 +521,9 @@ pub struct QueueEntry {
     pub temp_recovery_paths: Vec<String>,
     #[serde(default)]
     pub retained_backup_paths: Vec<String>,
+    /// Terminale Dateioperation mit ausgelassenem Dateiinhalt; kein Wiederholauftrag.
+    #[serde(default)]
+    pub file_incomplete: bool,
     /// Nur `true`, wenn zu genau diesem bidirektionalen Eintrag ein persistentes
     /// Core-Laufjournal existiert. Die Oberfläche leitet Recovery nie aus Text oder
     /// Status allein ab.
@@ -487,6 +571,19 @@ impl Default for QueueSnapshot {
 fn bidirectional_recovery_kind(
     operation: &QueueOperation,
 ) -> crate::bidirectional::BidirectionalRunRecovery {
+    if let QueueOperation::BidirectionalForward { baseline_path, .. } = operation {
+        return match crate::bidirectional::forward::forward_bidirectional_journal_status(Path::new(
+            baseline_path,
+        )) {
+            Ok(None) => crate::bidirectional::BidirectionalRunRecovery::Absent,
+            Ok(Some(status)) if status.baseline_completion_available => {
+                crate::bidirectional::BidirectionalRunRecovery::CompletionCleanup
+            }
+            Ok(Some(_)) | Err(_) => {
+                crate::bidirectional::BidirectionalRunRecovery::ResumeOrRollback
+            }
+        };
+    }
     let QueueOperation::Bidirectional { baseline_path, .. } = operation else {
         return crate::bidirectional::BidirectionalRunRecovery::Absent;
     };
@@ -896,6 +993,17 @@ impl OperationQueue {
             }
             Err(error) => return Err(error),
         };
+        if snapshot.version < 40
+            && snapshot
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.operation, QueueOperation::ArchiveUpload { .. }))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Archivphasen benötigen Journalversion 40",
+            ));
+        }
         // Version 2 ergänzte SFTP, Version 3 FTPS, Version 4 WebDAV, Version 5 SMB
         // und Version 6 bidirektionale Läufe. Version 8 ergänzt die generische
         // Provider→Provider-Variante; Version 9 ergänzt interaktive Provider-Dateien,
@@ -925,6 +1033,28 @@ impl OperationQueue {
         // Version 23 unterscheidet normale lokale Ausführung ausdrücklich von
         // persistentem Dry-Run; ältere Aufträge werden niemals hochgestuft.
         let source_version = snapshot.version;
+        if source_version < 39
+            && snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.generated_source.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Altes Queuejournal enthält eine dort nicht erlaubte erzeugte Quelle",
+            ));
+        }
+        if source_version < 38
+            && snapshot
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.operation, QueueOperation::RenameCycleRecovery { .. }))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Altes Queuejournal enthält eine dort nicht erlaubte Namenstausch-Recovery",
+            ));
+        }
         // Version 24 bindet rekursive interaktive Quellen und deren Auslassungen.
         // Ein älterer Executor darf den neuen Baumbeleg nicht still ignorieren.
         // Version 25 erhält Remote-Dateiintents und verlangt nach Reopen eine
@@ -933,7 +1063,137 @@ impl OperationQueue {
         // Ältere Executoren dürfen die Ordnerintents und diese Wirkungsbindung nicht ignorieren.
         // Version 27 zeigt auch vor einem Queueauftrag unterbrochene FTPS-Proben
         // als reine Recovery. Ältere Executoren dürfen sie nicht wiederholen.
-        let migrated = if matches!(source_version, 1..=26) {
+        // Version 28 ergänzt lokale ZIP-Erzeugung samt authentischer Bestandsbindung.
+        // Version 30 bindet Datei-/Unterbaumauswahl; ältere Executoren dürfen sie
+        // niemals als Ganzarchivauftrag ignorieren. Version 29 erhält All als Default.
+        if source_version < 30 && snapshot.entries.iter().any(|entry| {
+            matches!(&entry.operation, QueueOperation::ArchiveExtract { request, expected }
+                if !matches!(request.selection, crate::archive_extract::ArchiveExtractSelection::All)
+                    || !matches!(expected.preview.selection, crate::archive_extract::ArchiveExtractSelection::All))
+        }) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "Altes Queuejournal enthält eine dort nicht unterstützte ZIP-Auswahl"));
+        }
+        // Version 31 erlaubt ausschließlich manifestgebundene interne Snapshotquellen.
+        // Kein älteres Journal darf diese Quellenklasse nachträglich einschleusen.
+        if source_version < 31 && snapshot.entries.iter().any(|entry| {
+            matches!(&entry.operation, QueueOperation::ArchiveExtract { request, expected }
+                if request.snapshot.is_some() || expected.preview.snapshot.is_some())
+                || matches!(&entry.attention, Some(QueueAttention::ArchiveExtractChanged { current, .. }) if current.preview.snapshot.is_some())
+                || entry.archive_extract_report.as_ref().is_some_and(|report| report.preview.snapshot.is_some())
+        }) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Altes Queuejournal enthält eine dort nicht unterstützte Archivmomentaufnahme"));
+        }
+        // Version 32 erweitert nur Snapshotquellen um Ganzarchiv und Unterbaum.
+        // Diese Kombination darf in älteren Journalen auch nicht über eine
+        // Rückfrage oder historische Teilbilanz nachträglich eingeschleust werden.
+        if source_version < 32 && snapshot.entries.iter().any(|entry| {
+            let needs_new_schema = |snapshot: bool, selection: &crate::archive_extract::ArchiveExtractSelection| {
+                snapshot && !matches!(selection, crate::archive_extract::ArchiveExtractSelection::Entry { .. })
+            };
+            matches!(&entry.operation, QueueOperation::ArchiveExtract { request, expected }
+                if needs_new_schema(request.snapshot.is_some(), &request.selection)
+                    || needs_new_schema(expected.preview.snapshot.is_some(), &expected.preview.selection))
+                || matches!(&entry.attention, Some(QueueAttention::ArchiveExtractChanged { current, .. })
+                    if needs_new_schema(current.preview.snapshot.is_some(), &current.preview.selection))
+                || entry.archive_extract_report.as_ref().is_some_and(|report|
+                    needs_new_schema(report.preview.snapshot.is_some(), &report.preview.selection))
+        }) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "Altes Queuejournal enthält einen dort nicht unterstützten Snapshot-Entpackumfang"));
+        }
+        if source_version < 33
+            && snapshot
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.operation, QueueOperation::ContentSync { .. }))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Altes Queuejournal enthält eine dort nicht unterstützte Inhaltssync-Klasse",
+            ));
+        }
+        if source_version < 34
+            && snapshot
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.operation, QueueOperation::BidirectionalForward { .. }))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,"Altes Queuejournal enthält eine dort nicht unterstützte bidirektionale Forwardklasse"));
+        }
+        // Version 35 bindet objektweite Datei-DACL-Wirkungen samt Aliasstimmen
+        // und Recoverybericht; ältere Executoren dürfen diese Klasse nicht ignorieren.
+        if source_version<35 && snapshot.entries.iter().any(|entry| {
+            entry.file_dacl_recovery || !entry.file_dacl_report.is_empty() || !entry.progress.file_dacl_report.is_empty()
+                || matches!(&entry.operation,QueueOperation::ContentSync{expected_plan,..} if !expected_plan.file_dacl_selections.is_empty() || expected_plan.actions.iter().any(|action|matches!(action,crate::Action::SetFileDacl{..})))
+        }) { return Err(io::Error::new(io::ErrorKind::InvalidData,"Altes Queuejournal enthält eine dort nicht unterstützte objektweite Datei-DACL-Klasse")); }
+        if source_version < 36
+            && snapshot.entries.iter().any(|entry| {
+                entry.created_directory_dacl_recovery
+                    || !entry.created_directory_dacl_report.is_empty()
+                    || !entry.progress.created_directory_dacl_report.is_empty()
+                    || queue_entry_created_payload(entry)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Altes Queuejournal enthält eine dort nicht unterstützte Neuordner-Rechteklasse",
+            ));
+        }
+        if source_version < 37
+            && snapshot
+                .entries
+                .iter()
+                .any(queue_entry_before_children_payload)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Altes Queuejournal enthält eine dort nicht unterstützte V8-Rechteklasse",
+            ));
+        }
+        for entry in &snapshot.entries {
+            let invalid_original = operation_sync_plan(&entry.operation).is_some_and(|plan| {
+                before_children_plan_payload(plan) && !before_children_class(&entry.operation, plan)
+            });
+            let invalid_preview = matches!(&entry.attention, Some(QueueAttention::PlanChanged { current_plan, .. })
+                if before_children_plan_payload(current_plan) && !before_children_class(&entry.operation, current_plan));
+            let has_rights = before_children_rights_report(&entry.created_directory_dacl_report)
+                || before_children_rights_report(&entry.progress.created_directory_dacl_report);
+            let original_class = operation_sync_plan(&entry.operation)
+                .is_some_and(|plan| before_children_class(&entry.operation, plan));
+            if invalid_original || invalid_preview || (has_rights && !original_class) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "V8 benötigt passenden NativeBestEffort-ContentSync/CreateDir; Rechtebelege behalten ihre ursprüngliche Absicht"));
+            }
+        }
+        for entry in &snapshot.entries {
+            let has_rights = entry.created_directory_dacl_recovery
+                || entry.created_directory_dacl_report.has_rights_effects()
+                || entry
+                    .progress
+                    .created_directory_dacl_report
+                    .has_rights_effects();
+            let has_creation = !entry.created_directory_dacl_report.created.is_empty()
+                || !entry
+                    .progress
+                    .created_directory_dacl_report
+                    .created
+                    .is_empty();
+            if has_rights
+                && !matches!(&entry.operation,QueueOperation::ContentSync{expected_plan,..} if expected_plan.actions.iter().any(created_directory_action))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Neuordner-Rechtebeleg ohne passende ursprüngliche CreateDir-Absicht",
+                ));
+            }
+            if has_creation && !matches!(entry.operation, QueueOperation::ContentSync { .. }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Historische Neuordneranlage benötigt ihren ursprünglichen Inhaltssync",
+                ));
+            }
+        }
+        let migrated = if matches!(source_version, 1..=39) {
             for entry in &mut snapshot.entries {
                 if let QueueOperation::File {
                     destination,
@@ -1248,7 +1508,7 @@ impl OperationQueue {
                     "Queue-Journal enthält eine leere oder mehrfach vergebene Operations-ID",
                 ));
             }
-            validate_persisted_entry_state(entry).map_err(|error| {
+            validate_persisted_entry_state(entry, process_lock.root.path()).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -1275,6 +1535,35 @@ impl OperationQueue {
         }
         let staging_recovery =
             crate::local_staging::recover_queue_beneath(&path, &process_lock.root)?;
+        if source_version < 37
+            && staging_recovery.iter().any(|recovery| {
+                recovery.before_children_recovery
+                    != crate::created_directory_dacl::BeforeChildrenRecovery::Absent
+                    || before_children_report(&recovery.created_directory_dacl_report)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Altes Queuejournal kann keine V8-Recovery aufnehmen",
+            ));
+        }
+        for recovery in &staging_recovery {
+            if recovery.before_children_recovery
+                == crate::created_directory_dacl::BeforeChildrenRecovery::Pending
+            {
+                let matches_original = snapshot.entries.iter().any(|entry| {
+                    entry.operation_id == recovery.operation
+                        && operation_sync_plan(&entry.operation)
+                            .is_some_and(|plan| before_children_class(&entry.operation, plan))
+                });
+                if !matches_original {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "V8-Recovery ohne ursprünglichen NativeBestEffort-ContentSync/CreateDir",
+                    ));
+                }
+            }
+        }
         for recovery in &staging_recovery {
             if snapshot
                 .entries
@@ -1283,10 +1572,26 @@ impl OperationQueue {
             {
                 continue;
             }
+            if recovery.directory_dacl_acknowledged
+                && recovery.paths.is_empty()
+                && recovery.directory_dacl_report.is_empty()
+            {
+                continue;
+            }
             let Some((root, account_digest)) = &recovery.ftps_root else {
                 continue;
             };
             snapshot.entries.push(QueueEntry {
+                file_incomplete: false,
+            generated_source: None,
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report:Default::default(),
+            archive_extract_report: None,
+            directory_dacl_recovery: false,
+            file_dacl_recovery: false,
+            created_directory_dacl_recovery:false,
                 operation_id: recovery.operation.clone(),
                 operation: QueueOperation::FtpsRecovery { identity: Box::new(root.clone()), account_digest: *account_digest },
                 profile_bindings: Vec::new(),
@@ -1334,6 +1639,76 @@ impl OperationQueue {
                 .iter()
                 .filter(|recovery| recovery.operation == entry.operation_id)
             {
+                let before = entry.directory_stream_report.clone();
+                entry
+                    .directory_stream_report
+                    .merge(&recovery.directory_stream_report);
+                recovered |= before != entry.directory_stream_report;
+                if recovery.directory_dacl_acknowledged {
+                    recovered |= entry.directory_dacl_report != recovery.directory_dacl_report
+                        || entry.progress.directory_dacl_report != recovery.directory_dacl_report
+                        || entry.directory_dacl_recovery;
+                    entry.directory_dacl_report = recovery.directory_dacl_report.clone();
+                    entry.progress.directory_dacl_report = recovery.directory_dacl_report.clone();
+                    entry.directory_dacl_recovery = false;
+                    let previous = entry.temp_recovery_paths.len();
+                    entry
+                        .temp_recovery_paths
+                        .retain(|path| !recovery.directory_dacl_acknowledged_paths.contains(path));
+                    recovered |= previous != entry.temp_recovery_paths.len();
+                } else {
+                    let before = entry.directory_dacl_report.clone();
+                    entry
+                        .directory_dacl_report
+                        .merge(&recovery.directory_dacl_report);
+                    recovered |= before != entry.directory_dacl_report;
+                    if recovery.directory_dacl_recovery && !entry.directory_dacl_recovery {
+                        entry.directory_dacl_recovery = true;
+                        recovered = true;
+                    }
+                }
+                let previous_report = entry.file_dacl_report.clone();
+                entry
+                    .file_dacl_report
+                    .reconcile(&recovery.file_dacl_resolved, &recovery.file_dacl_report);
+                entry.progress.file_dacl_report = entry.file_dacl_report.clone();
+                recovered |= previous_report != entry.file_dacl_report;
+                if recovery.file_dacl_acknowledged {
+                    recovered |= entry.file_dacl_recovery;
+                    entry.file_dacl_recovery = false;
+                    let previous = entry.temp_recovery_paths.len();
+                    entry
+                        .temp_recovery_paths
+                        .retain(|path| !recovery.file_dacl_acknowledged_paths.contains(path));
+                    recovered |= previous != entry.temp_recovery_paths.len();
+                } else if recovery.file_dacl_recovery && !entry.file_dacl_recovery {
+                    entry.file_dacl_recovery = true;
+                    recovered = true;
+                }
+                let previous_report = entry.created_directory_dacl_report.clone();
+                entry.created_directory_dacl_report.reconcile(
+                    &recovery.created_directory_dacl_resolved,
+                    &recovery.created_directory_dacl_report,
+                );
+                entry.progress.created_directory_dacl_report =
+                    entry.created_directory_dacl_report.clone();
+                recovered |= previous_report != entry.created_directory_dacl_report;
+                if recovery.created_directory_dacl_acknowledged {
+                    recovered |= entry.created_directory_dacl_recovery;
+                    entry.created_directory_dacl_recovery = false;
+                    let previous = entry.temp_recovery_paths.len();
+                    entry.temp_recovery_paths.retain(|path| {
+                        !recovery
+                            .created_directory_dacl_acknowledged_paths
+                            .contains(path)
+                    });
+                    recovered |= previous != entry.temp_recovery_paths.len();
+                } else if recovery.created_directory_dacl_recovery
+                    && !entry.created_directory_dacl_recovery
+                {
+                    entry.created_directory_dacl_recovery = true;
+                    recovered = true;
+                }
                 for path in &recovery.paths {
                     if !entry.temp_recovery_paths.contains(path) {
                         entry.temp_recovery_paths.push(path.clone());
@@ -1346,7 +1721,11 @@ impl OperationQueue {
                         | QueueState::Validating
                         | QueueState::Interrupted
                         | QueueState::Failed
-                ) {
+                ) || ((recovery.directory_dacl_recovery
+                    || recovery.file_dacl_recovery
+                    || recovery.created_directory_dacl_recovery)
+                    && matches!(entry.state, QueueState::Cancelled | QueueState::Completed))
+                {
                     entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
                     entry.error = Some(if recovery.ftps_root.is_some() {
                         "FTPS-Intent des vorherigen Laufs blieb erhalten; mögliche Proben- und STOU-Reste manuell prüfen. Ein STOU-Name kann unbekannt sein; keine automatische Wiederholung oder Löschung."
@@ -1398,6 +1777,21 @@ impl OperationQueue {
                 }
             }
             if entry.state == QueueState::Running {
+                if let QueueOperation::ContentSync { target, .. } = &entry.operation {
+                    entry.state = QueueState::Interrupted;
+                    entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+                    entry.error = Some("Prozessende während Inhaltssync; Teilwirkungen und Zwischenstände manuell prüfen, nicht automatisch wiederholen".into());
+                    if !entry
+                        .temp_recovery_paths
+                        .iter()
+                        .any(|path| path == target.root())
+                    {
+                        entry.temp_recovery_paths.push(target.root().to_owned());
+                    }
+                    recovered = true;
+                }
+            }
+            if entry.state == QueueState::Running {
                 let ftps_target = match &entry.operation {
                     QueueOperation::FtpsSync {
                         direction: SftpQueueDirection::Upload,
@@ -1417,6 +1811,46 @@ impl OperationQueue {
                     entry.error = Some("Prozessende während FTPS-Zielwirkung; Zielbaum und mögliche STOU-Reste manuell prüfen, nicht automatisch wiederholen".into());
                     if !entry.temp_recovery_paths.contains(&root) {
                         entry.temp_recovery_paths.push(root);
+                    }
+                    recovered = true;
+                }
+            }
+            if entry.state == QueueState::Running {
+                if let QueueOperation::ArchivePack { request, .. } = &entry.operation {
+                    entry.state = QueueState::Interrupted;
+                    entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+                    entry.error = Some("Prozessende während ZIP-Erzeugung; Ziel und erhaltene Temps manuell prüfen, nicht automatisch wiederholen".into());
+                    let target = request
+                        .target_dir
+                        .join(&request.target_name)
+                        .to_string_lossy()
+                        .into_owned();
+                    if !entry.temp_recovery_paths.contains(&target) {
+                        entry.temp_recovery_paths.push(target);
+                    }
+                    recovered = true;
+                }
+            }
+            if entry.state == QueueState::Running {
+                if let QueueOperation::ArchiveExtract { request, .. } = &entry.operation {
+                    entry.state = QueueState::Interrupted;
+                    entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+                    entry.error = Some("Prozessende während ZIP-Entpacken; bereits entpackte Dateien/Ordner und Temps manuell prüfen, nicht automatisch wiederholen".into());
+                    let target = request.target_dir.display().to_string();
+                    if !entry.temp_recovery_paths.contains(&target) {
+                        entry.temp_recovery_paths.push(target);
+                    }
+                    recovered = true;
+                }
+            }
+            if entry.state == QueueState::Running {
+                if let QueueOperation::ArchiveUpload { generation, .. } = &entry.operation {
+                    entry.state = QueueState::Interrupted;
+                    entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+                    entry.error = Some("Prozessende während der lokalen Archivphase; Zwischenstand prüfen. Upload wurde noch nicht begonnen.".into());
+                    let path = generation.target_dir().to_string_lossy().into_owned();
+                    if !entry.temp_recovery_paths.contains(&path) {
+                        entry.temp_recovery_paths.push(path);
                     }
                     recovered = true;
                 }
@@ -1447,6 +1881,16 @@ impl OperationQueue {
                 entry.error_code = Some(crate::ErrorCode::Interrupted);
                 recovered = true;
             }
+            if entry.state == QueueState::Pending
+                && matches!(entry.operation, QueueOperation::BidirectionalForward { .. })
+                && bidirectional_recovery_kind(&entry.operation)
+                    != crate::bidirectional::BidirectionalRunRecovery::Absent
+            {
+                entry.state = QueueState::Interrupted;
+                entry.error=Some("Die Forward-RAM-Freigabe ging beim Prozessende verloren; der offene Auftrag verlangt einen frischen Neuabgleich".into());
+                entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+                recovered = true;
+            }
             if let Some(completion) = entry.bidirectional_completion_recovery {
                 let valid_state = match completion {
                     BidirectionalCompletionRecovery::Complete => {
@@ -1456,7 +1900,14 @@ impl OperationQueue {
                         matches!(entry.state, QueueState::Interrupted | QueueState::Cancelled)
                     }
                 };
-                if !matches!(entry.operation, QueueOperation::Bidirectional { .. }) || !valid_state
+                if (matches!(entry.operation, QueueOperation::BidirectionalForward { .. })
+                    && completion == BidirectionalCompletionRecovery::RolledBack)
+                    || !matches!(
+                        entry.operation,
+                        QueueOperation::Bidirectional { .. }
+                            | QueueOperation::BidirectionalForward { .. }
+                    )
+                    || !valid_state
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1478,8 +1929,10 @@ impl OperationQueue {
                 entry.progress.current.clear();
                 entry.recovery_available = false;
                 recovered |= changed;
-            } else if matches!(entry.operation, QueueOperation::Bidirectional { .. })
-                && matches!(entry.state, QueueState::Failed | QueueState::Interrupted)
+            } else if matches!(
+                entry.operation,
+                QueueOperation::Bidirectional { .. } | QueueOperation::BidirectionalForward { .. }
+            ) && matches!(entry.state, QueueState::Failed | QueueState::Interrupted)
             {
                 let old_state = entry.state;
                 let old_phase = entry.progress.phase.clone();
@@ -1530,6 +1983,28 @@ impl OperationQueue {
             } else {
                 entry.recovery_available = false;
             }
+            if !entry.directory_dacl_report.is_empty() {
+                if let Some(error) = &mut entry.error {
+                    let effects =
+                        crate::error::directory_dacl_report_text(&entry.directory_dacl_report);
+                    if !error.contains(&effects) {
+                        error.push_str("; ");
+                        error.push_str(&effects);
+                        recovered = true;
+                    }
+                }
+            }
+            if !entry.directory_stream_report.is_empty() {
+                if let Some(error) = &mut entry.error {
+                    let effects =
+                        crate::error::directory_stream_report_text(&entry.directory_stream_report);
+                    if !error.contains(&effects) {
+                        error.push_str("; ");
+                        error.push_str(&effects);
+                        recovered = true;
+                    }
+                }
+            }
         }
         let queue = Self {
             path,
@@ -1565,6 +2040,23 @@ impl OperationQueue {
                 &snapshot,
                 AtomicWriteMode::Replace,
             )?;
+        }
+        for recovery in &staging_recovery {
+            queue.checkpoint_file_dacl(
+                &recovery.operation,
+                &recovery.file_dacl_resolved,
+                recovery.file_dacl_acknowledged,
+            )?;
+            queue.checkpoint_created_directory_dacl(
+                &recovery.operation,
+                &recovery.created_directory_dacl_resolved,
+                recovery.created_directory_dacl_acknowledged,
+            )?;
+        }
+        for entry in queue.snapshot().entries {
+            if entry.state == QueueState::Completed && entry.generated_source.is_some() {
+                queue.cleanup_completed_generated_source(&entry.operation_id);
+            }
         }
         Ok(queue)
     }
@@ -1616,7 +2108,15 @@ impl OperationQueue {
                 let snapshot = self.snapshot();
                 if !snapshot.entries.iter().any(|entry| {
                     entry.operation_id == operation
-                        && matches!(entry.state, QueueState::Validating | QueueState::Running)
+                        && (matches!(entry.state, QueueState::Validating | QueueState::Running)
+                            || (matches!(entry.state, QueueState::Interrupted | QueueState::Failed)
+                                && entry.recovery_available
+                                && matches!(entry.operation, QueueOperation::Bidirectional { .. })
+                                && bidirectional_recovery_kind(&entry.operation)
+                                    == crate::bidirectional::BidirectionalRunRecovery::ResumeOrRollback)
+                            || (matches!(entry.state, QueueState::Interrupted | QueueState::Failed)
+                                && (entry.directory_dacl_recovery || entry.file_dacl_recovery || entry.created_directory_dacl_recovery)
+                                && matches!(entry.operation, QueueOperation::ContentSync { .. })))
                 }) {
                     return Err(io::Error::other(
                         "FTPS-Owner benötigt den aktiven Queueeintrag",
@@ -1643,7 +2143,10 @@ impl OperationQueue {
     }
 
     #[cfg(test)]
-    fn fail_nonterminal_progress_update_after_for_test(&self, successful_updates: usize) {
+    pub(crate) fn fail_nonterminal_progress_update_after_for_test(
+        &self,
+        successful_updates: usize,
+    ) {
         self.fail_nonterminal_progress_update_after
             .store(successful_updates, Ordering::SeqCst);
     }
@@ -1776,6 +2279,16 @@ impl OperationQueue {
     pub fn enqueue(&self, operation: QueueOperation) -> io::Result<QueueEntry> {
         validate_enqueue_operation(&operation)?;
         let entry = QueueEntry {
+            file_incomplete: false,
+            generated_source: None,
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
+            archive_extract_report: None,
+            directory_dacl_recovery: false,
+            file_dacl_recovery: false,
+            created_directory_dacl_recovery: false,
             operation_id: new_operation_id()?,
             operation,
             profile_bindings: Vec::new(),
@@ -1791,9 +2304,90 @@ impl OperationQueue {
             recovery_available: false,
             bidirectional_completion_recovery: None,
         };
+        validate_generated_entry(&entry, self._process_lock.root.path())?;
         self.transact(|journal| {
             journal.entries.push(entry.clone());
             Ok(entry)
+        })
+    }
+
+    /// Persistiert die genaue Namenslage vor jedem Schritt. Der Eintrag bleibt
+    /// auch nach einem Crash ausschließlich manuell prüfbar, niemals retryfähig.
+    pub fn checkpoint_rename_cycle(
+        &self,
+        record: &crate::remote_rename_cycle::RenameCycleRecord,
+    ) -> io::Result<()> {
+        record.validate()?;
+        self.transact(|journal| {
+            let operation = QueueOperation::RenameCycleRecovery { record: Box::new(record.clone()) };
+            let entry = if let Some(entry) = journal.entries.iter_mut().find(|entry| entry.operation_id == record.id) {
+                let QueueOperation::RenameCycleRecovery { record: previous } = &entry.operation else {
+                    return Err(io::Error::other("Namenstausch-ID gehört zu einem anderen Queueeintrag"));
+                };
+                if entry.state != QueueState::Interrupted || previous.finished
+                    || previous.id != record.id || previous.root != record.root
+                    || previous.identity != record.identity || previous.old_names != record.old_names
+                    || previous.new_names != record.new_names || previous.temp_name != record.temp_name
+                {
+                    return Err(io::Error::other("Namenstausch-Recoverybindung änderte sich"));
+                }
+                let confirmed_step = previous.pending.as_ref().is_some_and(|step| {
+                    previous.current_names.iter().enumerate().all(|(index,name)| {
+                        record.current_names[index].as_str() == if index == step.member { step.to.as_str() } else { name.as_str() }
+                    }) && record.pending.is_none()
+                });
+                if (previous.current_names != record.current_names && !confirmed_step)
+                    || (previous.pending.is_some() && record.pending.is_some() && previous.pending != record.pending)
+                {
+                    return Err(io::Error::other("Namenslage darf nur den zuvor gespeicherten Schritt bestätigen"));
+                }
+                entry.operation = operation;
+                entry
+            } else {
+                journal.entries.push(QueueEntry {
+                    file_incomplete: false,
+                    generated_source: None,
+                    operation_id: record.id.clone(), operation, profile_bindings: Vec::new(),
+                    created_unix_ms: unix_millis()?, state: QueueState::Interrupted, attempts: 1,
+                    progress: Progress::default(), attention: None, error: None, error_code: None,
+                    temp_recovery_paths: Vec::new(), retained_backup_paths: Vec::new(),
+                    recovery_available: false, bidirectional_completion_recovery: None,
+                    directory_stream_report: Default::default(), directory_dacl_report: Default::default(),
+                    file_dacl_report: Default::default(), created_directory_dacl_report: Default::default(),
+                    archive_extract_report: None, directory_dacl_recovery: false,
+                    file_dacl_recovery: false, created_directory_dacl_recovery: false,
+                });
+                journal.entries.last_mut().expect("Gerade angelegte Recovery")
+            };
+            entry.state = if record.finished { QueueState::Completed } else { QueueState::Interrupted };
+            entry.progress.phase = if record.finished { "rename_cycle_complete" } else { "rename_cycle_recovery" }.into();
+            entry.error = (!record.finished).then(|| "Entfernter Namenstausch kann Teilwirkungen besitzen. Zwischenname und gespeicherte Namenslage prüfen; kein automatischer Rücktausch, Retry oder Cleanup.".into());
+            entry.error_code = (!record.finished).then_some(crate::ErrorCode::OutcomeUnclear);
+            entry.temp_recovery_paths = if record.finished { Vec::new() } else { record.recovery_paths() };
+            Ok(())
+        })
+    }
+
+    pub(crate) fn discard_unstarted_rename_cycle(
+        &self,
+        record: &crate::remote_rename_cycle::RenameCycleRecord,
+    ) -> io::Result<()> {
+        record.validate()?;
+        if record.finished || record.pending.is_some() || record.current_names != record.old_names {
+            return Err(io::Error::other(
+                "Begonnener Namenstausch darf nicht als unverändert entfernt werden",
+            ));
+        }
+        self.transact(|journal| {
+            let Some(index) = journal.entries.iter().position(|entry| entry.operation_id == record.id) else { return Ok(()); };
+            let entry = &journal.entries[index];
+            if entry.state != QueueState::Interrupted
+                || !matches!(&entry.operation, QueueOperation::RenameCycleRecovery { record: stored } if stored.as_ref() == record)
+            {
+                return Err(crate::real_mode::plan_drift("Namenslage des unbegonnenen Tauschs änderte sich"));
+            }
+            journal.entries.remove(index);
+            Ok(())
         })
     }
 
@@ -1854,9 +2448,29 @@ impl OperationQueue {
         profile_bindings: Vec<crate::RemoteProfileBinding>,
         write: impl FnOnce(&Path, &QueueSnapshot) -> io::Result<()>,
     ) -> io::Result<QueueEntry> {
+        self.enqueue_reconciled_source_using(operation, profile_bindings, None, write)
+    }
+
+    fn enqueue_reconciled_source_using(
+        &self,
+        operation: QueueOperation,
+        profile_bindings: Vec<crate::RemoteProfileBinding>,
+        generated_source: Option<crate::generated_source::GeneratedSourceReference>,
+        write: impl FnOnce(&Path, &QueueSnapshot) -> io::Result<()>,
+    ) -> io::Result<QueueEntry> {
         validate_enqueue_operation(&operation)?;
         validate_profile_bindings(&profile_bindings)?;
         let entry = QueueEntry {
+            file_incomplete: false,
+            generated_source,
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
+            archive_extract_report: None,
+            directory_dacl_recovery: false,
+            file_dacl_recovery: false,
+            created_directory_dacl_recovery: false,
             operation_id: new_operation_id()?,
             operation,
             profile_bindings,
@@ -1872,12 +2486,168 @@ impl OperationQueue {
             recovery_available: false,
             bidirectional_completion_recovery: None,
         };
+        validate_generated_entry(&entry, self._process_lock.root.path())?;
         self.transact_using(
             |journal| {
                 journal.entries.push(entry.clone());
                 Ok(entry)
             },
             write,
+        )
+    }
+
+    /// Übergibt genau den versiegelten Ergebnisbaum an den normalen Uploadweg.
+    /// Referenz und Dateiabsicht erreichen gemeinsam ihren ersten Journalcommit.
+    pub fn enqueue_generated_upload(
+        &self,
+        reference: crate::generated_source::GeneratedSourceReference,
+        target: BidirectionalQueueEndpoint,
+        profile_bindings: Vec<crate::RemoteProfileBinding>,
+        cancel: &Cancel,
+    ) -> io::Result<QueueEntry> {
+        target.validate()?;
+        validate_profile_bindings(&profile_bindings)?;
+        if matches!(target, BidirectionalQueueEndpoint::Local { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Die erzeugte Uploadquelle benötigt ein entferntes Ziel",
+            ));
+        }
+        let operation = self.generated_upload_operation(&reference, target, cancel)?;
+        self.enqueue_reconciled_source_using(
+            operation,
+            profile_bindings,
+            Some(reference),
+            |path, snapshot| {
+                write_snapshot_bound(
+                    &self._process_lock.root,
+                    path,
+                    snapshot,
+                    AtomicWriteMode::Replace,
+                )
+            },
+        )
+    }
+
+    fn generated_upload_operation(
+        &self,
+        reference: &crate::generated_source::GeneratedSourceReference,
+        target: BidirectionalQueueEndpoint,
+        cancel: &Cancel,
+    ) -> io::Result<QueueOperation> {
+        let store = crate::generated_source::GeneratedSourceStore::for_queue(self)?;
+        let source = store.resolve(reference, cancel)?;
+        let source_vfs = source.read_vfs(cancel)?;
+        let root = crate::fileops::path_to_utf8(source.path())?;
+        let items = source
+            .items()
+            .iter()
+            .map(|path| crate::fileops::path_to_utf8(path))
+            .collect::<io::Result<Vec<_>>>()?;
+        let destination = target.root().to_string();
+        Ok(QueueOperation::ProviderFile {
+            kind: FileQueueKind::Copy,
+            source: Box::new(BidirectionalQueueEndpoint::Local { root }),
+            target: Box::new(target),
+            items,
+            destination,
+            overwrite: false,
+            expected_conflicts: Vec::new(),
+            source_tree_expected: source_vfs.interactive_source_tree()?.map(Box::new),
+            expected_conflict_proofs: Vec::new(),
+            keep_both_targets: Vec::new(),
+            best_effort_commit_expected: None,
+            local_copy_new_best_effort_expected: None,
+            copy_new_best_effort_expected: Some(true),
+            replace_best_effort_expected: Some(false),
+            remove_source_best_effort_expected: None,
+        })
+    }
+
+    fn transition_archive_upload(
+        &self,
+        previous: &QueueEntry,
+        reference: crate::generated_source::GeneratedSourceReference,
+        cancel: &Cancel,
+    ) -> io::Result<QueueEntry> {
+        self.transition_archive_upload_using(previous, reference, cancel, |path, snapshot| {
+            write_snapshot_bound(
+                &self._process_lock.root,
+                path,
+                snapshot,
+                AtomicWriteMode::Replace,
+            )
+        })
+    }
+
+    fn transition_archive_upload_using(
+        &self,
+        previous: &QueueEntry,
+        reference: crate::generated_source::GeneratedSourceReference,
+        cancel: &Cancel,
+        write: impl FnOnce(&Path, &QueueSnapshot) -> io::Result<()>,
+    ) -> io::Result<QueueEntry> {
+        let QueueOperation::ArchiveUpload { target, .. } = &previous.operation else {
+            return Err(invalid_transition(previous.state));
+        };
+        let operation = self.generated_upload_operation(&reference, *target.clone(), cancel)?;
+        self.transact_using(
+            |journal| {
+                let entry = find_mut(journal, &previous.operation_id)?;
+                require_state(entry, QueueState::Running)?;
+                if entry.operation != previous.operation {
+                    return Err(crate::real_mode::plan_drift(
+                        "Archivauftrag änderte sich während der Erzeugung",
+                    ));
+                }
+                entry.operation = operation;
+                entry.generated_source = Some(reference);
+                entry.state = QueueState::Validating;
+                entry.progress = Progress::default();
+                entry.attention = None;
+                entry.error = None;
+                entry.error_code = None;
+                entry.temp_recovery_paths.clear();
+                validate_generated_entry(entry, self._process_lock.root.path())?;
+                Ok(entry.clone())
+            },
+            write,
+        )
+    }
+
+    /// Verwendet die normalen Zielkonfliktbelege und Aliasziele einer vorbereiteten
+    /// Dateiaktion. Ausschließlich die Ergebnisquelle kommt aus dem versiegelten Lauf.
+    pub fn enqueue_generated_upload_operation(
+        &self,
+        reference: crate::generated_source::GeneratedSourceReference,
+        mut operation: QueueOperation,
+        profile_bindings: Vec<crate::RemoteProfileBinding>,
+        cancel: &Cancel,
+    ) -> io::Result<QueueEntry> {
+        validate_enqueue_operation(&operation)?;
+        validate_profile_bindings(&profile_bindings)?;
+        let (_held, vfs) =
+            resolve_generated_operation_source(self, &reference, &operation, cancel)?;
+        let QueueOperation::ProviderFile {
+            source_tree_expected,
+            ..
+        } = &mut operation
+        else {
+            unreachable!()
+        };
+        *source_tree_expected = vfs.interactive_source_tree()?.map(Box::new);
+        self.enqueue_reconciled_source_using(
+            operation,
+            profile_bindings,
+            Some(reference),
+            |path, snapshot| {
+                write_snapshot_bound(
+                    &self._process_lock.root,
+                    path,
+                    snapshot,
+                    AtomicWriteMode::Replace,
+                )
+            },
         )
     }
 
@@ -1902,6 +2672,16 @@ impl OperationQueue {
         validate_enqueue_operation(&operation)?;
         validate_profile_bindings(&profile_bindings)?;
         let entry = QueueEntry {
+            file_incomplete: false,
+            generated_source: None,
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
+            archive_extract_report: None,
+            directory_dacl_recovery: false,
+            file_dacl_recovery: false,
+            created_directory_dacl_recovery: false,
             operation_id: new_operation_id()?,
             operation,
             profile_bindings,
@@ -1917,6 +2697,7 @@ impl OperationQueue {
             recovery_available: false,
             bidirectional_completion_recovery: None,
         };
+        validate_generated_entry(&entry, self._process_lock.root.path())?;
         self.transact(|journal| {
             if journal.paused
                 || journal
@@ -2002,6 +2783,66 @@ impl OperationQueue {
         })
     }
 
+    fn checkpoint_file_dacl(
+        &self,
+        operation_id: &str,
+        resolved: &[crate::file_dacl::FileDaclOutcome],
+        terminal: bool,
+    ) -> io::Result<()> {
+        let snapshot = self.snapshot();
+        let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.operation_id == operation_id)
+        else {
+            return Ok(());
+        };
+        if !matches!(&entry.operation, QueueOperation::ContentSync { expected_plan, .. } if expected_plan.actions.iter().any(|action| matches!(action, crate::Action::SetFileDacl { .. })))
+        {
+            return Ok(());
+        }
+        crate::file_dacl_registry::checkpoint(
+            &crate::local_staging::StagingOwner {
+                queue: self.path.clone(),
+                operation: operation_id.into(),
+            },
+            &self._process_lock.root,
+            &entry.file_dacl_report,
+            resolved,
+            terminal,
+        )
+    }
+
+    fn checkpoint_created_directory_dacl(
+        &self,
+        operation_id: &str,
+        resolved: &[crate::created_directory_dacl::CreatedDirectoryDaclOutcome],
+        terminal: bool,
+    ) -> io::Result<()> {
+        let snapshot = self.snapshot();
+        let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.operation_id == operation_id)
+        else {
+            return Ok(());
+        };
+        if !matches!(&entry.operation, QueueOperation::ContentSync { expected_plan, .. } if expected_plan.actions.iter().any(created_directory_action))
+        {
+            return Ok(());
+        }
+        crate::created_directory_dacl_registry::checkpoint(
+            &crate::local_staging::StagingOwner {
+                queue: self.path.clone(),
+                operation: operation_id.into(),
+            },
+            &self._process_lock.root,
+            &entry.created_directory_dacl_report,
+            resolved,
+            terminal,
+        )
+    }
+
     pub fn update_progress(&self, operation_id: &str, progress: &Progress) -> io::Result<()> {
         #[cfg(test)]
         if file_progress_is_terminal(progress)
@@ -2032,9 +2873,21 @@ impl OperationQueue {
         }
         self.update(operation_id, |entry| {
             require_state(entry, QueueState::Running)?;
+            entry
+                .directory_stream_report
+                .merge(&progress.directory_stream_report);
+            entry
+                .directory_dacl_report
+                .merge(&progress.directory_dacl_report);
+            entry.file_dacl_report.merge(&progress.file_dacl_report);
+            entry
+                .created_directory_dacl_report
+                .merge(&progress.created_directory_dacl_report);
             entry.progress = progress.clone();
             Ok(())
-        })
+        })?;
+        self.checkpoint_file_dacl(operation_id, &[], false)?;
+        self.checkpoint_created_directory_dacl(operation_id, &[], false)
     }
 
     pub fn complete(&self, operation_id: &str, progress: Progress) -> io::Result<()> {
@@ -2052,6 +2905,7 @@ impl OperationQueue {
         progress: Progress,
         temp_recovery_paths: &[String],
         retained_backup_paths: &[String],
+        incomplete: bool,
     ) -> io::Result<()> {
         #[cfg(test)]
         if self
@@ -2065,7 +2919,11 @@ impl OperationQueue {
         self.update(operation_id, |entry| {
             if !matches!(
                 entry.operation,
-                QueueOperation::File { .. } | QueueOperation::ProviderFile { .. }
+                QueueOperation::File { .. }
+                    | QueueOperation::ProviderFile { .. }
+                    | QueueOperation::ArchiveUpload { .. }
+                    | QueueOperation::ArchivePack { .. }
+                    | QueueOperation::ArchiveExtract { .. }
             ) {
                 return Err(invalid_transition(entry.state));
             }
@@ -2076,6 +2934,7 @@ impl OperationQueue {
                 QueueState::Completed
             };
             entry.progress = progress;
+            entry.file_incomplete = incomplete;
             for path in retained_backup_paths {
                 if !entry.retained_backup_paths.contains(path) {
                     entry.retained_backup_paths.push(path.clone());
@@ -2109,7 +2968,13 @@ impl OperationQueue {
             completion.progress.clone(),
             &completion.temp_recovery_paths,
             &completion.stats.retained_backup_paths,
-        )
+            completion.stats.incomplete_resource_forks > 0
+                || !completion.stats.retained_source_paths.is_empty(),
+        )?;
+        if !completion.cancelled {
+            self.cleanup_completed_generated_source(operation_id);
+        }
+        Ok(())
     }
 
     /// Schreibt nach einem erfolgreich nachgeholten Queueabschluss denselben
@@ -2126,6 +2991,10 @@ impl OperationQueue {
             completion.audit_operation,
             if completion.cancelled {
                 "cancelled"
+            } else if completion.stats.incomplete_resource_forks > 0
+                || !completion.stats.retained_source_paths.is_empty()
+            {
+                "completed_with_omissions"
             } else {
                 "completed"
             },
@@ -2272,7 +3141,7 @@ impl OperationQueue {
         error: &io::Error,
         paths: &[String],
     ) -> io::Result<()> {
-        self.fail_with_temp_paths(
+        self.fail_with_temp_paths_and_directory_stream_report(
             operation_id,
             progress,
             error.to_string(),
@@ -2282,6 +3151,8 @@ impl OperationQueue {
                 backups: &[],
             },
             false,
+            &crate::error::directory_stream_report(error),
+            &crate::error::directory_dacl_report(error),
         )
     }
 
@@ -2294,10 +3165,86 @@ impl OperationQueue {
         paths: FileRecoveryPaths<'_>,
         require_file_operation: bool,
     ) -> io::Result<()> {
-        let error = error.into();
+        self.fail_with_temp_paths_and_directory_stream_report(
+            operation_id,
+            progress,
+            error,
+            error_code,
+            paths,
+            require_file_operation,
+            &Default::default(),
+            &Default::default(),
+        )
+    }
+
+    fn has_pending_file_dacl(&self, operation_id: &str) -> bool {
+        let planned=self.snapshot().entries.iter().find(|entry|entry.operation_id==operation_id).is_some_and(|entry|matches!(&entry.operation,QueueOperation::ContentSync{expected_plan,..} if expected_plan.actions.iter().any(|action|matches!(action,crate::Action::SetFileDacl{..}))));
+        planned
+            && crate::file_dacl_registry::has_open(
+                &crate::local_staging::StagingOwner {
+                    queue: self.path.clone(),
+                    operation: operation_id.into(),
+                },
+                &self._process_lock.root,
+            )
+            .unwrap_or(true)
+    }
+
+    fn has_pending_created_directory_dacl(&self, operation_id: &str) -> bool {
+        let planned=self.snapshot().entries.iter().find(|entry|entry.operation_id==operation_id).is_some_and(|entry|matches!(&entry.operation,QueueOperation::ContentSync{expected_plan,..} if expected_plan.actions.iter().any(created_directory_action)));
+        planned
+            && crate::created_directory_dacl_registry::has_open(
+                &crate::local_staging::StagingOwner {
+                    queue: self.path.clone(),
+                    operation: operation_id.into(),
+                },
+                &self._process_lock.root,
+            )
+            .unwrap_or(true)
+    }
+
+    fn has_pending_directory_dacl(&self, operation_id: &str) -> bool {
+        let planned_dacl = self.snapshot().entries.iter().find(|entry| entry.operation_id == operation_id)
+            .is_some_and(|entry| matches!(&entry.operation,
+                QueueOperation::ContentSync { expected_plan, .. } if expected_plan.actions.iter().any(|action|
+                    matches!(action, crate::Action::SetDirectoryMetadata { metadata, .. }
+                        if matches!(metadata.windows_dacl, Some(crate::windows_dacl::WindowsDaclTransfer::DirectoryExact(_)))))));
+        planned_dacl
+            && crate::local_staging::has_open_directory_dacl_intent_beneath(
+                &crate::local_staging::StagingOwner {
+                    queue: self.path.clone(),
+                    operation: operation_id.into(),
+                },
+                &self._process_lock.root,
+            )
+            .unwrap_or(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fail_with_temp_paths_and_directory_stream_report(
+        &self,
+        operation_id: &str,
+        progress: Progress,
+        error: impl Into<String>,
+        error_code: Option<crate::ErrorCode>,
+        paths: FileRecoveryPaths<'_>,
+        require_file_operation: bool,
+        report: &crate::directory_streams::DirectoryStreamReport,
+        dacl_report: &crate::directory_dacl::DirectoryDaclReport,
+    ) -> io::Result<()> {
+        let pending_dacl = self.has_pending_directory_dacl(operation_id);
+        let pending_file_dacl = self.has_pending_file_dacl(operation_id);
+        let pending_created_directory_dacl = self.has_pending_created_directory_dacl(operation_id);
+        let created_directory_dacl_report = progress.created_directory_dacl_report.clone();
+        let file_dacl_report = progress.file_dacl_report.clone();
+        let mut dacl_report = dacl_report.clone();
+        dacl_report.merge(&progress.directory_dacl_report);
+        let mut error = error.into();
+        let mut report = report.clone();
+        report.merge(&progress.directory_stream_report);
         self.transact(|journal| {
             let entry = find_mut(journal, operation_id)?;
-            if matches!(entry.operation, QueueOperation::Bidirectional { .. }) {
+            if matches!(entry.operation, QueueOperation::Bidirectional { .. } | QueueOperation::BidirectionalForward { .. }) {
                 // Sicherheitsgrenze: Ein generisches `Failed` würde das offene
                 // Core-Journal und seinen speziellen Recoveryweg verbergen. Nur
                 // `interrupt_bidirectional` darf diesen Laufzustand einordnen.
@@ -2312,7 +3259,7 @@ impl OperationQueue {
             if require_file_operation
                 && !matches!(
                     entry.operation,
-                    QueueOperation::File { .. } | QueueOperation::ProviderFile { .. }
+                    QueueOperation::File { .. } | QueueOperation::ProviderFile { .. } | QueueOperation::ArchiveUpload { .. } | QueueOperation::ArchivePack { .. } | QueueOperation::ArchiveExtract { .. }
                 )
             {
                 return Err(invalid_transition(entry.state));
@@ -2320,6 +3267,24 @@ impl OperationQueue {
             if !matches!(entry.state, QueueState::Validating | QueueState::Running) {
                 return Err(invalid_transition(entry.state));
             }
+            entry.directory_stream_report.merge(&report);
+            entry.directory_dacl_report.merge(&dacl_report);
+            entry.file_dacl_report.merge(&file_dacl_report);
+            entry.file_dacl_recovery |= pending_file_dacl || !file_dacl_report.uncertain.is_empty();
+            entry.created_directory_dacl_report.merge(&created_directory_dacl_report);
+            entry.created_directory_dacl_recovery |= pending_created_directory_dacl || !created_directory_dacl_report.uncertain.is_empty();
+            entry.directory_dacl_recovery |= pending_dacl || !dacl_report.uncertain.is_empty()
+                || (!dacl_report.is_empty() && !paths.temporary.is_empty());
+            if !entry.directory_dacl_report.is_empty() {
+                let effects = crate::error::directory_dacl_report_text(&entry.directory_dacl_report);
+                if !error.contains(&effects) { error.push_str("; "); error.push_str(&effects); }
+            }
+            if !entry.directory_stream_report.is_empty() {
+                let effects = crate::error::directory_stream_report_text(&entry.directory_stream_report);
+                if !error.contains(&effects) { error.push_str("; "); error.push_str(&effects); }
+            }
+            if !entry.file_dacl_report.is_empty() { error.push_str("; ");error.push_str(&crate::error::file_dacl_report_text(&entry.file_dacl_report)); }
+            if !entry.created_directory_dacl_report.is_empty(){error.push_str("; ");error.push_str(&crate::error::created_directory_dacl_report_text(&entry.created_directory_dacl_report));}
             entry.state = QueueState::Failed;
             entry.progress = progress;
             entry.error = Some(error);
@@ -2337,7 +3302,8 @@ impl OperationQueue {
                 journal.paused = true;
             }
             Ok(())
-        })
+        }).map_err(|error| crate::error::with_directory_dacl_report(
+            crate::error::with_directory_stream_report(error, &report), &dacl_report))
     }
 
     /// Ein bidirektionaler Lauf darf nach einem Ausführungsfehler nicht einfach die
@@ -2353,7 +3319,7 @@ impl OperationQueue {
         self.interrupt_bidirectional_with_paths(operation_id, progress, error.into(), &[])
     }
 
-    fn interrupt_bidirectional_coded(
+    pub fn interrupt_bidirectional_coded(
         &self,
         operation_id: &str,
         progress: Progress,
@@ -2376,11 +3342,17 @@ impl OperationQueue {
     ) -> io::Result<()> {
         self.transact(|journal| {
             let entry = find_mut(journal, operation_id)?;
+            let failed_recovery = entry.state == QueueState::Failed
+                && entry.recovery_available
+                && matches!(bidirectional_recovery_kind(&entry.operation),
+                    crate::bidirectional::BidirectionalRunRecovery::ResumeOrRollback
+                    | crate::bidirectional::BidirectionalRunRecovery::CompletionCleanup
+                    | crate::bidirectional::BidirectionalRunRecovery::RollbackCompletionCleanup);
             if !matches!(entry.operation, QueueOperation::Bidirectional { .. })
-                || !matches!(
+                || !(matches!(
                     entry.state,
                     QueueState::Validating | QueueState::Running | QueueState::Interrupted
-                )
+                ) || failed_recovery)
             {
                 return Err(invalid_transition(entry.state));
             }
@@ -2499,7 +3471,14 @@ impl OperationQueue {
             {
                 return Ok(());
             }
-            if entry.state.is_terminal() {
+            let failed_recovery_completion = entry.state == QueueState::Failed
+                && entry.recovery_available
+                && matches!((marker, bidirectional_recovery_kind(&entry.operation)),
+                    (BidirectionalCompletionRecovery::Complete,
+                        crate::bidirectional::BidirectionalRunRecovery::CompletionCleanup)
+                    | (BidirectionalCompletionRecovery::RolledBack,
+                        crate::bidirectional::BidirectionalRunRecovery::RollbackCompletionCleanup));
+            if entry.state.is_terminal() && !failed_recovery_completion {
                 return Err(invalid_transition(entry.state));
             }
             entry.state = QueueState::Interrupted;
@@ -2531,7 +3510,7 @@ impl OperationQueue {
         self.finish_bidirectional_after_effect_with_paths(operation_id, rolled_back, progress, &[])
     }
 
-    fn finish_bidirectional_after_effect_with_paths(
+    pub fn finish_bidirectional_after_effect_with_paths(
         &self,
         operation_id: &str,
         rolled_back: bool,
@@ -2853,19 +3832,98 @@ impl OperationQueue {
     /// Die aktuell sichtbare Plan-/Konfliktlage explizit übernehmen und den Eintrag
     /// wieder ans Ende der sofort ausführbaren Pending-Folge stellen.
     pub fn approve_attention(&self, operation_id: &str, confirmation: &str) -> io::Result<()> {
-        self.update(operation_id, |entry| {
-            require_state(entry, QueueState::AwaitingConfirmation)?;
-            let attention = entry.attention.take().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "Bestätigungsdaten fehlen")
-            })?;
-            if attention_confirmation(&attention) != confirmation {
-                return Err(crate::error::coded_error(
-                    io::ErrorKind::PermissionDenied,
-                    crate::error::ErrorCode::ConfirmationMismatch,
+        self.approve_attention_checked(operation_id, |_, attention| {
+            if attention_confirmation(attention) != confirmation {
+                return Err(crate::real_mode::confirmation_mismatch(
                     "Queue-Bestätigungsphrase stimmt nicht überein",
                 ));
             }
+            Ok(())
+        })
+    }
+
+    /// Übernimmt ausschließlich die exakt angezeigte Wirkung. Vergleich und
+    /// Zustandswechsel liegen unter derselben Journal-Sperre; eine neue Attention
+    /// mit gleicher Phrase oder gleichem Typ erhält dadurch keine alte Zustimmung.
+    pub fn approve_attention_effects(
+        &self,
+        operation_id: &str,
+        expected_attention: &QueueAttention,
+        effects_confirmed: bool,
+    ) -> io::Result<()> {
+        self.approve_attention_checked(operation_id, |entry, attention| {
+            if !effects_confirmed {
+                return Err(crate::real_mode::confirmation_mismatch(
+                    "Die angezeigte Queue-Wirkung wurde nicht bestätigt",
+                ));
+            }
+            if matches!(attention, QueueAttention::RemoteRun { .. }) {
+                return Err(crate::real_mode::confirmation_mismatch(
+                    "Dieser Lauf benötigt seine backendgehaltene Vorbereitung",
+                ));
+            }
+            if entry.error_code == Some(crate::ErrorCode::OutcomeUnclear)
+                || entry.recovery_available
+                || entry.bidirectional_completion_recovery.is_some()
+            {
+                return Err(crate::coded_error(io::ErrorKind::PermissionDenied,
+                    crate::ErrorCode::ReplanRequired,
+                    "Unklare Wirkungen und Recovery brauchen ihren eigenen Abschlussweg"));
+            }
+            if attention != expected_attention {
+                return Err(crate::real_mode::plan_drift(
+                    "Die Queue-Rückfrage hat sich seit der Anzeige geändert; aktuellen Stand erneut bestätigen",
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn approve_attention_checked(
+        &self,
+        operation_id: &str,
+        check: impl FnOnce(&QueueEntry, &QueueAttention) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.update(operation_id, |entry| {
+            require_state(entry, QueueState::AwaitingConfirmation)?;
+            let attention = entry.attention.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Bestätigungsdaten fehlen")
+            })?;
+            check(entry, attention)?;
+            let attention = entry.attention.take().expect("unmittelbar zuvor geprüft");
             match (&mut entry.operation, attention) {
+                (
+                    QueueOperation::ArchiveUpload { generation, .. },
+                    QueueAttention::ArchivePackChanged { current, .. },
+                ) => {
+                    let crate::archive_upload::ArchiveGeneration::Pack { expected, .. } =
+                        generation.as_mut()
+                    else {
+                        return Err(invalid_transition(entry.state));
+                    };
+                    *expected = current;
+                }
+                (
+                    QueueOperation::ArchiveUpload { generation, .. },
+                    QueueAttention::ArchiveExtractChanged { current, .. },
+                ) => {
+                    let crate::archive_upload::ArchiveGeneration::Extract { expected, .. } =
+                        generation.as_mut()
+                    else {
+                        return Err(invalid_transition(entry.state));
+                    };
+                    *expected = current;
+                }
+                (
+                    QueueOperation::ArchiveExtract { expected, .. },
+                    QueueAttention::ArchiveExtractChanged { current, .. },
+                ) => {
+                    *expected = current;
+                }
+                (
+                    QueueOperation::ArchivePack { expected, .. },
+                    QueueAttention::ArchivePackChanged { current, .. },
+                ) => *expected = current,
                 (
                     QueueOperation::ProviderFile {
                         source_tree_expected,
@@ -2896,7 +3954,8 @@ impl OperationQueue {
                     QueueAttention::PlanChanged { current_plan, .. },
                 ) => *expected_plan = current_plan,
                 (
-                    QueueOperation::ProviderSync { expected_plan, .. },
+                    QueueOperation::ProviderSync { expected_plan, .. }
+                    | QueueOperation::ContentSync { expected_plan, .. },
                     QueueAttention::PlanChanged { current_plan, .. },
                 ) => *expected_plan = current_plan,
                 (
@@ -3024,6 +4083,44 @@ impl OperationQueue {
         })
     }
 
+    fn record_archive_extract_report(
+        &self,
+        operation_id: &str,
+        report: &crate::archive_extract::ArchiveExtractReport,
+    ) -> io::Result<()> {
+        self.update(operation_id, |entry| {
+            require_state(entry, QueueState::Running)?;
+            if !matches!(
+                entry.operation,
+                QueueOperation::ArchiveExtract { .. }
+                    | QueueOperation::ArchiveUpload { generation: _, .. }
+            ) {
+                return Err(invalid_transition(entry.state));
+            }
+            entry.archive_extract_report = Some(report.clone());
+            for path in &report.recovery_paths {
+                if !entry.temp_recovery_paths.contains(path) {
+                    entry.temp_recovery_paths.push(path.clone());
+                }
+            }
+            Ok(())
+        })
+    }
+    /// Schließt ausschließlich die geprüfte ZIP-Teilbilanz ohne neue Datenwirkung.
+    pub fn acknowledge_archive_extract_outcome(&self, operation_id: &str) -> io::Result<()> {
+        self.update(operation_id, |entry| {
+            if !matches!(
+                entry.operation,
+                QueueOperation::ArchiveExtract { .. } | QueueOperation::ArchiveUpload { .. }
+            ) || !matches!(entry.state, QueueState::Failed | QueueState::Interrupted)
+            {
+                return Err(invalid_transition(entry.state));
+            }
+            entry.state = QueueState::Cancelled;
+            entry.attention = None;
+            Ok(())
+        })
+    }
     pub fn retry(&self, operation_id: &str) -> io::Result<()> {
         self.update(operation_id, |entry| {
             if !matches!(
@@ -3031,6 +4128,31 @@ impl OperationQueue {
                 QueueState::Failed | QueueState::Cancelled | QueueState::Interrupted
             ) {
                 return Err(invalid_transition(entry.state));
+            }
+            if matches!(entry.operation, QueueOperation::ArchiveExtract { .. } | QueueOperation::ArchiveUpload { .. }) {
+                return Err(crate::coded_error(io::ErrorKind::Other, crate::ErrorCode::ReplanRequired,"ZIP-Entpacken wird nach Abschluss, Abbruch oder Fehler nicht automatisch wiederholt; sichtbaren Zielbestand prüfen und bei Bedarf eine neue Absicht erstellen"));
+            }
+            if entry.directory_dacl_recovery || !entry.directory_dacl_report.is_empty() {
+                return Err(crate::error::with_directory_dacl_report(
+                    crate::coded_error(io::ErrorKind::Other, crate::ErrorCode::ReplanRequired,
+                        "Verzeichnis-DACLs wurden bereits verändert oder ihr Ausgang ist unklar; Ziel prüfen und einen neuen Abgleich vorbereiten"),
+                    &entry.directory_dacl_report,
+                ));
+            }
+            if entry.created_directory_dacl_recovery || entry.created_directory_dacl_report.has_rights_effects() {return Err(crate::error::with_created_directory_dacl_report(crate::coded_error(io::ErrorKind::Other,crate::ErrorCode::ReplanRequired,"Rechte neuer Ordner wurden bereits verändert oder ihr Ausgang ist unklar; aktuellen Zustand prüfen und einen neuen Abgleich vorbereiten"),&entry.created_directory_dacl_report));}
+            if entry.file_dacl_recovery || !entry.file_dacl_report.is_empty() {
+                return Err(crate::error::with_file_dacl_report(
+                    crate::coded_error(io::ErrorKind::Other, crate::ErrorCode::ReplanRequired,
+                        "Objektweite Datei-DACLs wurden bereits verändert oder ihr Ausgang ist unklar; Ziel prüfen und einen neuen Abgleich vorbereiten"),
+                    &entry.file_dacl_report,
+                ));
+            }
+            if !entry.directory_stream_report.is_empty() {
+                return Err(crate::error::with_directory_stream_report(
+                    crate::coded_error(io::ErrorKind::Other, crate::ErrorCode::ReplanRequired,
+                        "Verzeichnisstreams wurden bereits verändert oder ihr Ausgang ist unklar; Ziel prüfen und einen neuen Abgleich vorbereiten"),
+                    &entry.directory_stream_report,
+                ));
             }
             if entry.error_code == Some(crate::ErrorCode::OutcomeUnclear) {
                 return Err(crate::coded_error(
@@ -3072,7 +4194,7 @@ impl OperationQueue {
                         .unwrap_or(LEGACY_WEBDAV_REPLAN_ERROR),
                 ));
             }
-            if matches!(entry.operation, QueueOperation::Bidirectional { .. })
+            if matches!(entry.operation, QueueOperation::Bidirectional { .. } | QueueOperation::BidirectionalForward { .. })
                 && entry.state == QueueState::Interrupted
                 && (entry.recovery_available
                     || bidirectional_recovery_kind(&entry.operation)
@@ -3114,6 +4236,9 @@ impl OperationQueue {
             if entry.state != QueueState::Failed
                 || entry.error_code != Some(crate::ErrorCode::ReplanRequired)
                 || entry.progress != Progress::default()
+                || entry.directory_dacl_recovery
+                || entry.file_dacl_recovery
+                || entry.created_directory_dacl_recovery
                 || entry.attention.is_some()
                 || !entry.temp_recovery_paths.is_empty()
                 || entry.recovery_available
@@ -3134,14 +4259,49 @@ impl OperationQueue {
         operation_id: &str,
         possible_effect_reviewed: bool,
     ) -> io::Result<()> {
+        if let Some(entry) = self
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.operation_id == operation_id)
+        {
+            if let QueueOperation::RenameCycleRecovery { record } = &entry.operation {
+                if !possible_effect_reviewed
+                    || entry.state != QueueState::Interrupted
+                    || record.finished
+                {
+                    return Err(crate::coded_error(
+                        io::ErrorKind::PermissionDenied,
+                        crate::ErrorCode::ConfirmationMismatch,
+                        "Die offene Namenslage wurde nicht als manuell geprüft bestätigt",
+                    ));
+                }
+                crate::local_staging::acknowledge_rename_cycle_intents_after_review(
+                    &crate::local_staging::StagingOwner {
+                        queue: self.path.clone(),
+                        operation: operation_id.into(),
+                    },
+                    &self._process_lock.root,
+                    &Path::new(&record.root).join(&record.temp_name),
+                )?;
+            }
+        }
         self.update(operation_id, |entry| {
             if !matches!(entry.state, QueueState::Failed | QueueState::Interrupted)
                 || entry.error_code != Some(crate::ErrorCode::OutcomeUnclear)
-                || matches!(entry.operation, QueueOperation::Bidirectional { .. })
+                || matches!(entry.operation, QueueOperation::Bidirectional { .. } | QueueOperation::BidirectionalForward { .. })
                 || entry.bidirectional_completion_recovery.is_some()
                 || has_legacy_unbound_webdav_delete(entry)
             {
                 return Err(invalid_transition(entry.state));
+            }
+            if entry.created_directory_dacl_recovery {return Err(crate::coded_error(io::ErrorKind::WouldBlock,crate::ErrorCode::OutcomeUnclear,"Rechte des neu erzeugten Ordners benötigen den rein beobachtenden Abschluss"));}
+            if entry.file_dacl_recovery {
+                return Err(crate::coded_error(io::ErrorKind::Other,crate::ErrorCode::ReplanRequired,"Die offene Datei-DACL benötigt zuerst den frisch gebundenen Rechte-Prüfweg"));
+            }
+            if entry.directory_dacl_recovery {
+                return Err(crate::coded_error(io::ErrorKind::Other, crate::ErrorCode::ReplanRequired,
+                    "Die offene Verzeichnis-DACL benötigt zuerst den frisch gebundenen Rechte-Prüfweg"));
             }
             if !possible_effect_reviewed {
                 return Err(crate::coded_error(
@@ -3162,6 +4322,90 @@ impl OperationQueue {
             ));
             Ok(())
         })
+    }
+
+    /// Nur der lesende, frisch gebundene DACL-Prüfweg darf diesen Checkpoint setzen.
+    pub(crate) fn commit_directory_dacl_acknowledgement(
+        &self,
+        operation_id: &str,
+        report: &crate::directory_dacl::DirectoryDaclReport,
+        acknowledged_paths: &[String],
+    ) -> io::Result<()> {
+        self.update(operation_id, |entry| {
+            if !matches!(entry.state, QueueState::Failed | QueueState::Interrupted)
+                || !entry.directory_dacl_recovery
+                || !matches!(entry.operation, QueueOperation::ContentSync { .. }) {
+                return Err(invalid_transition(entry.state));
+            }
+            entry.directory_dacl_report = report.clone();
+            entry.progress.directory_dacl_report = report.clone();
+            entry.directory_dacl_recovery = false;
+            entry.temp_recovery_paths.retain(|path| !acknowledged_paths.contains(path));
+            entry.state = QueueState::Cancelled;
+            entry.progress.phase = "recovery_acknowledged".into();
+            entry.attention = None;
+            entry.recovery_available = false;
+            let previous = entry.error.take().unwrap_or_else(|| "Verzeichnis-DACL-Recovery".into());
+            entry.error = Some(format!("{previous}; Aktueller Rechtezustand frisch geprüft und ohne erneutes Setzen abgeschlossen."));
+            Ok(())
+        })
+    }
+
+    /// Nur der lesende, frisch gebundene DACL-Prüfweg darf diesen Checkpoint setzen.
+    pub(crate) fn commit_file_dacl_acknowledgement(
+        &self,
+        operation_id: &str,
+        report: &crate::file_dacl::FileDaclReport,
+        acknowledged_paths: &[String],
+        resolved: &[crate::file_dacl::FileDaclOutcome],
+    ) -> io::Result<()> {
+        self.update(operation_id, |entry| {
+            if !matches!(entry.state, QueueState::Failed | QueueState::Interrupted)
+                || !entry.file_dacl_recovery
+                || !matches!(entry.operation, QueueOperation::ContentSync { .. }) {
+                return Err(invalid_transition(entry.state));
+            }
+            entry.file_dacl_report.reconcile(resolved, report);
+            entry.progress.file_dacl_report = entry.file_dacl_report.clone();
+            entry.file_dacl_recovery = false;
+            entry.temp_recovery_paths.retain(|path| !acknowledged_paths.contains(path));
+            entry.state = QueueState::Cancelled;
+            entry.progress.phase = "recovery_acknowledged".into();
+            entry.attention = None;
+            entry.recovery_available = false;
+            let previous = entry.error.take().unwrap_or_else(|| "Datei-DACL-Recovery".into());
+            entry.error = Some(format!("{previous}; Aktueller Rechtezustand frisch geprüft und ohne erneutes Setzen abgeschlossen."));
+            Ok(())
+        })?;
+        self.checkpoint_file_dacl(operation_id, resolved, true)
+    }
+
+    pub(crate) fn commit_created_directory_dacl_acknowledgement(
+        &self,
+        operation_id: &str,
+        report: &crate::created_directory_dacl::CreatedDirectoryDaclReport,
+        acknowledged_paths: &[String],
+        resolved: &[crate::created_directory_dacl::CreatedDirectoryDaclOutcome],
+    ) -> io::Result<()> {
+        self.update(operation_id, |entry| {
+            if !matches!(entry.state, QueueState::Failed | QueueState::Interrupted)
+                || !entry.created_directory_dacl_recovery
+                || !matches!(entry.operation, QueueOperation::ContentSync { .. }) {
+                return Err(invalid_transition(entry.state));
+            }
+            entry.created_directory_dacl_report.reconcile(resolved, report);
+            entry.progress.created_directory_dacl_report = entry.created_directory_dacl_report.clone();
+            entry.created_directory_dacl_recovery = false;
+            entry.temp_recovery_paths.retain(|path| !acknowledged_paths.contains(path));
+            entry.state = QueueState::Cancelled;
+            entry.progress.phase = "recovery_acknowledged".into();
+            entry.attention = None;
+            entry.recovery_available = false;
+            let previous = entry.error.take().unwrap_or_else(|| "Neuordner-DACL-Recovery".into());
+            entry.error = Some(format!("{previous}; Aktueller Rechtezustand frisch geprüft und ohne erneutes Setzen abgeschlossen."));
+            Ok(())
+        })?;
+        self.checkpoint_created_directory_dacl(operation_id, resolved, true)
     }
 
     /// Schließt ausschließlich einen nicht wiederholbaren WebDAV-Löschaltstand aus
@@ -3276,7 +4520,7 @@ impl OperationQueue {
                     "Eine wartende Remote-Vorbereitung wird zuerst über discard_remote_preparation abgebaut",
                 ));
             }
-            if matches!(entry.operation, QueueOperation::Bidirectional { .. })
+            if matches!(entry.operation, QueueOperation::Bidirectional { .. } | QueueOperation::BidirectionalForward { .. })
                 && bidirectional_recovery_kind(&entry.operation)
                     != crate::bidirectional::BidirectionalRunRecovery::Absent
             {
@@ -3300,6 +4544,9 @@ impl OperationQueue {
     pub fn discard_remote_preparation(&self, operation_id: &str) -> io::Result<()> {
         self.update(operation_id, |entry| {
             require_state(entry, QueueState::AwaitingConfirmation)?;
+            if matches!(entry.operation,QueueOperation::BidirectionalForward {..}) {
+                return Err(crate::coded_error(io::ErrorKind::PermissionDenied,crate::ErrorCode::ReplanRequired,"Forwardvorbereitung besitzt ein eigenes Journal; nur den speziellen Forward-Verwerfweg verwenden"));
+            }
             if !matches!(entry.attention, Some(QueueAttention::RemoteRun { .. })) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -3322,6 +4569,7 @@ impl OperationQueue {
         operation_id: &str,
         prepared: &crate::PreparedLocalSyncRun,
     ) -> io::Result<()> {
+        prepared.require_queue(self)?;
         self.update(operation_id, |entry| {
             require_state(entry, QueueState::AwaitingConfirmation)?;
             if !matches!(entry.attention, Some(QueueAttention::RemoteRun { .. })) {
@@ -3346,8 +4594,37 @@ impl OperationQueue {
         })
     }
 
+    pub fn confirm_content_sync_preparation(
+        &self,
+        operation_id: &str,
+        prepared: &crate::PreparedContentSync,
+    ) -> io::Result<()> {
+        self.update(operation_id, |entry| {
+            require_state(entry, QueueState::AwaitingConfirmation)?;
+            if !matches!(entry.attention, Some(QueueAttention::RemoteRun { .. })) {
+                return Err(invalid_transition(entry.state));
+            }
+            require_content_sync_binding(&entry.operation, prepared, false)?;
+            let QueueOperation::ContentSync {
+                expected_plan,
+                binding_digest,
+                ..
+            } = &mut entry.operation
+            else {
+                unreachable!()
+            };
+            **expected_plan = prepared.preview().plan.clone();
+            *binding_digest = prepared.preview().digest;
+            entry.state = QueueState::Pending;
+            entry.attention = None;
+            entry.error = None;
+            entry.error_code = None;
+            Ok(())
+        })
+    }
+
     pub fn remove_pending(&self, operation_id: &str) -> io::Result<()> {
-        self.transact(|journal| {
+        let removed = self.transact(|journal| {
             let index = journal
                 .entries
                 .iter()
@@ -3356,9 +4633,9 @@ impl OperationQueue {
             if journal.entries[index].state != QueueState::Pending {
                 return Err(invalid_transition(journal.entries[index].state));
             }
-            journal.entries.remove(index);
-            Ok(())
-        })
+            Ok(journal.entries.remove(index))
+        })?;
+        self.cleanup_removed_generated_source(&removed)
     }
 
     /// Nur mit dem nächsten/vorherigen ebenfalls wartenden Eintrag tauschen. So kann
@@ -3448,8 +4725,39 @@ impl OperationQueue {
         error: Option<String>,
         recovery_paths: &[String],
     ) -> io::Result<()> {
+        self.finish_with_directory_stream_report(
+            operation_id,
+            state,
+            progress,
+            error,
+            recovery_paths,
+            &Default::default(),
+            &Default::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_with_directory_stream_report(
+        &self,
+        operation_id: &str,
+        state: QueueState,
+        progress: Progress,
+        error: Option<String>,
+        recovery_paths: &[String],
+        report: &crate::directory_streams::DirectoryStreamReport,
+        dacl_report: &crate::directory_dacl::DirectoryDaclReport,
+    ) -> io::Result<()> {
+        let pending_dacl = self.has_pending_directory_dacl(operation_id);
+        let pending_file_dacl = self.has_pending_file_dacl(operation_id);
+        let pending_created_directory_dacl = self.has_pending_created_directory_dacl(operation_id);
+        let created_directory_dacl_report = progress.created_directory_dacl_report.clone();
+        let file_dacl_report = progress.file_dacl_report.clone();
+        let mut dacl_report = dacl_report.clone();
+        dacl_report.merge(&progress.directory_dacl_report);
+        let mut report = report.clone();
+        report.merge(&progress.directory_stream_report);
         self.update(operation_id, |entry| {
-            if matches!(entry.operation, QueueOperation::Bidirectional { .. }) {
+            if matches!(entry.operation, QueueOperation::Bidirectional { .. } | QueueOperation::BidirectionalForward { .. }) {
                 // `Completed` und `Cancelled` benötigen den separat gebundenen
                 // Core-Beleg. Der allgemeine Datei-/Sync-Abschluss darf weder den
                 // Marker löschen noch die nächste Queue-Operation freigeben.
@@ -3462,10 +4770,26 @@ impl OperationQueue {
                 ));
             }
             require_state(entry, QueueState::Running)?;
-            entry.state = state;
+            entry.directory_stream_report.merge(&report);
+            entry.directory_dacl_report.merge(&dacl_report);
+            entry.file_dacl_report.merge(&file_dacl_report);
+            entry.file_dacl_recovery |= pending_file_dacl || !file_dacl_report.uncertain.is_empty();
+            entry.created_directory_dacl_report.merge(&created_directory_dacl_report);
+            entry.created_directory_dacl_recovery |= pending_created_directory_dacl || !created_directory_dacl_report.uncertain.is_empty();
+            entry.state = if pending_dacl || pending_file_dacl || pending_created_directory_dacl { QueueState::Interrupted } else { state };
             entry.progress = progress;
             entry.error = error;
             entry.error_code = None;
+            if pending_created_directory_dacl {entry.progress.phase="interrupted".into();entry.error_code=Some(crate::ErrorCode::OutcomeUnclear);entry.error=Some("Rechte des neu erzeugten Ordners sind noch offen; aktuellen Zustand bewusst prüfen. Keine automatische Wiederholung.".into());}
+            if pending_file_dacl {
+                entry.progress.phase="interrupted".into(); entry.error_code=Some(crate::ErrorCode::OutcomeUnclear); entry.error=Some("Objektweite Datei-DACL ist noch offen; frischen Rechtezustand bewusst prüfen. Keine automatische Wiederholung.".into());
+            }
+            if pending_dacl {
+                entry.directory_dacl_recovery = true;
+                entry.progress.phase = "interrupted".into();
+                entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+                entry.error = Some("Der Verzeichnis-DACL-Abschluss blieb offen; aktuellen Rechtezustand vor dem bewussten Abschluss frisch prüfen. Keine automatische Wiederholung.".into());
+            }
             entry.attention = None;
             entry.recovery_available = false;
             entry.bidirectional_completion_recovery = None;
@@ -3475,7 +4799,10 @@ impl OperationQueue {
                 }
             }
             Ok(())
-        })
+        }).map_err(|error| crate::error::with_directory_dacl_report(
+            crate::error::with_directory_stream_report(error, &report), &dacl_report))?;
+        self.checkpoint_file_dacl(operation_id, &[], true)?;
+        self.checkpoint_created_directory_dacl(operation_id, &[], true)
     }
 
     fn update(
@@ -3636,6 +4963,374 @@ impl OperationQueue {
     }
 }
 
+fn require_content_sync_binding(
+    operation: &QueueOperation,
+    prepared: &crate::PreparedContentSync,
+    check_plan: bool,
+) -> io::Result<()> {
+    let QueueOperation::ContentSync {
+        source,
+        target,
+        options,
+        expected_plan,
+        binding_digest,
+    } = operation
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Kein Inhaltssync-Auftrag",
+        ));
+    };
+    let preview = prepared.preview();
+    if !prepared.matches_queue_endpoints(source, target)
+        || source.root() != preview.source_root
+        || target.root() != preview.target_root
+        || options != &preview.options
+        || (check_plan
+            && (expected_plan.as_ref() != &preview.plan || binding_digest != &preview.digest))
+    {
+        return Err(crate::real_mode::plan_drift(
+            "Inhaltssync-Queueauftrag und gehaltene Vorschau stimmen nicht überein",
+        ));
+    }
+    Ok(())
+}
+
+pub fn prepare_content_sync_queue_entry(
+    queue: &OperationQueue,
+    entry: &QueueEntry,
+    secrets: Arc<dyn SecretResolver>,
+    cancel: &Cancel,
+) -> io::Result<crate::PreparedContentSync> {
+    validate_operation(&entry.operation)?;
+    let QueueOperation::ContentSync {
+        source,
+        target,
+        options,
+        ..
+    } = &entry.operation
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Kein Inhaltssync-Auftrag",
+        ));
+    };
+    let source_endpoint = source.connect(secrets.clone())?;
+    let target_endpoint = target.connect(secrets)?;
+    let (source_endpoint, target_endpoint, _) = bind_connected_queue_endpoints(
+        source_endpoint,
+        target_endpoint,
+        source.shares_connection_definition(target),
+        Path::new(target.root()),
+    )?;
+    let source_endpoint = source_endpoint.with_queue_owner_with_cancel(
+        queue,
+        Some(&entry.operation_id),
+        &[],
+        Some(cancel),
+    )?;
+    let target_endpoint = target_endpoint.with_queue_owner_with_cancel(
+        queue,
+        Some(&entry.operation_id),
+        &[],
+        Some(cancel),
+    )?;
+    let prepared = crate::content_sync::prepare_content_sync_owned(
+        source_endpoint,
+        target_endpoint,
+        options.clone(),
+        cancel,
+        Some(crate::remote_real_mode::InteractiveFileOwner {
+            staging: crate::local_staging::StagingOwner {
+                queue: queue.path.clone(),
+                operation: entry.operation_id.clone(),
+            },
+            profiles: entry.profile_bindings.clone(),
+        }),
+    )?;
+    queue.require_confirmation(
+        &entry.operation_id,
+        QueueAttention::RemoteRun {
+            reason: "Inhaltssync wurde frisch geprüft; die konkrete Wirkung erneut bestätigen"
+                .into(),
+            confirmation: blake3::Hash::from_bytes(prepared.preview().digest)
+                .to_hex()
+                .to_string(),
+        },
+    )?;
+    Ok(prepared)
+}
+
+pub fn bind_prepared_content_sync_queue_entry(
+    queue: &OperationQueue,
+    entry: &QueueEntry,
+    prepared: crate::PreparedContentSync,
+    cancel: &Cancel,
+) -> io::Result<crate::PreparedContentSync> {
+    let current = queue
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|current| current.operation_id == entry.operation_id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Inhaltssync-Queueeintrag fehlt"))?;
+    if current.state != QueueState::Validating
+        || current.operation != entry.operation
+        || current.profile_bindings != entry.profile_bindings
+    {
+        return Err(crate::real_mode::plan_drift(
+            "Inhaltssync-Queueeintrag änderte sich vor der Bindung",
+        ));
+    }
+    require_content_sync_binding(&entry.operation, &prepared, true)?;
+    prepared.with_queue_owner(queue, &entry.operation_id, &entry.profile_bindings, cancel)
+}
+
+pub fn execute_prepared_content_sync_queue_entry(
+    queue: &OperationQueue,
+    entry: &QueueEntry,
+    prepared: crate::PreparedContentSync,
+    effects_confirmed: bool,
+    audit_path: &Path,
+    cancel: &Cancel,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> io::Result<QueueExecutionResult> {
+    execute_prepared_content_sync_queue_entry_with_removal_phrase(
+        queue,
+        entry,
+        prepared,
+        effects_confirmed,
+        None,
+        audit_path,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_prepared_content_sync_queue_entry_with_removal_phrase(
+    queue: &OperationQueue,
+    entry: &QueueEntry,
+    prepared: crate::PreparedContentSync,
+    effects_confirmed: bool,
+    removal_phrase: Option<&str>,
+    audit_path: &Path,
+    cancel: &Cancel,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> io::Result<QueueExecutionResult> {
+    require_content_sync_binding(&entry.operation, &prepared, true)?;
+    let context = ProviderAuditContext {
+        source_provider: Some(prepared.preview().source_provider),
+        target_provider: prepared.preview().target_provider,
+        execution_class: ProviderAuditExecutionClass::BestEffort,
+        source_removal_best_effort_expected: false,
+        target_copy_new_best_effort_expected: true,
+        target_replace_best_effort_expected: prepared.preview().irreversible_replacements > 0,
+        source_removal_best_effort_actual: None,
+        target_copy_new_best_effort_actual: None,
+        target_replace_best_effort_actual: None,
+    };
+    let prepared =
+        prepared.with_queue_owner(queue, &entry.operation_id, &entry.profile_bindings, cancel)?;
+    let digest = prepared.preview().digest;
+    let preview = prepared.preview().clone();
+    let run =
+        prepared.confirm_effects_with_removal_phrase(digest, effects_confirmed, removal_phrase)?;
+    queue.mark_running(&entry.operation_id)?;
+    queue.append_file_audit(
+        &entry.operation_id,
+        "content_sync",
+        "started",
+        &Progress::default(),
+        &context,
+        None,
+    )?;
+    if let Err(error) = crate::content_sync::append_audit(
+        audit_path,
+        &entry.operation_id,
+        "started",
+        &preview,
+        &Progress::default(),
+        None,
+        None,
+        0,
+    ) {
+        if let Err(journal_error) =
+            queue.fail_coded(&entry.operation_id, Progress::default(), &error)
+        {
+            return Err(failed_queue_error_commit(
+                &error,
+                &journal_error,
+                "Inhaltssync-Auditstartfehler",
+            ));
+        }
+        return Err(error);
+    }
+    let mut progress = QueueProgress::new(queue, &entry.operation_id, cancel, on_progress);
+    let mut known_deleted = 0u64;
+    let result = run.execute(cancel, &mut |value| {
+        if matches!(value.phase.as_str(), "delete" | "quarantine") {
+            known_deleted = known_deleted.max(value.files_done);
+        }
+        progress.report(value);
+    });
+    let (mut latest, persistence_error) = progress.finish();
+    if let Some(error) = persistence_error {
+        let failure = possible_mutation_progress_error(error, &result);
+        let mut failure = match &result {
+            Ok(stats) => with_sync_outcome(failure, stats),
+            Err(_) => failure,
+        };
+        if let Err(journal_error) = queue.fail_coded(
+            &entry.operation_id,
+            failed_progress(latest.clone()),
+            &failure,
+        ) {
+            failure = failed_queue_error_commit(
+                &failure,
+                &journal_error,
+                "terminale Inhaltssync-Fehlercommit",
+            );
+        }
+        // Auch nach fehlgeschlagenem Fortschrittscommit müssen die bekannten
+        // Teilwirkungen auditierbar bleiben. Beide unabhängigen Audits werden
+        // versucht; kein Auditfehler verdrängt den ursprünglichen Ausgang.
+        let paths = crate::error::recovery_paths(&failure);
+        if let Err(audit_error) = queue.append_file_audit_with_temp_paths(
+            &entry.operation_id,
+            "content_sync",
+            "failed",
+            &latest,
+            &context,
+            FileAuditRecovery {
+                provider: None,
+                temp_paths: &paths,
+                retained_backups: &[],
+            },
+        ) {
+            failure =
+                failed_queue_error_commit(&failure, &audit_error, "Abschluss des Queue-Audits");
+        }
+        if let Err(audit_error) = crate::content_sync::append_audit(
+            audit_path,
+            &entry.operation_id,
+            "failed",
+            &preview,
+            &latest,
+            None,
+            Some(&failure),
+            known_deleted,
+        ) {
+            failure = failed_queue_error_commit(
+                &failure,
+                &audit_error,
+                "Abschluss des Inhaltssync-Audits",
+            );
+        }
+        return Err(failure);
+    }
+    match result {
+        Ok(stats) => {
+            latest.phase = if stats.cancelled { "cancelled" } else { "done" }.into();
+            queue
+                .finish_with_directory_stream_report(
+                    &entry.operation_id,
+                    if stats.cancelled {
+                        QueueState::Cancelled
+                    } else {
+                        QueueState::Completed
+                    },
+                    latest.clone(),
+                    None,
+                    &stats.temp_recovery_paths,
+                    &stats.directory_stream_report,
+                    &stats.directory_dacl_report,
+                )
+                .map_err(|error| with_sync_outcome(error, &stats))?;
+            let context = ProviderAuditContext {
+                target_copy_new_best_effort_actual: Some(stats.files_copied > 0),
+                target_replace_best_effort_actual: Some(stats.irreversible_replacements > 0),
+                ..context
+            };
+            queue
+                .append_file_audit_with_temp_paths(
+                    &entry.operation_id,
+                    "content_sync",
+                    if stats.cancelled {
+                        "cancelled"
+                    } else {
+                        "completed"
+                    },
+                    &latest,
+                    &context,
+                    FileAuditRecovery {
+                        provider: None,
+                        temp_paths: &stats.temp_recovery_paths,
+                        retained_backups: &[],
+                    },
+                )
+                .map_err(|error| with_sync_outcome(error, &stats))?;
+            crate::content_sync::append_audit(
+                audit_path,
+                &entry.operation_id,
+                if stats.cancelled {
+                    "cancelled"
+                } else {
+                    "completed"
+                },
+                &preview,
+                &latest,
+                Some(&stats),
+                None,
+                stats.files_deleted,
+            )
+            .map_err(|error| with_sync_outcome(error, &stats))?;
+            Ok(QueueExecutionResult::Sync(stats))
+        }
+        Err(error) => {
+            if let Err(journal_error) =
+                queue.fail_coded(&entry.operation_id, failed_progress(latest.clone()), &error)
+            {
+                return Err(failed_queue_error_commit(
+                    &error,
+                    &journal_error,
+                    "terminale Inhaltssync-Fehlercommit",
+                ));
+            }
+            if let Err(audit_error) = queue.append_file_audit(
+                &entry.operation_id,
+                "content_sync",
+                "failed",
+                &latest,
+                &context,
+                None,
+            ) {
+                return Err(crate::error::with_recovery_context(
+                    error,
+                    &[&audit_error],
+                    &[],
+                ));
+            }
+            if let Err(audit_error) = crate::content_sync::append_audit(
+                audit_path,
+                &entry.operation_id,
+                "failed",
+                &preview,
+                &latest,
+                None,
+                Some(&error),
+                known_deleted,
+            ) {
+                return Err(crate::error::with_recovery_context(
+                    error,
+                    &[&audit_error],
+                    &[],
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
 fn require_local_sync_binding(
     operation: &QueueOperation,
     prepared: &crate::PreparedLocalSyncRun,
@@ -3707,7 +5402,8 @@ pub fn prepare_local_sync_queue_entry(
         require_sandbox_child(root, &source, "Quelle")?;
         require_sandbox_child(root, &target, "Ziel")?;
     }
-    let prepared = crate::prepare_local_sync_run_with_sandbox(
+    let prepared = crate::prepare_local_sync_run_for_queue(
+        queue,
         &source,
         &target,
         options.clone(),
@@ -3729,16 +5425,23 @@ pub fn execute_prepared_local_sync_queue_entry(
     cancel: &Cancel,
     on_progress: &mut dyn FnMut(&Progress),
 ) -> io::Result<QueueExecutionResult> {
+    prepared.require_queue(queue)?;
     require_local_sync_binding(&entry.operation, &prepared, true)?;
     let run = prepared
         .confirm(replacements_confirmed)?
-        .with_queue_staging_owner(&queue.path, &entry.operation_id);
+        .with_queue_staging_owner(queue, &entry.operation_id)?;
     queue.mark_running(&entry.operation_id)?;
     let mut queue_progress = QueueProgress::new(queue, &entry.operation_id, cancel, on_progress);
     let result = run.execute_with_audit_detailed(audit_path, cancel, &mut |progress| {
         queue_progress.report(progress);
     });
     let (mut latest, persistence_error) = queue_progress.finish();
+    let result = result.and_then(|success| {
+        success.validate_staging_completion().map_err(|error| {
+            crate::error::with_recovery_paths(error, &success.stats().temp_recovery_paths)
+        })?;
+        Ok(success)
+    });
     if let Some(error) = persistence_error {
         let failure = possible_mutation_progress_error(error, &result);
         let failure = match &result {
@@ -3868,7 +5571,10 @@ fn finish_remote_queue_preparation(
         &operation_id,
         QueueAttention::RemoteRun {
             reason: format!(
-                "{provider_label}-Lauf ist frisch geprüft und wartet auf die einmalige Laufphrase"
+                "{provider_label}-Lauf ist frisch geprüft: {} neue Dateien, {} Ersetzungen, {} Metadatenänderungen und {} Quarantäne-Einträge. {}",
+                prepared.preview().impact.new_files, prepared.preview().impact.replacements,
+                prepared.preview().impact.metadata_changes, prepared.preview().impact.quarantine_entries,
+                prepared.preview().scope_warnings.join(" ")
             ),
             confirmation: prepared.preview().confirmation_phrase.clone(),
         },
@@ -3882,7 +5588,7 @@ fn finish_remote_queue_preparation(
 }
 
 /// Einen geclaimten SFTP-Eintrag frisch verbinden, vollständig vorbereiten und bis
-/// zur zufälligen Realmodusphrase im Backend-RAM halten.
+/// zur Wirkungsbestätigung im Backend-RAM halten.
 pub fn prepare_sftp_queue_entry(
     queue: &OperationQueue,
     entry: QueueEntry,
@@ -3909,23 +5615,24 @@ pub fn prepare_sftp_queue_entry(
     };
     prepare_protocol_queue_run(
         queue,
-        operation_id,
+        operation_id.clone(),
         &expected_plan,
         "SFTP",
         || SftpVfs::connect(*connection, secrets),
-        |vfs| match direction {
-            SftpQueueDirection::Upload => prepare_sftp_upload(
-                Path::new(&local_root),
-                vfs,
-                Path::new(&remote_root),
+        |vfs| {
+            let local = ProviderEndpoint::local(Path::new(&local_root))?;
+            let remote = ProviderEndpoint::sftp(vfs, Path::new(&remote_root))?;
+            let (source, target) = match direction {
+                SftpQueueDirection::Upload => (local, remote),
+                SftpQueueDirection::Download => (remote, local),
+            };
+            crate::remote_real_mode::prepare_provider_transfer_owned(
+                queue,
+                Some(&operation_id),
+                source,
+                target,
                 options,
-            ),
-            SftpQueueDirection::Download => prepare_sftp_download(
-                vfs,
-                Path::new(&remote_root),
-                Path::new(&local_root),
-                options,
-            ),
+            )
         },
     )
 }
@@ -3984,7 +5691,13 @@ pub fn prepare_provider_queue_entry(
     )?;
     let source = source.with_queue_owner(queue, Some(&operation_id), &[])?;
     let target = target.with_queue_owner(queue, Some(&operation_id), &[])?;
-    let prepared = prepare_provider_transfer(source, target, options)?;
+    let prepared = crate::remote_real_mode::prepare_provider_transfer_owned(
+        queue,
+        Some(&operation_id),
+        source,
+        target,
+        options,
+    )?;
     finish_remote_queue_preparation(queue, operation_id, &expected_plan, "Provider", prepared)
 }
 
@@ -4024,19 +5737,20 @@ pub fn prepare_ftps_queue_entry(
                 &[],
             )
         },
-        |vfs| match direction {
-            SftpQueueDirection::Upload => prepare_ftps_upload(
-                Path::new(&local_root),
-                vfs,
-                Path::new(&remote_root),
+        |vfs| {
+            let local = ProviderEndpoint::local(Path::new(&local_root))?;
+            let remote = ProviderEndpoint::ftps(vfs, Path::new(&remote_root))?;
+            let (source, target) = match direction {
+                SftpQueueDirection::Upload => (local, remote),
+                SftpQueueDirection::Download => (remote, local),
+            };
+            crate::remote_real_mode::prepare_provider_transfer_owned(
+                queue,
+                Some(&operation_id),
+                source,
+                target,
                 options,
-            ),
-            SftpQueueDirection::Download => prepare_ftps_download(
-                vfs,
-                Path::new(&remote_root),
-                Path::new(&local_root),
-                options,
-            ),
+            )
         },
     )
 }
@@ -4066,23 +5780,24 @@ pub fn prepare_webdav_queue_entry(
     };
     prepare_protocol_queue_run(
         queue,
-        operation_id,
+        operation_id.clone(),
         &expected_plan,
         "WebDAV",
         || WebDavVfs::connect(*connection, secrets),
-        |vfs| match direction {
-            SftpQueueDirection::Upload => prepare_webdav_upload(
-                Path::new(&local_root),
-                vfs,
-                Path::new(&remote_root),
+        |vfs| {
+            let local = ProviderEndpoint::local(Path::new(&local_root))?;
+            let remote = ProviderEndpoint::webdav(vfs, Path::new(&remote_root))?;
+            let (source, target) = match direction {
+                SftpQueueDirection::Upload => (local, remote),
+                SftpQueueDirection::Download => (remote, local),
+            };
+            crate::remote_real_mode::prepare_provider_transfer_owned(
+                queue,
+                Some(&operation_id),
+                source,
+                target,
                 options,
-            ),
-            SftpQueueDirection::Download => prepare_webdav_download(
-                vfs,
-                Path::new(&remote_root),
-                Path::new(&local_root),
-                options,
-            ),
+            )
         },
     )
 }
@@ -4112,30 +5827,56 @@ pub fn prepare_smb_queue_entry(
     };
     prepare_protocol_queue_run(
         queue,
-        operation_id,
+        operation_id.clone(),
         &expected_plan,
         "SMB",
         || SmbVfs::connect(*connection, secrets),
-        |vfs| match direction {
-            SftpQueueDirection::Upload => prepare_smb_upload(
-                Path::new(&local_root),
-                vfs,
-                Path::new(&remote_root),
+        |vfs| {
+            let local = ProviderEndpoint::local(Path::new(&local_root))?;
+            let remote = ProviderEndpoint::smb(vfs, Path::new(&remote_root))?;
+            let (source, target) = match direction {
+                SftpQueueDirection::Upload => (local, remote),
+                SftpQueueDirection::Download => (remote, local),
+            };
+            crate::remote_real_mode::prepare_provider_transfer_owned(
+                queue,
+                Some(&operation_id),
+                source,
+                target,
                 options,
-            ),
-            SftpQueueDirection::Download => prepare_smb_download(
-                vfs,
-                Path::new(&remote_root),
-                Path::new(&local_root),
-                options,
-            ),
+            )
         },
     )
 }
 
 /// Eine im RAM gehaltene Remote-Vorbereitung ausführen. `Running` wird dauerhaft
-/// geschrieben, nachdem Phrase/Backup und frischer Driftcheck erfolgreich waren,
+/// geschrieben, nachdem Wirkung und frischer Driftcheck bestätigt wurden,
 /// aber noch vor der ersten Nutzerdatenmutation.
+pub fn execute_prepared_sftp_queue_entry_effects(
+    queue: &OperationQueue,
+    prepared: PreparedSftpQueueRun,
+    effects_confirmed: bool,
+    audit_path: &Path,
+    cancel: &Cancel,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> io::Result<QueueExecutionResult> {
+    if !effects_confirmed {
+        return Err(crate::real_mode::confirmation_mismatch(
+            "Die angezeigte Sync-Wirkung wurde nicht bestätigt",
+        ));
+    }
+    let confirmation = prepared.preview().confirmation_phrase.clone();
+    execute_prepared_sftp_queue_entry(
+        queue,
+        prepared,
+        &confirmation,
+        true,
+        audit_path,
+        cancel,
+        on_progress,
+    )
+}
+
 pub fn execute_prepared_sftp_queue_entry(
     queue: &OperationQueue,
     prepared: PreparedSftpQueueRun,
@@ -4153,6 +5894,12 @@ pub fn execute_prepared_sftp_queue_entry(
         queue_progress.report(progress);
     });
     let (mut latest, persistence_error) = queue_progress.finish();
+    let result = result.and_then(|success| {
+        success.validate_staging_completion().map_err(|error| {
+            crate::error::with_recovery_paths(error, &success.stats().temp_recovery_paths)
+        })?;
+        Ok(success)
+    });
     if let Some(persistence_error) = persistence_error {
         let failure = possible_mutation_progress_error(persistence_error, &result);
         let failure = match &result {
@@ -4215,13 +5962,12 @@ pub fn execute_prepared_sftp_queue_entry(
 /// Einen bidirektionalen Queue-Eintrag aus seinen geheimnisfreien Entscheidungen
 /// frisch scannen. Das gespeicherte Journal autorisiert nichts: Erst identische
 /// Baseline-/Plan-Digests führen zu einer RAM-gehaltenen Einmal-Vorbereitung.
-pub fn prepare_bidirectional_queue_entry(
+fn prepare_strict_queue_operation(
     queue: &OperationQueue,
-    entry: QueueEntry,
+    operation_id: &str,
+    operation: &QueueOperation,
     secrets: Arc<dyn SecretResolver>,
-) -> io::Result<BidirectionalQueuePreparation> {
-    validate_operation(&entry.operation)?;
-    let operation_id = entry.operation_id;
+) -> io::Result<PreparedLocalBidirectionalRun> {
     let QueueOperation::Bidirectional {
         pair_id,
         pair_name,
@@ -4229,37 +5975,115 @@ pub fn prepare_bidirectional_queue_entry(
         right,
         baseline_path,
         resolutions,
-        expected_baseline_digest,
-        expected_plan_digest,
-    } = entry.operation
+        ..
+    } = operation
     else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Bidirektionaler Executor erhielt keinen passenden Queue-Eintrag",
         ));
     };
-    let prepared = if matches!(left.as_ref(), BidirectionalQueueEndpoint::Local { .. })
+    if matches!(left.as_ref(), BidirectionalQueueEndpoint::Local { .. })
         && matches!(right.as_ref(), BidirectionalQueueEndpoint::Local { .. })
     {
-        prepare_local_bidirectional_with_decisions(
-            pair_id,
-            &pair_name,
+        crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue_operation(
+            queue,
+            operation_id,
+            *pair_id,
+            pair_name,
             Path::new(left.root()),
             Path::new(right.root()),
-            Path::new(&baseline_path),
-            &resolutions,
-        )?
+            Path::new(baseline_path),
+            resolutions,
+            None,
+        )
     } else {
         let left_endpoint = left.connect(secrets.clone())?;
         let right_endpoint = right.connect(secrets)?;
-        prepare_provider_bidirectional_with_decisions(
-            pair_id,
-            &pair_name,
-            left_endpoint,
-            right_endpoint,
-            Path::new(&baseline_path),
-            &resolutions,
-        )?
+        crate::bidirectional::prepare_provider_bidirectional_with_decisions_bound_for_queue_operation(
+            queue, operation_id, *pair_id, pair_name, left_endpoint, right_endpoint,
+            Path::new(baseline_path), resolutions, None)
+    }
+}
+
+/// Ersetzt eine direkte Erstvorschau erst nach ihrem bewiesenen Queueclaim durch
+/// eine frische Vorbereitung. Alle Unterprojektionen erhalten dabei bereits vor
+/// ihren Proben den tatsächlichen Queueowner; ein äußeres Rebind genügt nicht.
+pub fn reprepare_direct_bidirectional_queue_run(
+    queue: &OperationQueue,
+    operation_id: &str,
+    secrets: Arc<dyn SecretResolver>,
+    prepared: PreparedLocalBidirectionalRun,
+) -> io::Result<PreparedLocalBidirectionalRun> {
+    let snapshot = queue.snapshot();
+    let entry = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.operation_id == operation_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Direkter bidirektionaler Queueclaim fehlt",
+            )
+        })?;
+    let QueueOperation::Bidirectional {
+        pair_id,
+        left,
+        right,
+        baseline_path,
+        expected_baseline_digest,
+        expected_plan_digest,
+        ..
+    } = &entry.operation
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Queueclaim gehört nicht zur strikten bidirektionalen Klasse",
+        ));
+    };
+    let plan = &prepared.preview().plan;
+    if prepared.staging_queue() != queue.path
+        || entry.state != QueueState::Validating
+        || *pair_id != plan.pair_id
+        || *expected_baseline_digest != plan.baseline_digest
+        || *expected_plan_digest != plan.plan_digest
+        || Path::new(baseline_path) != prepared.baseline_path()
+        || !prepared.matches_queue_roots(Path::new(left.root()), Path::new(right.root()))
+    {
+        return Err(crate::real_mode::plan_drift(
+            "Direkter Queueclaim gehört nicht zur gehaltenen bidirektionalen Vorschau",
+        ));
+    }
+    queue.ftps_owner(Some(operation_id))?;
+    let deadline = prepared.confirmation_deadline()?;
+    prepared.finish_enqueue_transition()?;
+    drop(prepared);
+    let mut fresh = prepare_strict_queue_operation(queue, operation_id, &entry.operation, secrets)?;
+    fresh.limit_confirmation_deadline(deadline)?;
+    if fresh.preview().plan.baseline_digest != *expected_baseline_digest
+        || fresh.preview().plan.plan_digest != *expected_plan_digest
+    {
+        fresh.discard()?;
+        return Err(crate::real_mode::plan_drift("Bidirektionaler Bestand änderte sich beim direkten Queueübergang; frisch planen und bestätigen"));
+    }
+    Ok(fresh)
+}
+
+pub fn prepare_bidirectional_queue_entry(
+    queue: &OperationQueue,
+    entry: QueueEntry,
+    secrets: Arc<dyn SecretResolver>,
+) -> io::Result<BidirectionalQueuePreparation> {
+    validate_operation(&entry.operation)?;
+    let operation_id = entry.operation_id;
+    let prepared = prepare_strict_queue_operation(queue, &operation_id, &entry.operation, secrets)?;
+    let QueueOperation::Bidirectional {
+        expected_baseline_digest,
+        expected_plan_digest,
+        ..
+    } = entry.operation
+    else {
+        unreachable!("Klasse wurde vor der Vorbereitung geprüft");
     };
     let current_baseline_digest = prepared.preview().plan.baseline_digest;
     let current_plan_digest = prepared.preview().plan.plan_digest;
@@ -4285,9 +6109,8 @@ pub fn prepare_bidirectional_queue_entry(
         )?;
         return Ok(BidirectionalQueuePreparation::AwaitingConfirmation { reason });
     }
-    let reason =
-        "Bidirektionaler Lauf ist frisch geprüft und wartet auf seine einmalige Laufphrase"
-            .to_string();
+    let reason = format!("Bidirektionaler Lauf ist frisch geprüft; beide Richtungen und die angezeigten Wirkungen werden bestätigt. {}",
+        prepared.preview().scope_warnings.join(" "));
     if let Err(error) = queue.require_confirmation(
         &operation_id,
         QueueAttention::RemoteRun {
@@ -4315,8 +6138,31 @@ fn bidirectional_temp_recovery_paths(stats: &LocalBidirectionalStats) -> Vec<Str
 }
 
 /// Eine RAM-gehaltene bidirektionale Queue-Vorbereitung ausführen. Der Queue-
-/// `Running`-Commit liegt nach Phrase, Backup-Gate und frischem Driftcheck, aber vor
+/// `Running`-Commit liegt nach Wirkungsbestätigung und frischem Driftcheck, aber vor
 /// der ersten Nutzerdatenmutation.
+pub fn execute_prepared_bidirectional_queue_entry_effects(
+    queue: &OperationQueue,
+    prepared: PreparedBidirectionalQueueRun,
+    effects_confirmed: bool,
+    cancel: &Cancel,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> io::Result<QueueExecutionResult> {
+    if !effects_confirmed {
+        return Err(crate::real_mode::confirmation_mismatch(
+            "Die angezeigte bidirektionale Wirkung wurde nicht bestätigt",
+        ));
+    }
+    let confirmation = prepared.preview().confirmation_phrase.clone();
+    execute_prepared_bidirectional_queue_entry(
+        queue,
+        prepared,
+        &confirmation,
+        true,
+        cancel,
+        on_progress,
+    )
+}
+
 pub fn execute_prepared_bidirectional_queue_entry(
     queue: &OperationQueue,
     prepared: PreparedBidirectionalQueueRun,
@@ -4414,7 +6260,7 @@ pub fn execute_local_queue_entry(
 enum SettledQueueFailure {
     /// Der bereits vollzogene Dateiabschluss ließ sich nachträglich doch noch
     /// dauerhaft festschreiben. Der Eintrag gilt damit als erfolgreich.
-    Completed(QueueExecutionResult),
+    Completed(Box<QueueExecutionResult>),
     /// Der Eintrag bleibt gescheitert. `error` ist der öffentlich führende
     /// Fehler, `journal_errors` sammelt zusätzlich misslungene Journalschritte.
     Failed {
@@ -4459,8 +6305,8 @@ fn settle_failed_queue_entry(
                     *pending_completion = None;
                     match queue.append_file_completion_audit(operation_id, &completion) {
                         Ok(()) => {
-                            return SettledQueueFailure::Completed(QueueExecutionResult::File(
-                                completion.stats.clone(),
+                            return SettledQueueFailure::Completed(Box::new(
+                                QueueExecutionResult::File(completion.stats.clone()),
                             ));
                         }
                         Err(audit_error) => error = audit_error,
@@ -4541,10 +6387,34 @@ pub fn execute_local_queue_entry_detailed(
     cancel: &Cancel,
     on_progress: &mut dyn FnMut(&Progress),
 ) -> Result<QueueExecutionResult, ProviderFileExecutionFailure> {
+    execute_local_queue_entry_detailed_with_snapshot_store(
+        queue,
+        entry,
+        execution,
+        None,
+        cancel,
+        on_progress,
+    )
+}
+/// Die Oberfläche liefert den bekannten Cachekontext separat vom untrusted Journal.
+/// Ohne Store bleiben gewöhnliche lokale Quellen unverändert verfügbar.
+pub fn execute_local_queue_entry_detailed_with_snapshot_store(
+    queue: &OperationQueue,
+    entry: QueueEntry,
+    execution: &LocalQueueExecution,
+    snapshot_store: Option<&crate::remote_snapshot::SnapshotStore>,
+    cancel: &Cancel,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> Result<QueueExecutionResult, ProviderFileExecutionFailure> {
     let mut actuals = FileOperationActuals::default();
     let mut pending_completion = None;
     let operation_id = entry.operation_id.clone();
-    let is_file_operation = matches!(&entry.operation, QueueOperation::File { .. });
+    let is_file_operation = matches!(
+        &entry.operation,
+        QueueOperation::File { .. }
+            | QueueOperation::ArchivePack { .. }
+            | QueueOperation::ArchiveExtract { .. }
+    );
     let mut progress = entry.progress.clone();
     let mut capture_progress = |current: &Progress| {
         progress = current.clone();
@@ -4554,6 +6424,7 @@ pub fn execute_local_queue_entry_detailed(
         queue,
         entry,
         execution,
+        snapshot_store,
         cancel,
         &mut capture_progress,
         &mut actuals,
@@ -4573,7 +6444,7 @@ pub fn execute_local_queue_entry_detailed(
         &actuals,
         &mut pending_completion,
     ) {
-        SettledQueueFailure::Completed(result) => return Ok(result),
+        SettledQueueFailure::Completed(result) => return Ok(*result),
         SettledQueueFailure::Failed {
             error,
             journal_errors,
@@ -4589,10 +6460,12 @@ pub fn execute_local_queue_entry_detailed(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_local_queue_entry_inner(
     queue: &OperationQueue,
     entry: QueueEntry,
     execution: &LocalQueueExecution,
+    snapshot_store: Option<&crate::remote_snapshot::SnapshotStore>,
     cancel: &Cancel,
     on_progress: &mut dyn FnMut(&Progress),
     actuals: &mut FileOperationActuals,
@@ -4601,6 +6474,29 @@ fn execute_local_queue_entry_inner(
     validate_operation(&entry.operation)?;
     let operation_id = entry.operation_id;
     match entry.operation {
+        QueueOperation::ArchiveExtract { request, expected } => archive_extract_queue::execute(
+            queue,
+            &operation_id,
+            *request,
+            *expected,
+            execution,
+            snapshot_store,
+            cancel,
+            on_progress,
+            actuals,
+            pending_completion,
+        ),
+        QueueOperation::ArchivePack { request, expected } => archive_pack_queue::execute(
+            queue,
+            &operation_id,
+            *request,
+            *expected,
+            execution,
+            cancel,
+            on_progress,
+            actuals,
+            pending_completion,
+        ),
         QueueOperation::File {
             kind,
             items,
@@ -4651,7 +6547,9 @@ fn execute_local_queue_entry_inner(
             cancel,
             on_progress,
         ),
-        QueueOperation::FtpsRecovery { .. }
+        QueueOperation::ArchiveUpload { .. }
+        | QueueOperation::RenameCycleRecovery { .. }
+        | QueueOperation::FtpsRecovery { .. }
         | QueueOperation::LocalSync { .. }
         | QueueOperation::ProviderFile { .. }
         | QueueOperation::ProviderDelete { .. }
@@ -4660,7 +6558,9 @@ fn execute_local_queue_entry_inner(
         | QueueOperation::WebDavSync { .. }
         | QueueOperation::SmbSync { .. }
         | QueueOperation::ProviderSync { .. }
-        | QueueOperation::Bidirectional { .. } => Err(io::Error::new(
+        | QueueOperation::ContentSync { .. }
+        | QueueOperation::Bidirectional { .. }
+        | QueueOperation::BidirectionalForward { .. } => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Remote-Queue-Einträge benötigen den Remote-Executor",
         )),
@@ -4974,6 +6874,27 @@ pub fn execute_provider_file_queue_entry_detailed(
     cancel: &Cancel,
     on_progress: &mut dyn FnMut(&Progress),
 ) -> Result<QueueExecutionResult, ProviderFileExecutionFailure> {
+    execute_provider_file_queue_entry_detailed_with_snapshot_store(
+        queue,
+        entry,
+        execution,
+        secrets,
+        None,
+        cancel,
+        on_progress,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub fn execute_provider_file_queue_entry_detailed_with_snapshot_store(
+    queue: &OperationQueue,
+    entry: QueueEntry,
+    execution: &LocalQueueExecution,
+    secrets: Arc<dyn SecretResolver>,
+    snapshot_store: Option<&crate::remote_snapshot::SnapshotStore>,
+    cancel: &Cancel,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> Result<QueueExecutionResult, ProviderFileExecutionFailure> {
+    let archive_generation = matches!(&entry.operation, QueueOperation::ArchiveUpload { .. });
     let ftps_preparation = provider_file_has_ftps_endpoint(&entry.operation);
     let mut actuals = FileOperationActuals::default();
     let mut recovery = None;
@@ -4990,15 +6911,69 @@ pub fn execute_provider_file_queue_entry_detailed(
             recovery: &mut recovery,
             pending_completion: &mut pending_completion,
         };
-        execute_provider_file_queue_entry_inner(
-            queue,
-            entry,
-            execution,
-            secrets,
-            cancel,
-            &mut capture_progress,
-            &mut tracking,
-        )
+        (|| {
+            let entry = if matches!(&entry.operation, QueueOperation::ArchiveUpload { .. }) {
+                match archive_upload_queue::generate(
+                    queue,
+                    entry,
+                    execution,
+                    snapshot_store,
+                    cancel,
+                    &mut capture_progress,
+                    tracking.actuals,
+                )? {
+                    archive_upload_queue::GenerationResult::Ready(entry) => {
+                        capture_progress(&Progress {
+                            phase: "archive_upload_ready".into(),
+                            current: entry
+                                .generated_source
+                                .as_ref()
+                                .map(|source| source.label.clone())
+                                .unwrap_or_default(),
+                            ..Progress::default()
+                        });
+                        if cancel.is_cancelled() {
+                            queue.mark_running(&entry.operation_id)?;
+                            queue.cancel(
+                                &entry.operation_id,
+                                Progress {
+                                    phase: "cancelled".into(),
+                                    ..Progress::default()
+                                },
+                            )?;
+                            return Ok(QueueExecutionResult::File(OpStats {
+                                cancelled: true,
+                                ..OpStats::default()
+                            }));
+                        }
+                        *entry
+                    }
+                    archive_upload_queue::GenerationResult::Waiting(reason) => {
+                        return Ok(QueueExecutionResult::AwaitingConfirmation {
+                            class: QueueOperationClass::File,
+                            reason,
+                        })
+                    }
+                    archive_upload_queue::GenerationResult::Cancelled => {
+                        return Ok(QueueExecutionResult::File(OpStats {
+                            cancelled: true,
+                            ..OpStats::default()
+                        }))
+                    }
+                }
+            } else {
+                entry
+            };
+            execute_provider_file_queue_entry_inner(
+                queue,
+                entry,
+                execution,
+                secrets,
+                cancel,
+                &mut capture_progress,
+                &mut tracking,
+            )
+        })()
     };
     let error = match result {
         Ok(result) => return Ok(result),
@@ -5007,7 +6982,7 @@ pub fn execute_provider_file_queue_entry_detailed(
     let mut error = failure_with_staging_recovery(queue, &operation_id, &mut actuals, error);
     // Vor der Nutzerwirkung darf ein sauberer Abbruch keine Fehler-/Retry-Zeile
     // erzeugen. Unklare Probenreste und bereits laufende Wirkungen bleiben Fehler.
-    if ftps_preparation
+    if (ftps_preparation || archive_generation)
         && cancel.is_cancelled()
         && crate::error_code(&error) == crate::ErrorCode::Interrupted
         && crate::error::recovery_paths(&error).is_empty()
@@ -5045,7 +7020,7 @@ pub fn execute_provider_file_queue_entry_detailed(
         &actuals,
         &mut pending_completion,
     ) {
-        SettledQueueFailure::Completed(result) => return Ok(result),
+        SettledQueueFailure::Completed(result) => return Ok(*result),
         SettledQueueFailure::Failed {
             error,
             journal_errors,
@@ -5116,6 +7091,14 @@ fn execute_provider_file_queue_entry_inner(
     // Persistierte Eingaben müssen scheitern, bevor Destrukturierung, Secretzugriff,
     // Netzwerk oder eine Capability-Probe überhaupt möglich werden.
     validate_operation(&entry.operation)?;
+    validate_generated_entry(&entry, queue._process_lock.root.path())?;
+    let generated_source = entry
+        .generated_source
+        .as_ref()
+        .map(|reference| {
+            resolve_generated_operation_source(queue, reference, &entry.operation, cancel)
+        })
+        .transpose()?;
     let preparation_cancel = provider_file_has_ftps_endpoint(&entry.operation).then_some(cancel);
     provider_file_preparation_not_cancelled(preparation_cancel)?;
     let operation_id = entry.operation_id;
@@ -5187,6 +7170,18 @@ fn execute_provider_file_queue_entry_inner(
             reason: "Provider-Zugangsdaten sind nicht verfügbar oder wurden abgelehnt".into(),
         });
     };
+    if entry.generated_source.is_none()
+        && source_endpoint.kind() == crate::ProviderKind::Local
+        && crate::generated_source::is_store_path(
+            queue._process_lock.root.path(),
+            source_endpoint.root(),
+        )
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Interne Ergebnisquelle benötigt ihre versiegelte Referenz",
+        ));
+    }
     let Some(independently_connected_target) =
         connect_queue_endpoint_with_credential_attention(queue, &operation_id, &target, secrets)?
     else {
@@ -5236,6 +7231,10 @@ fn execute_provider_file_queue_entry_inner(
         lexical_item_paths
     };
 
+    if let Some((held, vfs)) = &generated_source {
+        held.ensure_current()?;
+        vfs.verified_source_binding_digest()?;
+    }
     let crate::InteractiveFileContexts {
         source_vfs,
         target_vfs: interactive_target_vfs,
@@ -5254,6 +7253,11 @@ fn execute_provider_file_queue_entry_inner(
             profiles: entry.profile_bindings.clone(),
         }),
     )?;
+    let source_vfs: Arc<dyn Vfs> = if let Some((_, vfs)) = &generated_source {
+        vfs.clone()
+    } else {
+        source_vfs
+    };
     let current_tree = source_vfs.interactive_source_tree()?;
     if current_tree.as_ref() != source_tree_expected.as_deref() {
         let reason = "Der Quellbaum ist neu oder hat sich seit der Vorschau geändert; vor jeder Zielwirkung erneut bestätigen".to_owned();
@@ -5274,16 +7278,25 @@ fn execute_provider_file_queue_entry_inner(
             reason,
         });
     }
-    let (target_vfs, target_root): (Arc<dyn Vfs>, PathBuf) = if source.kind()
-        == crate::ProviderKind::Sftp
-    {
+    let (target_vfs, target_root): (Arc<dyn Vfs>, PathBuf) = if target.kind()
+        == crate::ProviderKind::Local
+        && (source.kind() == crate::ProviderKind::Sftp
+            || (kind == FileQueueKind::Copy
+                && !overwrite
+                && matches!(
+                    source.kind(),
+                    crate::ProviderKind::Ftps
+                        | crate::ProviderKind::WebDav
+                        | crate::ProviderKind::Smb
+                ))) {
         let root = target.root().to_path_buf();
-        (
-            Arc::new(
-                LocalVfs::rooted(&root)?.with_required_temp_recovery(&queue.path, &operation_id),
-            ),
-            root,
-        )
+        let local = LocalVfs::rooted(&root)?;
+        let local = if source.kind() == crate::ProviderKind::Sftp {
+            local.with_required_temp_recovery(&queue.path, &operation_id)
+        } else {
+            local.with_preferred_temp_recovery(&queue.path, &operation_id)
+        };
+        (Arc::new(local), root)
     } else {
         (interactive_target_vfs, target.root().to_path_buf())
     };
@@ -5813,6 +7826,22 @@ fn execute_provider_file_queue_entry_inner(
         return Err(crate::error::with_recovery_paths(crate::coded_error(io::ErrorKind::Interrupted, crate::ErrorCode::OutcomeUnclear,
             "FTPS-Abbruch erhält mögliche Teilwirkungen; Ziel und STOU-Reste manuell prüfen, nicht wiederholen"), &stats.temp_recovery_paths));
     }
+    if let Some(reference) = &entry.generated_source {
+        stats.source_read_limitations.extend(
+            reference
+                .issues
+                .iter()
+                .map(|issue| format!("Lokale Ergebnisphase: {} — {}", issue.path, issue.reason)),
+        );
+        stats.skipped = stats.skipped.saturating_add(
+            reference
+                .issues
+                .iter()
+                .filter(|issue| issue.content_omitted)
+                .count() as u64,
+        );
+    }
+    drop(generated_source);
     complete_file_queue_entry(
         queue,
         &operation_id,
@@ -6550,15 +8579,14 @@ fn failed_queue_error_commit(
     journal_error: &io::Error,
     context: &str,
 ) -> io::Error {
-    let mut paths = crate::error::recovery_paths(execution_error);
-    paths.extend(crate::error::recovery_paths(journal_error));
-    crate::error::with_recovery_paths(
+    crate::error::with_recovery_context(
         crate::coded_error(
             io::ErrorKind::Other,
             crate::ErrorCode::OutcomeUnclear,
             format!("{execution_error}; auch der {context} scheiterte: {journal_error}"),
         ),
-        &paths,
+        &[execution_error, journal_error],
+        &[],
     )
 }
 
@@ -6585,7 +8613,40 @@ fn possible_mutation_progress_error<T>(
             "Queue-Fortschritt konnte nicht gesichert werden: {persistence_error}; Ergebnis nach möglicher Mutation: {execution}"
         ),
     );
-    crate::error::with_recovery_paths(wrapped, &paths)
+    let wrapped = crate::error::with_recovery_context(wrapped, &[&persistence_error], &[]);
+    let wrapped = crate::error::with_recovery_paths(wrapped, &paths);
+    match result {
+        Err(error) => crate::error::with_directory_dacl_report(
+            crate::error::with_directory_stream_report(
+                crate::error::with_file_dacl_report(
+                    crate::error::with_created_directory_dacl_report(
+                        wrapped,
+                        &crate::error::created_directory_dacl_report(error),
+                    ),
+                    &crate::error::file_dacl_report(error),
+                ),
+                &crate::error::directory_stream_report(error),
+            ),
+            &crate::error::directory_dacl_report(error),
+        ),
+        Ok(_) => wrapped,
+    }
+}
+
+fn with_sync_outcome(error: io::Error, stats: &crate::sync::SyncStats) -> io::Error {
+    crate::error::with_directory_dacl_report(
+        crate::error::with_directory_stream_report(
+            crate::error::with_file_dacl_report(
+                crate::error::with_created_directory_dacl_report(
+                    crate::error::with_recovery_paths(error, &stats.temp_recovery_paths),
+                    &stats.created_directory_dacl_report,
+                ),
+                &stats.file_dacl_report,
+            ),
+            &stats.directory_stream_report,
+        ),
+        &stats.directory_dacl_report,
+    )
 }
 
 fn complete_file_queue_entry(
@@ -6662,11 +8723,34 @@ impl<'a> QueueProgress<'a> {
     }
 
     fn report(&mut self, progress: &Progress) {
+        let stream_report_changed = self.latest.directory_stream_report
+            != progress.directory_stream_report
+            || self.latest.directory_dacl_report != progress.directory_dacl_report
+            || self.latest.file_dacl_report != progress.file_dacl_report
+            || self.latest.created_directory_dacl_report != progress.created_directory_dacl_report;
         self.latest = progress.clone();
-        if should_persist_file_progress(progress, self.last_persist.elapsed()) {
+        // Ein Directory-Intent darf erst nach dauerhaftem Einzelwirkungsbeleg
+        // enden; dafür gilt die sonstige Fortschrittsdrosselung nicht.
+        if stream_report_changed
+            || should_persist_file_progress(progress, self.last_persist.elapsed())
+        {
             self.last_persist = Instant::now();
             if let Err(error) = self.queue.update_progress(self.operation_id, progress) {
-                self.persistence_error.get_or_insert(error);
+                self.persistence_error.get_or_insert_with(|| {
+                    crate::error::with_directory_dacl_report(
+                        crate::error::with_directory_stream_report(
+                            crate::error::with_created_directory_dacl_report(
+                                crate::error::with_file_dacl_report(
+                                    error,
+                                    &progress.file_dacl_report,
+                                ),
+                                &progress.created_directory_dacl_report,
+                            ),
+                            &progress.directory_stream_report,
+                        ),
+                        &progress.directory_dacl_report,
+                    )
+                });
                 self.cancel.cancel();
             }
         }
@@ -6820,7 +8904,9 @@ pub fn execute_provider_delete_queue_entry(
             reason: "Provider-Zugangsdaten sind nicht verfügbar oder wurden abgelehnt".into(),
         });
     };
-    let (vfs, root) = endpoint.file_context()?;
+    let endpoint =
+        endpoint.with_queue_owner_with_cancel(queue, Some(&operation_id), &[], Some(cancel))?;
+    let (vfs, root) = endpoint.ordinary_file_context()?;
     if root != Path::new(&expected_plan.root) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -6880,30 +8966,46 @@ pub fn execute_provider_delete_queue_entry(
         flush_latest_file_progress(queue, &operation_id, &latest, &mut persistence_error);
     }
     if let Some(error) = persistence_error {
-        let _ = queue.append_file_audit(
+        let mut paths = crate::error::recovery_paths(&error);
+        if let Err(execution_error) = &result {
+            paths.extend(crate::error::recovery_paths(execution_error));
+        }
+        paths.sort();
+        paths.dedup();
+        let _ = queue.append_file_audit_with_temp_paths(
             &operation_id,
             audit_operation,
             "failed",
             &latest,
             &audit_context,
-            None,
+            FileAuditRecovery {
+                provider: None,
+                temp_paths: &paths,
+                retained_backups: &[],
+            },
         );
         return Err(possible_mutation_progress_error(error, &result));
     }
     let stats = match result {
         Ok(stats) => stats,
         Err(error) => {
-            let _ = queue.append_file_audit(
+            let paths = crate::error::recovery_paths(&error);
+            let _ = queue.append_file_audit_with_temp_paths(
                 &operation_id,
                 audit_operation,
                 "failed",
                 &latest,
                 &audit_context,
-                None,
+                FileAuditRecovery {
+                    provider: None,
+                    temp_paths: &paths,
+                    retained_backups: &[],
+                },
             );
             return Err(error);
         }
     };
+    endpoint.finish_ftps_intents()?;
     finish_provider_delete_queue_entry(
         queue,
         &operation_id,
@@ -6946,6 +9048,8 @@ fn finish_provider_delete_queue_entry(
         None,
     )?;
     Ok(QueueExecutionResult::File(OpStats {
+        incomplete_resource_forks: 0,
+        retained_source_paths: Vec::new(),
         target_write_limitations: Vec::new(),
         source_read_limitations: Vec::new(),
         source_tree: None,
@@ -7249,7 +9353,112 @@ fn is_valid_legacy_unbound_webdav_delete(entry: &QueueEntry) -> bool {
         && entry.bidirectional_completion_recovery.is_none()
 }
 
-fn validate_persisted_entry_state(entry: &QueueEntry) -> io::Result<()> {
+fn validate_generated_entry(entry: &QueueEntry, config: &Path) -> io::Result<()> {
+    if let QueueOperation::ArchiveUpload {
+        generation,
+        workspace,
+        ..
+    } = &entry.operation
+    {
+        if generation.target_dir() != workspace.path_in(config)? || entry.generated_source.is_some()
+        {
+            return Err(crate::real_mode::plan_drift(
+                "Archivphase besitzt keinen passenden privaten Zwischenstand",
+            ));
+        }
+    }
+    if let QueueOperation::ProviderFile { source, .. } = &entry.operation {
+        if matches!(source.as_ref(), BidirectionalQueueEndpoint::Local { .. })
+            && crate::generated_source::is_store_path(config, Path::new(source.root()))
+            && entry.generated_source.is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Interne Ergebnisquelle besitzt keine versiegelte Referenz",
+            ));
+        }
+    }
+    let Some(reference) = &entry.generated_source else {
+        return Ok(());
+    };
+    validate_generated_operation(&entry.operation, reference, config)
+}
+
+fn validate_generated_operation(
+    operation: &QueueOperation,
+    reference: &crate::generated_source::GeneratedSourceReference,
+    config: &Path,
+) -> io::Result<()> {
+    reference.validate()?;
+    if let QueueOperation::ProviderFile { source, .. } = operation {
+        if Path::new(source.root()) != reference.path_in(config)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Ergebnisquelle und Queueordner unterscheiden sich",
+            ));
+        }
+    }
+    if !matches!(operation, QueueOperation::ProviderFile {
+        kind:FileQueueKind::Copy,source,target,.. }
+        if matches!(source.as_ref(),BidirectionalQueueEndpoint::Local {..})
+        && !matches!(target.as_ref(),BidirectionalQueueEndpoint::Local {..}))
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "Erzeugte Quelle darf ausschließlich einen lokalen Copy zu einem entfernten Ziel binden"));
+    }
+    Ok(())
+}
+
+fn resolve_generated_operation_source(
+    queue: &OperationQueue,
+    reference: &crate::generated_source::GeneratedSourceReference,
+    operation: &QueueOperation,
+    cancel: &Cancel,
+) -> io::Result<(
+    crate::generated_source::ResolvedGeneratedSource,
+    Arc<LocalVfs>,
+)> {
+    validate_generated_operation(operation, reference, queue._process_lock.root.path())?;
+    let QueueOperation::ProviderFile { items, .. } = operation else {
+        unreachable!()
+    };
+    let store = crate::generated_source::GeneratedSourceStore::for_queue(queue)?;
+    let resolved = store.resolve(reference, cancel)?;
+    let mut expected_items = resolved.items();
+    expected_items.sort();
+    let mut actual_items: Vec<_> = items.iter().map(PathBuf::from).collect();
+    actual_items.sort();
+    if expected_items != actual_items {
+        return Err(crate::real_mode::plan_drift(
+            "Die erzeugte Auswahl darf nicht nachträglich verändert werden",
+        ));
+    }
+    let vfs = Arc::new(resolved.read_vfs(cancel)?);
+    Ok((resolved, vfs))
+}
+
+fn validate_persisted_entry_state(entry: &QueueEntry, config: &Path) -> io::Result<()> {
+    validate_generated_entry(entry, config)?;
+    if let QueueOperation::RenameCycleRecovery { record } = &entry.operation {
+        let valid_state = if record.finished {
+            entry.state == QueueState::Completed && entry.error_code.is_none()
+        } else {
+            matches!(entry.state, QueueState::Interrupted | QueueState::Cancelled)
+                && entry.error_code == Some(crate::ErrorCode::OutcomeUnclear)
+        };
+        if !valid_state
+            || entry.operation_id != record.id
+            || !entry.profile_bindings.is_empty()
+            || entry.attention.is_some()
+            || entry.recovery_available
+            || entry.bidirectional_completion_recovery.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Namenstausch-Recovery darf kein ausführbarer Queueauftrag werden",
+            ));
+        }
+    }
     if matches!(entry.operation, QueueOperation::FtpsRecovery { .. })
         && (!matches!(entry.state, QueueState::Interrupted | QueueState::Cancelled)
             || entry.error_code != Some(crate::ErrorCode::OutcomeUnclear)
@@ -7299,7 +9508,10 @@ fn validate_persisted_entry_operation(entry: &QueueEntry) -> io::Result<()> {
 }
 
 fn validate_enqueue_operation(operation: &QueueOperation) -> io::Result<()> {
-    if matches!(operation, QueueOperation::FtpsRecovery { .. }) {
+    if matches!(
+        operation,
+        QueueOperation::FtpsRecovery { .. } | QueueOperation::RenameCycleRecovery { .. }
+    ) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "FTPS-Recovery kann nur aus einem dauerhaften Intent entstehen",
@@ -7309,7 +9521,73 @@ fn validate_enqueue_operation(operation: &QueueOperation) -> io::Result<()> {
 }
 
 fn validate_operation(operation: &QueueOperation) -> io::Result<()> {
+    if matches!(operation,QueueOperation::BidirectionalForward {expected_unresolved_digest,expected_preview_digest,..} if *expected_unresolved_digest==[0;32] || *expected_preview_digest==[0;32])
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Forwardqueue benötigt vollständige Vorschau- und Konfliktdigests",
+        ));
+    }
     match operation {
+        QueueOperation::ArchiveUpload {
+            generation,
+            workspace,
+            target,
+        } => {
+            workspace.validate()?;
+            target.validate()?;
+            if matches!(target.as_ref(), BidirectionalQueueEndpoint::Local { .. }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Archivupload benötigt ein entferntes Ziel",
+                ));
+            }
+            match generation.as_ref() {
+                crate::archive_upload::ArchiveGeneration::Pack { request, expected } => {
+                    validate_operation(&QueueOperation::ArchivePack {
+                        request: request.clone(),
+                        expected: expected.clone(),
+                    })
+                }
+                crate::archive_upload::ArchiveGeneration::Extract { request, expected } => {
+                    validate_operation(&QueueOperation::ArchiveExtract {
+                        request: request.clone(),
+                        expected: expected.clone(),
+                    })
+                }
+            }
+        }
+        QueueOperation::RenameCycleRecovery { record } => record.validate(),
+        QueueOperation::ArchiveExtract { request, expected } => {
+            request.validate()?;
+            if expected.digest == [0; 32]
+                || expected.preview.selection != request.selection
+                || expected.preview.source_root != request.source_root
+                || expected.preview.source_path != request.source_path
+                || expected.preview.snapshot != request.snapshot
+                || expected.preview.target_dir != request.target_dir
+                || (!expected.preview.catalog_complete && !request.options.allow_partial)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ZIP-Entpackabsicht und bestätigter Umfang passen nicht zusammen",
+                ));
+            }
+            Ok(())
+        }
+        QueueOperation::ArchivePack { request, expected } => {
+            request.validate()?;
+            if expected.digest == [0; 32]
+                || expected.preview.source_root != request.source_root
+                || expected.preview.target != request.target_dir.join(&request.target_name)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ZIP-Queueabsicht und bestätigte Wirkung passen nicht zusammen",
+                ));
+            }
+            Ok(())
+        }
         QueueOperation::FtpsRecovery {
             identity,
             account_digest,
@@ -7497,15 +9775,34 @@ fn validate_operation(operation: &QueueOperation) -> io::Result<()> {
                 ..
             } = operation
             {
-                let supported = matches!(source.as_ref(), BidirectionalQueueEndpoint::Sftp { .. })
-                    || (matches!(source.as_ref(), BidirectionalQueueEndpoint::Local { .. })
-                        && matches!(target.as_ref(), BidirectionalQueueEndpoint::WebDav { .. })
+                let additive_remote_download =
+                    matches!(
+                        source.as_ref(),
+                        BidirectionalQueueEndpoint::Ftps { .. }
+                            | BidirectionalQueueEndpoint::WebDav { .. }
+                            | BidirectionalQueueEndpoint::Smb { .. }
+                    ) && matches!(target.as_ref(), BidirectionalQueueEndpoint::Local { .. })
                         && *kind == FileQueueKind::Copy
-                        && !*overwrite);
+                        && !*overwrite;
+                let supported = additive_remote_download
+                    || matches!(source.as_ref(), BidirectionalQueueEndpoint::Sftp { .. })
+                    || (matches!(source.as_ref(), BidirectionalQueueEndpoint::Local { .. })
+                        && matches!(
+                            target.as_ref(),
+                            BidirectionalQueueEndpoint::Sftp { .. }
+                                | BidirectionalQueueEndpoint::WebDav { .. }
+                                | BidirectionalQueueEndpoint::Ftps { .. }
+                                | BidirectionalQueueEndpoint::Smb { .. }
+                        )
+                        && *kind == FileQueueKind::Copy
+                        // Vollständig versiegelte Archivbäume besitzen keine
+                        // Auslassungen. Ihr Beleg gilt auch beim bestätigten
+                        // Ersetzen; unvollständige Quellen bleiben additiv.
+                        && (!*overwrite || tree.omitted.is_empty()));
                 if !supported {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "Baumbeleg gehört zur begrenzten additiven Inhaltsklasse",
+                        "Baumbeleg benötigt eine Kopie mit passendem Vollständigkeitsvertrag",
                     ));
                 }
                 tree.validate()?;
@@ -7513,10 +9810,16 @@ fn validate_operation(operation: &QueueOperation) -> io::Result<()> {
                     if !items.iter().any(|item| {
                         Path::new(&omission.path).starts_with(item)
                             && (&omission.path != item
+                                || additive_remote_download
                                 || matches!(
                                     source.as_ref(),
                                     BidirectionalQueueEndpoint::Local { .. }
-                                ))
+                                )
+                                || (matches!(
+                                    source.as_ref(),
+                                    BidirectionalQueueEndpoint::Sftp { .. }
+                                ) && *kind == FileQueueKind::Copy
+                                    && !*overwrite))
                     }) {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -7530,13 +9833,7 @@ fn validate_operation(operation: &QueueOperation) -> io::Result<()> {
                 }
             }
             if matches!(source.as_ref(), BidirectionalQueueEndpoint::Sftp { .. }) {
-                if *kind != FileQueueKind::Copy
-                    || *overwrite
-                    || !matches!(target.as_ref(), BidirectionalQueueEndpoint::Local { .. })
-                {
-                    return Err(io::Error::new(io::ErrorKind::Unsupported, "SFTP-Inhalte erlauben nur additive lokale Downloads; Verschieben, Ersetzen und Remote-Ziele bleiben gesperrt"));
-                }
-                crate::sftp::validate_interactive_content_selection(
+                crate::sftp::validate_interactive_write_selection(
                     Path::new(source.root()),
                     &items.iter().map(PathBuf::from).collect::<Vec<_>>(),
                 )?;
@@ -7637,13 +9934,34 @@ fn validate_operation(operation: &QueueOperation) -> io::Result<()> {
             target,
             options,
             ..
+        }
+        | QueueOperation::ContentSync {
+            source,
+            target,
+            options,
+            ..
         } => {
             validate_bidirectional_endpoint(source)?;
             validate_bidirectional_endpoint(target)?;
-            options.validate()?;
+            if matches!(operation, QueueOperation::ContentSync { .. }) {
+                crate::validate_content_sync_options(options)?;
+            } else {
+                options.validate()?;
+            }
             Ok(())
         }
-        QueueOperation::Bidirectional {
+        QueueOperation::BidirectionalForward {
+            pair_id,
+            pair_name,
+            left,
+            right,
+            baseline_path,
+            resolutions,
+            expected_baseline_digest,
+            expected_plan_digest,
+            ..
+        }
+        | QueueOperation::Bidirectional {
             pair_id,
             pair_name,
             left,
@@ -7876,7 +10194,9 @@ fn invalid_transition(current: QueueState) -> io::Error {
 
 fn attention_reason(attention: &QueueAttention) -> &str {
     match attention {
-        QueueAttention::PlanChanged { reason, .. }
+        QueueAttention::ArchiveExtractChanged { reason, .. }
+        | QueueAttention::ArchivePackChanged { reason, .. }
+        | QueueAttention::PlanChanged { reason, .. }
         | QueueAttention::SourceTreeChanged { reason, .. }
         | QueueAttention::ConflictsChanged { reason, .. }
         | QueueAttention::Manual { reason, .. }
@@ -7889,7 +10209,9 @@ fn attention_reason(attention: &QueueAttention) -> &str {
 
 fn attention_confirmation(attention: &QueueAttention) -> &str {
     match attention {
-        QueueAttention::PlanChanged { confirmation, .. }
+        QueueAttention::ArchiveExtractChanged { confirmation, .. }
+        | QueueAttention::ArchivePackChanged { confirmation, .. }
+        | QueueAttention::PlanChanged { confirmation, .. }
         | QueueAttention::SourceTreeChanged { confirmation, .. }
         | QueueAttention::ConflictsChanged { confirmation, .. }
         | QueueAttention::Manual { confirmation, .. }
@@ -8169,8 +10491,15 @@ mod tests {
             compare: Compare::ContentHash,
             ..Default::default()
         };
-        let prepared = crate::prepare_local_sync_run(&source, &target, options.clone()).unwrap();
         let queue = OperationQueue::open(temp.path().join("state/queue.json")).unwrap();
+        let prepared = crate::prepare_local_sync_run_for_queue(
+            &queue,
+            &source,
+            &target,
+            options.clone(),
+            None,
+        )
+        .unwrap();
         let entry = queue
             .enqueue(QueueOperation::LocalSync {
                 execution_hint: prepared.preview().local_execution.clone(),
@@ -9385,6 +11714,16 @@ mod tests {
             max_delete_fraction: 1.0,
         };
         let make_entry = |operation_id: &str, operation| QueueEntry {
+            file_incomplete: false,
+            generated_source: None,
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
+            archive_extract_report: None,
+            directory_dacl_recovery: false,
+            file_dacl_recovery: false,
+            created_directory_dacl_recovery: false,
             operation_id: operation_id.into(),
             operation,
             profile_bindings: Vec::new(),
@@ -9463,6 +11802,16 @@ mod tests {
         let queue = OperationQueue::open(root.join("state/queue.json")).unwrap();
         let resolves = Arc::new(AtomicUsize::new(0));
         let entry = QueueEntry {
+            file_incomplete: false,
+            generated_source: None,
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
+            archive_extract_report: None,
+            directory_dacl_recovery: false,
+            file_dacl_recovery: false,
+            created_directory_dacl_recovery: false,
             operation_id: "ungueltig-bidirektional".into(),
             operation: QueueOperation::Bidirectional {
                 pair_id: PairId([7; 16]),
@@ -9500,6 +11849,16 @@ mod tests {
         assert_eq!(resolves.load(Ordering::SeqCst), 0);
 
         let entry = QueueEntry {
+            file_incomplete: false,
+            generated_source: None,
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
+            archive_extract_report: None,
+            directory_dacl_recovery: false,
+            file_dacl_recovery: false,
+            created_directory_dacl_recovery: false,
             operation_id: "ungueltige-entscheidung".into(),
             operation: QueueOperation::Bidirectional {
                 pair_id: PairId([7; 16]),
@@ -10263,6 +12622,16 @@ mod tests {
             // Ein bereits persistierter Altstand wird unmittelbar vor der
             // Ausführung erneut geprüft. Auch hier darf kein Secretresolver laufen.
             let entry = QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: format!("ungueltig-{index}"),
                 operation: operation.clone(),
                 profile_bindings: Vec::new(),
@@ -10693,6 +13062,38 @@ mod tests {
     }
 
     #[test]
+    fn native_copy_incomplete_completion_survives_reopen_and_legacy_defaults_false() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("queue.json");
+        let queue = OperationQueue::open(&path).unwrap();
+        let entry = queue
+            .enqueue(file_operation("partial-native-copy"))
+            .unwrap();
+        queue.claim_next().unwrap().unwrap();
+        queue.mark_running(&entry.operation_id).unwrap();
+        queue
+            .finish_file(
+                &entry.operation_id,
+                false,
+                Progress::default(),
+                &[],
+                &[],
+                true,
+            )
+            .unwrap();
+        drop(queue);
+        let reopened = OperationQueue::open(path).unwrap();
+        let entry = reopened.snapshot().entries[0].clone();
+        assert_eq!(entry.state, QueueState::Completed);
+        assert!(entry.file_incomplete);
+        assert!(reopened.claim_next().unwrap().is_none());
+        let mut legacy = serde_json::to_value(&entry).unwrap();
+        legacy.as_object_mut().unwrap().remove("file_incomplete");
+        let legacy: QueueEntry = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.file_incomplete);
+    }
+
+    #[test]
     fn temp_recoverypfade_sind_terminal_in_queue_und_audit_gebunden() {
         let temp = tempfile::tempdir().unwrap();
         let journal = temp.path().join("queue.json");
@@ -10706,7 +13107,14 @@ mod tests {
             ..Progress::default()
         };
         queue
-            .finish_file(&queued.operation_id, true, progress.clone(), &paths, &[])
+            .finish_file(
+                &queued.operation_id,
+                true,
+                progress.clone(),
+                &paths,
+                &[],
+                false,
+            )
             .unwrap();
         queue
             .append_file_audit_with_temp_paths(
@@ -11542,6 +13950,2067 @@ mod tests {
         assert!(current.attention.is_none());
     }
 
+    fn directory_dacl_queue_fixture() -> (
+        tempfile::TempDir,
+        OperationQueue,
+        QueueEntry,
+        crate::local_staging::RemoteDirectoryDaclIntent,
+    ) {
+        use crate::metadata::{Acl, MetadataManifest, WindowsSecurityObservation};
+        use crate::windows_security::{WindowsAce, WindowsDacl, WindowsDaclState, WindowsSid};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        // Die künstliche Queuewurzel braucht private Rechte ohne geerbte Schreib-ACLs.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        LocalVfs::new().write_acl_exact(&root, None).unwrap();
+        let queue = OperationQueue::open(root.join("queue.json")).unwrap();
+        let owner_sid = WindowsSid {
+            revision: 1,
+            authority: 5,
+            sub_authorities: vec![21, 42],
+        };
+        let dacl = |mask| WindowsDacl {
+            namespace: [1; 16],
+            control: 0x1004,
+            state: WindowsDaclState::Acl {
+                revision: 2,
+                aces: vec![WindowsAce::Allow {
+                    flags: 0,
+                    mask,
+                    sid: owner_sid.clone(),
+                }],
+            },
+        };
+        let before = dacl(0x0016_00a1);
+        let after = dacl(0x0016_00a3);
+        let context = crate::windows_dacl::WindowsDaclWriteContext {
+            namespace: [1; 16],
+            owner: owner_sid.clone(),
+            group: None,
+        };
+        let plan = crate::directory_dacl::DirectoryDaclPlan {
+            before: before.clone(),
+            after: after.clone(),
+            context: context.clone(),
+            target_proof: Some(Default::default()),
+        };
+        plan.validate().unwrap();
+        let manifest = |acl| {
+            MetadataManifest::new(
+                None,
+                0,
+                Some(Acl::WindowsDacl(acl)),
+                vec![],
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_windows_security(Some(WindowsSecurityObservation {
+                namespace: context.namespace,
+                owner: Some(context.owner.clone()),
+                group: None,
+                issue: None,
+                invalid_descriptor_digest: None,
+            }))
+            .unwrap()
+        };
+        let metadata = crate::sync::MetadataTransfer {
+            source: manifest(after),
+            target: Some(manifest(before)),
+            owner: false,
+            acl: false,
+            incompatible_acl_model: false,
+            windows_dacl: Some(crate::windows_dacl::WindowsDaclTransfer::DirectoryExact(
+                Box::new(plan.clone()),
+            )),
+            normal_mode: false,
+            special_mode_bits: false,
+            xattrs: false,
+            resource_fork: false,
+            named_streams: false,
+            directory_streams: None,
+            sparse_extents: false,
+            hardlinks: false,
+        };
+        let connection = SmbConnectionConfig {
+            host: "server".into(),
+            port: 445,
+            server_guid: [1; 16],
+            share: "share".into(),
+            username: "test".into(),
+            domain: String::new(),
+            requested_root: "/".into(),
+            password_reference: KeychainSecretReference::new(
+                "Doppeldecker-Test",
+                "directory-queue",
+            )
+            .unwrap(),
+        };
+        let endpoint = |root: &str| {
+            Box::new(BidirectionalQueueEndpoint::Smb {
+                connection: Box::new(connection.clone()),
+                root: root.into(),
+            })
+        };
+        let operation = QueueOperation::ContentSync {
+            source: endpoint("/source"),
+            target: endpoint("/pane"),
+            options: SyncOptions {
+                mode: crate::SyncMode::Update,
+                compare: crate::Compare::ContentHash,
+                metadata: crate::MetadataProfile::NativeBestEffort,
+                ..Default::default()
+            },
+            expected_plan: Box::new(SyncPlan {
+                actions: vec![crate::Action::SetDirectoryMetadata {
+                    path: "folder".into(),
+                    source_mtime: None,
+                    target_mtime: None,
+                    metadata,
+                }],
+                metadata_count: 1,
+                source_count: 1,
+                target_count: 1,
+                ..Default::default()
+            }),
+            binding_digest: [4; 32],
+        };
+        let entry = queue.enqueue_claimed(operation).unwrap();
+        queue.mark_running(&entry.operation_id).unwrap();
+        let identity = crate::RootIdentity::Smb(crate::remote::SmbRootIdentity {
+            server: crate::remote::SmbServerIdentity {
+                host: "server".into(),
+                port: 445,
+                server_guid: [1; 16],
+                share: "share".into(),
+                account_digest: [2; 32],
+                canonical_root: "/vault".into(),
+                dialect: 0x0311,
+                signing_active: true,
+                encryption_active: true,
+                signing_algorithm: "AES-GMAC".into(),
+                encryption_cipher: "AES-128-GCM".into(),
+            },
+            virtual_root: "/pane".into(),
+            root_file_id: 1,
+            tree_id: 1,
+            session_generation: 1,
+        });
+        let intent = crate::local_staging::RemoteDirectoryDaclIntent::create_with_root(
+            &crate::local_staging::StagingOwner {
+                queue: queue.path.clone(),
+                operation: entry.operation_id.clone(),
+            },
+            crate::local_staging::DirectoryDaclIntentBinding {
+                directory: "/pane/folder".into(),
+                base_id: 42,
+                namespace: context.namespace,
+                before_digest: crate::directory_dacl::dacl_digest(&plan.before).unwrap(),
+                after_digest: crate::directory_dacl::dacl_digest(&plan.after).unwrap(),
+                owner: context.owner,
+                group: context.group,
+                phase: crate::local_staging::DirectoryDaclIntentPhase::Prepared,
+            },
+            &identity,
+            [2; 32],
+        )
+        .unwrap();
+        (temp, queue, entry, intent)
+    }
+
+    fn created_directory_dacl_effect_fixture(
+    ) -> crate::created_directory_dacl::CreatedDirectoryDaclPlan {
+        let file = crate::file_dacl::tests::plan();
+        let mut after = file.after;
+        let crate::windows_security::WindowsDaclState::Acl { aces, .. } = &mut after.state else {
+            panic!()
+        };
+        let crate::windows_security::WindowsAce::Allow { mask, .. } = &mut aces[0] else {
+            panic!()
+        };
+        *mask = 0x0016_00a1;
+        let mut before = file.before;
+        before.control = 4;
+        crate::created_directory_dacl::CreatedDirectoryDaclPlan {
+            origin: crate::created_directory_dacl::CreatedDirectoryOrigin::ExclusiveMinimalCreate,
+            file_id: 42,
+            object_namespace: crate::created_directory_dacl_registry::object_namespace(
+                &crate::file_dacl::tests::identity("/pane"),
+            )
+            .unwrap(),
+            before,
+            after,
+            context: file.context,
+        }
+    }
+    fn created_directory_dacl_queue_fixture() -> (
+        tempfile::TempDir,
+        OperationQueue,
+        QueueEntry,
+        crate::created_directory_dacl_registry::Intent,
+    ) {
+        let (temp, queue, entry, directory) = directory_dacl_queue_fixture();
+        directory.finish_prepared().unwrap();
+        drop(directory);
+        let effect = created_directory_dacl_effect_fixture();
+        queue
+            .update(&entry.operation_id, |entry| {
+                let QueueOperation::ContentSync { expected_plan, .. } = &mut entry.operation else {
+                    panic!()
+                };
+                let crate::Action::SetDirectoryMetadata { metadata, .. } =
+                    &expected_plan.actions[0]
+                else {
+                    panic!()
+                };
+                let mut metadata = metadata.clone();
+                metadata.target = None;
+                metadata.acl = true;
+                metadata.source = crate::MetadataManifest::new(
+                    None,
+                    0,
+                    Some(crate::metadata::Acl::WindowsDacl(effect.after.clone())),
+                    vec![],
+                    None,
+                    None,
+                    None,
+                )?
+                .with_named_streams(Some(vec![]))?;
+                metadata.windows_dacl = Some(
+                    crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryExact(Box::new(
+                        crate::created_directory_dacl::CreatedDirectoryDaclSelection {
+                            after: effect.after.clone(),
+                            probe_context: effect.context.clone(),
+                        },
+                    )),
+                );
+                expected_plan.actions = vec![crate::Action::CreateDir {
+                    path: "a".into(),
+                    source_mode: None,
+                    source_mtime: None,
+                    metadata: Some(metadata),
+                }];
+                expected_plan.metadata_report.profile = crate::MetadataProfile::NativeBestEffort;
+                Ok(())
+            })
+            .unwrap();
+        let intent = crate::created_directory_dacl_registry::Intent::create(
+            &crate::local_staging::StagingOwner {
+                queue: queue.path.clone(),
+                operation: entry.operation_id.clone(),
+            },
+            Path::new("/pane/a"),
+            &effect,
+            &crate::file_dacl::tests::identity("/pane"),
+            [2; 32],
+            &crate::created_directory_dacl::CreatedDirectoryRootScope {
+                object_namespace: effect.object_namespace,
+                root_file_id: 1,
+                ancestor_file_ids: vec![100],
+            },
+        )
+        .unwrap();
+        (temp, queue, entry, intent)
+    }
+
+    fn file_dacl_queue_fixture() -> (
+        tempfile::TempDir,
+        OperationQueue,
+        QueueEntry,
+        crate::file_dacl_registry::Intent,
+    ) {
+        let (temp, queue, entry, directory) = directory_dacl_queue_fixture();
+        directory.finish_prepared().unwrap();
+        drop(directory);
+        let effect = crate::file_dacl::tests::plan();
+        queue
+            .update(&entry.operation_id, |entry| {
+                let QueueOperation::ContentSync { expected_plan, .. } = &mut entry.operation else {
+                    panic!()
+                };
+                expected_plan.actions = vec![crate::Action::SetFileDacl {
+                    path: "a".into(),
+                    source_hash: blake3::hash(b"data").to_hex().to_string(),
+                    source_metadata: crate::MetadataManifest::new(
+                        None,
+                        0,
+                        None,
+                        vec![],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    plan: effect.clone(),
+                }];
+                Ok(())
+            })
+            .unwrap();
+        let intent = crate::file_dacl_registry::Intent::create(
+            &crate::local_staging::StagingOwner {
+                queue: queue.path.clone(),
+                operation: entry.operation_id.clone(),
+            },
+            Path::new("/pane/a"),
+            &effect,
+            &crate::file_dacl::tests::identity("/pane"),
+            [2; 32],
+        )
+        .unwrap();
+        (temp, queue, entry, intent)
+    }
+    #[test]
+    fn file_dacl_new_fields_require_queue_journal_version_35() {
+        for kind in ["action", "selections", "report", "progress", "recovery"] {
+            let (_area, queue, entry, directory) = directory_dacl_queue_fixture();
+            directory.finish_prepared().unwrap();
+            drop(directory);
+            let mut snapshot = queue.snapshot();
+            snapshot.version = 34;
+            let current = &mut snapshot.entries[0];
+            let effect = crate::file_dacl::tests::plan();
+            let outcome = effect.outcome("/pane/a").unwrap();
+            match kind {
+                "report" => current.file_dacl_report.completed.push(outcome),
+                "progress" => current.progress.file_dacl_report.uncertain.push(outcome),
+                "recovery" => current.file_dacl_recovery = true,
+                "action" | "selections" => {
+                    let QueueOperation::ContentSync { expected_plan, .. } = &mut current.operation
+                    else {
+                        panic!()
+                    };
+                    if kind == "action" {
+                        expected_plan.actions = vec![crate::Action::SetFileDacl {
+                            path: "a".into(),
+                            source_hash: blake3::hash(b"data").to_hex().to_string(),
+                            source_metadata: crate::MetadataManifest::new(
+                                None,
+                                0,
+                                None,
+                                vec![],
+                                None,
+                                None,
+                                None,
+                            )
+                            .unwrap(),
+                            plan: effect,
+                        }];
+                    } else {
+                        expected_plan.file_dacl_selections.push(
+                            crate::file_dacl::FileDaclSelection {
+                                path: "a".into(),
+                                file_id: 42,
+                                object_namespace: effect.object_namespace,
+                                target_proof: effect.target_proof,
+                                source_metadata: None,
+                            },
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let path = queue.path.clone();
+            drop(queue);
+            std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            let error = OperationQueue::open(path).err().expect(kind);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("Datei-DACL"), "{kind}: {error}");
+            let _ = entry;
+        }
+    }
+
+    #[test]
+    fn created_directory_dacl_payload_requires_v36_in_every_plan_container() {
+        assert_created_directory_payload_version(35, false);
+    }
+    #[test]
+    fn before_children_payload_requires_v37_in_every_plan_container() {
+        assert_created_directory_payload_version(36, true);
+    }
+    fn convert_before_children_plan(plan: &mut SyncPlan) {
+        let crate::Action::CreateDir {
+            metadata: Some(metadata),
+            ..
+        } = &mut plan.actions[0]
+        else {
+            panic!()
+        };
+        let Some(crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryExact(selection)) =
+            metadata.windows_dacl.take()
+        else {
+            panic!()
+        };
+        let mut after = selection.after;
+        let crate::windows_security::WindowsDaclState::Acl { aces, .. } = &mut after.state else {
+            panic!()
+        };
+        let crate::windows_security::WindowsAce::Allow { mask, .. } = &mut aces[0] else {
+            panic!()
+        };
+        *mask = 0x0016_01e7;
+        metadata.source = crate::MetadataManifest::new(
+            None,
+            0,
+            Some(crate::metadata::Acl::WindowsDacl(after.clone())),
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_named_streams(Some(vec![]))
+        .unwrap();
+        metadata.windows_dacl = Some(
+            crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryBeforeChildrenExact(
+                Box::new(
+                    crate::created_directory_dacl::CreatedDirectoryBeforeChildrenSelection {
+                        after,
+                        probe_context: selection.probe_context,
+                        source_children:
+                            crate::created_directory_dacl::CreatedDirectoryChildrenProof {
+                                entries: 1,
+                                digest: [9; 32],
+                            },
+                    },
+                ),
+            ),
+        );
+    }
+    fn assert_created_directory_payload_version(version: u32, before_children: bool) {
+        for kind in [
+            "Sync",
+            "LocalSync",
+            "SftpSync",
+            "FtpsSync",
+            "WebDavSync",
+            "SmbSync",
+            "ProviderSync",
+            "ContentSync",
+            "PlanChanged",
+        ] {
+            let (_area, queue, _entry, intent) = created_directory_dacl_queue_fixture();
+            intent.finish(false).unwrap();
+            drop(intent);
+            let mut snapshot = queue.snapshot();
+            snapshot.version = version;
+            let entry = &mut snapshot.entries[0];
+            let QueueOperation::ContentSync {
+                source,
+                target,
+                options,
+                expected_plan,
+                ..
+            } = entry.operation.clone()
+            else {
+                panic!()
+            };
+            let mut expected_plan = expected_plan;
+            if before_children {
+                convert_before_children_plan(&mut expected_plan);
+            }
+            let plan = expected_plan.clone();
+            entry.operation = match kind {
+                "Sync" => QueueOperation::Sync {
+                    source: "/tmp/source".into(),
+                    target: "/tmp/target".into(),
+                    sandbox: None,
+                    options,
+                    expected_plan,
+                },
+                "LocalSync" => QueueOperation::LocalSync {
+                    source: "/tmp/source".into(),
+                    target: "/tmp/target".into(),
+                    sandbox: None,
+                    options,
+                    expected_plan,
+                    execution_hint: None,
+                },
+                "SftpSync" => {
+                    let mut operation = sftp_operation();
+                    let QueueOperation::SftpSync {
+                        expected_plan: stored,
+                        ..
+                    } = &mut operation
+                    else {
+                        panic!()
+                    };
+                    *stored = expected_plan;
+                    operation
+                }
+                "SmbSync" => {
+                    let mut operation = smb_operation();
+                    let QueueOperation::SmbSync {
+                        expected_plan: stored,
+                        ..
+                    } = &mut operation
+                    else {
+                        panic!()
+                    };
+                    *stored = expected_plan;
+                    operation
+                }
+                "FtpsSync" => QueueOperation::FtpsSync {
+                    direction: SftpQueueDirection::Upload,
+                    connection: Box::new(crate::FtpsConnectionConfig {
+                        host: "ftp.example.test".into(),
+                        alternate_hosts: vec![],
+                        port: 21,
+                        username: "test".into(),
+                        requested_root: "/".into(),
+                        transport_security: crate::FtpTransportSecurity::Plaintext,
+                        certificate: None,
+                        certificate_policy: None,
+                        password_reference: KeychainSecretReference::new(
+                            "Doppeldecker-Test",
+                            "v7-codec",
+                        )
+                        .unwrap(),
+                    }),
+                    local_root: "/tmp/source".into(),
+                    remote_root: "/target".into(),
+                    options,
+                    expected_plan,
+                },
+                "WebDavSync" => QueueOperation::WebDavSync {
+                    direction: SftpQueueDirection::Upload,
+                    connection: Box::new(crate::WebDavConnectionConfig {
+                        origin: "https://dav.example.test".into(),
+                        username: "test".into(),
+                        requested_root: "/".into(),
+                        certificate: crate::FtpsCertificatePin { sha256: [1; 32] },
+                        certificate_policy: crate::FtpsCertificatePolicy::WebPkiAndPin,
+                        password_reference: KeychainSecretReference::new(
+                            "Doppeldecker-Test",
+                            "v7-codec",
+                        )
+                        .unwrap(),
+                    }),
+                    local_root: "/tmp/source".into(),
+                    remote_root: "/target".into(),
+                    options,
+                    expected_plan,
+                },
+                "ProviderSync" => QueueOperation::ProviderSync {
+                    source,
+                    target,
+                    options,
+                    expected_plan,
+                },
+                "ContentSync" => QueueOperation::ContentSync {
+                    source,
+                    target,
+                    options,
+                    expected_plan,
+                    binding_digest: [1; 32],
+                },
+                "PlanChanged" => {
+                    entry.state = QueueState::AwaitingConfirmation;
+                    entry.attention = Some(QueueAttention::PlanChanged {
+                        reason: "geänderte Vorschau".into(),
+                        confirmation: "prüfen".into(),
+                        current_plan: plan,
+                    });
+                    file_operation("ordinary")
+                }
+                _ => unreachable!(),
+            };
+            let encoded = serde_json::to_vec(&snapshot).unwrap();
+            let decoded: QueueSnapshot = serde_json::from_slice(&encoded).unwrap();
+            assert!(queue_entry_created_payload(&decoded.entries[0]), "{kind}");
+            assert_eq!(
+                queue_entry_before_children_payload(&decoded.entries[0]),
+                before_children,
+                "{kind}"
+            );
+            let path = queue.path.clone();
+            drop(queue);
+            std::fs::write(&path, encoded).unwrap();
+            let error = OperationQueue::open(path).err().expect(kind);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error.to_string().contains(if before_children {
+                    "V8-Rechteklasse"
+                } else {
+                    "Neuordner-Rechteklasse"
+                }),
+                "{kind}: {error}"
+            );
+        }
+    }
+    #[test]
+    fn before_children_report_channels_require_v37_and_matching_original_class() {
+        use crate::created_directory_dacl::*;
+        for version in [36, 37] {
+            for channel in [
+                "created",
+                "completed",
+                "uncertain",
+                "progress_created",
+                "progress_completed",
+                "progress_uncertain",
+            ] {
+                let (_area, queue, _entry, intent) = created_directory_dacl_queue_fixture();
+                intent.finish(false).unwrap();
+                drop(intent);
+                let mut snapshot = queue.snapshot();
+                snapshot.version = version;
+                let entry = &mut snapshot.entries[0];
+                let mut effect = created_directory_dacl_effect_fixture();
+                effect.origin = CreatedDirectoryOrigin::ExclusiveMinimalCreateBeforeChildren;
+                let crate::windows_security::WindowsDaclState::Acl { aces, .. } =
+                    &mut effect.after.state
+                else {
+                    panic!()
+                };
+                let crate::windows_security::WindowsAce::Allow { mask, .. } = &mut aces[0] else {
+                    panic!()
+                };
+                *mask = 0x0016_01e7;
+                let outcome = effect.outcome("/pane/a").unwrap();
+                let report = if channel.starts_with("progress_") {
+                    &mut entry.progress.created_directory_dacl_report
+                } else {
+                    &mut entry.created_directory_dacl_report
+                };
+                match channel.trim_start_matches("progress_") {
+                    "created" => report.observe_created(CreatedDirectoryObservation {
+                        effect_key: CreatedDirectoryEffectKey {
+                            origin: outcome.origin,
+                            directory: outcome.directory,
+                            file_id: outcome.file_id,
+                            object_namespace: outcome.object_namespace,
+                        },
+                        ordinary_metadata_applied: false,
+                    }),
+                    "completed" => report.completed.push(outcome),
+                    "uncertain" => report.uncertain.push(outcome),
+                    _ => unreachable!(),
+                }
+                // Ein V7-Plan darf auch in J37 keinen V8-Effekt einschleusen.
+                assert!(queue_entry_before_children_payload(entry));
+                let path = queue.path.clone();
+                drop(queue);
+                std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+                let reopened = OperationQueue::open(path);
+                if version == 37 && channel.ends_with("created") {
+                    assert!(
+                        reopened.is_ok(),
+                        "Reine V8-Anlagehistorie bleibt am ContentSync erhalten"
+                    );
+                } else {
+                    let error = reopened.err().expect(channel);
+                    assert_eq!(
+                        error.kind(),
+                        io::ErrorKind::InvalidData,
+                        "{version}/{channel}: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn created_directory_ui_wire_fixtures_use_shared_serde_types() {
+        use crate::created_directory_dacl::*;
+        let (_area, queue, _entry, intent) = created_directory_dacl_queue_fixture();
+        intent.finish(false).unwrap();
+        drop(intent);
+        let mut legacy = queue.snapshot().entries.remove(0);
+        let QueueOperation::ContentSync {
+            options,
+            expected_plan,
+            ..
+        } = &legacy.operation
+        else {
+            panic!()
+        };
+        let crate::Action::CreateDir {
+            metadata: Some(metadata),
+            ..
+        } = &expected_plan.actions[0]
+        else {
+            panic!()
+        };
+        let Some(crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryExact(selection)) =
+            &metadata.windows_dacl
+        else {
+            panic!()
+        };
+        let selection = selection.as_ref().clone();
+        let mut preview = crate::ContentSyncPreview {
+            execution_class: crate::sync::SyncExecutionClass::BestEffort,
+            source_root: "/source".into(),
+            target_root: "/pane".into(),
+            source_provider: crate::ProviderKind::Smb,
+            target_provider: crate::ProviderKind::Smb,
+            source_identity: crate::file_dacl::tests::identity("/source"),
+            target_identity: crate::file_dacl::tests::identity("/pane"),
+            options: options.clone(),
+            plan: expected_plan.as_ref().clone(),
+            digest: [7; 32],
+            expires_unix_ms: 1_900_000_000_000,
+            limitations: vec![],
+            quarantined_replacements: 0,
+            quarantined_removals: 0,
+            quarantine_run: None,
+            restore_probe_ok: false,
+            local_execution: None,
+            irreversible_replacements: 0,
+            irreversible_removals: 0,
+            irreversible_removal_bytes: 0,
+            blocked_removals: 0,
+            removal_confirmation: None,
+            directory_stream_effects: vec![],
+            directory_dacl_effects: vec![],
+            file_dacl_effects: vec![],
+            created_directory_dacl_effects: vec![CreatedDirectoryDaclPreviewEffect {
+                directory: "/pane/a".into(),
+                selection,
+            }],
+            created_directory_before_children_effects: vec![],
+        };
+        let legacy_preview = serde_json::to_value(&preview).unwrap();
+        assert!(legacy_preview
+            .get("created_directory_before_children_effects")
+            .is_none());
+        let old_effect = created_directory_dacl_effect_fixture();
+        let make_report = |effect: &CreatedDirectoryDaclPlan, ordinary, uncertain| {
+            let mut report = CreatedDirectoryDaclReport::default();
+            report.observe_created(CreatedDirectoryObservation {
+                effect_key: CreatedDirectoryEffectKey {
+                    origin: effect.origin,
+                    directory: "/pane/a".into(),
+                    file_id: effect.file_id,
+                    object_namespace: effect.object_namespace,
+                },
+                ordinary_metadata_applied: ordinary,
+            });
+            if uncertain {
+                report.uncertain.push(effect.outcome("/pane/a").unwrap());
+            } else {
+                report.completed.push(effect.outcome("/pane/a").unwrap());
+            }
+            report
+        };
+        legacy.state = QueueState::Completed;
+        legacy.created_directory_dacl_report = make_report(&old_effect, true, false);
+        legacy.progress.created_directory_dacl_report =
+            legacy.created_directory_dacl_report.clone();
+        let mut current = legacy.clone();
+        let QueueOperation::ContentSync { expected_plan, .. } = &mut current.operation else {
+            panic!()
+        };
+        convert_before_children_plan(expected_plan);
+        let crate::Action::CreateDir { source_mtime, .. } = &mut expected_plan.actions[0] else {
+            panic!()
+        };
+        *source_mtime = Some(1_600_000_000);
+        preview.plan = expected_plan.as_ref().clone();
+        let crate::Action::CreateDir {
+            metadata: Some(metadata),
+            ..
+        } = &preview.plan.actions[0]
+        else {
+            panic!()
+        };
+        let Some(crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryBeforeChildrenExact(
+            selection,
+        )) = &metadata.windows_dacl
+        else {
+            panic!()
+        };
+        preview.created_directory_dacl_effects.clear();
+        preview.created_directory_before_children_effects.push(
+            CreatedDirectoryBeforeChildrenPreviewEffect {
+                directory: "/pane/a".into(),
+                selection: selection.as_ref().clone(),
+            },
+        );
+        let modern_preview = serde_json::to_value(&preview).unwrap();
+        assert!(modern_preview
+            .get("created_directory_dacl_effects")
+            .is_none());
+        assert!(
+            modern_preview["plan"]["actions"][0]["metadata"]["windows_dacl"]
+                .get("CreatedDirectoryBeforeChildrenExact")
+                .is_some()
+        );
+        let mut effect = old_effect;
+        effect.origin = CreatedDirectoryOrigin::ExclusiveMinimalCreateBeforeChildren;
+        effect.after = selection.after.clone();
+        current.created_directory_dacl_report = make_report(&effect, true, false);
+        current.progress.created_directory_dacl_report =
+            current.created_directory_dacl_report.clone();
+        let mut partial = current.clone();
+        partial.state = QueueState::Failed;
+        partial.error_code = Some(crate::ErrorCode::PlanDrift);
+        partial.created_directory_dacl_report = make_report(&effect, false, false);
+        partial.progress.created_directory_dacl_report =
+            partial.created_directory_dacl_report.clone();
+        let mut uncertain = partial.clone();
+        uncertain.state = QueueState::Interrupted;
+        uncertain.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+        uncertain.created_directory_dacl_recovery = true;
+        uncertain.created_directory_dacl_report = make_report(&effect, false, true);
+        uncertain.progress.created_directory_dacl_report =
+            uncertain.created_directory_dacl_report.clone();
+        let mut prepared = uncertain.clone();
+        prepared.created_directory_dacl_report.completed.clear();
+        prepared.created_directory_dacl_report.uncertain.clear();
+        prepared.progress.created_directory_dacl_report =
+            prepared.created_directory_dacl_report.clone();
+        let mut prepared_without_history = prepared.clone();
+        prepared_without_history.created_directory_dacl_report = Default::default();
+        prepared_without_history
+            .progress
+            .created_directory_dacl_report = Default::default();
+        let mut time_omission = partial.clone();
+        time_omission.state = QueueState::Completed;
+        time_omission.error_code = None;
+        let mut stats = crate::SyncStats {
+            files_copied: 2,
+            bytes_copied: 59,
+            created_directory_dacl_report: Box::new(
+                time_omission.created_directory_dacl_report.clone(),
+            ),
+            ..Default::default()
+        };
+        stats.metadata_report.profile = crate::MetadataProfile::NativeBestEffort;
+        crate::content_sync::record_mtime_omission(
+            &mut stats.metadata_report,
+            "a",
+            crate::content_sync::mtime_omission_reason(
+                &crate::content_sync::mtime_privilege_omission("Konkrete OPEN-Absage vor SET"),
+            )
+            .unwrap()
+            .clone(),
+        );
+        let fixtures = serde_json::json!({
+            "purpose": "Serde-Formen für kontrollierte UI-Brücken; keine Backend-Ausführungsbefugnis",
+            "v7_preview": legacy_preview, "v8_preview": modern_preview,
+            "v7_queue_completed": legacy, "v8_queue_completed": current,
+            "v8_queue_child_error": partial, "v8_queue_uncertain": uncertain,
+            "v8_queue_prepared_recovery": prepared, "v8_queue_prepared_without_history": prepared_without_history,
+            "v8_queue_time_omission": time_omission, "v8_time_omission_stats": stats,
+        });
+        assert_eq!(
+            fixtures["v7_queue_completed"]["created_directory_dacl_report"]["completed"][0]
+                ["origin"],
+            "ExclusiveMinimalCreate"
+        );
+        assert_eq!(
+            fixtures["v8_queue_completed"]["created_directory_dacl_report"]["completed"][0]
+                ["origin"],
+            "ExclusiveMinimalCreateBeforeChildren"
+        );
+        assert_eq!(
+            fixtures["v8_queue_child_error"]["created_directory_dacl_report"]["created"][0]
+                ["ordinary_metadata_applied"],
+            false
+        );
+        println!(
+            "CREATED_DIRECTORY_UI_WIRE_FIXTURES_JSON={}",
+            serde_json::to_string(&fixtures).unwrap()
+        );
+    }
+
+    #[test]
+    fn before_children_changed_preview_can_wait_without_v8_in_old_plan() {
+        let (_area, queue, _entry, intent) = created_directory_dacl_queue_fixture();
+        intent.finish(false).unwrap();
+        drop(intent);
+        let mut snapshot = queue.snapshot();
+        let entry = &mut snapshot.entries[0];
+        let QueueOperation::ContentSync { expected_plan, .. } = &entry.operation else {
+            panic!()
+        };
+        let mut current_plan = expected_plan.clone();
+        convert_before_children_plan(&mut current_plan);
+        entry.state = QueueState::AwaitingConfirmation;
+        entry.attention = Some(QueueAttention::PlanChanged {
+            reason: "neue Anlage im frischen Vergleich".into(),
+            confirmation: "prüfen".into(),
+            current_plan,
+        });
+        let path = queue.path.clone();
+        drop(queue);
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let reopened = OperationQueue::open(path).unwrap();
+        assert!(matches!(
+            reopened.snapshot().entries[0].attention,
+            Some(QueueAttention::PlanChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn before_children_payload_on_file_cannot_hide_beside_valid_created_directory() {
+        let (_area, queue, _entry, intent) = created_directory_dacl_queue_fixture();
+        intent.finish(false).unwrap();
+        drop(intent);
+        let mut snapshot = queue.snapshot();
+        let QueueOperation::ContentSync { expected_plan, .. } = &mut snapshot.entries[0].operation
+        else {
+            panic!()
+        };
+        convert_before_children_plan(expected_plan);
+        let crate::Action::CreateDir { metadata, .. } = &expected_plan.actions[0] else {
+            panic!()
+        };
+        expected_plan.actions.push(crate::Action::CopyFile {
+            path: "foreign-file".into(),
+            size: 0,
+            source_mtime: None,
+            source_mode: None,
+            source_hash: None,
+            metadata: metadata.clone(),
+        });
+        let path = queue.path.clone();
+        drop(queue);
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert_eq!(
+            OperationQueue::open(path)
+                .err()
+                .expect("V8 ist auf jeder einzelnen Wirkung CreateDir-gebunden")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn before_children_prepared_recovery_requires_j37_and_original_plan() {
+        use crate::created_directory_dacl::*;
+        for (version, matching, closed_before, profile, accepted) in [
+            (
+                36,
+                false,
+                false,
+                crate::MetadataProfile::NativeBestEffort,
+                false,
+            ),
+            (
+                36,
+                false,
+                true,
+                crate::MetadataProfile::NativeBestEffort,
+                false,
+            ),
+            (
+                37,
+                false,
+                false,
+                crate::MetadataProfile::NativeBestEffort,
+                false,
+            ),
+            (
+                37,
+                true,
+                false,
+                crate::MetadataProfile::NativeBestEffort,
+                true,
+            ),
+            (37, true, false, crate::MetadataProfile::NativeStrict, false),
+            (37, true, false, crate::MetadataProfile::Portable, false),
+            (
+                37,
+                false,
+                true,
+                crate::MetadataProfile::NativeBestEffort,
+                true,
+            ),
+        ] {
+            let (_area, queue, entry, old) = created_directory_dacl_queue_fixture();
+            old.finish(false).unwrap();
+            drop(old);
+            let mut plan = created_directory_dacl_effect_fixture();
+            plan.origin = CreatedDirectoryOrigin::ExclusiveMinimalCreateBeforeChildren;
+            let crate::windows_security::WindowsDaclState::Acl { aces, .. } = &mut plan.after.state
+            else {
+                panic!()
+            };
+            let crate::windows_security::WindowsAce::Allow { mask, .. } = &mut aces[0] else {
+                panic!()
+            };
+            *mask = 0x0016_01e7;
+            let intent = crate::created_directory_dacl_registry::Intent::create(
+                &crate::local_staging::StagingOwner {
+                    queue: queue.path.clone(),
+                    operation: entry.operation_id.clone(),
+                },
+                Path::new("/pane/a"),
+                &plan,
+                &crate::file_dacl::tests::identity("/pane"),
+                [2; 32],
+                &CreatedDirectoryRootScope {
+                    object_namespace: plan.object_namespace,
+                    root_file_id: 1,
+                    ancestor_file_ids: vec![100],
+                },
+            )
+            .unwrap();
+            assert!(intent.report().is_empty());
+            let mut snapshot = queue.snapshot();
+            snapshot.version = version;
+            if matching {
+                let QueueOperation::ContentSync { expected_plan, .. } =
+                    &mut snapshot.entries[0].operation
+                else {
+                    panic!()
+                };
+                convert_before_children_plan(expected_plan);
+                expected_plan.metadata_report.profile = profile;
+            }
+            if closed_before {
+                intent.finish(false).unwrap();
+            }
+            let path = queue.path.clone();
+            drop(intent);
+            drop(queue);
+            std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            let result = OperationQueue::open(path);
+            if accepted {
+                let reopened = result.unwrap();
+                let entry = &reopened.snapshot().entries[0];
+                assert_eq!(entry.created_directory_dacl_recovery, !closed_before);
+                assert!(entry.created_directory_dacl_report.is_empty());
+            } else {
+                assert_eq!(
+                    result
+                        .err()
+                        .expect("V8-Prepared darf nicht ungebunden migrieren")
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn created_directory_creation_history_survives_cancel_retry_new_plan_confirm_reload() {
+        assert_created_directory_history_reload(false);
+    }
+    #[test]
+    fn before_children_creation_history_survives_cancel_retry_new_plan_confirm_reload() {
+        assert_created_directory_history_reload(true);
+    }
+    fn assert_created_directory_history_reload(before_children: bool) {
+        let (_area, queue, entry, intent) = created_directory_dacl_queue_fixture();
+        intent.finish(false).unwrap();
+        drop(intent);
+        let mut report = crate::created_directory_dacl::CreatedDirectoryDaclReport::default();
+        report.observe_created(crate::created_directory_dacl::CreatedDirectoryObservation {
+            effect_key: crate::created_directory_dacl::CreatedDirectoryEffectKey {
+                origin: if before_children { crate::created_directory_dacl::CreatedDirectoryOrigin::ExclusiveMinimalCreateBeforeChildren } else { crate::created_directory_dacl::CreatedDirectoryOrigin::ExclusiveMinimalCreate },
+                directory: "/pane/a".into(),
+                file_id: 42,
+                object_namespace: created_directory_dacl_effect_fixture().object_namespace,
+            },
+            ordinary_metadata_applied: !before_children,
+        });
+        queue
+            .cancel(
+                &entry.operation_id,
+                Progress {
+                    created_directory_dacl_report: report.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        queue.retry(&entry.operation_id).unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        assert_eq!(claimed.operation_id, entry.operation_id);
+        let mut new_plan = SyncPlan::default();
+        new_plan.metadata_report.profile = crate::MetadataProfile::NativeBestEffort;
+        let attention = QueueAttention::PlanChanged {
+            reason: "A existiert nach dem Abbruch".into(),
+            confirmation: "prüfen".into(),
+            current_plan: Box::new(new_plan),
+        };
+        queue
+            .require_confirmation(&entry.operation_id, attention.clone())
+            .unwrap();
+        queue
+            .approve_attention_effects(&entry.operation_id, &attention, true)
+            .unwrap();
+        let path = queue.path.clone();
+        drop(queue);
+        let queue = OperationQueue::open(path).unwrap();
+        let entry = &queue.snapshot().entries[0];
+        assert_eq!(entry.created_directory_dacl_report, report);
+        assert!(!entry.created_directory_dacl_recovery);
+        assert!(!operation_sync_plan(&entry.operation)
+            .unwrap()
+            .actions
+            .iter()
+            .any(created_directory_action));
+    }
+
+    #[test]
+    fn created_directory_dacl_new_fields_require_queue_journal_version_36() {
+        for kind in ["action", "report", "progress", "recovery"] {
+            let (_area, queue, _entry, intent) = created_directory_dacl_queue_fixture();
+            intent.finish(false).unwrap();
+            drop(intent);
+            let mut snapshot = queue.snapshot();
+            snapshot.version = 35;
+            let entry = &mut snapshot.entries[0];
+            let outcome = created_directory_dacl_effect_fixture()
+                .outcome("/pane/a")
+                .unwrap();
+            if kind != "action" {
+                entry.operation = file_operation("forged-v7");
+            }
+            match kind {
+                "action" => {}
+                "report" => entry.created_directory_dacl_report.uncertain.push(outcome),
+                "progress" => entry
+                    .progress
+                    .created_directory_dacl_report
+                    .uncertain
+                    .push(outcome),
+                "recovery" => entry.created_directory_dacl_recovery = true,
+                _ => unreachable!(),
+            }
+            let path = queue.path.clone();
+            drop(queue);
+            std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            let error = OperationQueue::open(path).err().expect(kind);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("Neuordner"), "{kind}: {error}");
+        }
+    }
+
+    #[test]
+    fn file_dacl_cancel_after_applied_keeps_recovery_and_repairs_terminal_reload() {
+        use crate::file_dacl_registry::Phase;
+        for terminal in [QueueState::Cancelled, QueueState::Completed] {
+            let (_area, queue, entry, intent) = file_dacl_queue_fixture();
+            intent.phase(Phase::Applying).unwrap();
+            intent.phase(Phase::Applied).unwrap();
+            let report = intent.report();
+            let progress = Progress {
+                file_dacl_report: report.clone(),
+                phase: "metadata".into(),
+                ..Default::default()
+            };
+            queue
+                .update_progress(&entry.operation_id, &progress)
+                .unwrap();
+            let paths = vec![
+                "/pane/a".into(),
+                intent.path().to_string_lossy().into_owned(),
+            ];
+            queue
+                .finish_with_directory_stream_report(
+                    &entry.operation_id,
+                    terminal,
+                    progress,
+                    None,
+                    &paths,
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .unwrap();
+            let current = queue.snapshot().entries.remove(0);
+            assert_eq!(current.state, QueueState::Interrupted);
+            assert!(current.file_dacl_recovery);
+            assert!(queue.ftps_owner(Some(&entry.operation_id)).is_ok());
+            assert_eq!(current.file_dacl_report, report);
+            assert!(queue.retry(&entry.operation_id).is_err());
+            assert!(queue
+                .acknowledge_unclear_outcome(&entry.operation_id, true)
+                .is_err());
+            queue
+                .update(&entry.operation_id, |entry| {
+                    entry.state = terminal;
+                    entry.file_dacl_recovery = false;
+                    entry.error_code = None;
+                    Ok(())
+                })
+                .unwrap();
+            let path = queue.path.clone();
+            drop(intent);
+            drop(queue);
+            let queue = OperationQueue::open(path).unwrap();
+            let current = queue.snapshot().entries.remove(0);
+            assert_eq!(current.state, QueueState::Interrupted);
+            assert!(current.file_dacl_recovery);
+            assert!(queue.ftps_owner(Some(&entry.operation_id)).is_ok());
+            assert_eq!(current.file_dacl_report, report);
+        }
+    }
+    #[test]
+    fn file_dacl_failed_queue_checkpoint_cannot_retire_direct_closed_proof() {
+        use crate::file_dacl_registry::Phase;
+        let (_area, queue, entry, intent) = file_dacl_queue_fixture();
+        intent.phase(Phase::Applying).unwrap();
+        intent.phase(Phase::Applied).unwrap();
+        let report = intent.report();
+        queue
+            .fail_nonterminal_progress_update_after
+            .store(0, Ordering::SeqCst);
+        assert!(queue
+            .update_progress(
+                &entry.operation_id,
+                &Progress {
+                    file_dacl_report: report.clone(),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        intent.finish(true).unwrap();
+        drop(intent);
+        let recovered =
+            crate::file_dacl_registry::recover_queue(&queue.path, &queue._process_lock.root)
+                .unwrap();
+        assert_eq!(recovered[0].file_dacl_report, report);
+        let path = queue.path.clone();
+        drop(queue);
+        let queue = OperationQueue::open(path).unwrap();
+        assert_eq!(queue.snapshot().entries[0].file_dacl_report, report);
+        // Erst das beim Reopen dauerhaft reparierte Queuejournal gibt den Beleg frei.
+        assert!(
+            crate::file_dacl_registry::recover_queue(&queue.path, &queue._process_lock.root)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn created_directory_dacl_cancel_after_applied_keeps_recovery_and_repairs_terminal_reload() {
+        use crate::created_directory_dacl_registry::Phase;
+        for terminal in [QueueState::Cancelled, QueueState::Completed] {
+            let (_area, queue, entry, intent) = created_directory_dacl_queue_fixture();
+            intent.phase(Phase::Applying).unwrap();
+            intent.phase(Phase::Applied).unwrap();
+            let report = intent.report();
+            let progress = Progress {
+                created_directory_dacl_report: report.clone(),
+                phase: "metadata".into(),
+                ..Default::default()
+            };
+            queue
+                .update_progress(&entry.operation_id, &progress)
+                .unwrap();
+            let paths = vec![
+                "/pane/a".into(),
+                intent.path().to_string_lossy().into_owned(),
+            ];
+            queue
+                .finish_with_directory_stream_report(
+                    &entry.operation_id,
+                    terminal,
+                    progress,
+                    None,
+                    &paths,
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .unwrap();
+            let current = queue.snapshot().entries.remove(0);
+            assert_eq!(current.state, QueueState::Interrupted);
+            assert!(current.created_directory_dacl_recovery);
+            assert!(queue.ftps_owner(Some(&entry.operation_id)).is_ok());
+            assert_eq!(current.created_directory_dacl_report, report);
+            assert!(queue.retry(&entry.operation_id).is_err());
+            assert!(queue
+                .acknowledge_unclear_outcome(&entry.operation_id, true)
+                .is_err());
+            queue
+                .update(&entry.operation_id, |entry| {
+                    entry.state = terminal;
+                    entry.created_directory_dacl_recovery = false;
+                    entry.error_code = None;
+                    Ok(())
+                })
+                .unwrap();
+            let path = queue.path.clone();
+            drop(intent);
+            drop(queue);
+            let queue = OperationQueue::open(path).unwrap();
+            let current = queue.snapshot().entries.remove(0);
+            assert_eq!(current.state, QueueState::Interrupted);
+            assert!(current.created_directory_dacl_recovery);
+            assert!(queue.ftps_owner(Some(&entry.operation_id)).is_ok());
+            assert_eq!(current.created_directory_dacl_report, report);
+        }
+    }
+    #[test]
+    fn created_directory_dacl_failed_queue_checkpoint_cannot_retire_direct_closed_proof() {
+        use crate::created_directory_dacl_registry::Phase;
+        let (_area, queue, entry, intent) = created_directory_dacl_queue_fixture();
+        intent.phase(Phase::Applying).unwrap();
+        intent.phase(Phase::Applied).unwrap();
+        let report = intent.report();
+        queue
+            .fail_nonterminal_progress_update_after
+            .store(0, Ordering::SeqCst);
+        assert!(queue
+            .update_progress(
+                &entry.operation_id,
+                &Progress {
+                    created_directory_dacl_report: report.clone(),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        intent.finish(true).unwrap();
+        drop(intent);
+        let recovered = crate::created_directory_dacl_registry::recover_queue(
+            &queue.path,
+            &queue._process_lock.root,
+        )
+        .unwrap();
+        assert_eq!(recovered[0].created_directory_dacl_report, report);
+        let path = queue.path.clone();
+        drop(queue);
+        let queue = OperationQueue::open(path).unwrap();
+        assert_eq!(
+            queue.snapshot().entries[0].created_directory_dacl_report,
+            report
+        );
+        // Erst das beim Reopen dauerhaft reparierte Queuejournal gibt den Beleg frei.
+        assert!(crate::created_directory_dacl_registry::recover_queue(
+            &queue.path,
+            &queue._process_lock.root
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    fn file_dacl_retired_a_and_before_b_ack_fixture(fail_commit: bool) {
+        use crate::file_dacl_registry::{Intent, Phase};
+        let (_area, queue, entry, intent) = file_dacl_queue_fixture();
+        intent.phase(Phase::Applying).unwrap();
+        intent.phase(Phase::Applied).unwrap();
+        let completed = intent.report();
+        queue
+            .update_progress(
+                &entry.operation_id,
+                &Progress {
+                    file_dacl_report: completed.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        intent.finish(true).unwrap();
+        drop(intent);
+        assert!(
+            crate::file_dacl_registry::recover_queue(&queue.path, &queue._process_lock.root)
+                .unwrap()
+                .is_empty()
+        );
+        let mut effect = crate::file_dacl::tests::plan();
+        effect.file_id = 43;
+        effect.target_proof = crate::file_dacl::tests::proof("b", 43);
+        effect.alias_scope.selected_paths = vec!["b".into()];
+        let owner = crate::local_staging::StagingOwner {
+            queue: queue.path.clone(),
+            operation: entry.operation_id.clone(),
+        };
+        let second = Intent::create(
+            &owner,
+            Path::new("/pane/b"),
+            &effect,
+            &crate::file_dacl::tests::identity("/pane"),
+            [2; 32],
+        )
+        .unwrap();
+        second.phase(Phase::Applying).unwrap();
+        let mut report = completed.clone();
+        report.merge(&second.report());
+        queue
+            .fail_coded(
+                &entry.operation_id,
+                Progress {
+                    file_dacl_report: report,
+                    ..Default::default()
+                },
+                &crate::coded_error(
+                    io::ErrorKind::ConnectionAborted,
+                    crate::ErrorCode::OutcomeUnclear,
+                    "Antwortverlust B",
+                ),
+            )
+            .unwrap();
+        drop(second);
+        let path = queue.path.clone();
+        drop(queue);
+        let queue = OperationQueue::open(path.clone()).unwrap();
+        assert_eq!(
+            queue.snapshot().entries[0].file_dacl_report.completed,
+            completed.completed
+        );
+        assert_eq!(
+            queue.snapshot().entries[0].file_dacl_report.uncertain.len(),
+            1
+        );
+        let mut readback = crate::file_dacl::tests::Readback::new(false);
+        readback.observed.as_mut().unwrap().file_id = 43;
+        let ack = crate::file_dacl_registry::acknowledge(
+            &owner,
+            &readback,
+            Path::new("/pane"),
+            [2; 32],
+            &queue._process_lock.root,
+        )
+        .unwrap();
+        assert!(ack.report.is_empty());
+        let previous = queue.snapshot().entries[0].file_dacl_report.clone();
+        if fail_commit {
+            // Ausschließlich das isolierte Testjournal wird kurz durch einen
+            // Ordner ersetzt. So scheitert der echte atomare Queuewriter, während
+            // die vorherige dauerhafte Fassung für den Neustart erhalten bleibt.
+            let saved = path.with_extension("before-ack.json");
+            std::fs::rename(&path, &saved).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let error = crate::file_dacl_queue::commit_acknowledgement(
+                &queue,
+                &entry.operation_id,
+                &previous,
+                &ack,
+            )
+            .unwrap_err();
+            assert_eq!(crate::error::file_dacl_report(&error), completed);
+            assert_eq!(queue.snapshot().entries[0].file_dacl_report, previous);
+            assert!(queue.snapshot().entries[0].file_dacl_recovery);
+            let retained =
+                crate::file_dacl_registry::recover_queue(&queue.path, &queue._process_lock.root)
+                    .unwrap();
+            assert_eq!(retained[0].file_dacl_resolved.len(), 1);
+            assert!(retained[0].file_dacl_report.is_empty());
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(saved, &path).unwrap();
+        } else {
+            crate::file_dacl_queue::commit_acknowledgement(
+                &queue,
+                &entry.operation_id,
+                &previous,
+                &ack,
+            )
+            .unwrap();
+            assert_eq!(queue.snapshot().entries[0].file_dacl_report, completed);
+        }
+        drop(queue);
+        let queue = OperationQueue::open(path).unwrap();
+        assert_eq!(queue.snapshot().entries[0].file_dacl_report, completed);
+        assert!(!queue.snapshot().entries[0].file_dacl_recovery);
+    }
+
+    #[test]
+    fn file_dacl_retired_a_and_recognized_before_b_keep_durable_total_report() {
+        file_dacl_retired_a_and_before_b_ack_fixture(false);
+    }
+
+    #[test]
+    fn file_dacl_failed_ack_commit_reports_retired_a_and_resolved_before_b() {
+        file_dacl_retired_a_and_before_b_ack_fixture(true);
+    }
+
+    fn created_directory_dacl_retired_a_and_before_b_ack_fixture(fail_commit: bool) {
+        use crate::created_directory_dacl_registry::{Intent, Phase};
+        let (_area, queue, entry, intent) = created_directory_dacl_queue_fixture();
+        intent.phase(Phase::Applying).unwrap();
+        intent.phase(Phase::Applied).unwrap();
+        let completed = intent.report();
+        queue
+            .update_progress(
+                &entry.operation_id,
+                &Progress {
+                    created_directory_dacl_report: completed.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        intent.finish(true).unwrap();
+        drop(intent);
+        assert!(crate::created_directory_dacl_registry::recover_queue(
+            &queue.path,
+            &queue._process_lock.root
+        )
+        .unwrap()
+        .is_empty());
+        let mut effect = created_directory_dacl_effect_fixture();
+        effect.file_id = 43;
+
+        let owner = crate::local_staging::StagingOwner {
+            queue: queue.path.clone(),
+            operation: entry.operation_id.clone(),
+        };
+        let second = Intent::create(
+            &owner,
+            Path::new("/pane/b"),
+            &effect,
+            &crate::file_dacl::tests::identity("/pane"),
+            [2; 32],
+            &crate::created_directory_dacl::CreatedDirectoryRootScope {
+                object_namespace: effect.object_namespace,
+                root_file_id: 1,
+                ancestor_file_ids: vec![100],
+            },
+        )
+        .unwrap();
+        second.phase(Phase::Applying).unwrap();
+        let mut report = completed.clone();
+        report.merge(&second.report());
+        queue
+            .fail_coded(
+                &entry.operation_id,
+                Progress {
+                    created_directory_dacl_report: report,
+                    ..Default::default()
+                },
+                &crate::coded_error(
+                    io::ErrorKind::ConnectionAborted,
+                    crate::ErrorCode::OutcomeUnclear,
+                    "Antwortverlust B",
+                ),
+            )
+            .unwrap();
+        drop(second);
+        let path = queue.path.clone();
+        drop(queue);
+        let queue = OperationQueue::open(path.clone()).unwrap();
+        assert_eq!(
+            queue.snapshot().entries[0]
+                .created_directory_dacl_report
+                .completed,
+            completed.completed
+        );
+        assert_eq!(
+            queue.snapshot().entries[0]
+                .created_directory_dacl_report
+                .uncertain
+                .len(),
+            1
+        );
+        let mut readback = crate::file_dacl::tests::Readback::new(false);
+        readback.observed.as_mut().unwrap().file_id = 43;
+        readback.observed.as_mut().unwrap().dacl = effect.before.clone();
+        let ack = crate::created_directory_dacl_registry::acknowledge(
+            &owner,
+            &readback,
+            Path::new("/pane"),
+            [2; 32],
+            &queue._process_lock.root,
+        )
+        .unwrap();
+        assert!(ack.report.is_empty());
+        let previous = queue.snapshot().entries[0]
+            .created_directory_dacl_report
+            .clone();
+        if fail_commit {
+            // Ausschließlich das isolierte Testjournal wird kurz durch einen
+            // Ordner ersetzt. So scheitert der echte atomare Queuewriter, während
+            // die vorherige dauerhafte Fassung für den Neustart erhalten bleibt.
+            let saved = path.with_extension("before-ack.json");
+            std::fs::rename(&path, &saved).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let error = crate::created_directory_dacl_queue::commit_acknowledgement(
+                &queue,
+                &entry.operation_id,
+                &previous,
+                &ack,
+            )
+            .unwrap_err();
+            assert_eq!(
+                crate::error::created_directory_dacl_report(&error),
+                completed
+            );
+            assert_eq!(
+                queue.snapshot().entries[0].created_directory_dacl_report,
+                previous
+            );
+            assert!(queue.snapshot().entries[0].created_directory_dacl_recovery);
+            let retained = crate::created_directory_dacl_registry::recover_queue(
+                &queue.path,
+                &queue._process_lock.root,
+            )
+            .unwrap();
+            assert_eq!(retained[0].created_directory_dacl_resolved.len(), 1);
+            assert!(retained[0].created_directory_dacl_report.is_empty());
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(saved, &path).unwrap();
+        } else {
+            crate::created_directory_dacl_queue::commit_acknowledgement(
+                &queue,
+                &entry.operation_id,
+                &previous,
+                &ack,
+            )
+            .unwrap();
+            assert_eq!(
+                queue.snapshot().entries[0].created_directory_dacl_report,
+                completed
+            );
+        }
+        drop(queue);
+        let queue = OperationQueue::open(path).unwrap();
+        assert_eq!(
+            queue.snapshot().entries[0].created_directory_dacl_report,
+            completed
+        );
+        assert!(!queue.snapshot().entries[0].created_directory_dacl_recovery);
+    }
+
+    #[test]
+    fn created_directory_dacl_retired_a_and_recognized_before_b_keep_durable_total_report() {
+        created_directory_dacl_retired_a_and_before_b_ack_fixture(false);
+    }
+
+    #[test]
+    fn created_directory_dacl_failed_ack_commit_reports_retired_a_and_resolved_before_b() {
+        created_directory_dacl_retired_a_and_before_b_ack_fixture(true);
+    }
+
+    #[test]
+    fn file_dacl_owner_can_be_reacquired_for_failed_intent_before_and_after_reload() {
+        use crate::file_dacl_registry::Phase;
+        let (_area, queue, entry, intent) = file_dacl_queue_fixture();
+        intent.phase(Phase::Applying).unwrap();
+        let progress = Progress {
+            file_dacl_report: intent.report(),
+            ..Default::default()
+        };
+        queue
+            .fail_coded(
+                &entry.operation_id,
+                progress,
+                &crate::coded_error(
+                    io::ErrorKind::ConnectionAborted,
+                    crate::ErrorCode::OutcomeUnclear,
+                    "Antwortverlust nach möglichem Datei-SET",
+                ),
+            )
+            .unwrap();
+        assert_eq!(queue.snapshot().entries[0].state, QueueState::Failed);
+        assert_eq!(
+            queue
+                .ftps_owner(Some(&entry.operation_id))
+                .unwrap()
+                .0
+                .operation,
+            entry.operation_id
+        );
+        let path = queue.path.clone();
+        drop(intent);
+        drop(queue);
+        let queue = OperationQueue::open(path).unwrap();
+        assert_eq!(queue.snapshot().entries[0].state, QueueState::Interrupted);
+        assert_eq!(
+            queue
+                .ftps_owner(Some(&entry.operation_id))
+                .unwrap()
+                .0
+                .operation,
+            entry.operation_id
+        );
+        queue
+            .update(&entry.operation_id, |entry| {
+                entry.file_dacl_recovery = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(queue.ftps_owner(Some(&entry.operation_id)).is_err());
+    }
+    #[test]
+    fn file_dacl_owner_recovery_flag_does_not_authorize_an_unrelated_file_operation() {
+        let area = tempfile::tempdir().unwrap();
+        let queue = OperationQueue::open(area.path().join("queue.json")).unwrap();
+        let entry = queue.enqueue_claimed(file_operation("unrelated")).unwrap();
+        queue.mark_running(&entry.operation_id).unwrap();
+        queue
+            .update(&entry.operation_id, |entry| {
+                entry.state = QueueState::Failed;
+                entry.file_dacl_recovery = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(queue.ftps_owner(Some(&entry.operation_id)).is_err());
+    }
+
+    #[test]
+    fn created_directory_dacl_owner_can_be_reacquired_for_failed_intent_before_and_after_reload() {
+        use crate::created_directory_dacl_registry::Phase;
+        let (_area, queue, entry, intent) = created_directory_dacl_queue_fixture();
+        intent.phase(Phase::Applying).unwrap();
+        let progress = Progress {
+            created_directory_dacl_report: intent.report(),
+            ..Default::default()
+        };
+        queue
+            .fail_coded(
+                &entry.operation_id,
+                progress,
+                &crate::coded_error(
+                    io::ErrorKind::ConnectionAborted,
+                    crate::ErrorCode::OutcomeUnclear,
+                    "Antwortverlust nach möglichem Datei-SET",
+                ),
+            )
+            .unwrap();
+        assert_eq!(queue.snapshot().entries[0].state, QueueState::Failed);
+        assert_eq!(
+            queue
+                .ftps_owner(Some(&entry.operation_id))
+                .unwrap()
+                .0
+                .operation,
+            entry.operation_id
+        );
+        let path = queue.path.clone();
+        drop(intent);
+        drop(queue);
+        let queue = OperationQueue::open(path).unwrap();
+        assert_eq!(queue.snapshot().entries[0].state, QueueState::Interrupted);
+        assert_eq!(
+            queue
+                .ftps_owner(Some(&entry.operation_id))
+                .unwrap()
+                .0
+                .operation,
+            entry.operation_id
+        );
+        queue
+            .update(&entry.operation_id, |entry| {
+                entry.created_directory_dacl_recovery = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(queue.ftps_owner(Some(&entry.operation_id)).is_err());
+    }
+    #[test]
+    fn created_directory_dacl_owner_recovery_flag_does_not_authorize_an_unrelated_file_operation() {
+        let area = tempfile::tempdir().unwrap();
+        let queue = OperationQueue::open(area.path().join("queue.json")).unwrap();
+        let entry = queue.enqueue_claimed(file_operation("unrelated")).unwrap();
+        queue.mark_running(&entry.operation_id).unwrap();
+        queue
+            .update(&entry.operation_id, |entry| {
+                entry.state = QueueState::Failed;
+                entry.created_directory_dacl_recovery = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(queue.ftps_owner(Some(&entry.operation_id)).is_err());
+    }
+
+    #[test]
+    fn file_dacl_prepared_empty_failure_requires_specific_recovery() {
+        let (_area, queue, entry, intent) = file_dacl_queue_fixture();
+        queue
+            .fail_coded(
+                &entry.operation_id,
+                Progress::default(),
+                &io::Error::other("vor SET"),
+            )
+            .unwrap();
+        let current = queue.snapshot().entries.remove(0);
+        assert!(current.file_dacl_recovery);
+        assert!(current.file_dacl_report.is_empty());
+        assert!(queue.retry(&entry.operation_id).is_err());
+        assert!(queue
+            .acknowledge_unclear_outcome(&entry.operation_id, true)
+            .is_err());
+        drop(intent);
+    }
+    #[test]
+    fn local_file_failure_does_not_acquire_file_dacl_recovery_without_its_plan() {
+        use std::os::unix::fs::PermissionsExt;
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let queue = OperationQueue::open(root.join("queue.json")).unwrap();
+        let entry = queue
+            .enqueue_claimed(file_operation("local-failure"))
+            .unwrap();
+        queue.mark_running(&entry.operation_id).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
+        queue
+            .fail_coded(
+                &entry.operation_id,
+                Progress::default(),
+                &io::Error::other("lokal"),
+            )
+            .unwrap();
+        assert!(!queue.snapshot().entries[0].file_dacl_recovery);
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn directory_dacl_cancel_after_applied_keeps_recovery_and_repairs_legacy_terminal_reload() {
+        use crate::local_staging::DirectoryDaclIntentPhase;
+        for terminal in [QueueState::Cancelled, QueueState::Completed] {
+            let (_temp, queue, entry, intent) = directory_dacl_queue_fixture();
+            intent.phase(DirectoryDaclIntentPhase::Applying).unwrap();
+            intent.phase(DirectoryDaclIntentPhase::Applied).unwrap();
+            let report = intent.report();
+            let paths = vec![
+                "/pane/folder".to_string(),
+                intent.path().to_string_lossy().into_owned(),
+            ];
+            let progress = Progress {
+                phase: "metadata".into(),
+                directory_dacl_report: report.clone(),
+                ..Default::default()
+            };
+            // Der synchrone Fortschrittscheckpoint liegt vor dem Cancel und dem
+            // noch ausstehenden Intentfinish, genau wie beim echten Queuecallback.
+            queue
+                .update_progress(&entry.operation_id, &progress)
+                .unwrap();
+            queue
+                .finish_with_directory_stream_report(
+                    &entry.operation_id,
+                    terminal,
+                    progress,
+                    None,
+                    &paths,
+                    &Default::default(),
+                    &report,
+                )
+                .unwrap();
+            let current = &queue.snapshot().entries[0];
+            assert_eq!(current.state, QueueState::Interrupted);
+            assert!(current.directory_dacl_recovery);
+            assert_eq!(current.error_code, Some(crate::ErrorCode::OutcomeUnclear));
+            assert_eq!(current.directory_dacl_report, report);
+            assert_eq!(current.temp_recovery_paths, paths);
+            assert!(queue.retry(&entry.operation_id).is_err());
+            assert!(queue
+                .acknowledge_unclear_outcome(&entry.operation_id, true)
+                .is_err());
+            // Ein bereits von einem älteren Stand gespeichertes Cancelled/Completed
+            // muss beim Neustart denselben explizit prüfbaren Zustand zurückerhalten.
+            queue
+                .update(&entry.operation_id, |entry| {
+                    entry.state = terminal;
+                    entry.directory_dacl_recovery = false;
+                    entry.error_code = None;
+                    Ok(())
+                })
+                .unwrap();
+            let path = queue.path.clone();
+            drop(intent);
+            drop(queue);
+            let reopened = OperationQueue::open(path).unwrap();
+            let current = &reopened.snapshot().entries[0];
+            assert_eq!(current.state, QueueState::Interrupted);
+            assert!(current.directory_dacl_recovery);
+            assert_eq!(current.directory_dacl_report, report);
+            assert_eq!(current.progress.directory_dacl_report, report);
+            assert_eq!(current.temp_recovery_paths, paths);
+            assert!(reopened.ftps_owner(Some(&entry.operation_id)).is_ok());
+        }
+    }
+
+    #[test]
+    fn directory_dacl_prepared_empty_failure_cannot_retry_ack_or_discard_before_fresh_recovery() {
+        let (_temp, queue, entry, intent) = directory_dacl_queue_fixture();
+        assert!(intent.report().is_empty());
+        queue
+            .fail_coded(
+                &entry.operation_id,
+                Progress::default(),
+                &crate::coded_error(
+                    io::ErrorKind::InvalidInput,
+                    crate::ErrorCode::ReplanRequired,
+                    "Validierung vor SET fehlgeschlagen",
+                ),
+            )
+            .unwrap();
+        let current = &queue.snapshot().entries[0];
+        assert!(current.directory_dacl_recovery);
+        assert!(current.directory_dacl_report.is_empty());
+        assert!(queue.retry(&entry.operation_id).is_err());
+        assert!(queue
+            .acknowledge_unclear_outcome(&entry.operation_id, true)
+            .is_err());
+        assert!(queue.discard_replan_required(&entry.operation_id).is_err());
+        let path = queue.path.clone();
+        drop(intent);
+        drop(queue);
+        let reopened = OperationQueue::open(path).unwrap();
+        let current = &reopened.snapshot().entries[0];
+        assert_eq!(current.state, QueueState::Interrupted);
+        assert!(current.directory_dacl_recovery);
+        assert!(current.directory_dacl_report.is_empty());
+        assert!(reopened.ftps_owner(Some(&entry.operation_id)).is_ok());
+    }
+
+    fn directory_stream_test_report() -> crate::directory_streams::DirectoryStreamReport {
+        use crate::directory_streams::{
+            DirectoryStreamEffect, DirectoryStreamOutcome, DirectoryStreamReport,
+        };
+        DirectoryStreamReport {
+            completed: vec![DirectoryStreamOutcome {
+                directory: "ordner".into(),
+                effect: DirectoryStreamEffect::Remove {
+                    before: crate::metadata::NamedBlobSummary {
+                        name: b"alt".to_vec(),
+                        value: crate::metadata::BlobSummary::from_bytes(b"inhalt"),
+                    },
+                },
+            }],
+            uncertain: vec![],
+        }
+    }
+
+    #[test]
+    fn verzeichnisstream_bilanz_bleibt_atomar_mit_terminalzustand_und_nach_reload() {
+        for cancelled in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("queue.json");
+            let queue = OperationQueue::open(&path).unwrap();
+            let entry = queue.enqueue_claimed(file_operation("stream")).unwrap();
+            queue.mark_running(&entry.operation_id).unwrap();
+            let report = directory_stream_test_report();
+            queue
+                .finish_with_directory_stream_report(
+                    &entry.operation_id,
+                    if cancelled {
+                        QueueState::Cancelled
+                    } else {
+                        QueueState::Completed
+                    },
+                    Progress::default(),
+                    None,
+                    &[],
+                    &report,
+                    &Default::default(),
+                )
+                .unwrap();
+            drop(queue);
+            let queue = OperationQueue::open(&path).unwrap();
+            assert_eq!(queue.snapshot().entries[0].directory_stream_report, report);
+            assert_eq!(
+                queue.snapshot().entries[0].state,
+                if cancelled {
+                    QueueState::Cancelled
+                } else {
+                    QueueState::Completed
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn verzeichnisstream_fehlerbilanz_sperrt_retry_und_ueberlebt_journalfehler() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("queue.json");
+        let queue = OperationQueue::open(&path).unwrap();
+        let entry = queue.enqueue_claimed(file_operation("stream")).unwrap();
+        let report = directory_stream_test_report();
+        let error =
+            crate::error::with_directory_stream_report(io::Error::other("Folgefehler"), &report);
+        let failure =
+            possible_mutation_progress_error(io::Error::other("Fortschritt"), &Err::<(), _>(error));
+        let combined =
+            failed_queue_error_commit(&failure, &io::Error::other("Abschluss"), "Commit");
+        assert_eq!(crate::error::directory_stream_report(&combined), report);
+        queue
+            .fail_coded(&entry.operation_id, Progress::default(), &combined)
+            .unwrap();
+        drop(queue);
+        let queue = OperationQueue::open(&path).unwrap();
+        assert_eq!(queue.snapshot().entries[0].directory_stream_report, report);
+        let retry = queue.retry(&entry.operation_id).unwrap_err();
+        assert_eq!(crate::error::directory_stream_report(&retry), report);
+    }
+
+    #[test]
+    fn verzeichnisstream_fortschritt_persistiert_sofort_und_stoppt_bei_fehler() {
+        for fail in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let queue = OperationQueue::open(temp.path().join("queue.json")).unwrap();
+            let entry = queue.enqueue_claimed(file_operation("stream")).unwrap();
+            queue.mark_running(&entry.operation_id).unwrap();
+            let cancel = Cancel::new();
+            let report = directory_stream_test_report();
+            let mut on_progress = |_: &Progress| {};
+            let mut tracker =
+                QueueProgress::new(&queue, &entry.operation_id, &cancel, &mut on_progress);
+            tracker.last_persist = Instant::now();
+            if fail {
+                queue.fail_nonterminal_progress_update_after_for_test(0);
+            }
+            tracker.report(&Progress {
+                phase: "metadata".into(),
+                directory_stream_report: report.clone(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                ..Default::default()
+            });
+            let (latest, failure) = tracker.finish();
+            assert_eq!(latest.directory_stream_report, report);
+            assert_eq!(cancel.is_cancelled(), fail);
+            if fail {
+                assert_eq!(
+                    crate::error::directory_stream_report(&failure.unwrap()),
+                    report
+                );
+            } else {
+                assert!(failure.is_none());
+                assert_eq!(queue.snapshot().entries[0].directory_stream_report, report);
+                let disk: QueueSnapshot =
+                    serde_json::from_slice(&std::fs::read(&queue.path).unwrap()).unwrap();
+                assert_eq!(disk.entries[0].directory_stream_report, report);
+            }
+        }
+    }
+
+    #[test]
+    fn verzeichnisstream_terminalfehler_verliert_dauerhaften_fortschrittsbeleg_nicht() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("queue.json");
+        let queue = OperationQueue::open(&path).unwrap();
+        let entry = queue.enqueue_claimed(file_operation("stream")).unwrap();
+        queue.mark_running(&entry.operation_id).unwrap();
+        let report = directory_stream_test_report();
+        let progress = Progress {
+            directory_stream_report: report.clone(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
+            ..Default::default()
+        };
+        queue
+            .update_progress(&entry.operation_id, &progress)
+            .unwrap();
+        // Ein zuvor unklar gewordener Journalwrite sperrt auch den Abschluss.
+        queue.journal_outcome_unclear.store(true, Ordering::Release);
+        let error = queue
+            .finish_with_directory_stream_report(
+                &entry.operation_id,
+                QueueState::Completed,
+                progress,
+                None,
+                &[],
+                &report,
+                &Default::default(),
+            )
+            .unwrap_err();
+        assert_eq!(crate::error::directory_stream_report(&error), report);
+        drop(queue);
+        let queue = OperationQueue::open(&path).unwrap();
+        assert_eq!(queue.snapshot().entries[0].state, QueueState::Interrupted);
+        assert_eq!(queue.snapshot().entries[0].directory_stream_report, report);
+        assert!(queue.retry(&entry.operation_id).is_err());
+    }
+
+    #[test]
+    fn verzeichnisstream_legacy_eintrag_bleibt_json_identisch() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = OperationQueue::open(temp.path().join("queue.json")).unwrap();
+        let entry = queue.enqueue(file_operation("legacy")).unwrap();
+        let value = serde_json::to_value(entry).unwrap();
+        assert!(value.get("directory_stream_report").is_none());
+        let decoded: QueueEntry = serde_json::from_value(value.clone()).unwrap();
+        assert!(decoded.directory_stream_report.is_empty());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+    }
+
     #[test]
     fn unklarer_mutationsausgang_bleibt_nach_neustart_nicht_wiederholbar() {
         let temp = tempfile::tempdir().unwrap();
@@ -11587,6 +16056,16 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, state)| QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: format!("alt-fehler-{index}"),
                 operation: file_operation(&format!("alt-{index}")),
                 profile_bindings: Vec::new(),
@@ -11644,6 +16123,16 @@ mod tests {
             ..QueueSnapshot::default()
         };
         old.entries.push(QueueEntry {
+            file_incomplete: false,
+            generated_source: None,
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
+            archive_extract_report: None,
+            directory_dacl_recovery: false,
+            file_dacl_recovery: false,
+            created_directory_dacl_recovery: false,
             operation_id: "alt-lokal".into(),
             operation: file_operation("alt"),
             profile_bindings: Vec::new(),
@@ -11680,6 +16169,16 @@ mod tests {
             paused: false,
             stop_on_error: false,
             entries: vec![QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: "alt-webdav".into(),
                 operation: webdav_delete_operation(),
                 profile_bindings: Vec::new(),
@@ -11740,6 +16239,16 @@ mod tests {
             paused: false,
             stop_on_error: false,
             entries: vec![QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: "v17-headerlos".into(),
                 operation,
                 profile_bindings: Vec::new(),
@@ -11784,6 +16293,16 @@ mod tests {
             paused: false,
             stop_on_error: false,
             entries: vec![QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: "v18-bereits-stillgelegt".into(),
                 operation,
                 profile_bindings: Vec::new(),
@@ -11832,6 +16351,16 @@ mod tests {
             };
             identity.root_etag = LEGACY_UNBOUND_WEBDAV_ETAG.into();
             QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: operation_id.into(),
                 operation,
                 profile_bindings: Vec::new(),
@@ -11913,6 +16442,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("queue.json");
         let entry = |operation_id: &str, state: QueueState, attempts| QueueEntry {
+            file_incomplete: false,
+            generated_source: None,
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
+            archive_extract_report: None,
+            directory_dacl_recovery: false,
+            file_dacl_recovery: false,
+            created_directory_dacl_recovery: false,
             operation_id: operation_id.into(),
             operation: webdav_delete_operation(),
             profile_bindings: Vec::new(),
@@ -12178,6 +16717,16 @@ mod tests {
             paused: false,
             stop_on_error: false,
             entries: vec![QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: "v19-replan".into(),
                 operation: webdav_delete_operation(),
                 profile_bindings: Vec::new(),
@@ -12218,6 +16767,16 @@ mod tests {
             stop_on_error: false,
             entries: vec![
                 QueueEntry {
+                    file_incomplete: false,
+                    generated_source: None,
+                    directory_stream_report: Default::default(),
+                    directory_dacl_report: Default::default(),
+                    file_dacl_report: Default::default(),
+                    created_directory_dacl_report: Default::default(),
+                    archive_extract_report: None,
+                    directory_dacl_recovery: false,
+                    file_dacl_recovery: false,
+                    created_directory_dacl_recovery: false,
                     operation_id: "laufend-webdav".into(),
                     operation: webdav_delete_operation(),
                     profile_bindings: Vec::new(),
@@ -12238,6 +16797,16 @@ mod tests {
                     bidirectional_completion_recovery: None,
                 },
                 QueueEntry {
+                    file_incomplete: false,
+                    generated_source: None,
+                    directory_stream_report: Default::default(),
+                    directory_dacl_report: Default::default(),
+                    file_dacl_report: Default::default(),
+                    created_directory_dacl_report: Default::default(),
+                    archive_extract_report: None,
+                    directory_dacl_recovery: false,
+                    file_dacl_recovery: false,
+                    created_directory_dacl_recovery: false,
                     operation_id: "fertig-webdav".into(),
                     operation: webdav_delete_operation(),
                     profile_bindings: Vec::new(),
@@ -12321,6 +16890,16 @@ mod tests {
             paused: false,
             stop_on_error: false,
             entries: vec![QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: "ungueltig-webdav".into(),
                 operation: webdav_delete_operation(),
                 profile_bindings: Vec::new(),
@@ -12368,6 +16947,16 @@ mod tests {
             stop_on_error: false,
             entries: vec![
                 QueueEntry {
+                    file_incomplete: false,
+                    generated_source: None,
+                    directory_stream_report: Default::default(),
+                    directory_dacl_report: Default::default(),
+                    file_dacl_report: Default::default(),
+                    created_directory_dacl_report: Default::default(),
+                    archive_extract_report: None,
+                    directory_dacl_recovery: false,
+                    file_dacl_recovery: false,
+                    created_directory_dacl_recovery: false,
                     operation_id: "alt-ersetzen".into(),
                     operation: replace,
                     profile_bindings: Vec::new(),
@@ -12384,6 +16973,16 @@ mod tests {
                     bidirectional_completion_recovery: None,
                 },
                 QueueEntry {
+                    file_incomplete: false,
+                    generated_source: None,
+                    directory_stream_report: Default::default(),
+                    directory_dacl_report: Default::default(),
+                    file_dacl_report: Default::default(),
+                    created_directory_dacl_report: Default::default(),
+                    archive_extract_report: None,
+                    directory_dacl_recovery: false,
+                    file_dacl_recovery: false,
+                    created_directory_dacl_recovery: false,
                     operation_id: "alt-neu".into(),
                     operation: file_operation("neu"),
                     profile_bindings: Vec::new(),
@@ -12445,6 +17044,16 @@ mod tests {
             paused: false,
             stop_on_error: false,
             entries: vec![QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: "v10-provider".into(),
                 operation: QueueOperation::ProviderFile {
                     source_tree_expected: None,
@@ -12511,6 +17120,16 @@ mod tests {
             paused: false,
             stop_on_error: false,
             entries: vec![QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: "v12-provider".into(),
                 operation: QueueOperation::ProviderFile {
                     source_tree_expected: None,
@@ -12577,6 +17196,16 @@ mod tests {
             paused: false,
             stop_on_error: false,
             entries: vec![QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: "v13-provider-move".into(),
                 operation: QueueOperation::ProviderFile {
                     source_tree_expected: None,
@@ -12915,10 +17544,20 @@ mod tests {
                 .chain(crate::atomic_file::staging_fault_tests::stages(&root))
                 .collect::<Vec<_>>();
             assert_eq!(stages.len(), 1);
-            let paths = vec![stages[0].to_string_lossy().into_owned()];
+            let paths = [stages[0].to_string_lossy().into_owned()];
             if mode == 2 {
                 let error = result.expect_err("Journalabschluss muss scheitern");
-                assert_eq!(crate::error::recovery_paths(&error), paths);
+                let actual = crate::error::recovery_paths(&error);
+                assert!(
+                    paths.iter().all(|path| actual.contains(path)),
+                    "bekannte Stagewurzel muss erhalten bleiben"
+                );
+                assert!(
+                    actual
+                        .iter()
+                        .all(|path| Path::new(path).starts_with(&stages[0])),
+                    "zusätzliche Hinweise bleiben im konkret betroffenen Stage"
+                );
                 assert!(sabotaged);
                 std::fs::remove_dir(&journal).unwrap();
                 std::fs::rename(&saved, &journal).unwrap();
@@ -12936,7 +17575,19 @@ mod tests {
                 drop(queue);
                 let reopened = OperationQueue::open(&journal).unwrap();
                 let snapshot = reopened.snapshot();
-                assert_eq!(snapshot.entries[0].temp_recovery_paths, paths);
+                assert!(
+                    paths
+                        .iter()
+                        .all(|path| snapshot.entries[0].temp_recovery_paths.contains(path)),
+                    "Queue-Reopen darf keinen bekannten Tempbeleg verlieren"
+                );
+                assert!(
+                    snapshot.entries[0]
+                        .temp_recovery_paths
+                        .iter()
+                        .all(|path| Path::new(path).starts_with(&stages[0])),
+                    "zusätzlicher registrierter Stagebeleg bleibt im betroffenen privaten Stage"
+                );
                 assert_eq!(
                     snapshot.entries[0].state,
                     if mode == 1 {
@@ -13533,6 +18184,385 @@ mod tests {
             .unwrap();
         assert!(queue.snapshot().paused);
         assert_eq!(queue.snapshot().entries[1].state, QueueState::Failed);
+    }
+
+    #[test]
+    fn attention_wirkung_verweigert_veralteten_plan_trotz_gleicher_phrase() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("queue.json");
+        let queue = OperationQueue::open(&path).unwrap();
+        let entry = queue
+            .enqueue(QueueOperation::Sync {
+                source: "/tmp/quelle".into(),
+                target: "/tmp/ziel".into(),
+                sandbox: None,
+                options: SyncOptions::default(),
+                expected_plan: Box::default(),
+            })
+            .unwrap();
+        queue.claim_next().unwrap().unwrap();
+        let expected = QueueAttention::PlanChanged {
+            reason: "Neuer Plan".into(),
+            confirmation: "gleiche-backendphrase".into(),
+            current_plan: Box::default(),
+        };
+        queue
+            .require_confirmation(&entry.operation_id, expected.clone())
+            .unwrap();
+        let mut fresh = expected.clone();
+        if let QueueAttention::PlanChanged { current_plan, .. } = &mut fresh {
+            current_plan.comparison.categories.additions = 7;
+        }
+        queue
+            .update(&entry.operation_id, |entry| {
+                entry.attention = Some(fresh.clone());
+                Ok(())
+            })
+            .unwrap();
+        let before = queue.snapshot();
+        assert_eq!(
+            crate::error_code(
+                &queue
+                    .approve_attention_effects(&entry.operation_id, &expected, true)
+                    .unwrap_err()
+            ),
+            crate::ErrorCode::PlanDrift
+        );
+        assert_eq!(queue.snapshot(), before);
+        assert_eq!(
+            crate::error_code(
+                &queue
+                    .approve_attention_effects(&entry.operation_id, &fresh, false)
+                    .unwrap_err()
+            ),
+            crate::ErrorCode::ConfirmationMismatch
+        );
+        assert_eq!(queue.snapshot(), before);
+        queue
+            .approve_attention_effects(&entry.operation_id, &fresh, true)
+            .unwrap();
+        let approved = queue.snapshot();
+        assert_eq!(approved.entries[0].state, QueueState::Pending);
+        let QueueOperation::Sync { expected_plan, .. } = &approved.entries[0].operation else {
+            panic!("Sync fehlt");
+        };
+        assert_eq!(expected_plan.comparison.categories.additions, 7);
+        drop(queue);
+        assert_eq!(OperationQueue::open(path).unwrap().snapshot(), approved);
+    }
+
+    #[test]
+    fn attention_wirkung_verlangt_den_angezeigten_konfliktinhalt() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let target = root.join("ziel");
+        std::fs::create_dir(&target).unwrap();
+        let file = target.join("datei");
+        std::fs::write(&file, b"urspruenglicher Inhalt").unwrap();
+        let conflicts = vec![file.to_string_lossy().into_owned()];
+        let proofs = capture_file_conflict_proofs(&LocalVfs::new(), &conflicts).unwrap();
+        let queue = OperationQueue::open(root.join("queue.json")).unwrap();
+        let entry = queue
+            .enqueue(QueueOperation::File {
+                kind: FileQueueKind::Copy,
+                items: vec![root.join("datei").to_string_lossy().into_owned()],
+                destination: target.to_string_lossy().into_owned(),
+                overwrite: true,
+                expected_conflicts: Vec::new(),
+                expected_conflict_proofs: Vec::new(),
+                keep_both_targets: Vec::new(),
+                local_replace_best_effort_expected: Some(false),
+                local_copy_new_best_effort_expected: None,
+            })
+            .unwrap();
+        queue.claim_next().unwrap().unwrap();
+        let actual = QueueAttention::ConflictsChanged {
+            reason: "Ein Ziel wird ersetzt".into(),
+            confirmation: "opaque".into(),
+            current_conflicts: conflicts.clone(),
+            current_conflict_proofs: proofs.clone(),
+        };
+        queue
+            .require_confirmation(&entry.operation_id, actual.clone())
+            .unwrap();
+        let mut stale = actual.clone();
+        if let QueueAttention::ConflictsChanged {
+            current_conflict_proofs,
+            ..
+        } = &mut stale
+        {
+            current_conflict_proofs[0].content_hash = Some([9; 32]);
+        }
+        assert!(queue
+            .approve_attention_effects(&entry.operation_id, &stale, true)
+            .is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"urspruenglicher Inhalt");
+        queue
+            .approve_attention_effects(&entry.operation_id, &actual, true)
+            .unwrap();
+        let QueueOperation::File {
+            expected_conflicts,
+            expected_conflict_proofs,
+            ..
+        } = &queue.snapshot().entries[0].operation
+        else {
+            panic!("Dateiauftrag fehlt");
+        };
+        assert_eq!(expected_conflicts, &conflicts);
+        assert_eq!(expected_conflict_proofs, &proofs);
+    }
+
+    #[test]
+    fn smb_namensgruppen_queue_beleg_bleibt_nach_neustart_gebunden() {
+        let area = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(area.path()).unwrap();
+        let source_root = root.join("quelle");
+        let target_root = root.join("zielattrappe");
+        std::fs::create_dir(&source_root).unwrap();
+        std::fs::create_dir(&target_root).unwrap();
+        for name in ["a", "A", "good"] {
+            std::fs::write(source_root.join(name), name).unwrap();
+        }
+        let items = ["a", "A", "good"].map(|name| source_root.join(name));
+        let source = ProviderEndpoint::local(&source_root).unwrap();
+        let target =
+            ProviderEndpoint::test_remote_local(crate::ProviderKind::Smb, &target_root).unwrap();
+        let tree = source
+            .interactive_file_contexts(&target, &items, false, false, &Cancel::new())
+            .unwrap()
+            .source_vfs
+            .interactive_source_tree()
+            .unwrap()
+            .unwrap();
+        assert_eq!((tree.files, tree.omitted.len()), (1, 2));
+        let QueueOperation::SmbSync { connection, .. } = smb_operation() else {
+            panic!("SMB-Testkonfiguration fehlt");
+        };
+        let operation = QueueOperation::ProviderFile {
+            kind: FileQueueKind::Copy,
+            source: local_bidirectional_endpoint(&source_root),
+            target: Box::new(BidirectionalQueueEndpoint::Smb {
+                connection,
+                root: "/ziel".into(),
+            }),
+            items: items
+                .iter()
+                .map(|path| path.to_str().unwrap().into())
+                .collect(),
+            destination: "/ziel".into(),
+            overwrite: false,
+            expected_conflicts: Vec::new(),
+            expected_conflict_proofs: Vec::new(),
+            keep_both_targets: Vec::new(),
+            source_tree_expected: Some(Box::new(tree.clone())),
+            best_effort_commit_expected: None,
+            local_copy_new_best_effort_expected: None,
+            copy_new_best_effort_expected: Some(false),
+            replace_best_effort_expected: Some(false),
+            remove_source_best_effort_expected: Some(false),
+        };
+        let journal = root.join("queue.json");
+        let queue = OperationQueue::open(&journal).unwrap();
+        let entry = queue.enqueue(operation.clone()).unwrap();
+        drop(queue);
+        let queue = OperationQueue::open(&journal).unwrap();
+        let restored = queue.claim_next().unwrap().unwrap();
+        assert_eq!(restored.operation_id, entry.operation_id);
+        let QueueOperation::ProviderFile {
+            source_tree_expected,
+            ..
+        } = restored.operation
+        else {
+            panic!("Providerauftrag fehlt");
+        };
+        assert_eq!(source_tree_expected.as_deref(), Some(&tree));
+        for (kind, overwrite) in [(FileQueueKind::Move, false), (FileQueueKind::Copy, true)] {
+            let mut invalid = operation.clone();
+            let QueueOperation::ProviderFile {
+                kind: actual_kind,
+                overwrite: actual_overwrite,
+                ..
+            } = &mut invalid
+            else {
+                unreachable!();
+            };
+            *actual_kind = kind;
+            *actual_overwrite = overwrite;
+            assert!(validate_operation(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn attention_wirkung_bindet_vollstaendigen_baum_und_best_effort_erwartungen() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = OperationQueue::open(temp.path().join("queue.json")).unwrap();
+        let QueueOperation::SftpSync { connection, .. } = sftp_operation() else {
+            panic!("SFTP-Konfiguration fehlt");
+        };
+        let entry = queue
+            .enqueue(QueueOperation::ProviderFile {
+                kind: FileQueueKind::Copy,
+                source: Box::new(BidirectionalQueueEndpoint::Sftp {
+                    connection,
+                    root: "/daten".into(),
+                }),
+                target: Box::new(BidirectionalQueueEndpoint::Local {
+                    root: "/tmp/ziel".into(),
+                }),
+                items: vec!["/daten/ordner".into()],
+                destination: "/tmp/ziel".into(),
+                overwrite: false,
+                expected_conflicts: Vec::new(),
+                expected_conflict_proofs: Vec::new(),
+                keep_both_targets: Vec::new(),
+                source_tree_expected: None,
+                best_effort_commit_expected: None,
+                local_copy_new_best_effort_expected: None,
+                copy_new_best_effort_expected: Some(false),
+                replace_best_effort_expected: Some(false),
+                remove_source_best_effort_expected: Some(false),
+            })
+            .unwrap();
+        queue.claim_next().unwrap().unwrap();
+        let tree = crate::vfs::InteractiveSourceTree {
+            digest: "ab".repeat(32),
+            entries: 3,
+            files: 1,
+            directories: 1,
+            bytes: 12,
+            omitted: vec![crate::vfs::SourceReadOmission {
+                path: "/daten/ordner/ausgelassen".into(),
+                reason: "Symlink".into(),
+            }],
+        };
+        let actual = QueueAttention::SourceTreeChanged {
+            reason: "Auswahl geändert".into(),
+            confirmation: "gleiche-phrase".into(),
+            current_tree: Some(Box::new(tree.clone())),
+        };
+        queue
+            .require_confirmation(&entry.operation_id, actual.clone())
+            .unwrap();
+        let mut stale = actual.clone();
+        if let QueueAttention::SourceTreeChanged {
+            current_tree: Some(tree),
+            ..
+        } = &mut stale
+        {
+            tree.omitted[0].reason = "andere Auslassung".into();
+        }
+        assert!(queue
+            .approve_attention_effects(&entry.operation_id, &stale, true)
+            .is_err());
+        queue
+            .approve_attention_effects(&entry.operation_id, &actual, true)
+            .unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let QueueOperation::ProviderFile {
+            source_tree_expected,
+            ..
+        } = claimed.operation
+        else {
+            panic!("Providerauftrag fehlt");
+        };
+        assert_eq!(source_tree_expected.as_deref(), Some(&tree));
+        let downgrade = QueueAttention::BestEffortCommitDowngrade {
+            reason: "Schwächere Wirkung".into(),
+            confirmation: "opaque".into(),
+            copy_new_best_effort: true,
+            replace_best_effort: false,
+            remove_source_best_effort: true,
+        };
+        queue
+            .require_confirmation(&entry.operation_id, downgrade.clone())
+            .unwrap();
+        queue
+            .approve_attention_effects(&entry.operation_id, &downgrade, true)
+            .unwrap();
+        let QueueOperation::ProviderFile {
+            copy_new_best_effort_expected,
+            remove_source_best_effort_expected,
+            ..
+        } = &queue.snapshot().entries[0].operation
+        else {
+            panic!("Providerauftrag fehlt");
+        };
+        assert_eq!(*copy_new_best_effort_expected, Some(true));
+        assert_eq!(*remove_source_best_effort_expected, Some(true));
+    }
+
+    #[test]
+    fn attention_wirkung_bindet_lokalen_root_und_umgeht_keinen_ram_oder_recoverystatus() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let queue = OperationQueue::open(root.join("queue.json")).unwrap();
+        let entry = queue.enqueue(file_operation("datei")).unwrap();
+        queue.claim_next().unwrap().unwrap();
+        let identity = LocalVfs::new().local_root_identity(&root).unwrap();
+        let actual = QueueAttention::LocalFileCommit {
+            reason: "Best Effort".into(),
+            confirmation: "opaque".into(),
+            target_identity: identity.clone(),
+        };
+        queue
+            .require_confirmation(&entry.operation_id, actual.clone())
+            .unwrap();
+        let mut stale = actual.clone();
+        if let QueueAttention::LocalFileCommit {
+            target_identity, ..
+        } = &mut stale
+        {
+            target_identity.inode += 1;
+        }
+        assert!(queue
+            .approve_attention_effects(&entry.operation_id, &stale, true)
+            .is_err());
+        queue
+            .approve_attention_effects(&entry.operation_id, &actual, true)
+            .unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let QueueOperation::File {
+            local_copy_new_best_effort_expected,
+            ..
+        } = claimed.operation
+        else {
+            panic!("Dateiauftrag fehlt");
+        };
+        assert_eq!(
+            local_copy_new_best_effort_expected.as_deref(),
+            Some(&identity)
+        );
+        let remote = QueueAttention::RemoteRun {
+            reason: "RAM-Permit nötig".into(),
+            confirmation: "opaque".into(),
+        };
+        queue
+            .require_confirmation(&entry.operation_id, remote.clone())
+            .unwrap();
+        let before = queue.snapshot();
+        assert!(queue
+            .approve_attention_effects(&entry.operation_id, &remote, true)
+            .is_err());
+        assert_eq!(queue.snapshot(), before);
+        queue
+            .update(&entry.operation_id, |entry| {
+                entry.attention = Some(QueueAttention::Manual {
+                    reason: "Recovery nötig".into(),
+                    confirmation: "opaque".into(),
+                });
+                entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+                Ok(())
+            })
+            .unwrap();
+        let before = queue.snapshot();
+        assert!(queue
+            .approve_attention_effects(
+                &entry.operation_id,
+                before.entries[0].attention.as_ref().unwrap(),
+                true
+            )
+            .is_err());
+        assert_eq!(queue.snapshot(), before);
     }
 
     #[test]
@@ -14402,8 +19432,17 @@ mod tests {
         let baseline_path = root.join("state/paar.json");
         let pair_id = PairId([77; 16]);
         let draft =
-            crate::prepare_local_bidirectional(pair_id, "Queuepaar", &left, &right, &baseline_path)
-                .unwrap();
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&baseline_path),
+                pair_id,
+                "Queuepaar",
+                &left,
+                &right,
+                &baseline_path,
+                &[],
+                None,
+            )
+            .unwrap();
         let baseline_digest = draft.preview().plan.baseline_digest;
         let plan_digest = draft.preview().plan.plan_digest;
         draft.discard().unwrap();
@@ -14465,15 +19504,18 @@ mod tests {
             path: crate::BinaryRelativePath(vec![b"datei.txt".to_vec()]),
             decision: crate::ConflictDecision::KeepLeft,
         }];
-        let draft = crate::prepare_local_bidirectional_with_decisions(
-            pair_id,
-            "Queuepaar",
-            &left,
-            &right,
-            &baseline_path,
-            &resolutions,
-        )
-        .unwrap();
+        let draft =
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&baseline_path),
+                pair_id,
+                "Queuepaar",
+                &left,
+                &right,
+                &baseline_path,
+                &resolutions,
+                None,
+            )
+            .unwrap();
         let baseline_digest = draft.preview().plan.baseline_digest;
         let plan_digest = draft.preview().plan.plan_digest;
         draft.discard().unwrap();
@@ -14549,15 +19591,18 @@ mod tests {
                     decision: crate::ConflictDecision::KeepRight,
                 },
             ];
-            let draft = crate::prepare_local_bidirectional_with_decisions(
-                pair_id,
-                "Recoverytest",
-                &left,
-                &right,
-                &baseline_path,
-                &resolutions,
-            )
-            .unwrap();
+            let draft =
+                crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                    &crate::bidirectional::strict_test_queue(&baseline_path),
+                    pair_id,
+                    "Recoverytest",
+                    &left,
+                    &right,
+                    &baseline_path,
+                    &resolutions,
+                    None,
+                )
+                .unwrap();
             let baseline_digest = draft.preview().plan.baseline_digest;
             let plan_digest = draft.preview().plan.plan_digest;
             draft.discard().unwrap();
@@ -14677,15 +19722,18 @@ mod tests {
                 decision: crate::ConflictDecision::KeepRight,
             },
         ];
-        let draft = crate::prepare_local_bidirectional_with_decisions(
-            pair_id,
-            "Mehrprojektion",
-            &left,
-            &right,
-            &baseline_path,
-            &resolutions,
-        )
-        .unwrap();
+        let draft =
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&baseline_path),
+                pair_id,
+                "Mehrprojektion",
+                &left,
+                &right,
+                &baseline_path,
+                &resolutions,
+                None,
+            )
+            .unwrap();
         let baseline_digest = draft.preview().plan.baseline_digest;
         let plan_digest = draft.preview().plan.plan_digest;
         draft.discard().unwrap();
@@ -14754,14 +19802,18 @@ mod tests {
         std::fs::create_dir(&right).unwrap();
 
         let resume_baseline = root.join("state/resume.json");
-        let prepared = crate::prepare_local_bidirectional(
-            PairId([80; 16]),
-            "Recovery beim Oeffnen",
-            &left,
-            &right,
-            &resume_baseline,
-        )
-        .unwrap();
+        let prepared =
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&resume_baseline),
+                PairId([80; 16]),
+                "Recovery beim Oeffnen",
+                &left,
+                &right,
+                &resume_baseline,
+                &[],
+                None,
+            )
+            .unwrap();
         let resume_operation = QueueOperation::Bidirectional {
             pair_id: PairId([80; 16]),
             pair_name: "Recovery beim Oeffnen".into(),
@@ -14850,14 +19902,18 @@ mod tests {
         std::fs::create_dir(&left).unwrap();
         std::fs::create_dir(&right).unwrap();
         let baseline_path = root.join("state/paar.json");
-        let prepared = crate::prepare_local_bidirectional(
-            PairId([82; 16]),
-            "Retry-Recovery",
-            &left,
-            &right,
-            &baseline_path,
-        )
-        .unwrap();
+        let prepared =
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&baseline_path),
+                PairId([82; 16]),
+                "Retry-Recovery",
+                &left,
+                &right,
+                &baseline_path,
+                &[],
+                None,
+            )
+            .unwrap();
         let queue_path = root.join("queue/queue.json");
         let queue = OperationQueue::open(&queue_path).unwrap();
         let entry = queue
@@ -14957,14 +20013,18 @@ mod tests {
         std::fs::create_dir(&left).unwrap();
         std::fs::create_dir(&right).unwrap();
         let baseline_path = root.join("state/paar.json");
-        let prepared = crate::prepare_local_bidirectional(
-            PairId([79; 16]),
-            "Recovery-Paar",
-            &left,
-            &right,
-            &baseline_path,
-        )
-        .unwrap();
+        let prepared =
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&baseline_path),
+                PairId([79; 16]),
+                "Recovery-Paar",
+                &left,
+                &right,
+                &baseline_path,
+                &[],
+                None,
+            )
+            .unwrap();
         let operation = QueueOperation::Bidirectional {
             pair_id: PairId([79; 16]),
             pair_name: "Recovery-Paar".into(),
@@ -15037,14 +20097,18 @@ mod tests {
         std::fs::create_dir(&left).unwrap();
         std::fs::create_dir(&right).unwrap();
         let baseline_path = root.join("state/paar.json");
-        let prepared = crate::prepare_local_bidirectional(
-            PairId([83; 16]),
-            "Generischer Abschluss",
-            &left,
-            &right,
-            &baseline_path,
-        )
-        .unwrap();
+        let prepared =
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&baseline_path),
+                PairId([83; 16]),
+                "Generischer Abschluss",
+                &left,
+                &right,
+                &baseline_path,
+                &[],
+                None,
+            )
+            .unwrap();
         let queue = OperationQueue::open(root.join("queue/queue.json")).unwrap();
         let entry = queue
             .enqueue_claimed(QueueOperation::Bidirectional {
@@ -15098,14 +20162,18 @@ mod tests {
         std::fs::create_dir(&right).unwrap();
         let baseline_path = root.join("state/paar.json");
         let pair_id = PairId([81; 16]);
-        let prepared = crate::prepare_local_bidirectional(
-            pair_id,
-            "Direktpaar",
-            &left,
-            &right,
-            &baseline_path,
-        )
-        .unwrap();
+        let prepared =
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&baseline_path),
+                pair_id,
+                "Direktpaar",
+                &left,
+                &right,
+                &baseline_path,
+                &[],
+                None,
+            )
+            .unwrap();
         let preview = prepared.preview().clone();
         let queue = OperationQueue::open(root.join("state/queue.json")).unwrap();
         let entry = queue
@@ -15290,6 +20358,16 @@ mod tests {
             paused: false,
             stop_on_error: false,
             entries: vec![QueueEntry {
+                file_incomplete: false,
+                generated_source: None,
+                directory_stream_report: Default::default(),
+                directory_dacl_report: Default::default(),
+                file_dacl_report: Default::default(),
+                created_directory_dacl_report: Default::default(),
+                archive_extract_report: None,
+                directory_dacl_recovery: false,
+                file_dacl_recovery: false,
+                created_directory_dacl_recovery: false,
                 operation_id: "ungueltig".into(),
                 operation: QueueOperation::Bidirectional {
                     pair_id: PairId([80; 16]),
@@ -15374,8 +20452,17 @@ mod tests {
         let baseline_path = root.join("state/paar.json");
         let pair_id = PairId([78; 16]);
         let draft =
-            crate::prepare_local_bidirectional(pair_id, "Driftpaar", &left, &right, &baseline_path)
-                .unwrap();
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&baseline_path),
+                pair_id,
+                "Driftpaar",
+                &left,
+                &right,
+                &baseline_path,
+                &[],
+                None,
+            )
+            .unwrap();
         let plan_digest = draft.preview().plan.plan_digest;
         draft.discard().unwrap();
         drop(draft);
@@ -16108,14 +21195,18 @@ mod tests {
         std::fs::create_dir(&left).unwrap();
         std::fs::create_dir(&right).unwrap();
         let baseline = root.join("state/paar.json");
-        let prepared = crate::prepare_local_bidirectional(
-            PairId([42; 16]),
-            "Verwerfen mit Laufjournal",
-            &left,
-            &right,
-            &baseline,
-        )
-        .unwrap();
+        let prepared =
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&baseline),
+                PairId([42; 16]),
+                "Verwerfen mit Laufjournal",
+                &left,
+                &right,
+                &baseline,
+                &[],
+                None,
+            )
+            .unwrap();
         let bidirectional_queue = OperationQueue::open(root.join("bidi/queue.json")).unwrap();
         let entry = bidirectional_queue
             .enqueue_claimed(QueueOperation::Bidirectional {
@@ -16812,4 +21903,660 @@ mod tests {
             run_queue_state_machine(&steps)?;
         }
     }
+    #[test]
+    fn strict_queue_owner_crash_child() {
+        let Some(root) = std::env::var_os("DOPPELDECKER_STRICT_OWNER_CRASH_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        assert_eq!(
+            std::fs::read(root.join("crash-marker")).unwrap(),
+            b"strict-owner"
+        );
+        let queue = OperationQueue::open(root.join("state/queue.json")).unwrap();
+        let entry = queue.claim_next().unwrap().unwrap();
+        let mut crash = |progress: &Progress| {
+            if progress.bytes_done > 0 {
+                assert_eq!(progress.files_done, 0);
+                assert!(!root.join("rechts/gross.bin").exists());
+                // Ein echter SIGKILL im ersten Dateiinhalt führt keine Destruktoren aus.
+                unsafe {
+                    libc::raise(libc::SIGKILL);
+                }
+                unreachable!("SIGKILL muss den Prozess beenden");
+            }
+        };
+        if std::env::var_os("DOPPELDECKER_STRICT_OWNER_DIRECT").is_some() {
+            let QueueOperation::Bidirectional {
+                pair_id,
+                pair_name,
+                left,
+                right,
+                baseline_path,
+                resolutions,
+                ..
+            } = &entry.operation
+            else {
+                panic!("Strictentry fehlt");
+            };
+            let preview = crate::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &queue,
+                *pair_id,
+                pair_name,
+                Path::new(left.root()),
+                Path::new(right.root()),
+                Path::new(baseline_path),
+                resolutions,
+                None,
+            )
+            .unwrap();
+            let prepared = reprepare_direct_bidirectional_queue_run(
+                &queue,
+                &entry.operation_id,
+                no_secrets(),
+                preview,
+            )
+            .unwrap();
+            queue.mark_running(&entry.operation_id).unwrap();
+            prepared
+                .confirm_effects(true)
+                .unwrap()
+                .execute(&Cancel::new(), &mut crash)
+                .unwrap();
+        } else {
+            let BidirectionalQueuePreparation::Ready(prepared) =
+                prepare_bidirectional_queue_entry(&queue, entry, no_secrets()).unwrap()
+            else {
+                panic!("Frischer Strictplan darf nicht driften");
+            };
+            execute_prepared_bidirectional_queue_entry_effects(
+                &queue,
+                *prepared,
+                true,
+                &Cancel::new(),
+                &mut crash,
+            )
+            .unwrap();
+        }
+        panic!("Der echte Transfer erreichte den Crashpunkt nicht");
+    }
+
+    #[test]
+    fn strict_queue_midfile_sigkill_ordnet_stage_nur_dem_echten_fenstereintrag_zu() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::ExitStatusExt;
+        for direct in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::local_fs::write_acl_exact(&root, None).unwrap();
+            let left = root.join("links");
+            let right = root.join("rechts");
+            std::fs::create_dir(&left).unwrap();
+            std::fs::create_dir(&right).unwrap();
+            std::fs::write(root.join("crash-marker"), b"strict-owner").unwrap();
+            let queue_path = root.join("state/queue.json");
+            let baseline = root.join("state/bidirectional/pair.json");
+            let queue = OperationQueue::open(&queue_path).unwrap();
+            let pair_id = PairId([211; 16]);
+            crate::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &queue,
+                pair_id,
+                "Strict-Crash",
+                &left,
+                &right,
+                &baseline,
+                &[],
+                None,
+            )
+            .unwrap()
+            .confirm_effects(true)
+            .unwrap()
+            .execute(&Cancel::new(), &mut |_| {})
+            .unwrap();
+            crate::bidirectional::finish_bidirectional_run_completion(&baseline).unwrap();
+            let b0 = std::fs::read(&baseline).unwrap();
+            std::fs::write(left.join("gross.bin"), vec![0x6bu8; 8 * 1024 * 1024]).unwrap();
+            let draft = crate::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &queue,
+                pair_id,
+                "Strict-Crash",
+                &left,
+                &right,
+                &baseline,
+                &[],
+                None,
+            )
+            .unwrap();
+            let operation = QueueOperation::Bidirectional {
+                pair_id,
+                pair_name: "Strict-Crash".into(),
+                left: local_bidirectional_endpoint(&left),
+                right: local_bidirectional_endpoint(&right),
+                baseline_path: baseline.to_string_lossy().into_owned(),
+                resolutions: Vec::new(),
+                expected_baseline_digest: draft.preview().plan.baseline_digest,
+                expected_plan_digest: draft.preview().plan.plan_digest,
+            };
+            let entry = queue.enqueue(operation.clone()).unwrap();
+            draft.finish_enqueue_transition().unwrap();
+            drop(draft);
+            let other_path = root.join("state/operations-queue-other-window.json");
+            let other =
+                OperationQueue::open_with_process_lock(&other_path, queue._process_lock.clone())
+                    .unwrap();
+            let mut other_operation = operation;
+            if let QueueOperation::Bidirectional {
+                pair_id,
+                baseline_path,
+                ..
+            } = &mut other_operation
+            {
+                *pair_id = PairId([212; 16]);
+                *baseline_path = root
+                    .join("state/bidirectional/other.json")
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            let other_entry = other.enqueue(other_operation).unwrap();
+            drop(other);
+            drop(queue);
+            let executable = std::env::current_exe().unwrap();
+            let child = "queue::tests::strict_queue_owner_crash_child";
+            let listed = std::process::Command::new(&executable)
+                .args(["--list", "--exact", child])
+                .output()
+                .unwrap();
+            assert!(listed.status.success());
+            assert_eq!(
+                String::from_utf8(listed.stdout)
+                    .unwrap()
+                    .lines()
+                    .filter(|line| *line == format!("{child}: test"))
+                    .count(),
+                1
+            );
+            let mut command = std::process::Command::new(executable);
+            command
+                .args(["--exact", child, "--nocapture"])
+                .env("DOPPELDECKER_STRICT_OWNER_CRASH_ROOT", &root);
+            if direct {
+                command.env("DOPPELDECKER_STRICT_OWNER_DIRECT", "1");
+            }
+            let status = command.status().unwrap();
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+            assert_eq!(std::fs::read(&baseline).unwrap(), b0);
+            assert!(!right.join("gross.bin").exists());
+            let reopened = OperationQueue::open(queue_path).unwrap();
+            let snapshot = reopened.snapshot();
+            assert_eq!(snapshot.entries.len(), 1);
+            let recovered = &snapshot.entries[0];
+            assert_eq!(recovered.operation_id, entry.operation_id);
+            assert_eq!(recovered.state, QueueState::Interrupted);
+            assert!(
+                !recovered.temp_recovery_paths.is_empty(),
+                "Der echte Queueeintrag muss seine unterbrochene Stage zeigen"
+            );
+            assert_eq!(recovered.error_code, Some(crate::ErrorCode::OutcomeUnclear));
+            assert!(recovered.recovery_available);
+            for path in &recovered.temp_recovery_paths {
+                let path = Path::new(path);
+                assert!(
+                    path.is_file(),
+                    "Der konkrete Teilinhalt bleibt zur manuellen Sicherung erhalten"
+                );
+                assert!(std::fs::metadata(path).unwrap().len() > 0);
+                assert!(std::fs::metadata(path).unwrap().len() < 8 * 1024 * 1024);
+                assert!(
+                    !path.starts_with(&left) && !path.starts_with(&right),
+                    "Gegenfall liegt außerhalb beider Panes"
+                );
+            }
+            if direct {
+                reopened
+                    .update(&entry.operation_id, |entry| {
+                        entry.state = QueueState::Failed;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let resumed = crate::prepare_resume_local_bidirectional_for_queue_operation(
+                &reopened,
+                &entry.operation_id,
+                "Strict-Crash",
+                &left,
+                &right,
+                &baseline,
+            )
+            .expect("Interrupted und Failed behalten den echten Strict-Recoveryowner");
+            drop(resumed);
+            if direct {
+                let error = crate::error::with_recovery_paths(
+                    crate::coded_error(
+                        io::ErrorKind::Interrupted,
+                        crate::ErrorCode::PlanDrift,
+                        "gezielter Recoveryfehler",
+                    ),
+                    &recovered.temp_recovery_paths,
+                );
+                reopened
+                    .interrupt_bidirectional_coded(&entry.operation_id, Progress::default(), &error)
+                    .expect(
+                        "Failed mit offenem Strict-Recovery behält die strukturierte Fehlerbilanz",
+                    );
+                assert_eq!(
+                    reopened.snapshot().entries[0].state,
+                    QueueState::Interrupted
+                );
+                assert!(reopened.snapshot().entries[0]
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("gezielter Recoveryfehler"));
+            }
+            assert_eq!(std::fs::read(&baseline).unwrap(), b0);
+            assert_eq!(
+                reopened.snapshot().entries[0].temp_recovery_paths,
+                recovered.temp_recovery_paths
+            );
+            let other =
+                OperationQueue::open_with_process_lock(other_path, reopened._process_lock.clone())
+                    .unwrap();
+            let other_snapshot = other.snapshot();
+            assert_eq!(other_snapshot.entries.len(), 1);
+            assert_eq!(
+                other_snapshot.entries[0].operation_id,
+                other_entry.operation_id
+            );
+            assert!(other_snapshot.entries[0].temp_recovery_paths.is_empty());
+            assert_eq!(other_snapshot.entries[0].state, QueueState::Pending);
+        }
+    }
+    #[test]
+    fn strict_direktuebergang_prueft_claim_und_frischen_plan_vor_wirkung() {
+        for scenario in ["tree", "digest", "window"] {
+            let changed_claim = scenario == "digest";
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            let left = root.join("links");
+            let right = root.join("rechts");
+            std::fs::create_dir(&left).unwrap();
+            std::fs::create_dir(&right).unwrap();
+            let queue = OperationQueue::open(root.join("state/queue.json")).unwrap();
+            let baseline = root.join("state/bidirectional/pair.json");
+            let pair_id = PairId([213; 16]);
+            crate::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &queue,
+                pair_id,
+                "Direkt",
+                &left,
+                &right,
+                &baseline,
+                &[],
+                None,
+            )
+            .unwrap()
+            .confirm_effects(true)
+            .unwrap()
+            .execute(&Cancel::new(), &mut |_| {})
+            .unwrap();
+            crate::bidirectional::finish_bidirectional_run_completion(&baseline).unwrap();
+            let b0 = std::fs::read(&baseline).unwrap();
+            std::fs::write(left.join("datei"), b"vorher").unwrap();
+            let prepared = crate::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &queue,
+                pair_id,
+                "Direkt",
+                &left,
+                &right,
+                &baseline,
+                &[],
+                None,
+            )
+            .unwrap();
+            let old_journal = std::fs::read(baseline.with_extension("run.json")).unwrap();
+            let queue = if scenario == "window" {
+                OperationQueue::open_with_process_lock(
+                    root.join("state/operations-queue-other-window.json"),
+                    queue._process_lock.clone(),
+                )
+                .unwrap()
+            } else {
+                queue
+            };
+            let entry = queue
+                .enqueue_claimed(QueueOperation::Bidirectional {
+                    pair_id,
+                    pair_name: "Direkt".into(),
+                    left: local_bidirectional_endpoint(&left),
+                    right: local_bidirectional_endpoint(&right),
+                    baseline_path: baseline.to_string_lossy().into_owned(),
+                    resolutions: Vec::new(),
+                    expected_baseline_digest: prepared.preview().plan.baseline_digest,
+                    expected_plan_digest: if changed_claim {
+                        [1; 32]
+                    } else {
+                        prepared.preview().plan.plan_digest
+                    },
+                })
+                .unwrap();
+            if scenario == "tree" {
+                std::fs::write(left.join("datei"), b"gedriftet").unwrap();
+            }
+            let error = reprepare_direct_bidirectional_queue_run(
+                &queue,
+                &entry.operation_id,
+                no_secrets(),
+                prepared,
+            )
+            .err()
+            .expect("Abweichender Claim oder frisch geänderter Plan darf nicht wirken");
+            assert_eq!(crate::error_code(&error), crate::ErrorCode::PlanDrift);
+            assert_eq!(std::fs::read(&baseline).unwrap(), b0);
+            assert!(!right.join("datei").exists());
+            if scenario != "tree" {
+                assert_eq!(
+                    std::fs::read(baseline.with_extension("run.json")).unwrap(),
+                    old_journal,
+                    "Ein falscher Queueclaim darf das alte Journal nicht entfernen"
+                );
+            } else {
+                assert!(
+                    !baseline.with_extension("run.json").exists(),
+                    "Die neue unbestätigte Driftvorbereitung wird mutationslos verworfen"
+                );
+            }
+            assert_eq!(queue.snapshot().entries[0].state, QueueState::Validating);
+        }
+    }
+    #[test]
+    fn strict_failed_recovery_bewahrt_fehlerpfade_nach_bewiesenem_coreabschluss() {
+        for rolled_back in [false, true] {
+            for refresh_only in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = std::fs::canonicalize(temp.path()).unwrap();
+                let left = root.join("links");
+                let right = root.join("rechts");
+                std::fs::create_dir(&left).unwrap();
+                std::fs::create_dir(&right).unwrap();
+                let queue = OperationQueue::open(root.join("state/queue.json")).unwrap();
+                let baseline = root.join("state/bidirectional/pair.json");
+                let pair_id = PairId([214; 16]);
+                crate::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                    &queue,
+                    pair_id,
+                    "Failed-Recovery",
+                    &left,
+                    &right,
+                    &baseline,
+                    &[],
+                    None,
+                )
+                .unwrap()
+                .confirm_effects(true)
+                .unwrap()
+                .execute(&Cancel::new(), &mut |_| {})
+                .unwrap();
+                crate::bidirectional::finish_bidirectional_run_completion(&baseline).unwrap();
+                let b0 = std::fs::read(&baseline).unwrap();
+                std::fs::write(left.join("von-links"), b"links").unwrap();
+                std::fs::write(right.join("von-rechts"), b"rechts").unwrap();
+                let draft = crate::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                    &queue,
+                    pair_id,
+                    "Failed-Recovery",
+                    &left,
+                    &right,
+                    &baseline,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                let entry = queue
+                    .enqueue_claimed(QueueOperation::Bidirectional {
+                        pair_id,
+                        pair_name: "Failed-Recovery".into(),
+                        left: local_bidirectional_endpoint(&left),
+                        right: local_bidirectional_endpoint(&right),
+                        baseline_path: baseline.to_string_lossy().into_owned(),
+                        resolutions: Vec::new(),
+                        expected_baseline_digest: draft.preview().plan.baseline_digest,
+                        expected_plan_digest: draft.preview().plan.plan_digest,
+                    })
+                    .unwrap();
+                let prepared = reprepare_direct_bidirectional_queue_run(
+                    &queue,
+                    &entry.operation_id,
+                    no_secrets(),
+                    draft,
+                )
+                .unwrap();
+                queue.mark_running(&entry.operation_id).unwrap();
+                let cancel = Cancel::new();
+                let error = prepared
+                    .confirm_effects(true)
+                    .unwrap()
+                    .execute(&cancel, &mut |progress| {
+                        if progress.phase == "done" {
+                            cancel.cancel();
+                        }
+                    })
+                    .unwrap_err();
+                queue
+                    .interrupt_bidirectional_coded(&entry.operation_id, Progress::default(), &error)
+                    .unwrap();
+                assert_eq!(std::fs::read(&baseline).unwrap(), b0);
+                queue
+                    .update(&entry.operation_id, |entry| {
+                        entry.state = QueueState::Failed;
+                        assert!(entry.recovery_available);
+                        Ok(())
+                    })
+                    .unwrap();
+                if rolled_back {
+                    crate::prepare_local_bidirectional_rollback_for_queue_operation(
+                        &queue,
+                        &entry.operation_id,
+                        "Failed-Recovery",
+                        &left,
+                        &right,
+                        &baseline,
+                    )
+                    .unwrap()
+                    .confirm_effects(true)
+                    .unwrap()
+                    .execute(&Cancel::new())
+                    .unwrap();
+                } else {
+                    crate::prepare_resume_local_bidirectional_for_queue_operation(
+                        &queue,
+                        &entry.operation_id,
+                        "Failed-Recovery",
+                        &left,
+                        &right,
+                        &baseline,
+                    )
+                    .unwrap()
+                    .confirm_effects(true)
+                    .unwrap()
+                    .execute(&Cancel::new(), &mut |_| {})
+                    .unwrap();
+                }
+                let expected = if rolled_back {
+                    BidirectionalCompletionRecovery::RolledBack
+                } else {
+                    BidirectionalCompletionRecovery::Complete
+                };
+                assert_eq!(queue.snapshot().entries[0].state, QueueState::Failed);
+                assert!(
+                    queue.ftps_owner(Some(&entry.operation_id)).is_err(),
+                    "Ein bewiesener Coreabschluss darf keinen neuen Datenowner ausgeben"
+                );
+                let path = root
+                    .join("bekannter-recoverypfad")
+                    .to_string_lossy()
+                    .into_owned();
+                if refresh_only {
+                    queue
+                        .refresh_bidirectional_completion_recovery_with_paths(
+                            &entry.operation_id,
+                            std::slice::from_ref(&path),
+                        )
+                        .unwrap();
+                } else {
+                    let error = crate::error::with_recovery_paths(
+                        crate::coded_error(
+                            io::ErrorKind::Other,
+                            crate::ErrorCode::OutcomeUnclear,
+                            "Abschlussbarriere fehlgeschlagen",
+                        ),
+                        std::slice::from_ref(&path),
+                    );
+                    queue
+                        .interrupt_bidirectional_coded(
+                            &entry.operation_id,
+                            Progress::default(),
+                            &error,
+                        )
+                        .unwrap();
+                }
+                let snapshot = queue.snapshot();
+                let recovered = &snapshot.entries[0];
+                assert_eq!(recovered.state, QueueState::Interrupted);
+                assert_eq!(recovered.bidirectional_completion_recovery, Some(expected));
+                assert!(!recovered.recovery_available);
+                assert_eq!(recovered.progress.phase, "completion_unclear");
+                assert!(recovered.temp_recovery_paths.contains(&path));
+                queue
+                    .finish_bidirectional_completion_recovery(&entry.operation_id)
+                    .unwrap();
+                assert_eq!(
+                    queue.snapshot().entries[0].state,
+                    if rolled_back {
+                        QueueState::Cancelled
+                    } else {
+                        QueueState::Completed
+                    }
+                );
+                if rolled_back {
+                    assert_eq!(std::fs::read(&baseline).unwrap(), b0);
+                }
+            }
+        }
+    }
+}
+
+#[path = "archive_pack_queue.rs"]
+mod archive_pack_queue;
+#[path = "archive_upload_queue.rs"]
+mod archive_upload_queue;
+#[path = "generated_upload_queue.rs"]
+mod generated_upload_queue;
+pub use generated_upload_queue::GeneratedUploadPreparation;
+
+#[path = "archive_extract_queue.rs"]
+mod archive_extract_queue;
+
+fn created_directory_action(action: &crate::Action) -> bool {
+    matches!(action,crate::Action::CreateDir{metadata:Some(metadata),..} if matches!(metadata.windows_dacl,Some(crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryExact(_) | crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryBeforeChildrenExact(_))))
+}
+
+fn created_directory_payload(action: &crate::Action) -> bool {
+    let metadata = match action {
+        crate::Action::CreateDir { metadata, .. }
+        | crate::Action::CopyFile { metadata, .. }
+        | crate::Action::UpdateFile { metadata, .. } => metadata.as_ref(),
+        crate::Action::CreateHardlink { metadata, .. }
+        | crate::Action::SetDirectoryMetadata { metadata, .. } => Some(metadata),
+        _ => None,
+    };
+    metadata.is_some_and(|m| {
+        matches!(
+            m.windows_dacl,
+            Some(
+                crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryExact(_)
+                    | crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryBeforeChildrenExact(
+                        _
+                    )
+            )
+        )
+    })
+}
+
+fn operation_sync_plan(operation: &QueueOperation) -> Option<&SyncPlan> {
+    match operation {
+        QueueOperation::Sync { expected_plan, .. }
+        | QueueOperation::LocalSync { expected_plan, .. }
+        | QueueOperation::SftpSync { expected_plan, .. }
+        | QueueOperation::FtpsSync { expected_plan, .. }
+        | QueueOperation::WebDavSync { expected_plan, .. }
+        | QueueOperation::SmbSync { expected_plan, .. }
+        | QueueOperation::ProviderSync { expected_plan, .. }
+        | QueueOperation::ContentSync { expected_plan, .. } => Some(expected_plan),
+        _ => None,
+    }
+}
+fn queue_entry_created_payload(entry: &QueueEntry) -> bool {
+    operation_sync_plan(&entry.operation)
+        .is_some_and(|plan| plan.actions.iter().any(created_directory_payload))
+        || matches!(&entry.attention,Some(QueueAttention::PlanChanged{current_plan,..}) if current_plan.actions.iter().any(created_directory_payload))
+}
+
+fn before_children_action(action: &crate::Action) -> bool {
+    matches!(action, crate::Action::CreateDir { metadata: Some(metadata), .. } if before_children_metadata(metadata))
+}
+fn before_children_metadata(metadata: &crate::sync::MetadataTransfer) -> bool {
+    matches!(
+        metadata.windows_dacl,
+        Some(crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryBeforeChildrenExact(_))
+    )
+}
+fn before_children_class(operation: &QueueOperation, plan: &SyncPlan) -> bool {
+    matches!(operation, QueueOperation::ContentSync { options, .. }
+        if options.metadata == crate::MetadataProfile::NativeBestEffort && options.compare == crate::Compare::ContentHash)
+        && plan.metadata_report.profile == crate::MetadataProfile::NativeBestEffort
+        && plan.actions.iter().any(before_children_action)
+        && plan
+            .actions
+            .iter()
+            .all(|action| !before_children_payload(action) || before_children_action(action))
+}
+fn before_children_payload(action: &crate::Action) -> bool {
+    let metadata = match action {
+        crate::Action::CreateDir { metadata, .. }
+        | crate::Action::CopyFile { metadata, .. }
+        | crate::Action::UpdateFile { metadata, .. } => metadata.as_ref(),
+        crate::Action::CreateHardlink { metadata, .. }
+        | crate::Action::SetDirectoryMetadata { metadata, .. } => Some(metadata),
+        _ => None,
+    };
+    metadata.is_some_and(before_children_metadata)
+}
+fn before_children_plan_payload(plan: &SyncPlan) -> bool {
+    plan.actions.iter().any(before_children_payload)
+}
+fn before_children_rights_report(
+    report: &crate::created_directory_dacl::CreatedDirectoryDaclReport,
+) -> bool {
+    report.completed.iter().chain(&report.uncertain).any(|value| value.origin == crate::created_directory_dacl::CreatedDirectoryOrigin::ExclusiveMinimalCreateBeforeChildren)
+}
+fn before_children_report(
+    report: &crate::created_directory_dacl::CreatedDirectoryDaclReport,
+) -> bool {
+    use crate::created_directory_dacl::CreatedDirectoryOrigin::ExclusiveMinimalCreateBeforeChildren;
+    report
+        .created
+        .iter()
+        .any(|value| value.effect_key.origin == ExclusiveMinimalCreateBeforeChildren)
+        || report
+            .completed
+            .iter()
+            .chain(&report.uncertain)
+            .any(|value| value.origin == ExclusiveMinimalCreateBeforeChildren)
+}
+fn queue_entry_before_children_payload(entry: &QueueEntry) -> bool {
+    operation_sync_plan(&entry.operation).is_some_and(before_children_plan_payload)
+        || matches!(&entry.attention, Some(QueueAttention::PlanChanged { current_plan, .. }) if before_children_plan_payload(current_plan))
+        || before_children_report(&entry.created_directory_dacl_report)
+        || before_children_report(&entry.progress.created_directory_dacl_report)
 }

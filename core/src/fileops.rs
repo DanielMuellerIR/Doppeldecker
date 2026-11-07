@@ -61,7 +61,11 @@ pub enum OverwritePolicy {
 pub struct OpStats {
     /// Einschränkungen der tatsächlich verwendeten interaktiven Inhaltsquelle.
     pub source_read_limitations: Vec<String>,
-    /// Ausgelassene Zielmetadaten der tatsächlich kopierten Dateien.
+    /// Nicht vollständig am Ziel bestätigte Resource Forks.
+    pub incomplete_resource_forks: u64,
+    /// Bewusst erhaltene Move-Quellen; Inhalte wurden nur teilweise übertragen.
+    pub retained_source_paths: Vec<String>,
+    /// Konkrete Schreibgrenzen am Ziel, einschließlich Metadaten und Temp-Recovery.
     pub target_write_limitations: Vec<String>,
     pub source_tree: Option<crate::vfs::InteractiveSourceTree>,
     /// Anzahl kopierter/verschobener Dateien (bei Ordnern: die enthaltenen Dateien).
@@ -244,8 +248,16 @@ pub fn find_recursive_conflicts(
     dst_dir: &Path,
     items: &[PathBuf],
 ) -> io::Result<Vec<String>> {
+    let source_tree = src.interactive_source_tree()?;
     let mut conflicts = Vec::new();
     for source in items {
+        if source_tree.as_ref().is_some_and(|tree| {
+            tree.omitted
+                .iter()
+                .any(|omission| Path::new(&omission.path) == source)
+        }) {
+            continue;
+        }
         let target = target_path_in(dst_dir, source)?;
         collect_conflicts(src, source, dst, &target, &mut conflicts)?;
     }
@@ -539,6 +551,43 @@ pub fn prepare_keep_both_targets(
     }
     verify_keep_both_targets(src, dst, items, destination, &targets)?;
     Ok(targets)
+}
+
+/// Vergibt ausschließlich lokale Duplikatnamen neben den ausgewählten Originalen.
+/// Die zurückgegebenen Quellbelege und Aliasziele müssen unverändert in die Copy-Queue.
+pub fn prepare_local_duplicate_targets(
+    vfs: &dyn Vfs,
+    parent: &Path,
+    items: &[PathBuf],
+) -> io::Result<Vec<FileKeepBothTarget>> {
+    if !vfs.is_local() {
+        return Err(coded_error(
+            io::ErrorKind::Unsupported,
+            ErrorCode::Unsupported,
+            "Duplizieren ist derzeit nur für lokale Dateien und Ordner umgesetzt",
+        ));
+    }
+    validate_local_duplicate_selection(items, parent)?;
+    let originals = items
+        .iter()
+        .map(|path| path_to_utf8(path))
+        .collect::<io::Result<Vec<_>>>()?;
+    // Auch leere Ordner brauchen einen neuen Namen; eine rekursive Liste von
+    // Blattkonflikten würde sie hier übersehen.
+    let targets = prepare_keep_both_targets(vfs, vfs, parent, items, &originals)?;
+    if targets.len() != items.len() {
+        return Err(coded_error(io::ErrorKind::Unsupported, ErrorCode::Unsupported,
+            "Die Auswahl kann nicht vollständig dupliziert werden: Sie enthält nicht unterstützte Quellen oder unsichere Namen, oder das Ziel bietet keinen atomaren kollisionsfreien Neunamencommit"));
+    }
+    Ok(targets)
+}
+
+fn validate_local_duplicate_selection(items: &[PathBuf], parent: &Path) -> io::Result<()> {
+    validate_file_operation_paths(items, parent)?;
+    if items.is_empty() || items.iter().any(|item| item.parent() != Some(parent)) {
+        return Err(invalid_transfer("Duplizieren benötigt eine nichtleere Auswahl direkter Kinder desselben lokalen Ordners"));
+    }
+    Ok(())
 }
 
 fn transfer_target(
@@ -1176,7 +1225,7 @@ fn copy_items_inner(
         && (!request.dst.is_local() || request.policy == OverwritePolicy::Overwrite)
     {
         return Err(coded_error(io::ErrorKind::Unsupported, ErrorCode::Unsupported,
-            "Die begrenzte SFTP-Inhaltsquelle erlaubt ausschließlich additive lokale Kopien; Remote-Ziele, Ersetzen und Verschieben bleiben gesperrt"));
+            "Diese interaktive Inhaltsquelle erlaubt ausschließlich additive lokale Kopien; Remote-Ziele, Ersetzen und Verschieben bleiben gesperrt"));
     }
     let FileTransferBindings {
         targets,
@@ -1191,9 +1240,28 @@ fn copy_items_inner(
         policy,
         sandbox,
     } = request;
-    validate_transfer_targets(src, dst, items, dst_dir)?;
+    validate_keep_both_targets(items, dst_dir, targets)?;
+    let duplicates_originals = src.is_local()
+        && dst.is_local()
+        && items.iter().any(|source| source.parent() == Some(dst_dir));
+    if duplicates_originals {
+        validate_local_duplicate_selection(items, dst_dir)?;
+        if policy != OverwritePolicy::Skip || targets.len() != items.len() {
+            return Err(invalid_transfer("Eine Kopie neben das Original benötigt für die vollständige Auswahl gebundene neue Namen ohne Ersetzen"));
+        }
+    }
     verify_keep_both_targets(src, dst, items, dst_dir, targets)?;
+    validate_transfer_targets_resolved(
+        src,
+        dst,
+        items,
+        dst_dir,
+        if duplicates_originals { targets } else { &[] },
+    )?;
     guard_transfer_scope(src, dst, items, dst_dir, sandbox, false)?;
+    for source in items {
+        guard_vfs(dst, sandbox, &transfer_target(dst_dir, source, targets)?)?;
+    }
     let source_tree = src.interactive_source_tree()?;
     let mut stats = OpStats {
         skipped: source_tree
@@ -1206,7 +1274,18 @@ fn copy_items_inner(
     // Fortschritts-Summen vorab ermitteln (rekursiv über alle Items), damit die UI einen
     // sinnvollen Balken zeigen kann. Symlinks zählen nicht mit (werden übersprungen).
     let allow_name_omissions = policy == OverwritePolicy::Skip && targets.is_empty();
-    let (files_total, bytes_total) = scan_totals(src, items, allow_name_omissions)?;
+    let counted_items = items
+        .iter()
+        .filter(|source| {
+            !stats.source_tree.as_ref().is_some_and(|tree| {
+                tree.omitted
+                    .iter()
+                    .any(|omission| Path::new(&omission.path) == source.as_path())
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let (files_total, bytes_total) = scan_totals(src, &counted_items, allow_name_omissions)?;
     let mut prog = Progress {
         files_total,
         bytes_total,
@@ -1439,6 +1518,16 @@ fn copy_tree(
             guard_vfs(dst, sandbox, dst_abs)?;
             // Ein Typkonflikt wird nicht vorab gelöscht. Wir parken ihn atomar, bauen den
             // neuen Ordner und können bei Fehler/Abbruch den alten Eintrag zurückholen.
+            let source_metadata = match src.read_copy_metadata(src_abs, &meta, cancel) {
+                Ok(source) => source.filter(|source| source.needs_copy()),
+                Err(error)
+                    if cancel.is_cancelled() && error_code(&error) == ErrorCode::Interrupted =>
+                {
+                    return Ok(())
+                }
+                Err(error) => return Err(error),
+            };
+            let mut directory_metadata = None;
             let (parked, verified_parked, created_destination, created_proof) = match dst
                 .stat(dst_abs)
             {
@@ -1489,8 +1578,12 @@ fn copy_tree(
                     };
                     let best_effort_create =
                         target_file_commit_class(dst, dst_abs)? == FileCommitClass::BestEffort;
-                    let created_proof = match dst.create_dir_with_removal_proof(dst_abs) {
-                        Ok(proof) => {
+                    let created_proof = match dst
+                        .create_dir_for_copy(dst_abs, source_metadata.is_some())
+                    {
+                        Ok(created) => {
+                            directory_metadata = created.metadata;
+                            let proof = created.removal_proof;
                             if best_effort_create {
                                 // Die Anlage ist sichtbar, aber erst der folgende
                                 // Eltern-Sync bestätigt ihren endgültigen Ausgang.
@@ -1537,8 +1630,12 @@ fn copy_tree(
                     // brechen wir ab, statt den fremden Ordner stillschweigend zu befüllen.
                     let best_effort_create =
                         target_file_commit_class(dst, dst_abs)? == FileCommitClass::BestEffort;
-                    let created_proof = match dst.create_dir_with_removal_proof(dst_abs) {
-                        Ok(proof) => {
+                    let created_proof = match dst
+                        .create_dir_for_copy(dst_abs, source_metadata.is_some())
+                    {
+                        Ok(created) => {
+                            directory_metadata = created.metadata;
+                            let proof = created.removal_proof;
                             if best_effort_create {
                                 actuals.record_target_copy_new(None);
                             }
@@ -1647,10 +1744,22 @@ fn copy_tree(
             // würde sonst seine eigenen noch ausstehenden Schreibzugriffe blockieren.
             if created_destination {
                 let metadata_result = (|| -> io::Result<()> {
-                    if dst.supports_mtime_write() {
-                        if let Some(mtime) = meta.mtime {
-                            dst.set_mtime(dst_abs, mtime)?;
-                        }
+                    let report = apply_copy_metadata(
+                        source_metadata.as_ref(),
+                        directory_metadata.as_ref(),
+                        cancel,
+                    )?;
+                    let mut report = report;
+                    apply_copy_mtime(
+                        dst,
+                        dst_abs,
+                        src.read_copy_mtime(src_abs, &meta)?,
+                        &mut report,
+                    )?;
+                    record_copy_metadata(stats, actuals, report);
+                    let creation_time = src.read_copy_creation_time(src_abs, &meta)?;
+                    if apply_copy_creation_time(dst, dst_abs, creation_time)? {
+                        record_creation_time_omission(stats, actuals);
                     }
                     if dst.supports_mode_write_at(dst_abs)? {
                         if let Some(mode) = meta.mode {
@@ -1672,9 +1781,29 @@ fn copy_tree(
                     // Die Kinder sind bereits einzeln bestätigt. Dieser letzte Sync
                     // bindet die abschließenden Ordner-Metadaten vor einem möglichen
                     // Quellabbau an den sichtbaren Zielordner.
-                    dst.sync_dir(dst_abs)
+                    dst.sync_dir(dst_abs)?;
+                    let report = finish_copy_flags(
+                        dst,
+                        source_metadata.as_ref(),
+                        directory_metadata.as_ref(),
+                        dst_abs,
+                    )?;
+                    record_copy_metadata(stats, actuals, report);
+                    Ok(())
                 })();
                 if let Err(metadata_error) = metadata_result {
+                    if cancel.is_cancelled()
+                        && error_code(&metadata_error) == ErrorCode::Interrupted
+                    {
+                        return rollback_created_target(
+                            dst,
+                            dst_abs,
+                            parked.as_deref(),
+                            verified_parked.as_ref(),
+                            created_proof.as_ref(),
+                            None,
+                        );
+                    }
                     return rollback_created_target(
                         dst,
                         dst_abs,
@@ -1699,6 +1828,15 @@ fn copy_tree(
                 // Zielwirkung in der Ergebnisbilanz.
                 stats.target_copy_new_best_effort |=
                     target_file_commit_class(dst, dst_abs)? == FileCommitClass::BestEffort;
+            }
+
+            if !created_destination {
+                if let Some(source) = source_metadata
+                    .as_ref()
+                    .filter(|source| source.omitted_report().resource_fork_incomplete)
+                {
+                    record_copy_metadata(stats, actuals, source.omitted_report());
+                }
             }
 
             let limitations = dst.interactive_write_limitations();
@@ -1759,8 +1897,10 @@ fn copy_tree(
                     sandbox,
                     replace_existing,
                     expected_replacement,
-                    source_mtime: meta.mtime,
+                    source_mtime: src.read_copy_mtime(src_abs, &meta)?,
                     source_mode: meta.mode,
+                    source_created: src.read_copy_creation_time(src_abs, &meta)?,
+                    source_entry: &meta,
                 },
                 cancel,
                 prog,
@@ -1788,6 +1928,10 @@ fn copy_tree(
             if !outcome.complete {
                 return Ok(());
             }
+            record_copy_metadata(stats, actuals, outcome.metadata_report);
+            if outcome.creation_time_omitted {
+                record_creation_time_omission(stats, actuals);
+            }
             stats.target_copy_new_best_effort |= outcome.target_copy_new_best_effort;
             stats.target_replace_best_effort |= outcome.target_replace_best_effort;
             if outcome.target_copy_new_best_effort {
@@ -1807,6 +1951,9 @@ fn copy_tree(
             stats.bytes = stats.bytes.saturating_add(meta.size);
             prog.files_done = prog.files_done.saturating_add(1);
             on_progress(prog);
+            if let Some(error) = outcome.completion_error {
+                return Err(error);
+            }
         }
         Ok(())
     })();
@@ -1840,7 +1987,11 @@ struct MoveSnapshotEntry {
     size: u64,
     mtime: Option<i64>,
     mode: Option<u32>,
+    created: Option<crate::vfs::FileCreationTime>,
+    precise_mtime: Option<crate::vfs::FileTimestamp>,
     content_hash: Option<[u8; 32]>,
+    native_version: Option<[u8; 32]>,
+    resource_digest: Option<[u8; 32]>,
     /// Bei einem Merge gehört der Zielordner schon dem Zielbestand. Sein Modus darf
     /// nicht still an den Quellordner angeglichen werden. `Some` bindet diesen
     /// Vorzustand; `None` bedeutet, dass der Ordner von diesem Move neu entsteht.
@@ -1855,7 +2006,11 @@ struct MoveSourceBinding {
 /// Liest den gesamten Quellbestand vor dem Kopieren. Der Digest allein erlaubt noch
 /// keine Entfernung: Erst `bind_move_source_for_removal` darf ihn provideratomar an
 /// eine unveränderliche Version der Datei beziehungsweise des ganzen Baums binden.
-fn bind_move_source(src: &dyn Vfs, source: &Path) -> io::Result<MoveSourceBinding> {
+fn bind_move_source(
+    src: &dyn Vfs,
+    source: &Path,
+    cancel: &Cancel,
+) -> io::Result<MoveSourceBinding> {
     fn collect(
         src: &dyn Vfs,
         path: &Path,
@@ -1863,6 +2018,7 @@ fn bind_move_source(src: &dyn Vfs, source: &Path) -> io::Result<MoveSourceBindin
         entries: &mut Vec<MoveSnapshotEntry>,
         digest: &mut blake3::Hasher,
         removal_possible: &mut bool,
+        cancel: &Cancel,
     ) -> io::Result<()> {
         let metadata = src.stat(path)?;
         let relative_text = relative.to_str().ok_or_else(|| {
@@ -1897,13 +2053,33 @@ fn bind_move_source(src: &dyn Vfs, source: &Path) -> io::Result<MoveSourceBindin
         } else {
             None
         };
+        // Der Baumbeleg behält nur Werte; native FDs enden vor der Rekursion.
+        let (native_version, resource_digest) = {
+            let native = src.read_copy_metadata(path, &metadata, cancel)?;
+            (
+                native.as_ref().map(|value| value.version_digest()),
+                native
+                    .as_ref()
+                    .filter(|value| value.resource_needed())
+                    .and_then(|value| value.resource_digest()),
+            )
+        };
+        let precise_mtime = src.read_copy_mtime(path, &metadata)?;
+        if let Some(time) = precise_mtime {
+            digest.update(&time.seconds.to_le_bytes());
+            digest.update(&time.nanoseconds.to_le_bytes());
+        }
         entries.push(MoveSnapshotEntry {
             relative: relative.to_path_buf(),
             is_dir: metadata.is_dir,
             size: metadata.size,
             mtime: metadata.mtime,
             mode: metadata.mode,
+            created: src.read_copy_creation_time(path, &metadata)?,
+            precise_mtime,
             content_hash,
+            native_version,
+            resource_digest,
             destination_preexisting_mode: None,
         });
 
@@ -1920,6 +2096,7 @@ fn bind_move_source(src: &dyn Vfs, source: &Path) -> io::Result<MoveSourceBindin
                     entries,
                     digest,
                     removal_possible,
+                    cancel,
                 )?;
             }
         }
@@ -1936,6 +2113,7 @@ fn bind_move_source(src: &dyn Vfs, source: &Path) -> io::Result<MoveSourceBindin
         &mut entries,
         &mut digest,
         &mut removal_possible,
+        cancel,
     )?;
     let content_digest = *digest.finalize().as_bytes();
     let recursive = entries.first().is_some_and(|entry| entry.is_dir);
@@ -1993,6 +2171,7 @@ fn verify_move_destination(
     dst: &dyn Vfs,
     destination: &Path,
     binding: &MoveSourceBinding,
+    cancel: &Cancel,
 ) -> io::Result<()> {
     for expected in &binding.entries {
         let path = if expected.relative.as_os_str().is_empty() {
@@ -2034,6 +2213,26 @@ fn verify_move_destination(
                     ),
                 ));
             }
+        }
+        if let Some(resource) = expected.resource_digest {
+            let actual_resource = dst
+                .read_copy_metadata(&path, &actual, cancel)?
+                .and_then(|value| value.resource_digest());
+            if actual_resource != Some(resource) {
+                return Err(crate::real_mode::plan_drift(
+                    "Ressourcen-Fork des Move-Ziels wurde nach dem Kopieren verändert",
+                ));
+            }
+        }
+        if dst.supports_mtime_write()
+            && dst.supports_precise_copy_mtime()
+            && expected.destination_preexisting_mode.is_none()
+            && expected.precise_mtime.is_some()
+            && dst.read_copy_mtime(&path, &actual)? != expected.precise_mtime
+        {
+            return Err(crate::real_mode::plan_drift(
+                "Änderungszeit des Move-Ziels nach dem Kopieren verändert",
+            ));
         }
         let mode_write = dst.supports_mode_write_at(if expected.is_dir {
             &path
@@ -2086,6 +2285,7 @@ fn verify_move_source_entry(
     src: &dyn Vfs,
     source: &Path,
     expected: &MoveSnapshotEntry,
+    cancel: &Cancel,
 ) -> io::Result<()> {
     let actual = src.stat(source)?;
     if actual.is_symlink
@@ -2093,6 +2293,8 @@ fn verify_move_source_entry(
         || (!expected.is_dir && (!actual.is_file || actual.size != expected.size))
         || actual.mtime != expected.mtime
         || actual.mode != expected.mode
+        || src.read_copy_creation_time(source, &actual)? != expected.created
+        || src.read_copy_mtime(source, &actual)? != expected.precise_mtime
     {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -2101,6 +2303,17 @@ fn verify_move_source_entry(
                 source.display()
             ),
         ));
+    }
+    if let Some(version) = expected.native_version {
+        if src
+            .read_copy_metadata(source, &actual, cancel)?
+            .map(|value| value.version_digest())
+            != Some(version)
+        {
+            return Err(crate::real_mode::plan_drift(
+                "Native Metadaten der Move-Quelle wurden nach dem Kopieren verändert",
+            ));
+        }
     }
     if let Some(expected_hash) = expected.content_hash {
         if hash_vfs_file(src, source)?.as_bytes() != &expected_hash {
@@ -2124,6 +2337,7 @@ fn remove_move_source_best_effort(
     src: &dyn Vfs,
     source: &Path,
     binding: &MoveSourceBinding,
+    cancel: &Cancel,
     on_first_remove: impl FnOnce(),
 ) -> io::Result<()> {
     for expected in &binding.entries {
@@ -2132,7 +2346,7 @@ fn remove_move_source_best_effort(
         } else {
             source.join(&expected.relative)
         };
-        verify_move_source_entry(src, &path, expected)?;
+        verify_move_source_entry(src, &path, expected, cancel)?;
         if expected.is_dir {
             let listing = src.list_complete(&path)?;
             require_complete_safe_listing(&listing, "Move-Quellprüfung")?;
@@ -2192,7 +2406,7 @@ fn remove_move_source_best_effort(
             // Direkt vor jedem irreversiblen Blatt-Remove wird Inhalt und Metadaten
             // nochmals gelesen. Ein Austausch nach der Gesamtprüfung bleibt dadurch
             // auf genau diese eine Datei begrenzt und kann nie einen ganzen Baum treffen.
-            verify_move_source_entry(src, &path, expected)?;
+            verify_move_source_entry(src, &path, expected, cancel)?;
             if let Some(mark_started) = on_first_remove.take() {
                 mark_started();
             }
@@ -2285,7 +2499,7 @@ fn move_items_inner(
     }
     if request.src.interactive_additive_only() {
         return Err(coded_error(io::ErrorKind::Unsupported, ErrorCode::Unsupported,
-            "Die begrenzte SFTP-Inhaltsquelle erlaubt ausschließlich additive lokale Kopien; Remote-Ziele, Ersetzen und Verschieben bleiben gesperrt"));
+            "Diese interaktive Inhaltsquelle erlaubt ausschließlich additive lokale Kopien; Remote-Ziele, Ersetzen und Verschieben bleiben gesperrt"));
     }
     let FileTransferBindings {
         targets,
@@ -2372,6 +2586,42 @@ fn move_items_inner(
         // Sitzungs-/Rootbindung und Übernahme der typisierten Zielbelege verwenden.
         // Seine bestätigte reine Rename-Wirkung erlaubt keinen Copy-/Remove-Rückfall.
         let same_vfs = std::ptr::eq::<dyn Vfs>(src, dst);
+        if exists && same_vfs && src.supports_interactive_best_effort_move() {
+            return Err(coded_error(io::ErrorKind::AlreadyExists, ErrorCode::PlanDrift,
+                "Das SFTP-Moveziel entstand nach der Vorbereitung; Zusammenführen benötigt eine neue Bestätigung"));
+        }
+        if !exists && !exclusive && same_vfs && src.supports_interactive_best_effort_move() {
+            // Beide Pane-Roots gehören derselben gehaltenen SFTP-Verbindung. Der
+            // private Adapter prüft beide Eltern und sendet genau ein Standard-
+            // Rename. Ein Fehler nach Versand darf keinen Copy-/Remove-Rückfall
+            // auslösen; eine atomare No-Replace-Garantie wird nicht behauptet.
+            prog.current = name.clone();
+            on_progress(&prog);
+            if let Err(error) = src.rename_plain_once(src_abs, &dst_abs) {
+                if error_code(&error) == ErrorCode::OutcomeUnclear {
+                    actuals.source_removal_best_effort = None;
+                    actuals.target_copy_new_best_effort = None;
+                }
+                return Err(error);
+            }
+            actuals.source_removal_best_effort = Some(true);
+            actuals.record_target_copy_new(Some(true));
+            stats.source_removal_best_effort = true;
+            stats.target_copy_new_best_effort = true;
+            let (files, bytes) = subtree_totals(dst, &dst_abs, false).map_err(|error| {
+                with_recovery_context(coded_error(io::ErrorKind::Other, ErrorCode::OutcomeUnclear,
+                    format!("SFTP-Move wurde umbenannt, aber die nachgelagerte Bestandszählung scheiterte ({error})")), &[&error], &[src_abs, &dst_abs])
+            })?;
+            stats.files = stats.files.saturating_add(files);
+            stats.bytes = stats.bytes.saturating_add(bytes);
+            stats
+                .target_write_limitations
+                .extend(dst.interactive_write_limitations());
+            prog.files_done = prog.files_done.saturating_add(files).min(prog.files_total);
+            prog.bytes_done = prog.bytes_done.saturating_add(bytes).min(prog.bytes_total);
+            on_progress(&prog);
+            continue;
+        }
         if !exists
             && (rename_only
                 || (same_vfs && dst.file_commit_class_at(dst_dir)? == FileCommitClass::Assured))
@@ -2470,13 +2720,22 @@ fn move_items_inner(
         // Skip bindet ausdrücklich den Erhalt dieses gesamten Quellbaums. Dafür
         // ist weder ein Inhaltsbeleg ausgelassener Dateien noch Löschfähigkeit nötig.
         let mut source_binding = if skipped_targets.is_empty() {
-            Some(bind_move_source(src, src_abs)?)
+            Some(match bind_move_source(src, src_abs, cancel) {
+                Ok(binding) => binding,
+                Err(error)
+                    if cancel.is_cancelled() && error_code(&error) == ErrorCode::Interrupted =>
+                {
+                    return Ok(finish_cancelled(stats, &mut prog, on_progress))
+                }
+                Err(error) => return Err(error),
+            })
         } else {
             None
         };
         if let Some(binding) = &mut source_binding {
             bind_existing_move_destination_directories(dst, &dst_abs, binding)?;
         }
+        let resource_forks_before = stats.incomplete_resource_forks;
         let symlinks_skipped_before = stats.symlinks_skipped;
         let conflicts_skipped_before = stats.skipped;
         copy_tree(
@@ -2501,6 +2760,15 @@ fn move_items_inner(
         if cancel.is_cancelled() {
             return Ok(finish_cancelled(stats, &mut prog, on_progress));
         }
+        if stats.incomplete_resource_forks > resource_forks_before {
+            stats
+                .retained_source_paths
+                .push(src_abs.to_string_lossy().into_owned());
+            let note = format!("Verschieben unvollständig: Quelle wegen nicht vollständig übertragener Ressourcen-Forks behalten: {}", src_abs.display());
+            stats.target_write_limitations.push(note.clone());
+            actuals.target_write_limitations.push(note);
+            continue;
+        }
         if stats.symlinks_skipped > symlinks_skipped_before
             || stats.skipped > conflicts_skipped_before
         {
@@ -2515,7 +2783,11 @@ fn move_items_inner(
             // Auch bei späterem Zielwechsel bleibt die bestätigte Quelle erhalten.
             continue;
         };
-        if let Err(readback_error) = verify_move_destination(dst, &dst_abs, &source_binding) {
+        if let Err(readback_error) = verify_move_destination(dst, &dst_abs, &source_binding, cancel)
+        {
+            if cancel.is_cancelled() && error_code(&readback_error) == ErrorCode::Interrupted {
+                return Ok(finish_cancelled(stats, &mut prog, on_progress));
+            }
             return Err(coded_error(
                 io::ErrorKind::Other,
                 ErrorCode::OutcomeUnclear,
@@ -2541,7 +2813,7 @@ fn move_items_inner(
             Some(proof) if !root_is_dir && !proof.recursive => {
                 src.remove_move_source_if_matches(src_abs, proof)
             }
-            _ => remove_move_source_best_effort(src, src_abs, &source_binding, || {
+            _ => remove_move_source_best_effort(src, src_abs, &source_binding, cancel, || {
                 // Erst unmittelbar vor der ersten irreversiblen Einzelwirkung ist
                 // der tatsächliche Ausgang nicht mehr sicher `false`. Jeder rein
                 // lesende Verifyfehler davor behält die klare Nullwirkung.
@@ -2878,6 +3150,16 @@ fn validate_transfer_targets(
     items: &[PathBuf],
     dst_dir: &Path,
 ) -> io::Result<()> {
+    validate_transfer_targets_resolved(src_vfs, dst_vfs, items, dst_dir, &[])
+}
+
+fn validate_transfer_targets_resolved(
+    src_vfs: &dyn Vfs,
+    dst_vfs: &dyn Vfs,
+    items: &[PathBuf],
+    dst_dir: &Path,
+    targets: &[FileKeepBothTarget],
+) -> io::Result<()> {
     validate_file_operation_paths(items, dst_dir)?;
     let destination = normalize_absolute(dst_dir)?;
     // Gleicher Pfadtext bedeutet bei zwei Remote-Verbindungen nicht derselbe
@@ -2894,8 +3176,21 @@ fn validate_transfer_targets(
                 "Quelle besitzt keinen Dateinamen",
             )
         })?;
-        let target = destination.join(name);
-        if same_namespace && (target == source || target.starts_with(&source)) {
+        let target = if targets.is_empty() {
+            destination.join(name)
+        } else {
+            transfer_target(&destination, &source, targets)?
+        };
+        if normalize_absolute(&target)? != target {
+            return Err(invalid_transfer(
+                "Aliasziel muss absolut und lexikalisch normalisiert sein",
+            ));
+        }
+        if same_namespace
+            && items
+                .iter()
+                .any(|selected| target == *selected || target.starts_with(selected))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -3812,26 +4107,26 @@ fn exchange_assured_replacement(
 /// Eine vollständig geschriebene Temp-Datei atomar sichtbar machen. Reguläre Dateien
 /// und Symlinks werden als Verzeichniseintrag ersetzt, ohne ihr Ziel zu öffnen. Ein
 /// vorhandener Ordner wird erst geparkt; bei Commit-Fehler bleibt er wiederherstellbar.
-struct TempFileCommitRequest<'a> {
-    dst: &'a dyn Vfs,
-    temp_path: &'a Path,
-    dst_path: &'a Path,
-    sandbox: &'a Option<PathBuf>,
-    replace_existing: bool,
-    expected_replacement: Option<&'a FileConflictProof>,
-    expected_size: Option<u64>,
-    expected_hash: Option<[u8; 32]>,
+pub(crate) struct TempFileCommitRequest<'a> {
+    pub(crate) dst: &'a dyn Vfs,
+    pub(crate) temp_path: &'a Path,
+    pub(crate) dst_path: &'a Path,
+    pub(crate) sandbox: &'a Option<PathBuf>,
+    pub(crate) replace_existing: bool,
+    pub(crate) expected_replacement: Option<&'a FileConflictProof>,
+    pub(crate) expected_size: Option<u64>,
+    pub(crate) expected_hash: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum TargetCommitEffect {
+pub(crate) enum TargetCommitEffect {
     Assured,
     BackupRetained(String),
     CopyNewBestEffort,
     ReplaceBestEffort,
 }
 
-fn commit_temp_file_with_phase(
+pub(crate) fn commit_temp_file_with_phase(
     request: TempFileCommitRequest<'_>,
     name_verification: Option<&Cancel>,
 ) -> Result<TargetCommitEffect, TempCommitFailure> {
@@ -4909,7 +5204,7 @@ fn target_file_commit_class(dst: &dyn Vfs, target: &Path) -> io::Result<FileComm
 
 /// Hängt eine fertige Temp-Datei an einen als frei bestätigten Zielnamen — in der
 /// stärksten Commit-Klasse, die das konkrete Ziel beweist.
-fn commit_new_name(
+pub(crate) fn commit_new_name(
     dst: &dyn Vfs,
     temp_path: &Path,
     dst_path: &Path,
@@ -5387,32 +5682,156 @@ struct FileTransferRequest<'a> {
     sandbox: &'a Option<PathBuf>,
     replace_existing: bool,
     expected_replacement: Option<&'a FileConflictProof>,
-    source_mtime: Option<i64>,
+    source_mtime: Option<crate::vfs::FileTimestamp>,
     source_mode: Option<u32>,
+    source_created: Option<crate::vfs::FileCreationTime>,
+    source_entry: &'a Entry,
+}
+
+fn apply_copy_metadata(
+    source: Option<&crate::vfs::FileCopyMetadataSource>,
+    target: Option<&crate::vfs::FileCopyMetadataTarget>,
+    cancel: &Cancel,
+) -> io::Result<crate::vfs::FileCopyMetadataReport> {
+    let Some(source) = source else {
+        return Ok(Default::default());
+    };
+    source.verify(cancel)?;
+    match target {
+        Some(target) => target.apply(source, cancel),
+        None => Ok(source.omitted_report()),
+    }
+}
+fn record_copy_metadata(
+    stats: &mut OpStats,
+    actuals: &mut FileOperationActuals,
+    report: crate::vfs::FileCopyMetadataReport,
+) {
+    stats.incomplete_resource_forks += u64::from(report.resource_fork_incomplete);
+    for note in report.limitations {
+        if !stats.target_write_limitations.contains(&note) {
+            stats.target_write_limitations.push(note.clone());
+        }
+        if !actuals.target_write_limitations.contains(&note) {
+            actuals.target_write_limitations.push(note);
+        }
+    }
+}
+fn cancelled_copy_outcome(temp_recovery_path: Option<String>) -> FileCopyOutcome {
+    FileCopyOutcome {
+        complete: false,
+        temp_recovery_path,
+        target_copy_new_best_effort: false,
+        target_replace_best_effort: false,
+        creation_time_omitted: false,
+        metadata_report: Default::default(),
+        completion_error: None,
+    }
+}
+
+fn record_creation_time_omission(stats: &mut OpStats, actuals: &mut FileOperationActuals) {
+    let note = "Erstellungszeiten werden am Ziel nicht vollständig übernommen; ein bestätigter Schreibweg fehlt.";
+    for notes in [
+        &mut stats.target_write_limitations,
+        &mut actuals.target_write_limitations,
+    ] {
+        if !notes.iter().any(|existing| existing == note) {
+            notes.push(note.into());
+        }
+    }
+}
+
+fn finish_copy_flags(
+    dst: &dyn Vfs,
+    source: Option<&crate::vfs::FileCopyMetadataSource>,
+    target: Option<&crate::vfs::FileCopyMetadataTarget>,
+    path: &Path,
+) -> io::Result<crate::vfs::FileCopyMetadataReport> {
+    match (source, target) {
+        (Some(source), Some(target)) => dst.finish_copy_metadata(path, source, target),
+        _ => Ok(crate::vfs::FileCopyMetadataReport::default()),
+    }
+}
+
+fn apply_copy_mtime(
+    dst: &dyn Vfs,
+    path: &Path,
+    time: Option<crate::vfs::FileTimestamp>,
+    report: &mut crate::vfs::FileCopyMetadataReport,
+) -> io::Result<()> {
+    if let Some(time) = time.filter(|_| dst.supports_mtime_write()) {
+        match dst.set_copy_mtime(path, time) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                report.limitations.push(format!(
+                    "Änderungszeit am Ziel nicht vollständig übernommen: {error}"
+                ));
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        if time.nanoseconds != 0 && !dst.supports_precise_copy_mtime() {
+            report
+                .limitations
+                .push("Änderungszeit am Ziel nur sekundengenau übernommen".into());
+        }
+    }
+    Ok(())
+}
+
+fn apply_copy_creation_time(
+    dst: &dyn Vfs,
+    path: &Path,
+    time: Option<crate::vfs::FileCreationTime>,
+) -> io::Result<bool> {
+    let Some(time) = time else {
+        return Ok(false);
+    };
+    match dst.set_creation_time(path, time) {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 /// Legt einen kollisionsfreien Datei-Tempnachbarn an und übernimmt nur einen Beleg,
 /// den der Provider untrennbar mit genau dieser Anlage verbunden hat.
-struct CreatedFileopTemp {
-    path: PathBuf,
-    writer: Box<dyn io::Write + Send>,
-    removal_proof: Option<ProofListEntry>,
+pub(crate) struct CreatedFileopTemp {
+    pub(crate) path: PathBuf,
+    pub(crate) writer: Box<dyn io::Write + Send>,
+    pub(crate) removal_proof: Option<ProofListEntry>,
+    pub(crate) metadata: Option<crate::vfs::FileCopyMetadataTarget>,
 }
 
-fn create_fileop_temp(
+pub(crate) fn create_fileop_temp(
     dst: &dyn Vfs,
     dst_path: &Path,
     sandbox: &Option<PathBuf>,
 ) -> Result<CreatedFileopTemp, FileCopyFailure> {
+    create_fileop_temp_with_metadata(dst, dst_path, sandbox, false)
+}
+
+fn create_fileop_temp_with_metadata(
+    dst: &dyn Vfs,
+    dst_path: &Path,
+    sandbox: &Option<PathBuf>,
+    metadata: bool,
+) -> Result<CreatedFileopTemp, FileCopyFailure> {
     for _ in 0..100 {
         let candidate = dst.staging_candidate(dst_path, "fileop-tmp")?;
         guard_vfs(dst, sandbox, &candidate)?;
-        match dst.open_write_new_with_removal_proof(&candidate) {
-            Ok((writer, removal_proof)) => {
+        match dst.open_write_new_for_copy(&candidate, metadata) {
+            Ok(created) => {
+                let crate::vfs::FileCopyWriter {
+                    writer,
+                    removal_proof,
+                    metadata,
+                } = created;
                 return Ok(CreatedFileopTemp {
                     path: candidate,
                     writer,
                     removal_proof,
+                    metadata,
                 });
             }
             Err(MutationFailure::Unchanged(error))
@@ -5458,7 +5877,7 @@ fn create_fileop_temp(
 /// gebundenen Beleg. Übertragene Bytes und der bis dahin gebildete Hash wären hier
 /// kein Besitznachweis, sondern nur ein zweiter, schwächerer Anhaltspunkt — die
 /// Signatur trug sie deshalb bislang ungenutzt mit sich.
-fn cleanup_fileop_temp(
+pub(crate) fn cleanup_fileop_temp(
     dst: &dyn Vfs,
     temp_path: &Path,
     removal_proof: Option<&ProofListEntry>,
@@ -5508,10 +5927,15 @@ struct FileCopyOutcome {
     temp_recovery_path: Option<String>,
     target_copy_new_best_effort: bool,
     target_replace_best_effort: bool,
+    creation_time_omitted: bool,
+    metadata_report: crate::vfs::FileCopyMetadataReport,
+    // Inhalt/Commitklasse werden bilanziert, bevor ein später Flagabschlussfehler
+    // den Lauf und damit jeden Move-Quellabbau stoppt.
+    completion_error: Option<io::Error>,
 }
 
-struct FileCopyFailure {
-    error: io::Error,
+pub(crate) struct FileCopyFailure {
+    pub(crate) error: io::Error,
     unclear_effect: Option<UnclearBestEffortEffect>,
     temp_recovery_path: Option<String>,
 }
@@ -5540,7 +5964,7 @@ fn with_temp_recovery(error: io::Error, recovery_path: Option<&str>) -> io::Erro
     with_recovery_context(failure, &[&error], &[Path::new(recovery_path)])
 }
 
-fn fail_file_copy_before_commit(
+pub(crate) fn fail_file_copy_before_commit(
     dst: &dyn Vfs,
     temp_path: &Path,
     removal_proof: Option<&ProofListEntry>,
@@ -5577,7 +6001,22 @@ fn copy_file_stream(
         expected_replacement,
         source_mtime,
         source_mode,
+        mut source_created,
+        source_entry,
     } = request;
+    let source_metadata = match src.read_copy_metadata(src_path, source_entry, cancel) {
+        Ok(source) => source,
+        Err(error) if cancel.is_cancelled() && error_code(&error) == ErrorCode::Interrupted => {
+            return Ok(cancelled_copy_outcome(None))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(time) = source_metadata
+        .as_ref()
+        .and_then(|source| source.creation_time())
+    {
+        source_created = Some(time);
+    }
     if let Some(parent) = dst_path.parent() {
         dst.create_dir_all(parent)?;
     }
@@ -5586,7 +6025,15 @@ fn copy_file_stream(
         path: temp_path,
         mut writer,
         removal_proof: temp_removal_proof,
-    } = create_fileop_temp(dst, dst_path, sandbox)?;
+        metadata: target_metadata,
+    } = create_fileop_temp_with_metadata(
+        dst,
+        dst_path,
+        sandbox,
+        source_metadata
+            .as_ref()
+            .is_some_and(|source| source.needs_copy()),
+    )?;
     let transfer = copy_stream(reader.as_mut(), writer.as_mut(), cancel, &mut |bytes| {
         prog.bytes_done = prog.bytes_done.saturating_add(bytes);
         on_progress(prog);
@@ -5606,6 +6053,9 @@ fn copy_file_stream(
                 temp_recovery_path,
                 target_copy_new_best_effort: false,
                 target_replace_best_effort: false,
+                creation_time_omitted: false,
+                metadata_report: Default::default(),
+                completion_error: None,
             });
         }
         Ok(result) => result,
@@ -5622,18 +6072,21 @@ fn copy_file_stream(
 
     let transferred_hash = transfer.hash;
     let transferred_bytes = transfer.bytes;
+    let mut creation_time_omitted = false;
+    let mut metadata_report = Default::default();
     let prepare = (|| -> io::Result<()> {
+        metadata_report =
+            apply_copy_metadata(source_metadata.as_ref(), target_metadata.as_ref(), cancel)?;
         let mode_write = dst.supports_mode_write_at(temp_path.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Tempdatei benötigt einen Elternordner",
             )
         })?)?;
-        if dst.supports_mtime_write() {
-            if let Some(mtime) = source_mtime {
-                dst.set_mtime(&temp_path, mtime)?;
-            }
-        }
+        apply_copy_mtime(dst, &temp_path, source_mtime, &mut metadata_report)?;
+        // mtime kann auf macOS eine jüngere Erstellungszeit mit absenken. Die
+        // gebundene Quellzeit wird deshalb danach und vor chmod gesetzt.
+        creation_time_omitted = apply_copy_creation_time(dst, &temp_path, source_created)?;
         dst.sync_file(&temp_path)?;
         if hash_vfs_file(dst, &temp_path)? != transferred_hash {
             return Err(io::Error::new(
@@ -5652,7 +6105,7 @@ fn copy_file_stream(
             let actual = dst.stat(&temp_path)?;
             if (mode_write && source_mode.is_some_and(|mode| actual.mode != Some(mode)))
                 || (dst.supports_mtime_write()
-                    && source_mtime.is_some_and(|mtime| actual.mtime != Some(mtime)))
+                    && source_mtime.is_some_and(|mtime| actual.mtime != Some(mtime.seconds)))
             {
                 return Err(io::Error::other(
                     "Temp-Metadaten stimmen im Readback nicht überein",
@@ -5660,6 +6113,11 @@ fn copy_file_stream(
             }
         }
         src.verify_transferred_source(src_path, &transferred_hash)?;
+        if src.read_copy_mtime(src_path, source_entry)? != source_mtime {
+            return Err(crate::real_mode::plan_drift(
+                "Änderungszeit der Quelle während des Kopierens verändert",
+            ));
+        }
         // Auch die zuletzt gesetzten Rechte müssen vor dem Rename bestätigt sein.
         // Sonst könnte ein Move die Quelle schon entfernen, obwohl am Ziel nur der
         // Dateiinhalt, nicht aber das gewählte Metadatenprofil dauerhaft ist.
@@ -5667,6 +6125,15 @@ fn copy_file_stream(
         Ok(())
     })();
     if let Err(error) = prepare {
+        if cancel.is_cancelled() && error_code(&error) == ErrorCode::Interrupted {
+            let recovery = cleanup_fileop_temp(
+                dst,
+                &temp_path,
+                temp_removal_proof.as_ref(),
+                "Metadatenübertragung abgebrochen",
+            )?;
+            return Ok(cancelled_copy_outcome(recovery));
+        }
         return Err(fail_file_copy_before_commit(
             dst,
             &temp_path,
@@ -5688,6 +6155,9 @@ fn copy_file_stream(
             temp_recovery_path,
             target_copy_new_best_effort: false,
             target_replace_best_effort: false,
+            creation_time_omitted: false,
+            metadata_report: Default::default(),
+            completion_error: None,
         });
     }
 
@@ -5705,15 +6175,39 @@ fn copy_file_stream(
         Some(cancel),
     );
     match commit {
-        Ok(effect) => Ok(FileCopyOutcome {
-            complete: true,
-            temp_recovery_path: match &effect {
-                TargetCommitEffect::BackupRetained(path) => Some(path.clone()),
-                _ => None,
-            },
-            target_copy_new_best_effort: effect == TargetCommitEffect::CopyNewBestEffort,
-            target_replace_best_effort: effect == TargetCommitEffect::ReplaceBestEffort,
-        }),
+        Ok(effect) => {
+            let flags_result = finish_copy_flags(
+                dst,
+                source_metadata.as_ref(),
+                target_metadata.as_ref(),
+                dst_path,
+            );
+            let completion_error = match flags_result {
+                Ok(report) => {
+                    metadata_report.limitations.extend(report.limitations);
+                    None
+                }
+                Err(error) => {
+                    let failure = coded_error(
+                        io::ErrorKind::Other, ErrorCode::OutcomeUnclear,
+                        format!("Dateiinhalt nach {} übertragen, aber der abschließende Sperrstatus konnte nicht bestätigt werden: {error}", dst_path.display()),
+                    );
+                    Some(with_recovery_context(failure, &[&error], &[dst_path]))
+                }
+            };
+            Ok(FileCopyOutcome {
+                complete: true,
+                temp_recovery_path: match &effect {
+                    TargetCommitEffect::BackupRetained(path) => Some(path.clone()),
+                    _ => None,
+                },
+                target_copy_new_best_effort: effect == TargetCommitEffect::CopyNewBestEffort,
+                target_replace_best_effort: effect == TargetCommitEffect::ReplaceBestEffort,
+                creation_time_omitted,
+                metadata_report,
+                completion_error,
+            })
+        }
         Err(TempCommitFailure::TempStillOwned(error)) => {
             // Nur diese Phase beweist, dass der Tempname noch den bei seiner Anlage
             // gebundenen Eintrag bezeichnet. Die bedingte Entfernung schützt ihn
@@ -5759,6 +6253,874 @@ mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_copy_weak_target_keeps_resource_source_and_allows_other_metadata_omissions() {
+        for with_resource in [false, true] {
+            let area = tempfile::tempdir().unwrap();
+            let root = area.path().canonicalize().unwrap();
+            let source = root.join("source");
+            let target = root.join("target");
+            std::fs::write(&source, b"plain payload").unwrap();
+            std::fs::create_dir(&target).unwrap();
+            let src = LocalVfs::rooted(&root).unwrap();
+            let mut attributes = src.read_xattrs(&source).unwrap();
+            attributes.push(crate::XattrValue {
+                name: b"com.doppeldecker.test".to_vec(),
+                value: b"attribute".to_vec(),
+            });
+            attributes.sort_by(|left, right| left.name.cmp(&right.name));
+            src.write_xattrs_exact(&source, &attributes).unwrap();
+            if with_resource {
+                let mut fork = src
+                    .open_fork_write_new(&source, crate::ForkKind::Resource)
+                    .unwrap();
+                fork.write_all(b"indispensable resource payload").unwrap();
+            }
+            // Dieser Adapter kann normalen Inhalt schreiben, besitzt aber keinen
+            // nativen Kopieradapter. Genau das ist eine schwächere Zielfähigkeit.
+            let dst = FileopsRaceVfs::different_remote_namespace();
+            let stats = move_items(
+                FileOperationRequest {
+                    src: &src,
+                    dst: &dst,
+                    items: std::slice::from_ref(&source),
+                    dst_dir: &target,
+                    policy: OverwritePolicy::Skip,
+                    sandbox: &Some(root.clone()),
+                },
+                &Cancel::new(),
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(target.join("source")).unwrap(),
+                b"plain payload"
+            );
+            assert_eq!(stats.files, 1);
+            assert!(stats
+                .target_write_limitations
+                .iter()
+                .any(|note| note.contains("xattrs")));
+            assert_eq!(stats.incomplete_resource_forks, u64::from(with_resource));
+            assert_eq!(source.exists(), with_resource);
+            assert_eq!(
+                stats.retained_source_paths,
+                if with_resource {
+                    vec![source.to_string_lossy().into_owned()]
+                } else {
+                    vec![]
+                }
+            );
+            if with_resource {
+                assert_eq!(
+                    std::fs::read(source.join("..namedfork/rsrc")).unwrap(),
+                    b"indispensable resource payload"
+                );
+                assert!(stats
+                    .target_write_limitations
+                    .iter()
+                    .any(|note| note.contains("Quelle") && note.contains("behalten")));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_copy_move_rechecks_resource_at_both_ends_before_removal() {
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::write(&source, b"same plain bytes").unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let vfs = LocalVfs::rooted(&root).unwrap();
+        {
+            let mut fork = vfs
+                .open_fork_write_new(&source, crate::ForkKind::Resource)
+                .unwrap();
+            fork.write_all(b"original resource").unwrap();
+        }
+        let cancel = Cancel::new();
+        let binding = bind_move_source(&vfs, &source, &cancel).unwrap();
+        copy_items(
+            FileOperationRequest {
+                src: &vfs,
+                dst: &vfs,
+                items: std::slice::from_ref(&source),
+                dst_dir: &target,
+                policy: OverwritePolicy::Skip,
+                sandbox: &Some(root.clone()),
+            },
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap();
+        verify_move_source_entry(&vfs, &source, &binding.entries[0], &cancel).unwrap();
+        verify_move_destination(&vfs, &target.join("source"), &binding, &cancel).unwrap();
+        std::fs::write(target.join("source/..namedfork/rsrc"), b"foreign resource").unwrap();
+        assert!(verify_move_destination(&vfs, &target.join("source"), &binding, &cancel).is_err());
+        std::fs::write(source.join("..namedfork/rsrc"), b"changed resource").unwrap();
+        vfs.set_mtime(&source, binding.entries[0].mtime.unwrap())
+            .unwrap();
+        assert!(verify_move_source_entry(&vfs, &source, &binding.entries[0], &cancel).is_err());
+        assert_eq!(std::fs::read(source).unwrap(), b"same plain bytes");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn move_creation_time_change_is_detected_before_source_removal() {
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let source = root.join("file");
+        std::fs::write(&source, b"unchanged content").unwrap();
+        let vfs = LocalVfs::rooted(&root).unwrap();
+        let first = crate::vfs::FileCreationTime {
+            seconds: 1_000_000_000,
+            nanoseconds: 123_456_789,
+        };
+        vfs.set_creation_time(&source, first).unwrap();
+        let binding = bind_move_source(&vfs, &source, &Cancel::new()).unwrap();
+        verify_move_source_entry(&vfs, &source, &binding.entries[0], &Cancel::new()).unwrap();
+        let before = vfs.stat(&source).unwrap();
+        vfs.set_creation_time(
+            &source,
+            crate::vfs::FileCreationTime {
+                nanoseconds: 987_654_321,
+                ..first
+            },
+        )
+        .unwrap();
+        let after = vfs.stat(&source).unwrap();
+        assert_eq!(
+            (before.size, before.mtime, before.mode),
+            (after.size, after.mtime, after.mode)
+        );
+        assert!(
+            verify_move_source_entry(&vfs, &source, &binding.entries[0], &Cancel::new()).is_err()
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"unchanged content");
+    }
+
+    #[test]
+    fn copy_creation_time_unsupported_keeps_copy_available_and_reports_class_once() {
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let items = [root.join("first"), root.join("second")];
+        for item in &items {
+            std::fs::write(item, b"synthetic content").unwrap();
+        }
+        let mut vfs = FileopsRaceVfs::new(ForeignReplacementKind::File);
+        vfs.creation_read_override = Some(crate::vfs::FileCreationTime {
+            seconds: 1_000_000_000,
+            nanoseconds: 942_123_456,
+        });
+        vfs.creation_write_error = Some(io::ErrorKind::Unsupported);
+        vfs.swapped.store(true, Ordering::SeqCst);
+        let mut actuals = FileOperationActuals::default();
+        let stats = copy_items_inner(
+            FileOperationRequest {
+                src: &vfs,
+                dst: &vfs,
+                items: &items,
+                dst_dir: &target,
+                policy: OverwritePolicy::Skip,
+                sandbox: &Some(root.clone()),
+            },
+            FileTransferBindings::default(),
+            &Cancel::new(),
+            &mut |_| {},
+            &mut actuals,
+        )
+        .unwrap();
+        assert_eq!(stats.files, 2);
+        assert_eq!(vfs.creation_write_calls.load(Ordering::SeqCst), 2);
+        for item in &items {
+            assert_eq!(
+                std::fs::read(item).unwrap(),
+                std::fs::read(target.join(item.file_name().unwrap())).unwrap()
+            );
+        }
+        assert_eq!(stats.target_write_limitations.len(), 1);
+        assert!(stats.target_write_limitations[0].contains("Erstellungszeiten"));
+        assert_eq!(
+            actuals.target_write_limitations,
+            stats.target_write_limitations
+        );
+    }
+
+    #[test]
+    fn copy_creation_time_failure_preserves_source_and_old_target_without_retry() {
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let source = root.join("file");
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(&source, b"new content").unwrap();
+        std::fs::write(target.join("file"), b"old content").unwrap();
+        let mut vfs = FileopsRaceVfs::new(ForeignReplacementKind::File);
+        vfs.creation_read_override = Some(crate::vfs::FileCreationTime {
+            seconds: 1_000_000_000,
+            nanoseconds: 942_123_456,
+        });
+        vfs.creation_write_error = Some(io::ErrorKind::Other);
+        vfs.swapped.store(true, Ordering::SeqCst);
+        let mut actuals = FileOperationActuals::default();
+        let result = copy_items_inner(
+            FileOperationRequest {
+                src: &vfs,
+                dst: &vfs,
+                items: std::slice::from_ref(&source),
+                dst_dir: &target,
+                policy: OverwritePolicy::Overwrite,
+                sandbox: &Some(root.clone()),
+            },
+            FileTransferBindings::default(),
+            &Cancel::new(),
+            &mut |_| {},
+            &mut actuals,
+        );
+        assert!(result.is_err());
+        assert_eq!(vfs.creation_write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&source).unwrap(), b"new content");
+        assert_eq!(std::fs::read(target.join("file")).unwrap(), b"old content");
+        for entry in std::fs::read_dir(&target).unwrap() {
+            let path = entry.unwrap().path();
+            if path != target.join("file") {
+                assert!(
+                    actuals
+                        .temp_recovery_paths
+                        .contains(&path.to_string_lossy().into_owned()),
+                    "Unbilanzierter Pfad {path:?}; Actuals {:?}",
+                    actuals.temp_recovery_paths
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copy_mtime_preserves_nanoseconds_for_files_new_directories_and_merge_roots() {
+        use crate::vfs::FileTimestamp;
+        use std::os::unix::fs::MetadataExt;
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir_all(source.join("folder")).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(source.join("folder/file"), b"precise dates").unwrap();
+        let vfs = LocalVfs::rooted(&root).unwrap();
+        let time = FileTimestamp {
+            seconds: 1_600_000_000,
+            nanoseconds: 215_466_166,
+        };
+        for path in [source.join("folder/file"), source.join("folder")] {
+            vfs.set_copy_mtime(&path, time).unwrap();
+        }
+        let copy = || {
+            copy_items(
+                FileOperationRequest {
+                    src: &vfs,
+                    dst: &vfs,
+                    items: &[source.join("folder")],
+                    dst_dir: &target,
+                    policy: OverwritePolicy::Skip,
+                    sandbox: &Some(root.clone()),
+                },
+                &Cancel::new(),
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+        assert_eq!(copy().files, 1);
+        for path in [target.join("folder/file"), target.join("folder")] {
+            let meta = std::fs::metadata(path).unwrap();
+            assert_eq!(
+                (meta.mtime(), meta.mtime_nsec()),
+                (time.seconds, i64::from(time.nanoseconds))
+            );
+        }
+        let own = FileTimestamp {
+            seconds: time.seconds - 100,
+            nanoseconds: 987_654_321,
+        };
+        vfs.set_copy_mtime(&target.join("folder"), own).unwrap();
+        assert_eq!(copy().skipped, 1);
+        assert_eq!(
+            vfs.read_copy_mtime(
+                &target.join("folder"),
+                &vfs.stat(&target.join("folder")).unwrap()
+            )
+            .unwrap(),
+            Some(own)
+        );
+    }
+
+    #[test]
+    fn copy_mtime_seconds_only_target_reports_precision_and_failure_preserves_old_target() {
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let source = root.join("file");
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(&source, b"new content").unwrap();
+        let src = LocalVfs::rooted(&root).unwrap();
+        src.set_copy_mtime(
+            &source,
+            crate::vfs::FileTimestamp {
+                seconds: 1_600_000_000,
+                nanoseconds: 942_123_456,
+            },
+        )
+        .unwrap();
+        let mut dst = FileopsRaceVfs::new(ForeignReplacementKind::File);
+        dst.swapped.store(true, Ordering::SeqCst);
+        let stats = copy_items(
+            FileOperationRequest {
+                src: &src,
+                dst: &dst,
+                items: std::slice::from_ref(&source),
+                dst_dir: &target,
+                policy: OverwritePolicy::Skip,
+                sandbox: &Some(root.clone()),
+            },
+            &Cancel::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(
+            stats
+                .target_write_limitations
+                .iter()
+                .filter(|n| n.contains("sekundengenau"))
+                .count(),
+            1
+        );
+        std::fs::write(target.join("file"), b"old content").unwrap();
+        dst.mtime_write_error = Some(io::ErrorKind::Other);
+        assert!(copy_items(
+            FileOperationRequest {
+                src: &src,
+                dst: &dst,
+                items: std::slice::from_ref(&source),
+                dst_dir: &target,
+                policy: OverwritePolicy::Overwrite,
+                sandbox: &Some(root.clone())
+            },
+            &Cancel::new(),
+            &mut |_| {}
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"new content");
+        assert_eq!(std::fs::read(target.join("file")).unwrap(), b"old content");
+    }
+
+    #[test]
+    fn move_mtime_nanosecond_drift_is_detected_at_source_and_target_before_removal() {
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let source = root.join("file");
+        let target = root.join("target");
+        std::fs::write(&source, b"unchanged bytes").unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let vfs = LocalVfs::rooted(&root).unwrap();
+        let cancel = Cancel::new();
+        let time = crate::vfs::FileTimestamp {
+            seconds: 1_600_000_000,
+            nanoseconds: 123_456_789,
+        };
+        vfs.set_copy_mtime(&source, time).unwrap();
+        let binding = bind_move_source(&vfs, &source, &cancel).unwrap();
+        copy_items(
+            FileOperationRequest {
+                src: &vfs,
+                dst: &vfs,
+                items: std::slice::from_ref(&source),
+                dst_dir: &target,
+                policy: OverwritePolicy::Skip,
+                sandbox: &Some(root.clone()),
+            },
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap();
+        let dest = target.join("file");
+        verify_move_source_entry(&vfs, &source, &binding.entries[0], &cancel).unwrap();
+        verify_move_destination(&vfs, &dest, &binding, &cancel).unwrap();
+        vfs.set_copy_mtime(
+            &dest,
+            crate::vfs::FileTimestamp {
+                nanoseconds: 987_654_321,
+                ..time
+            },
+        )
+        .unwrap();
+        assert!(verify_move_destination(&vfs, &dest, &binding, &cancel).is_err());
+        vfs.set_copy_mtime(
+            &source,
+            crate::vfs::FileTimestamp {
+                nanoseconds: 987_654_321,
+                ..time
+            },
+        )
+        .unwrap();
+        assert_eq!(vfs.stat(&source).unwrap().mtime, Some(time.seconds));
+        assert!(verify_move_source_entry(&vfs, &source, &binding.entries[0], &cancel).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"unchanged bytes");
+    }
+
+    #[cfg(target_os = "macos")]
+    struct UnlockCopies(Vec<PathBuf>);
+    #[cfg(target_os = "macos")]
+    impl Drop for UnlockCopies {
+        fn drop(&mut self) {
+            use std::os::fd::AsRawFd;
+            for path in &self.0 {
+                if let Ok(file) = std::fs::File::open(path) {
+                    unsafe {
+                        libc::fchflags(file.as_raw_fd(), 0);
+                    }
+                    if file.metadata().is_ok_and(|metadata| metadata.is_dir()) {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o700));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_copy_locked_files_and_new_directories_finish_after_commit_and_preserve_metadata() {
+        use std::os::darwin::fs::MetadataExt as _;
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let folder = root.join("source");
+        let target = root.join("target");
+        let replacement = root.join("replacement");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        let file = folder.join("file");
+        std::fs::write(&file, b"locked source data").unwrap();
+        std::fs::write(replacement.join("file"), b"old replaceable data").unwrap();
+        let _cleanup = UnlockCopies(vec![
+            file.clone(),
+            folder.clone(),
+            target.join("source/file"),
+            target.join("source"),
+            replacement.join("file"),
+        ]);
+        let vfs = LocalVfs::rooted(&root).unwrap();
+        {
+            let mut fork = vfs
+                .open_fork_write_new(&file, crate::ForkKind::Resource)
+                .unwrap();
+            fork.write_all(b"essential locked resource").unwrap();
+        }
+        let time = crate::vfs::FileTimestamp {
+            seconds: 1_600_000_000,
+            nanoseconds: 215_466_166,
+        };
+        for path in [&file, &folder] {
+            vfs.set_copy_mtime(path, time).unwrap();
+            vfs.set_mode(path, if path == &file { 0o640 } else { 0o555 })
+                .unwrap();
+            assert_eq!(
+                unsafe {
+                    libc::fchflags(
+                        std::fs::File::open(path).unwrap().as_raw_fd(),
+                        libc::UF_IMMUTABLE,
+                    )
+                },
+                0
+            );
+        }
+        let original = std::fs::metadata(&file).unwrap();
+        for (items, destination, policy) in [
+            (vec![folder.clone()], target.clone(), OverwritePolicy::Skip),
+            (
+                vec![file.clone()],
+                replacement.clone(),
+                OverwritePolicy::Overwrite,
+            ),
+        ] {
+            let stats = copy_items(
+                FileOperationRequest {
+                    src: &vfs,
+                    dst: &vfs,
+                    items: &items,
+                    dst_dir: &destination,
+                    policy,
+                    sandbox: &Some(root.clone()),
+                },
+                &Cancel::new(),
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(stats.files, 1);
+            assert!(
+                stats.temp_recovery_paths.is_empty(),
+                "{:?}",
+                stats.temp_recovery_paths
+            );
+            assert!(
+                stats.target_write_limitations.is_empty(),
+                "{:?}",
+                stats.target_write_limitations
+            );
+        }
+        for path in [target.join("source/file"), replacement.join("file")] {
+            let actual = std::fs::metadata(&path).unwrap();
+            assert_eq!(actual.st_flags() & libc::UF_IMMUTABLE, libc::UF_IMMUTABLE);
+            assert_eq!(
+                (
+                    actual.mode(),
+                    actual.uid(),
+                    actual.gid(),
+                    actual.mtime(),
+                    actual.mtime_nsec()
+                ),
+                (
+                    original.mode(),
+                    original.uid(),
+                    original.gid(),
+                    time.seconds,
+                    i64::from(time.nanoseconds)
+                )
+            );
+            assert_eq!(
+                (actual.st_birthtime(), actual.st_birthtime_nsec()),
+                (original.st_birthtime(), original.st_birthtime_nsec())
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"locked source data");
+            assert_eq!(
+                std::fs::read(path.join("..namedfork/rsrc")).unwrap(),
+                b"essential locked resource"
+            );
+        }
+        let copied_folder = std::fs::metadata(target.join("source")).unwrap();
+        assert_eq!(
+            copied_folder.st_flags() & libc::UF_IMMUTABLE,
+            libc::UF_IMMUTABLE
+        );
+        assert_eq!(
+            (copied_folder.mtime(), copied_folder.mtime_nsec()),
+            (time.seconds, i64::from(time.nanoseconds))
+        );
+        assert_eq!(std::fs::read(file).unwrap(), b"locked source data");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_locked_completion_rejects_replaced_pane_root_with_retained_target_parent() {
+        use std::os::{darwin::fs::MetadataExt as _, fd::AsRawFd, unix::fs::PermissionsExt};
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let pane = root.join("pane");
+        let parent = pane.join("target");
+        std::fs::create_dir(&pane).unwrap();
+        std::fs::set_permissions(&pane, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        let source = root.join("source");
+        let destination = parent.join("file");
+        std::fs::write(&source, b"committed bytes").unwrap();
+        let _cleanup = UnlockCopies(vec![source.clone(), destination.clone()]);
+        assert_eq!(
+            unsafe {
+                libc::fchflags(
+                    std::fs::File::open(&source).unwrap().as_raw_fd(),
+                    libc::UF_IMMUTABLE,
+                )
+            },
+            0
+        );
+        let src = LocalVfs::rooted(&root).unwrap();
+        let source_metadata = src
+            .read_copy_metadata(&source, &src.stat(&source).unwrap(), &Cancel::new())
+            .unwrap()
+            .unwrap();
+        let dst = LocalVfs::rooted(&pane).unwrap();
+        let scoped = dst
+            .staging_scope(&destination, Some(&root))
+            .unwrap()
+            .unwrap();
+        assert!(scoped.has_private_staging());
+        let staging_name = scoped
+            .staging_recovery_path()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_owned();
+        let sandbox = Some(root.clone());
+        let mut created =
+            create_fileop_temp_with_metadata(scoped.as_ref(), &destination, &sandbox, true)
+                .unwrap_or_else(|failure| panic!("{}", failure.error));
+        created.writer.write_all(b"committed bytes").unwrap();
+        drop(created.writer);
+        commit_temp_file_with_phase(
+            TempFileCommitRequest {
+                dst: scoped.as_ref(),
+                temp_path: &created.path,
+                dst_path: &destination,
+                sandbox: &sandbox,
+                replace_existing: false,
+                expected_replacement: None,
+                expected_size: Some(15),
+                expected_hash: None,
+            },
+            Some(&Cancel::new()),
+        )
+        .unwrap_or_else(|_| panic!("Kopiercommit muss vor dem Rootaustausch gelingen"));
+        std::fs::rename(&pane, root.join("pane-old")).unwrap();
+        std::fs::create_dir(&pane).unwrap();
+        std::fs::rename(root.join("pane-old/target"), &parent).unwrap();
+        std::fs::rename(
+            root.join("pane-old").join(&staging_name),
+            pane.join(&staging_name),
+        )
+        .unwrap();
+        assert!(!scoped.anchor_is_current().unwrap());
+        let error = scoped
+            .finish_copy_metadata(
+                &destination,
+                &source_metadata,
+                created.metadata.as_ref().unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(error_code(&error), ErrorCode::PlanDrift);
+        assert_eq!(
+            std::fs::metadata(&destination).unwrap().st_flags() & libc::UF_IMMUTABLE,
+            0
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"committed bytes");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_locked_completion_error_keeps_committed_effect_and_move_source_without_temp_cleanup()
+    {
+        use std::os::fd::AsRawFd;
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let source = root.join("file");
+        let target = root.join("target");
+        std::fs::write(&source, b"already committed content").unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let _cleanup = UnlockCopies(vec![source.clone()]);
+        assert_eq!(
+            unsafe {
+                libc::fchflags(
+                    std::fs::File::open(&source).unwrap().as_raw_fd(),
+                    libc::UF_IMMUTABLE,
+                )
+            },
+            0
+        );
+        let src = LocalVfs::rooted(&root).unwrap();
+        let mut dst = FileopsRaceVfs::new(ForeignReplacementKind::File);
+        dst.fail_copy_finish = true;
+        dst.swapped.store(true, Ordering::SeqCst);
+        dst.use_best_effort_commit();
+        let mut actuals = FileOperationActuals::default();
+        let mut files_done = 0;
+        let error = move_items_with_conflict_proofs_tracked(
+            FileOperationRequest {
+                src: &src,
+                dst: &dst,
+                items: std::slice::from_ref(&source),
+                dst_dir: &target,
+                policy: OverwritePolicy::Skip,
+                sandbox: &Some(root.clone()),
+            },
+            &[],
+            &Cancel::new(),
+            &mut |progress| files_done = progress.files_done,
+            &mut actuals,
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&error), ErrorCode::OutcomeUnclear);
+        assert_eq!(actuals.target_copy_new_best_effort, Some(true));
+        assert_eq!(actuals.source_removal_best_effort, Some(false));
+        assert_eq!(files_done, 1);
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"already committed content"
+        );
+        assert_eq!(
+            std::fs::read(target.join("file")).unwrap(),
+            b"already committed content"
+        );
+        assert!(crate::error::recovery_paths(&error)
+            .contains(&target.join("file").to_string_lossy().into_owned()));
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_copy_locked_source_without_target_adapter_keeps_content_and_reports_lock_omission() {
+        use std::os::darwin::fs::MetadataExt as _;
+        use std::os::fd::AsRawFd;
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let source = root.join("file");
+        let target = root.join("target");
+        std::fs::write(&source, b"locked bytes").unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let _cleanup = UnlockCopies(vec![source.clone()]);
+        assert_eq!(
+            unsafe {
+                libc::fchflags(
+                    std::fs::File::open(&source).unwrap().as_raw_fd(),
+                    libc::UF_IMMUTABLE,
+                )
+            },
+            0
+        );
+        let src = LocalVfs::rooted(&root).unwrap();
+        let dst = FileopsRaceVfs::new(ForeignReplacementKind::File);
+        dst.swapped.store(true, Ordering::SeqCst);
+        let stats = copy_items(
+            FileOperationRequest {
+                src: &src,
+                dst: &dst,
+                items: std::slice::from_ref(&source),
+                dst_dir: &target,
+                policy: OverwritePolicy::Skip,
+                sandbox: &Some(root.clone()),
+            },
+            &Cancel::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(stats.files, 1);
+        assert!(stats
+            .target_write_limitations
+            .iter()
+            .any(|note| note.contains("Dateisperre")));
+        assert_eq!(std::fs::read(target.join("file")).unwrap(), b"locked bytes");
+        assert_eq!(
+            std::fs::metadata(target.join("file")).unwrap().st_flags() & libc::UF_IMMUTABLE,
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().st_flags() & libc::UF_IMMUTABLE,
+            libc::UF_IMMUTABLE
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_creation_time_preserves_native_file_directory_precision_and_existing_merge_root() {
+        use crate::vfs::FileCreationTime;
+        use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir_all(source.join("folder")).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(source.join("folder/file"), b"content and dates").unwrap();
+        let src = LocalVfs::rooted(&source).unwrap();
+        let dst = LocalVfs::rooted(&target).unwrap();
+        let file_time = FileCreationTime {
+            seconds: 1_000_000_000,
+            nanoseconds: 942_123_456,
+        };
+        let dir_time = FileCreationTime {
+            seconds: 900_000_000,
+            nanoseconds: 123_456_789,
+        };
+        for (path, time, mode) in [
+            (source.join("folder/file"), file_time, 0o640),
+            (source.join("folder"), dir_time, 0o555),
+        ] {
+            src.set_mtime(&path, 1_200_000_000).unwrap();
+            src.set_creation_time(&path, time).unwrap();
+            src.set_mode(&path, mode).unwrap();
+            let actual = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                (actual.st_birthtime(), actual.st_birthtime_nsec()),
+                (time.seconds, i64::from(time.nanoseconds))
+            );
+        }
+        let items = [source.join("folder")];
+        let stats = copy_items(
+            FileOperationRequest {
+                src: &src,
+                dst: &dst,
+                items: &items,
+                dst_dir: &target,
+                policy: OverwritePolicy::Skip,
+                sandbox: &Some(root.clone()),
+            },
+            &Cancel::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(stats.files, 1);
+        assert!(
+            stats.target_write_limitations.is_empty(),
+            "{:?}",
+            stats.target_write_limitations
+        );
+        for (path, time, mode) in [
+            (target.join("folder/file"), file_time, 0o640),
+            (target.join("folder"), dir_time, 0o555),
+        ] {
+            let actual = std::fs::metadata(path).unwrap();
+            assert_eq!(
+                (actual.st_birthtime(), actual.st_birthtime_nsec()),
+                (time.seconds, i64::from(time.nanoseconds))
+            );
+            assert_eq!(actual.mtime(), 1_200_000_000);
+            assert_eq!(actual.permissions().mode() & 0o777, mode);
+        }
+        assert_eq!(
+            std::fs::read(target.join("folder/file")).unwrap(),
+            b"content and dates"
+        );
+        std::fs::set_permissions(
+            source.join("folder"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            target.join("folder"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let existing = FileCreationTime {
+            seconds: 800_000_000,
+            nanoseconds: 876_543_210,
+        };
+        dst.set_creation_time(&target.join("folder"), existing)
+            .unwrap();
+        copy_items(
+            FileOperationRequest {
+                src: &src,
+                dst: &dst,
+                items: &items,
+                dst_dir: &target,
+                policy: OverwritePolicy::Overwrite,
+                sandbox: &Some(root.clone()),
+            },
+            &Cancel::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let actual = std::fs::metadata(target.join("folder")).unwrap();
+        assert_eq!(
+            (actual.st_birthtime(), actual.st_birthtime_nsec()),
+            (existing.seconds, i64::from(existing.nanoseconds))
+        );
+    }
 
     #[test]
     fn review_best_effort_recovery_erreicht_die_operationsbilanz() {
@@ -6309,6 +7671,11 @@ mod tests {
     /// Sicherheitsgrenze. So bleiben die Regressionstests deterministisch.
     struct FileopsRaceVfs {
         inner: crate::LocalVfs,
+        creation_read_override: Option<crate::vfs::FileCreationTime>,
+        creation_write_error: Option<io::ErrorKind>,
+        mtime_write_error: Option<io::ErrorKind>,
+        fail_copy_finish: bool,
+        creation_write_calls: AtomicUsize,
         replacement: ForeignReplacementKind,
         swapped: AtomicBool,
         attacked_path: Mutex<Option<PathBuf>>,
@@ -6370,6 +7737,11 @@ mod tests {
         fn new(replacement: ForeignReplacementKind) -> Self {
             Self {
                 inner: crate::LocalVfs::new(),
+                creation_read_override: None,
+                creation_write_error: None,
+                mtime_write_error: None,
+                fail_copy_finish: false,
+                creation_write_calls: AtomicUsize::new(0),
                 replacement,
                 swapped: AtomicBool::new(false),
                 attacked_path: Mutex::new(None),
@@ -7031,6 +8403,35 @@ mod tests {
             }
         }
 
+        fn open_write_new_for_copy(
+            &self,
+            path: &Path,
+            metadata: bool,
+        ) -> Result<crate::vfs::FileCopyWriter, MutationFailure> {
+            if self.fail_copy_finish {
+                return self.inner.open_write_new_for_copy(path, metadata);
+            }
+            self.open_write_new_with_removal_proof(path)
+                .map(|(writer, removal_proof)| crate::vfs::FileCopyWriter {
+                    writer,
+                    removal_proof,
+                    metadata: None,
+                })
+        }
+        fn finish_copy_metadata(
+            &self,
+            _path: &Path,
+            source: &crate::vfs::FileCopyMetadataSource,
+            _target: &crate::vfs::FileCopyMetadataTarget,
+        ) -> io::Result<crate::vfs::FileCopyMetadataReport> {
+            if self.fail_copy_finish {
+                return Err(io::Error::other(
+                    "Gezielter Fehler nach dem sichtbaren Inhaltscommit",
+                ));
+            }
+            Ok(source.omitted_flags_report())
+        }
+
         fn sync_file(&self, path: &Path) -> io::Result<()> {
             self.inner.sync_file(path)
         }
@@ -7056,6 +8457,36 @@ mod tests {
 
         fn set_mtime(&self, path: &Path, mtime: i64) -> io::Result<()> {
             self.inner.set_mtime(path, mtime)
+        }
+
+        fn set_copy_mtime(&self, path: &Path, time: crate::vfs::FileTimestamp) -> io::Result<()> {
+            if let Some(kind) = self.mtime_write_error {
+                return Err(io::Error::new(kind, "Erzwungener Änderungszeitfehler"));
+            }
+            self.set_mtime(path, time.seconds)
+        }
+
+        fn read_copy_creation_time(
+            &self,
+            path: &Path,
+            entry: &Entry,
+        ) -> io::Result<Option<crate::vfs::FileCreationTime>> {
+            if let Some(time) = self.creation_read_override {
+                return Ok(Some(time));
+            }
+            self.inner.read_copy_creation_time(path, entry)
+        }
+
+        fn set_creation_time(
+            &self,
+            path: &Path,
+            time: crate::vfs::FileCreationTime,
+        ) -> io::Result<()> {
+            self.creation_write_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(kind) = self.creation_write_error {
+                return Err(io::Error::new(kind, "Erzwungener Erstellungszeitfehler"));
+            }
+            self.inner.set_creation_time(path, time)
         }
 
         fn set_mode(&self, path: &Path, mode: u32) -> io::Result<()> {
@@ -7250,6 +8681,10 @@ mod tests {
             digest.update(&metadata.mtime.unwrap_or(i64::MIN).to_le_bytes());
             digest.update(&metadata.mode.unwrap_or(u32::MAX).to_le_bytes());
             digest.update(hash_vfs_file(&self.inner, path)?.as_bytes());
+            if let Some(time) = self.read_copy_mtime(path, &metadata)? {
+                digest.update(&time.seconds.to_le_bytes());
+                digest.update(&time.nanoseconds.to_le_bytes());
+            }
             if *digest.finalize().as_bytes() != content_digest {
                 return Ok(None);
             }

@@ -48,6 +48,7 @@ struct PendingDirectoryMetadata<'a> {
 /// Unveränderlicher Ausführungskontext eines vollständig bestätigten Sync-Plans.
 /// Die Bündelung verhindert, dass Roots, VFS-Instanzen, Plan und Safety-Vertrag an
 /// einer Aufrufstelle versehentlich in unterschiedlicher Reihenfolge übergeben werden.
+#[derive(Clone, Copy)]
 pub struct ExecuteRequest<'a> {
     pub src: &'a dyn Vfs,
     pub src_root: &'a Path,
@@ -77,6 +78,15 @@ struct PlanTotals {
 /// dürfen deshalb weder versehentlich noch durch einen alten/manipulierten Datensatz
 /// die Löschgates, den Mirror-Zweitscan oder die Quarantäneanlage umgehen.
 fn validate_plan_consistency(plan: &SyncPlan) -> io::Result<()> {
+    let mut observed_paths = HashSet::new();
+    for observation in &plan.metadata_observations {
+        crate::path::validate_relative_path(Path::new(&observation.path))?;
+        if observation.target_digest.is_none() || !observed_paths.insert(&observation.path) {
+            return Err(invalid_plan(
+                "Metadatenbeobachtung benötigt einen eindeutigen vorhandenen Zielpfad",
+            ));
+        }
+    }
     let mut totals = PlanTotals::default();
     let mut paths = HashSet::with_capacity(plan.actions.len());
     let mut all_paths = Vec::with_capacity(plan.actions.len());
@@ -89,6 +99,7 @@ fn validate_plan_consistency(plan: &SyncPlan) -> io::Result<()> {
             | Action::UpdateFile { path, .. }
             | Action::CreateHardlink { path, .. }
             | Action::SetMode { path, .. }
+            | Action::SetFileDacl { path, .. }
             | Action::SetDirectoryMetadata { path, .. }
             | Action::DeleteFile { path, .. }
             | Action::DeleteDir { path, .. }
@@ -113,16 +124,108 @@ fn validate_plan_consistency(plan: &SyncPlan) -> io::Result<()> {
             )));
         }
 
+        let dacl_metadata = match action {
+            Action::CreateDir { metadata, .. }
+            | Action::CopyFile { metadata, .. }
+            | Action::UpdateFile { metadata, .. } => metadata.as_ref(),
+            Action::CreateHardlink { metadata, .. }
+            | Action::SetDirectoryMetadata { metadata, .. } => Some(metadata),
+            _ => None,
+        };
+        if let Some(crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryExact(selection)) =
+            dacl_metadata.and_then(|m| m.windows_dacl.as_ref())
+        {
+            selection.validate()?;
+            let metadata = dacl_metadata.unwrap();
+            if !matches!(action, Action::CreateDir { .. })
+                || plan.metadata_report.profile != crate::MetadataProfile::NativeBestEffort
+                || !metadata.acl
+                || metadata.target.is_some()
+                || !metadata
+                    .source
+                    .named_streams
+                    .as_ref()
+                    .is_some_and(Vec::is_empty)
+                || metadata.owner
+                || metadata.xattrs
+                || metadata.normal_mode
+                || metadata.special_mode_bits
+                || metadata.resource_fork
+                || metadata.directory_streams.is_some()
+            {
+                return Err(invalid_plan("V7 benötigt einen neuen leeren Ordner ohne weitere mutierende Metadatenklassen"));
+            }
+        }
+        if let Some(
+            crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryBeforeChildrenExact(
+                selection,
+            ),
+        ) = dacl_metadata.and_then(|m| m.windows_dacl.as_ref())
+        {
+            selection.validate()?;
+            let metadata = dacl_metadata.unwrap();
+            if !matches!(action, Action::CreateDir { .. })
+                || plan.metadata_report.profile != crate::MetadataProfile::NativeBestEffort
+                || !metadata.acl
+                || metadata.target.is_some()
+                || !metadata
+                    .source
+                    .named_streams
+                    .as_ref()
+                    .is_some_and(Vec::is_empty)
+                || metadata.owner
+                || metadata.xattrs
+                || metadata.normal_mode
+                || metadata.special_mode_bits
+                || metadata.resource_fork
+                || metadata.directory_streams.is_some()
+            {
+                return Err(invalid_plan("V8 benötigt einen neuen nichtleeren Ordner ohne weitere mutierende Metadatenklassen"));
+            }
+        }
+        if let Some(crate::windows_dacl::WindowsDaclTransfer::DirectoryExact(dacl)) =
+            dacl_metadata.and_then(|metadata| metadata.windows_dacl.as_ref())
+        {
+            if !matches!(action, Action::SetDirectoryMetadata { .. })
+                || plan.metadata_report.profile != crate::MetadataProfile::NativeBestEffort
+                || !dacl.target_proof.as_ref().is_some_and(|proof| {
+                    proof.validates_directory_action(path) && proof.inode.is_some()
+                })
+            {
+                return Err(invalid_plan("Verzeichnis-DACL benötigt NativeBestEffort und einen vorhandenen gebundenen Zielordner"));
+            }
+        }
+
+        if let Action::CopyFile {
+            metadata: Some(metadata),
+            ..
+        }
+        | Action::UpdateFile {
+            metadata: Some(metadata),
+            ..
+        }
+        | Action::CreateHardlink { metadata, .. } = action
+        {
+            if metadata.directory_streams.is_some() {
+                return Err(invalid_plan(
+                    "Dateiaktion enthält Verzeichnisstreamwirkungen",
+                ));
+            }
+        }
+
         match action {
             Action::CreateDir { metadata, .. } => {
                 if let Some(metadata) = metadata {
-                    validate_metadata_transfer(metadata)?;
+                    validate_directory_metadata_transfer(metadata)?;
                     if metadata.target.is_some() {
                         return Err(invalid_plan(
                             "CreateDir darf kein vorhandenes Zielmanifest enthalten",
                         ));
                     }
                 }
+                totals.bytes_to_transfer = totals.bytes_to_transfer.saturating_add(
+                    super::plan::planned_directory_stream_bytes(metadata.as_ref()),
+                );
                 totals.additions = totals.additions.saturating_add(1);
             }
             Action::CopyFile { size, metadata, .. } => {
@@ -194,6 +297,14 @@ fn validate_plan_consistency(plan: &SyncPlan) -> io::Result<()> {
             } => {
                 crate::path::validate_relative_path(Path::new(link_to))?;
                 validate_metadata_transfer(metadata)?;
+                if matches!(
+                    metadata.windows_dacl,
+                    Some(crate::windows_dacl::WindowsDaclTransfer::Exact(_))
+                ) {
+                    return Err(invalid_plan(
+                        "Windows-DACL-Transfer benötigt eine neue eigene Basisdatei",
+                    ));
+                }
                 if !metadata.hardlinks || metadata.source.hardlink_group.is_none() {
                     return Err(invalid_plan(
                         "CreateHardlink enthält keine gebundene Hardlink-Gruppe",
@@ -226,9 +337,50 @@ fn validate_plan_consistency(plan: &SyncPlan) -> io::Result<()> {
                     totals.additions = totals.additions.saturating_add(1);
                 }
             }
+            Action::SetFileDacl {
+                path,
+                plan: effect,
+                source_hash,
+                source_metadata,
+            } => {
+                effect.validate()?;
+                source_metadata.validate()?;
+                if !effect
+                    .alias_scope
+                    .selected_paths
+                    .iter()
+                    .any(|alias| alias == path)
+                    || blake3::Hash::from_hex(source_hash)
+                        .ok()
+                        .map(|hash| *hash.as_bytes())
+                        != Some(effect.content.digest)
+                {
+                    return Err(invalid_plan(
+                        "Datei-DACL-Quellinhalt oder Aliasbindung ist ungültig",
+                    ));
+                }
+                totals.metadata_count = totals.metadata_count.saturating_add(1);
+                totals.updates = totals
+                    .updates
+                    .saturating_add(effect.alias_scope.selected_paths.len() as u64);
+            }
             Action::SetMode { .. } | Action::SetDirectoryMetadata { .. } => {
                 if let Action::SetDirectoryMetadata { metadata, .. } = action {
-                    validate_metadata_transfer(metadata)?;
+                    validate_directory_metadata_transfer(metadata)?;
+                    if let Some(streams) = &metadata.directory_streams {
+                        if !streams
+                            .target_proof
+                            .as_ref()
+                            .is_some_and(|proof| proof.validates_directory_action(path))
+                        {
+                            return Err(invalid_plan(
+                                "Ordnerstreamplan besitzt keinen passenden Zielordnerbeleg",
+                            ));
+                        }
+                    }
+                    totals.bytes_to_transfer = totals.bytes_to_transfer.saturating_add(
+                        super::plan::planned_directory_stream_bytes(Some(metadata)),
+                    );
                     if metadata.target.is_none() {
                         return Err(invalid_plan(
                             "SetDirectoryMetadata benötigt das bestätigte Zielmanifest",
@@ -315,7 +467,18 @@ fn validate_plan_consistency(plan: &SyncPlan) -> io::Result<()> {
     // Alte Queue-Journale besitzen noch keine Vergleichszeilen. Sobald der DTO aber
     // vorhanden ist, müssen seine sichtbaren Kategorien denselben Aktionen folgen.
     if !plan.comparison.rows.is_empty()
-        && (plan.comparison.rows.len() != plan.actions.len()
+        && (plan.comparison.rows.len()
+            != plan.actions.len()
+                + plan
+                    .actions
+                    .iter()
+                    .map(|action| match action {
+                        Action::SetFileDacl { plan, .. } => {
+                            plan.alias_scope.selected_paths.len().saturating_sub(1)
+                        }
+                        _ => 0,
+                    })
+                    .sum::<usize>()
             || plan.comparison.categories.additions != totals.additions
             || plan.comparison.categories.updates != totals.updates
             || plan.comparison.categories.quarantines != totals.quarantines
@@ -344,14 +507,31 @@ pub fn execute(
     on_progress: &mut dyn FnMut(&Progress),
 ) -> io::Result<SyncStats> {
     let mut stats = SyncStats {
+        execution_class: request
+            .safety
+            .content_sync_permit()
+            .map(|_| super::SyncExecutionClass::BestEffort),
         local_execution: request.safety.local_execution().cloned(),
         dry_run: request.safety.is_dry_run(),
         metadata_report: request.plan.metadata_report.clone(),
         ..Default::default()
     };
     // Auch Fehler späterer Aktionen müssen Reste früherer Übertragungen behalten.
-    execute_with_stats(request, cancel, on_progress, &mut stats)
-        .map_err(|error| crate::error::with_recovery_paths(error, &stats.temp_recovery_paths))?;
+    execute_with_stats(request, cancel, on_progress, &mut stats).map_err(|error| {
+        crate::error::with_directory_dacl_report(
+            crate::error::with_directory_stream_report(
+                crate::error::with_file_dacl_report(
+                    crate::error::with_created_directory_dacl_report(
+                        crate::error::with_recovery_paths(error, &stats.temp_recovery_paths),
+                        &stats.created_directory_dacl_report,
+                    ),
+                    &stats.file_dacl_report,
+                ),
+                &stats.directory_stream_report,
+            ),
+            &stats.directory_dacl_report,
+        )
+    })?;
     Ok(stats)
 }
 
@@ -374,6 +554,7 @@ fn execute_with_stats(
 
     let dry = safety.is_dry_run();
     if !dry {
+        super::verify_metadata_observations(src, src_root, dst, dst_root, plan)?;
         for expected in &plan.local_parent_inheritance {
             let parent = &expected.identity.display_path;
             if !parent.starts_with(dst_root)
@@ -391,6 +572,7 @@ fn execute_with_stats(
         // Auch alle laufbezogenen Inode-Beziehungen werden vor der ersten Kopie
         // geprüft. Ein späterer Gruppenfehler darf keinen halbfertigen Zielbaum lassen.
         preflight_hardlinks(src, src_root, dst, dst_root, plan)?;
+        preflight_file_dacl(src, src_root, dst, dst_root, plan, safety)?;
     }
     let quarantine_run = (!dry
         && !safety.irreversible_replacements()
@@ -412,6 +594,9 @@ fn execute_with_stats(
         ..Default::default()
     };
 
+    let mut early_completed_directories = HashSet::new();
+    let mut before_children_keys = std::collections::BTreeMap::new();
+    let mut created_directory_proofs = std::collections::BTreeMap::new();
     // Phase 1: erst ALLE nicht löschenden Aktionen. Dadurch kann ein später Lesefehler
     // niemals dazu führen, dass bereits Zielobjekte entfernt wurden, obwohl Kopien fehlen.
     for action in &plan.actions {
@@ -426,17 +611,419 @@ fn execute_with_stats(
         }
 
         match action {
-            Action::CreateDir { path, .. } => {
+            Action::CreateDir {
+                path,
+                metadata,
+                source_mtime,
+                ..
+            } => {
                 if !dry {
                     let target = checked_join(dst_root, path)?;
                     guard_path(safety.sandbox(), &target, "Schreibziel")?;
                     if optional_stat(dst, &target)?.is_some() {
                         return Err(plan_changed(path, "Zielordner existiert inzwischen"));
                     }
+                    if let Some((metadata, selection)) = metadata.as_ref().and_then(|m| match &m.windows_dacl {
+                        Some(crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryBeforeChildrenExact(s)) => Some((m, s.as_ref())),
+                        _ => None,
+                    }) {
+                        if safety.content_sync_permit().is_none() {
+                            return Err(invalid_plan("V8 benötigt bestätigten gewöhnlichen Inhaltssync"));
+                        }
+                        let source_path = checked_join(src_root, path)?;
+                        if let Some(omission) = validate_created_nonempty_source(src, &source_path, *source_mtime, metadata, &selection.source_children)? {
+                            omission.record_before_children(&mut stats.metadata_report, path);
+                        } else {
+                            let scope = dst.staging_scope(&target, safety.sandbox())?;
+                            let directory_vfs = scope.as_deref().unwrap_or(dst);
+                            let result = directory_vfs.create_directory_before_children_receipt(&target);
+                            let receipt = crate::atomic_file::finish_staging_scope(directory_vfs, result, |_, recovery| stats.temp_recovery_paths.push(recovery))?;
+                            if let Some(mut receipt) = receipt {
+                                let Some(key) = receipt.effect_key() else {
+                                    let omission = receipt.omission();
+                                    receipt.abandon()?;
+                                    crate::content_sync::record_windows_dacl_omission(&mut stats.metadata_report, path, omission);
+                                    // Die gewöhnliche Anlage ist bereits bestätigt. Kein
+                                    // Originalbeleg wird aus einem späteren Pfadstat erfunden.
+                                    continue;
+                                };
+                                {
+                                    before_children_keys.insert(path.clone(), key.clone());
+                                    stats.created_directory_dacl_report.observe_created(crate::created_directory_dacl::CreatedDirectoryObservation { effect_key: key, ordinary_metadata_applied: false });
+                                    prog.created_directory_dacl_report = stats.created_directory_dacl_report.as_ref().clone();
+                                    prog.current = path.clone();
+                                    prog.phase = "directory_created".into();
+                                    on_progress(&prog);
+                                }
+                                if cancel.is_cancelled() {
+                                    receipt.abandon()?;
+                                    return finish_cancelled(stats, &mut prog, on_progress);
+                                }
+                                sync_parent(directory_vfs, &target)?;
+                                let mut transaction = match receipt.begin_before_children(selection) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        if let Some(issue) = crate::windows_dacl::known_write_omission(&error) {
+                                            crate::content_sync::record_windows_dacl_omission(&mut stats.metadata_report, path, issue);
+                                            continue;
+                                        }
+                                        return Err(error);
+                                    }
+                                };
+                                match validate_created_nonempty_source(src, &source_path, *source_mtime, metadata, &selection.source_children) {
+                                    Ok(None) => {},
+                                    Ok(Some(omission)) => {
+                                        transaction.abandon_prepared()?;
+                                        omission.record_before_children(&mut stats.metadata_report, path);
+                                        continue;
+                                    },
+                                    Err(error) => { transaction.abandon_prepared()?; return Err(error); }
+                                }
+                                if cancel.is_cancelled() {
+                                    transaction.abandon_prepared()?;
+                                    return finish_cancelled(stats, &mut prog, on_progress);
+                                }
+                                let result = transaction.apply();
+                                stats.created_directory_dacl_report.merge(&transaction.report());
+                                prog.created_directory_dacl_report = stats.created_directory_dacl_report.as_ref().clone();
+                                prog.phase = "directory_rights_before_children".into();
+                                // Der synchrone Queuefortschritt bestätigt Applied dauerhaft,
+                                // bevor finish alle Handles und den Anlageintent abschließt.
+                                on_progress(&prog);
+                                let paths = transaction.recovery_paths();
+                                if let Err(error) = result {
+                                    if !transaction.report().has_rights_effects() {
+                                        if let Some(issue) = crate::windows_dacl::known_write_omission(&error) {
+                                            transaction.abandon_prepared()?;
+                                            crate::content_sync::record_windows_dacl_omission(&mut stats.metadata_report, path, issue);
+                                            continue;
+                                        }
+                                    }
+                                    stats.temp_recovery_paths.extend(paths);
+                                    return Err(error);
+                                }
+                                if cancel.is_cancelled() {
+                                    stats.temp_recovery_paths.extend(paths);
+                                    return finish_cancelled(stats, &mut prog, on_progress);
+                                }
+                                match transaction.finish() {
+                                    Ok(report) => stats.created_directory_dacl_report.merge(&report),
+                                    Err(error) => { stats.temp_recovery_paths.extend(paths); return Err(error); }
+                                }
+                                prog.created_directory_dacl_report = stats.created_directory_dacl_report.as_ref().clone();
+                                on_progress(&prog);
+                                // Kein vorgezogener Metadatenabschluss: Kinder und normale
+                                // postorder-mtime bleiben weiterhin auszuführen.
+                                prog.phase = "copy".into();
+                                continue;
+                            } else {
+                                crate::content_sync::record_windows_dacl_omission(&mut stats.metadata_report, path, crate::windows_dacl::WindowsDaclTargetIssue::UnsupportedBackend);
+                            }
+                        }
+                    }
+                    if let Some((metadata, selection)) =
+                        metadata.as_ref().and_then(|m| match &m.windows_dacl {
+                            Some(
+                                crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryExact(s),
+                            ) => Some((m, s.as_ref())),
+                            _ => None,
+                        })
+                    {
+                        if safety.content_sync_permit().is_none() {
+                            return Err(invalid_plan(
+                                "V7 benötigt den gewöhnlichen bestätigten Inhaltssync",
+                            ));
+                        }
+                        let source_path = checked_join(src_root, path)?;
+                        if let Some(omission) = validate_created_empty_source(
+                            src,
+                            &source_path,
+                            *source_mtime,
+                            metadata,
+                        )? {
+                            omission.record(&mut stats.metadata_report, path);
+                        } else {
+                            let scope = dst.staging_scope(&target, safety.sandbox())?;
+                            let directory_vfs = scope.as_deref().unwrap_or(dst);
+                            let receipt_result =
+                                directory_vfs.create_directory_dacl_receipt(&target);
+                            let receipt_result = crate::atomic_file::finish_staging_scope(
+                                directory_vfs,
+                                receipt_result,
+                                |_, path| {
+                                    stats.temp_recovery_paths.push(path);
+                                },
+                            )?;
+                            if let Some(mut receipt) = receipt_result {
+                                if let Some(key) = receipt.effect_key() {
+                                    stats.created_directory_dacl_report.observe_created(
+                                    crate::created_directory_dacl::CreatedDirectoryObservation {
+                                        effect_key: key,
+                                        ordinary_metadata_applied: false,
+                                    },
+                                );
+                                    prog.created_directory_dacl_report =
+                                        stats.created_directory_dacl_report.as_ref().clone();
+                                    prog.current = path.clone();
+                                    prog.phase = "directory_created".into();
+                                    on_progress(&prog);
+                                }
+
+                                if cancel.is_cancelled() {
+                                    receipt.abandon()?;
+                                    drop(receipt);
+                                    return finish_cancelled(stats, &mut prog, on_progress);
+                                }
+                                sync_parent(directory_vfs, &target)?;
+                                // Vor der ersten normalen Metadatenmutation darf eine
+                                // zusätzliche Beobachtung das optionale Receipt aufgeben.
+                                let read_before = validate_directory_source(
+                                    src,
+                                    &source_path,
+                                    *source_mtime,
+                                    metadata,
+                                )
+                                .and_then(|()| directory_vfs.stat(&target).map(|_| ()));
+                                let mut mtime_state = DirectoryMtime::Pending;
+                                let mut usable = match read_before {
+                                    Ok(()) => match receipt.set_mtime(*source_mtime) {
+                                        Ok(usable) => {
+                                            mtime_state = DirectoryMtime::Applied;
+                                            usable
+                                        }
+                                        Err(error) => {
+                                            if let Some(omission) =
+                                                safety.mtime_omission_reason(&error)
+                                            {
+                                                receipt.abandon()?;
+                                                mtime_state =
+                                                    DirectoryMtime::Omitted(omission.clone());
+                                                false
+                                            } else {
+                                                return Err(error);
+                                            }
+                                        }
+                                    },
+                                    Err(error)
+                                        if matches!(
+                                            crate::error_code(&error),
+                                            crate::ErrorCode::PlanDrift
+                                                | crate::ErrorCode::Interrupted
+                                        ) =>
+                                    {
+                                        return Err(error)
+                                    }
+                                    Err(_) => {
+                                        receipt.abandon()?;
+                                        false
+                                    }
+                                };
+                                let normal_request = || DirectoryMetadataRequest {
+                                    src,
+                                    source_path: &source_path,
+                                    dst: directory_vfs,
+                                    target_path: &target,
+                                    source_mtime: *source_mtime,
+                                    target_mtime: None,
+                                    metadata,
+                                    is_new: true,
+                                    permit: safety.content_sync_permit(),
+                                    created_key: None,
+                                    created_dacl_applied: false,
+                                };
+                                let normal =
+                                    apply_directory_metadata(normal_request(), &mtime_state);
+                                let (omitted_mtime, omitted_mode) = match normal {
+                                    Ok(value) => value,
+                                    Err(error)
+                                        if !matches!(mtime_state, DirectoryMtime::Pending)
+                                            && !matches!(
+                                                crate::error_code(&error),
+                                                crate::ErrorCode::PlanDrift
+                                                    | crate::ErrorCode::Interrupted
+                                            ) =>
+                                    {
+                                        receipt.abandon()?;
+                                        usable = false;
+                                        // In dieser engen SMB-Klasse sind nach mtime nur
+                                        // Beobachtungen übrig. Kein zweiter normaler SET.
+                                        apply_directory_metadata(normal_request(), &mtime_state)?
+                                    }
+                                    Err(error) => return Err(error),
+                                };
+                                let ordinary_metadata_applied =
+                                    omitted_mtime.is_none() && omitted_mode.is_none();
+                                if let Some(reason) = omitted_mtime {
+                                    crate::content_sync::record_mtime_omission(
+                                        &mut stats.metadata_report,
+                                        path,
+                                        reason,
+                                    );
+                                }
+                                if let Some(reason) = omitted_mode {
+                                    crate::content_sync::record_normal_mode_omission(
+                                        &mut stats.metadata_report,
+                                        path,
+                                        reason,
+                                    );
+                                }
+                                // Der normale CREATE-Intent wurde genau einmal direkt
+                                // nach der bestätigten Anlage abgeschlossen. mtime ist
+                                // eine getrennte normale Metadatenwirkung, kein zweites mkdir-Finish.
+                                if let Some(key) = receipt.effect_key() {
+                                    stats.created_directory_dacl_report.observe_created(
+                                    crate::created_directory_dacl::CreatedDirectoryObservation {
+                                        effect_key: key,
+                                        ordinary_metadata_applied,
+                                    },
+                                );
+                                    prog.created_directory_dacl_report =
+                                        stats.created_directory_dacl_report.as_ref().clone();
+                                    prog.phase = "directory_metadata_applied".into();
+                                    on_progress(&prog);
+                                }
+
+                                // Auch eine legitim ausgelassene Zeit ist abschließend
+                                // bilanziert. Der spätere Durchgang darf sie nicht erneut setzen.
+                                early_completed_directories.insert(path.clone());
+                                if cancel.is_cancelled() {
+                                    receipt.abandon()?;
+                                    return finish_cancelled(stats, &mut prog, on_progress);
+                                }
+                                if usable {
+                                    if let Some(omission) = validate_created_empty_source(
+                                        src,
+                                        &source_path,
+                                        *source_mtime,
+                                        metadata,
+                                    )? {
+                                        receipt.abandon()?;
+                                        omission.record(&mut stats.metadata_report, path);
+                                        continue;
+                                    }
+                                    if cancel.is_cancelled() {
+                                        receipt.abandon()?;
+                                        return finish_cancelled(stats, &mut prog, on_progress);
+                                    }
+                                    let mut transaction = match receipt.begin(selection) {
+                                        Ok(transaction) => transaction,
+                                        Err(error) => {
+                                            if let Some(issue) =
+                                                crate::windows_dacl::known_write_omission(&error)
+                                            {
+                                                crate::content_sync::record_windows_dacl_omission(
+                                                    &mut stats.metadata_report,
+                                                    path,
+                                                    issue,
+                                                );
+                                                continue;
+                                            }
+                                            return Err(error);
+                                        }
+                                    };
+                                    match validate_created_empty_source(
+                                        src,
+                                        &source_path,
+                                        *source_mtime,
+                                        metadata,
+                                    ) {
+                                        Ok(None) => {}
+                                        Ok(Some(omission)) => {
+                                            transaction.abandon_prepared()?;
+                                            omission.record(&mut stats.metadata_report, path);
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            transaction.abandon_prepared()?;
+                                            return Err(error);
+                                        }
+                                    }
+                                    let result = transaction.apply();
+                                    stats
+                                        .created_directory_dacl_report
+                                        .merge(&transaction.report());
+                                    prog.created_directory_dacl_report =
+                                        stats.created_directory_dacl_report.as_ref().clone();
+                                    prog.current = path.clone();
+                                    on_progress(&prog);
+                                    let paths = transaction.recovery_paths();
+                                    if let Err(error) = result {
+                                        if !transaction.report().has_rights_effects() {
+                                            if let Some(issue) =
+                                                crate::windows_dacl::known_write_omission(&error)
+                                            {
+                                                transaction.abandon_prepared()?;
+                                                crate::content_sync::record_windows_dacl_omission(
+                                                    &mut stats.metadata_report,
+                                                    path,
+                                                    issue,
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                        stats.temp_recovery_paths.extend(paths);
+                                        return Err(error);
+                                    }
+                                    if cancel.is_cancelled() {
+                                        stats.temp_recovery_paths.extend(paths);
+                                        return finish_cancelled(stats, &mut prog, on_progress);
+                                    }
+                                    match transaction.finish() {
+                                        Ok(report) => {
+                                            stats.created_directory_dacl_report.merge(&report)
+                                        }
+                                        Err(error) => {
+                                            stats.temp_recovery_paths.extend(paths);
+                                            return Err(error);
+                                        }
+                                    }
+                                    prog.created_directory_dacl_report =
+                                        stats.created_directory_dacl_report.as_ref().clone();
+                                    on_progress(&prog);
+                                } else {
+                                    let omission = receipt.omission();
+                                    drop(receipt);
+                                    crate::content_sync::record_windows_dacl_omission(
+                                        &mut stats.metadata_report,
+                                        path,
+                                        omission,
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     // Atomare Einzelanlage: Entsteht der Name nach der Planprüfung,
                     // überschreiben/akzeptieren wir ihn nicht stillschweigend.
-                    dst.create_dir(&target)?;
-                    sync_parent(dst, &target)?;
+                    if safety.content_sync_permit().is_some() {
+                        let scope = dst.staging_scope(&target, safety.sandbox())?;
+                        let directory_vfs = scope.as_deref().unwrap_or(dst);
+                        let result = directory_vfs
+                            .create_dir(&target)
+                            .and_then(|()| sync_parent(directory_vfs, &target));
+                        crate::atomic_file::finish_staging_scope(
+                            directory_vfs,
+                            result,
+                            |(), _| {},
+                        )?;
+                    } else {
+                        dst.create_dir(&target)?;
+                        sync_parent(dst, &target)?;
+                    }
+                    if metadata
+                        .as_ref()
+                        .is_some_and(|value| value.directory_streams.is_some())
+                    {
+                        let entry = dst.stat(&target)?;
+                        let proof =
+                            super::SyncTargetProof::from_listed(&crate::vfs::ProofListEntry {
+                                raw_name: entry.name.as_bytes().to_vec(),
+                                entry,
+                                safely_decoded: true,
+                                provider_token: None,
+                            })?;
+                        created_directory_proofs.insert(path.clone(), proof);
+                    }
                 }
             }
             Action::CopyFile {
@@ -480,7 +1067,31 @@ fn execute_with_stats(
                         CopyResult::Complete {
                             quarantined,
                             recovery_paths,
+                            omitted_mtime,
+                            omitted_normal_mode,
+                            omitted_windows_dacl,
                         } => {
+                            if let Some(issue) = omitted_windows_dacl {
+                                crate::content_sync::record_windows_dacl_omission(
+                                    &mut stats.metadata_report,
+                                    path,
+                                    issue,
+                                );
+                            }
+                            if let Some(reason) = omitted_normal_mode {
+                                crate::content_sync::record_normal_mode_omission(
+                                    &mut stats.metadata_report,
+                                    path,
+                                    reason,
+                                );
+                            }
+                            if let Some(reason) = omitted_mtime {
+                                crate::content_sync::record_mtime_omission(
+                                    &mut stats.metadata_report,
+                                    path,
+                                    reason,
+                                );
+                            }
                             stats.temp_recovery_paths.extend(recovery_paths);
                             if quarantined {
                                 stats.quarantine = quarantine_label(safety);
@@ -545,7 +1156,31 @@ fn execute_with_stats(
                         CopyResult::Complete {
                             quarantined,
                             recovery_paths,
+                            omitted_mtime,
+                            omitted_normal_mode,
+                            omitted_windows_dacl,
                         } => {
+                            if let Some(issue) = omitted_windows_dacl {
+                                crate::content_sync::record_windows_dacl_omission(
+                                    &mut stats.metadata_report,
+                                    path,
+                                    issue,
+                                );
+                            }
+                            if let Some(reason) = omitted_normal_mode {
+                                crate::content_sync::record_normal_mode_omission(
+                                    &mut stats.metadata_report,
+                                    path,
+                                    reason,
+                                );
+                            }
+                            if let Some(reason) = omitted_mtime {
+                                crate::content_sync::record_mtime_omission(
+                                    &mut stats.metadata_report,
+                                    path,
+                                    reason,
+                                );
+                            }
                             stats.temp_recovery_paths.extend(recovery_paths);
                             if quarantined {
                                 stats.quarantine = quarantine_label(safety);
@@ -623,6 +1258,7 @@ fn execute_with_stats(
             | Action::SkipConflict { .. }
             | Action::SkipUnsupported { .. }
             | Action::SetMode { .. }
+            | Action::SetFileDacl { .. }
             | Action::SetDirectoryMetadata { .. } => { /* bewusst hier noch nichts tun */ }
             Action::DeleteFile { .. } | Action::DeleteDir { .. } => unreachable!(),
         }
@@ -672,9 +1308,39 @@ fn execute_with_stats(
         prog.phase = "metadata".into();
         prog.current = pending.path.to_string();
         on_progress(&prog);
-        apply_pending_mode(pending, &request)?;
-        if !pending.is_new {
+        if let Some(reason) = apply_pending_mode(pending, &request)? {
+            crate::content_sync::record_normal_mode_omission(
+                &mut stats.metadata_report,
+                pending.path,
+                reason,
+            );
+        } else if !pending.is_new {
             stats.metadata_updated = stats.metadata_updated.saturating_add(1);
+        }
+    }
+
+    // Erst sämtliche Streamkopien bestätigen; danach dürfen Stream- und
+    // Dateientfernungen beginnen. Ordnerrechte und -zeiten folgen weiterhin zuletzt.
+    for removals in [false, true] {
+        if !super::directory_streams::execute_directory_streams(
+            super::directory_streams::DirectoryStreamExecution {
+                request: ExecuteRequest {
+                    src,
+                    src_root,
+                    dst,
+                    dst_root,
+                    plan,
+                    safety,
+                },
+                created: &created_directory_proofs,
+                removals,
+            },
+            cancel,
+            &mut prog,
+            stats,
+            on_progress,
+        )? {
+            return finish_cancelled(stats, &mut prog, on_progress);
         }
     }
 
@@ -685,8 +1351,35 @@ fn execute_with_stats(
         if let Some(permit) = safety.real_permit() {
             permit.validate_mirror_rescan(src, src_root, dst, dst_root, plan)?;
         }
+        if let Some(permit) = safety.content_sync_permit() {
+            let stream_report = stats.directory_stream_report.clone();
+            let cancelled = permit.execute_removals(
+                src,
+                dst,
+                cancel,
+                &mut stats.files_deleted,
+                &mut |value| {
+                    let mut cumulative = value.clone();
+                    cumulative.directory_stream_report.merge(&stream_report);
+                    on_progress(&cumulative);
+                },
+            )?;
+            if cancelled {
+                return finish_cancelled(stats, &mut prog, on_progress);
+            }
+        }
     }
+    let mut removal_progress = Progress {
+        directory_stream_report: stats.directory_stream_report.clone(),
+        phase: "quarantine".into(),
+        files_total: plan.delete_count,
+        files_done: stats.files_deleted,
+        ..Progress::default()
+    };
     for action in &plan.actions {
+        if safety.content_sync_permit().is_some() && safety.quarantine.is_none() {
+            continue;
+        }
         if cancel.is_cancelled() {
             return finish_cancelled(stats, &mut prog, on_progress);
         }
@@ -699,9 +1392,8 @@ fn execute_with_stats(
                 target_proof,
                 target_hash,
             } => {
-                prog.phase = "quarantine".into();
-                prog.current = path.clone();
-                on_progress(&prog);
+                removal_progress.current = path.clone();
+                on_progress(&removal_progress);
                 let target = checked_join(dst_root, path)?;
                 if !dry {
                     validate_anchor_identity(src, dst, safety)?;
@@ -736,6 +1428,8 @@ fn execute_with_stats(
                     }
                 }
                 stats.files_deleted = stats.files_deleted.saturating_add(1);
+                removal_progress.files_done = stats.files_deleted;
+                on_progress(&removal_progress);
             }
             Action::DeleteDir {
                 path,
@@ -744,9 +1438,8 @@ fn execute_with_stats(
                 target_proof,
                 target_tree_hash,
             } => {
-                prog.phase = "quarantine".into();
-                prog.current = path.clone();
-                on_progress(&prog);
+                removal_progress.current = path.clone();
+                on_progress(&removal_progress);
                 let target = checked_join(dst_root, path)?;
                 if !dry {
                     validate_anchor_identity(src, dst, safety)?;
@@ -788,6 +1481,8 @@ fn execute_with_stats(
                     }
                 }
                 stats.files_deleted = stats.files_deleted.saturating_add(*entries);
+                removal_progress.files_done = stats.files_deleted;
+                on_progress(&removal_progress);
             }
             _ => {}
         }
@@ -803,9 +1498,43 @@ fn execute_with_stats(
         prog.phase = "metadata".into();
         prog.current = pending.path.to_string();
         on_progress(&prog);
-        apply_pending_mode(pending, &request)?;
-        if !pending.is_new {
+        if let Some(reason) = apply_pending_mode(pending, &request)? {
+            crate::content_sync::record_normal_mode_omission(
+                &mut stats.metadata_report,
+                pending.path,
+                reason,
+            );
+        } else if !pending.is_new {
             stats.metadata_updated = stats.metadata_updated.saturating_add(1);
+        }
+    }
+
+    if safety.content_sync_permit().is_some() && dst.supports_mtime_write() {
+        // Portable Ordner haben kein natives Manifest. Ihre bereits bestätigte
+        // Zeit wird trotzdem erst nach dem letzten Kindcommit gesetzt.
+        for action in plan.actions.iter().rev() {
+            let Action::CreateDir {
+                path,
+                source_mtime: Some(expected),
+                metadata: None,
+                ..
+            } = action
+            else {
+                continue;
+            };
+            if cancel.is_cancelled() {
+                return finish_cancelled(stats, &mut prog, on_progress);
+            }
+            prog.phase = "metadata".into();
+            prog.current = path.clone();
+            on_progress(&prog);
+            if let Some(reason) = apply_directory_time(path, *expected, &request)? {
+                crate::content_sync::record_mtime_omission(
+                    &mut stats.metadata_report,
+                    path,
+                    reason,
+                );
+            }
         }
     }
 
@@ -819,13 +1548,15 @@ fn execute_with_stats(
                 source_mtime,
                 metadata: Some(metadata),
                 ..
-            } => pending_directories.push(PendingDirectoryMetadata {
-                path,
-                source_mtime: *source_mtime,
-                target_mtime: None,
-                metadata,
-                is_new: true,
-            }),
+            } if !early_completed_directories.contains(path) => {
+                pending_directories.push(PendingDirectoryMetadata {
+                    path,
+                    source_mtime: *source_mtime,
+                    target_mtime: None,
+                    metadata,
+                    is_new: true,
+                })
+            }
             Action::SetDirectoryMetadata {
                 path,
                 source_mtime,
@@ -843,6 +1574,7 @@ fn execute_with_stats(
     }
     pending_directories.sort_by_key(|item| std::cmp::Reverse(item.path.matches('/').count()));
 
+    let mut updated_directories = HashSet::new();
     for pending in pending_directories {
         if cancel.is_cancelled() {
             return finish_cancelled(stats, &mut prog, on_progress);
@@ -855,20 +1587,293 @@ fn execute_with_stats(
             let source_path = checked_join(src_root, pending.path)?;
             let target_path = checked_join(dst_root, pending.path)?;
             guard_path(safety.sandbox(), &target_path, "Metadaten-Ziel")?;
-            apply_directory_metadata(DirectoryMetadataRequest {
-                src,
-                source_path: &source_path,
-                dst,
-                target_path: &target_path,
-                source_mtime: pending.source_mtime,
-                target_mtime: pending.target_mtime,
-                metadata: pending.metadata,
-                is_new: pending.is_new,
-            })?;
-        }
-        if !pending.is_new {
+            let projected = super::directory_streams::project_completed_streams(pending.metadata)?;
+            let (omitted_mtime, omitted_mode) = apply_directory_metadata(
+                DirectoryMetadataRequest {
+                    src,
+                    source_path: &source_path,
+                    dst,
+                    target_path: &target_path,
+                    source_mtime: pending.source_mtime,
+                    target_mtime: pending.target_mtime,
+                    metadata: &projected,
+                    is_new: pending.is_new,
+                    permit: safety.content_sync_permit(),
+                    created_key: before_children_keys.get(pending.path),
+                    created_dacl_applied: before_children_keys.get(pending.path).is_some_and(
+                        |key| {
+                            stats
+                                .created_directory_dacl_report
+                                .completed
+                                .iter()
+                                .any(|effect| {
+                                    effect.origin == key.origin
+                                        && effect.object_namespace == key.object_namespace
+                                        && effect.file_id == key.file_id
+                                        && effect.directory == key.directory
+                                })
+                        },
+                    ),
+                },
+                &DirectoryMtime::Pending,
+            )?;
+            if pending.metadata.directory_streams.is_some()
+                && dst.metadata_manifest(&target_path)?.named_streams
+                    != pending.metadata.source.named_streams
+            {
+                return Err(crate::coded_error(
+                    io::ErrorKind::InvalidData,
+                    crate::ErrorCode::OutcomeUnclear,
+                    "Ordnerstrommenge änderte sich nach dem Metadatenabschluss",
+                ));
+            }
+            let changed = pending.metadata.directory_streams.is_some()
+                || (pending.metadata.normal_mode && omitted_mode.is_none())
+                || pending.metadata.owner
+                || (pending.metadata.acl
+                    && !matches!(
+                        pending.metadata.windows_dacl,
+                        Some(crate::windows_dacl::WindowsDaclTransfer::DirectoryExact(_))
+                    ))
+                || pending.metadata.xattrs
+                || pending.metadata.special_mode_bits
+                || (dst.supports_mtime_write()
+                    && omitted_mtime.is_none()
+                    && pending.source_mtime != pending.target_mtime);
+            if omitted_mtime.is_none()
+                && omitted_mode.is_none()
+                && pending.source_mtime.is_some()
+                && dst.supports_mtime_write()
+            {
+                if let Some(key) = before_children_keys.get(pending.path) {
+                    stats.created_directory_dacl_report.observe_created(
+                        crate::created_directory_dacl::CreatedDirectoryObservation {
+                            effect_key: key.clone(),
+                            ordinary_metadata_applied: true,
+                        },
+                    );
+                    prog.created_directory_dacl_report =
+                        stats.created_directory_dacl_report.as_ref().clone();
+                    on_progress(&prog);
+                }
+            }
+            if let Some(reason) = omitted_mtime {
+                crate::content_sync::record_mtime_omission(
+                    &mut stats.metadata_report,
+                    pending.path,
+                    reason,
+                );
+            }
+            if let Some(reason) = omitted_mode {
+                crate::content_sync::record_normal_mode_omission(
+                    &mut stats.metadata_report,
+                    pending.path,
+                    reason,
+                );
+            }
+            if !pending.is_new && changed {
+                stats.metadata_updated = stats.metadata_updated.saturating_add(1);
+                updated_directories.insert(pending.path);
+            }
+        } else if !pending.is_new {
             stats.metadata_updated = stats.metadata_updated.saturating_add(1);
         }
+    }
+
+    // Datei-DACLs ändern bestehende Objekte; niemals copy_one oder Temp-Rename.
+    for action in &plan.actions {
+        let Action::SetFileDacl {
+            path,
+            source_hash,
+            source_metadata,
+            plan: effect,
+        } = action
+        else {
+            continue;
+        };
+        if cancel.is_cancelled() {
+            return finish_cancelled(stats, &mut prog, on_progress);
+        }
+        if dry {
+            continue;
+        }
+        validate_anchor_identity(src, dst, safety)?;
+        for alias in &effect.alias_scope.selected_paths {
+            let source_path = checked_join(src_root, alias)?;
+            if hash_file_hex(src, &source_path)? != *source_hash {
+                return Err(plan_changed(alias, "Datei-DACL-Quellinhalt änderte sich"));
+            }
+            let expected = plan
+                .file_dacl_selections
+                .iter()
+                .find(|selection| selection.path == *alias)
+                .and_then(|selection| selection.source_metadata.as_ref())
+                .unwrap_or(source_metadata);
+            crate::metadata::verify_metadata_manifest(src, &source_path, expected)?;
+        }
+        let target_path = checked_join(dst_root, path)?;
+        guard_path(safety.sandbox(), &target_path, "Datei-DACL-Ziel")?;
+        prog.phase = "metadata".into();
+        prog.current = path.clone();
+        let mut transaction = match dst.begin_file_dacl_transaction(&target_path, effect) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                if let Some(issue) = crate::windows_dacl::known_write_omission(&error) {
+                    crate::content_sync::record_windows_dacl_omission(
+                        &mut stats.metadata_report,
+                        path,
+                        issue,
+                    );
+                    on_progress(&prog);
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let applied = transaction.apply();
+        stats.file_dacl_report.merge(&transaction.report());
+        if let Ok(report) = &applied {
+            stats.file_dacl_report.merge(report);
+        }
+        if transaction
+            .report()
+            .completed
+            .iter()
+            .any(|outcome| outcome.file == target_path.to_string_lossy())
+        {
+            stats.metadata_updated = stats.metadata_updated.saturating_add(1);
+        }
+        prog.file_dacl_report = stats.file_dacl_report.clone();
+        on_progress(&prog);
+        let paths = transaction.recovery_paths();
+        if let Err(error) = applied {
+            if transaction.report().is_empty() {
+                if let Some(issue) = crate::windows_dacl::known_write_omission(&error) {
+                    crate::content_sync::record_windows_dacl_omission(
+                        &mut stats.metadata_report,
+                        path,
+                        issue,
+                    );
+                    continue;
+                }
+            }
+            stats.temp_recovery_paths.extend(paths);
+            return Err(error);
+        }
+        if cancel.is_cancelled() {
+            stats.temp_recovery_paths.extend(paths);
+            return finish_cancelled(stats, &mut prog, on_progress);
+        }
+        match transaction.finish() {
+            Ok(report) => stats.file_dacl_report.merge(&report),
+            Err(error) => {
+                stats.temp_recovery_paths.extend(paths);
+                return Err(error);
+            }
+        }
+        prog.file_dacl_report = stats.file_dacl_report.clone();
+        on_progress(&prog);
+    }
+
+    // Die dauerhaft gebundene DACL ist die letzte Wirkung: auch alle mtime- und
+    // Streamabschlüsse anderer Ordner müssen davor bereits abgeschlossen sein.
+    for action in &plan.actions {
+        let Action::SetDirectoryMetadata {
+            path,
+            source_mtime,
+            metadata,
+            ..
+        } = action
+        else {
+            continue;
+        };
+        let Some(crate::windows_dacl::WindowsDaclTransfer::DirectoryExact(dacl)) =
+            &metadata.windows_dacl
+        else {
+            continue;
+        };
+        if cancel.is_cancelled() {
+            return finish_cancelled(stats, &mut prog, on_progress);
+        }
+        if dry {
+            continue;
+        }
+        validate_anchor_identity(src, dst, safety)?;
+        let source_path = checked_join(src_root, path)?;
+        let target_path = checked_join(dst_root, path)?;
+        validate_directory_source(src, &source_path, *source_mtime, metadata)?;
+        prog.phase = "metadata".into();
+        prog.current = path.clone();
+        let mut transaction = match dst.begin_directory_dacl_transaction(&target_path, dacl) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                if let Some(issue) = crate::windows_dacl::known_write_omission(&error) {
+                    crate::content_sync::record_windows_dacl_omission(
+                        &mut stats.metadata_report,
+                        path,
+                        issue,
+                    );
+                    on_progress(&prog);
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let applied = transaction.apply();
+        stats.directory_dacl_report.merge(
+            &transaction
+                .report()
+                .at_directory(&target_path.to_string_lossy()),
+        );
+        if let Ok(report) = &applied {
+            stats
+                .directory_dacl_report
+                .merge(&report.clone().at_directory(&target_path.to_string_lossy()));
+        }
+        if stats
+            .directory_dacl_report
+            .completed
+            .iter()
+            .any(|outcome| outcome.directory == target_path.to_string_lossy())
+            && updated_directories.insert(path.as_str())
+        {
+            stats.metadata_updated = stats.metadata_updated.saturating_add(1);
+        }
+        prog.directory_dacl_report = stats.directory_dacl_report.clone();
+        // Der synchrone Queuecallback sichert den Wirkungsbeleg vor dem Intentabbau.
+        on_progress(&prog);
+        let recovery_paths = transaction.recovery_paths();
+        if let Err(error) = applied {
+            stats.temp_recovery_paths.extend(recovery_paths);
+            if transaction.report().is_empty() {
+                if let Some(issue) = crate::windows_dacl::known_write_omission(&error) {
+                    crate::content_sync::record_windows_dacl_omission(
+                        &mut stats.metadata_report,
+                        path,
+                        issue,
+                    );
+                    continue;
+                }
+            }
+            return Err(error);
+        }
+        if cancel.is_cancelled() {
+            stats.temp_recovery_paths.extend(recovery_paths);
+            return finish_cancelled(stats, &mut prog, on_progress);
+        }
+        match transaction.finish() {
+            Ok(report) => {
+                stats
+                    .directory_dacl_report
+                    .merge(&report.at_directory(&target_path.to_string_lossy()));
+            }
+            Err(error) => {
+                stats.temp_recovery_paths.extend(recovery_paths);
+                return Err(error);
+            }
+        }
+        prog.directory_dacl_report = stats.directory_dacl_report.clone();
+        on_progress(&prog);
     }
 
     prog.phase = "done".into();
@@ -889,7 +1894,10 @@ fn execute_with_stats(
     Ok(())
 }
 
-fn apply_pending_mode(pending: &PendingMode<'_>, request: &ExecuteRequest<'_>) -> io::Result<()> {
+fn apply_pending_mode(
+    pending: &PendingMode<'_>,
+    request: &ExecuteRequest<'_>,
+) -> io::Result<Option<String>> {
     let PendingMode {
         path,
         source_mode,
@@ -952,7 +1960,12 @@ fn apply_pending_mode(pending: &PendingMode<'_>, request: &ExecuteRequest<'_>) -
             }
         }
         guard_path(safety.sandbox(), &target_path, "Metadaten-Ziel")?;
-        dst.set_mode(&target_path, source_mode)?;
+        if let Err(error) = dst.set_mode(&target_path, source_mode) {
+            if let Some(reason) = safety.normal_mode_omission_reason(&error) {
+                return Ok(Some(reason.to_owned()));
+            }
+            return Err(error);
+        }
         // Die Rechte sind bereits sichtbar geändert. Ein Fehler ab hier darf weder
         // Erfolg noch eine wirkungslose Absage behaupten; das Ziel bleibt als
         // strukturierter Prüfpfad erhalten, auch wenn der Provider weitere Reste meldet.
@@ -984,7 +1997,64 @@ fn apply_pending_mode(pending: &PendingMode<'_>, request: &ExecuteRequest<'_>) -
             )));
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+fn apply_directory_time(
+    path: &str,
+    expected: i64,
+    request: &ExecuteRequest<'_>,
+) -> io::Result<Option<crate::content_sync::KnownMtimeOmission>> {
+    if request.safety.is_dry_run() {
+        return Ok(None);
+    }
+    validate_anchor_identity(request.src, request.dst, request.safety)?;
+    let source_path = checked_join(request.src_root, path)?;
+    let target_path = checked_join(request.dst_root, path)?;
+    let source = request.src.stat(&source_path)?;
+    let target = request.dst.stat(&target_path)?;
+    if source.is_symlink
+        || !source.is_dir
+        || source.mtime != Some(expected)
+        || target.is_symlink
+        || !target.is_dir
+    {
+        return Err(plan_changed(
+            path,
+            "Ordner oder Quellzeit änderte sich vor der Zeitübernahme",
+        ));
+    }
+    guard_path(request.safety.sandbox(), &target_path, "Ordnerzeit-Ziel")?;
+    if let Err(error) = request.dst.set_mtime(&target_path, expected) {
+        if let Some(reason) = request.safety.mtime_omission_reason(&error) {
+            return Ok(Some(reason.to_owned()));
+        }
+        return Err(error);
+    }
+    let unconfirmed = |error: io::Error| {
+        crate::error::with_recovery_context(
+            crate::coded_error(
+                error.kind(),
+                crate::ErrorCode::OutcomeUnclear,
+                format!(
+                    "Ordnerzeit von {} wurde gesetzt, aber ihr Abschluss ist unklar: {error}",
+                    target_path.display()
+                ),
+            ),
+            &[&error],
+            &[&target_path],
+        )
+    };
+    request.dst.sync_dir(&target_path).map_err(&unconfirmed)?;
+    validate_anchor_identity(request.src, request.dst, request.safety).map_err(&unconfirmed)?;
+    let actual = request.dst.stat(&target_path).map_err(&unconfirmed)?;
+    if actual.is_symlink || !actual.is_dir || actual.mtime != Some(expected) {
+        return Err(unconfirmed(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Ordnerzeit weicht beim Rücklesen ab",
+        )));
+    }
+    Ok(None)
 }
 
 fn preflight_hardlinks(
@@ -1096,6 +2166,25 @@ fn preflight_directory_metadata(
                     ));
                 }
                 verify_planned_metadata(src, &source_path, dst, &target_path, Some(metadata))?;
+                if let Some(crate::windows_dacl::WindowsDaclTransfer::DirectoryExact(dacl)) =
+                    &metadata.windows_dacl
+                {
+                    super::atomic::verify_target_proof(
+                        dst,
+                        &target_path,
+                        dacl.target_proof.as_ref(),
+                    )?;
+                    match dst.directory_dacl_write_support()? {
+                        crate::windows_dacl::WindowsDaclWriteSupport::Ready(current)
+                            if current == dacl.context => {}
+                        _ => {
+                            return Err(plan_changed(
+                                path,
+                                "Verzeichnis-DACL-Probekontext änderte sich seit der Vorschau",
+                            ))
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -1103,17 +2192,30 @@ fn preflight_directory_metadata(
     Ok(())
 }
 
-fn validate_directory_source(
+fn validate_directory_metadata_transfer(metadata: &MetadataTransfer) -> io::Result<()> {
+    validate_metadata_transfer(metadata)?;
+    if matches!(
+        metadata.windows_dacl,
+        Some(crate::windows_dacl::WindowsDaclTransfer::Exact(_))
+    ) {
+        return Err(invalid_plan(
+            "Verzeichnis-DACL besitzt keinen bestätigten Einzelwirkungsvertrag",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_directory_source(
     src: &dyn Vfs,
     source_path: &Path,
     source_mtime: Option<i64>,
     metadata: &MetadataTransfer,
 ) -> io::Result<()> {
-    validate_metadata_transfer(metadata)?;
-    if metadata.resource_fork {
+    validate_directory_metadata_transfer(metadata)?;
+    if metadata.resource_fork || metadata.named_streams {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Ordneraktion darf keinen Ressourcen-Fork-Inhaltsstrom enthalten",
+            "Ordneraktion darf keine Metadaten-Inhaltsströme enthalten",
         ));
     }
     let source = src.stat(source_path)?;
@@ -1135,9 +2237,25 @@ struct DirectoryMetadataRequest<'a> {
     target_mtime: Option<i64>,
     metadata: &'a MetadataTransfer,
     is_new: bool,
+    permit: Option<&'a crate::content_sync::ContentSyncPermit>,
+    created_key: Option<&'a crate::created_directory_dacl::CreatedDirectoryEffectKey>,
+    created_dacl_applied: bool,
 }
 
-fn apply_directory_metadata(request: DirectoryMetadataRequest<'_>) -> io::Result<()> {
+#[derive(Clone)]
+enum DirectoryMtime {
+    Pending,
+    Applied,
+    Omitted(crate::content_sync::KnownMtimeOmission),
+}
+
+fn apply_directory_metadata(
+    request: DirectoryMetadataRequest<'_>,
+    mtime_state: &DirectoryMtime,
+) -> io::Result<(
+    Option<crate::content_sync::KnownMtimeOmission>,
+    Option<String>,
+)> {
     let DirectoryMetadataRequest {
         src,
         source_path,
@@ -1147,7 +2265,17 @@ fn apply_directory_metadata(request: DirectoryMetadataRequest<'_>) -> io::Result
         target_mtime: _target_mtime,
         metadata,
         is_new,
+        permit,
+        created_key,
+        created_dacl_applied,
     } = request;
+    let allow_metadata_omission =
+        permit.is_some_and(crate::content_sync::ContentSyncPermit::allows_metadata_omission);
+    let mut omitted_mtime = match mtime_state {
+        DirectoryMtime::Omitted(omission) => Some(omission.clone()),
+        _ => None,
+    };
+    let mut omitted_mode = None;
     validate_directory_source(src, source_path, source_mtime, metadata)?;
     let target = dst.stat(target_path)?;
     if target.is_symlink || !target.is_dir {
@@ -1155,6 +2283,17 @@ fn apply_directory_metadata(request: DirectoryMetadataRequest<'_>) -> io::Result
             &target_path.to_string_lossy(),
             "Metadaten-Ziel ist kein echter Ordner",
         ));
+    }
+    if created_key.is_some_and(|key| {
+        target.inode != Some(key.file_id) || key.directory != target_path.to_string_lossy()
+    }) {
+        return Err(plan_changed(
+            &target_path.to_string_lossy(),
+            "Neuordneridentität änderte sich vor finalen Metadaten",
+        ));
+    }
+    if created_dacl_applied {
+        verify_before_children_rights(dst, target_path, metadata, false)?;
     }
     if is_new {
         if metadata.target.is_some() {
@@ -1192,18 +2331,46 @@ fn apply_directory_metadata(request: DirectoryMetadataRequest<'_>) -> io::Result
         })?;
         dst.set_metadata_owner(target_path, owner)?;
     }
-    if metadata.acl {
+    let directory_dacl = matches!(
+        metadata.windows_dacl,
+        Some(
+            crate::windows_dacl::WindowsDaclTransfer::DirectoryExact(_)
+                | crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryExact(_)
+                | crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryBeforeChildrenExact(_)
+        )
+    );
+    if metadata.acl && !directory_dacl {
         dst.write_acl_exact(target_path, metadata.source.acl.as_ref())?;
     }
     if let Some(values) = source_xattrs.as_deref() {
         dst.write_xattrs_exact(target_path, values)?;
     }
     if metadata.normal_mode {
-        dst.set_metadata_normal_mode(target_path, metadata.source.mode & 0o777)?;
+        if let Err(error) = dst.set_metadata_normal_mode(target_path, metadata.source.mode & 0o777)
+        {
+            if let Some(reason) = allow_metadata_omission
+                .then(|| crate::content_sync::normal_mode_omission_reason(&error))
+                .flatten()
+            {
+                omitted_mode = Some(reason.to_owned());
+            } else {
+                return Err(error);
+            }
+        }
     }
-    if dst.supports_mtime_write() {
+    if matches!(mtime_state, DirectoryMtime::Pending) && dst.supports_mtime_write() {
         if let Some(mtime) = source_mtime {
-            dst.set_mtime(target_path, mtime)?;
+            let result = match created_key {
+                Some(key) => dst.set_created_directory_mtime(target_path, mtime, key),
+                None => dst.set_mtime(target_path, mtime),
+            };
+            if let Err(error) = result {
+                if let Some(reason) = permit.and_then(|permit| permit.mtime_omission(&error)) {
+                    omitted_mtime = Some(reason.to_owned());
+                } else {
+                    return Err(error);
+                }
+            }
         }
     }
     dst.sync_dir(target_path)?;
@@ -1211,11 +2378,71 @@ fn apply_directory_metadata(request: DirectoryMetadataRequest<'_>) -> io::Result
         dst.set_metadata_special_bits(target_path, metadata.source.mode & 0o7000)?;
         dst.sync_dir(target_path)?;
     }
-    verify_selected_metadata(dst, target_path, metadata)?;
-    if source_mtime.is_some() && dst.stat(target_path)?.mtime != source_mtime {
+    let mut verified_metadata = metadata.clone();
+    if directory_dacl {
+        verified_metadata.acl = false;
+        verified_metadata.windows_dacl = None;
+    }
+    if omitted_mode.is_some() {
+        verified_metadata.normal_mode = false;
+    }
+    verify_selected_metadata(dst, target_path, &verified_metadata)?;
+    if created_dacl_applied {
+        verify_before_children_rights(dst, target_path, metadata, true)?;
+    }
+    if let Some(key) = created_key {
+        let final_entry = dst.stat(target_path)?;
+        if final_entry.inode != Some(key.file_id) || !final_entry.is_dir || final_entry.is_symlink {
+            return Err(crate::coded_error(
+                io::ErrorKind::InvalidData,
+                crate::ErrorCode::OutcomeUnclear,
+                "Neuordneridentität nach Metadatenabschluss unklar",
+            ));
+        }
+    }
+    if omitted_mtime.is_none()
+        && dst.supports_mtime_write()
+        && source_mtime.is_some()
+        && dst.stat(target_path)?.mtime != source_mtime
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Ordner-mtime stimmt nach dem Schreiben nicht exakt überein",
+        ));
+    }
+    Ok((omitted_mtime, omitted_mode))
+}
+
+fn verify_before_children_rights(
+    dst: &dyn Vfs,
+    path: &Path,
+    metadata: &MetadataTransfer,
+    after_mutation: bool,
+) -> io::Result<()> {
+    let Some(crate::windows_dacl::WindowsDaclTransfer::CreatedDirectoryBeforeChildrenExact(
+        selection,
+    )) = &metadata.windows_dacl
+    else {
+        return Err(invalid_plan("V8-Rechteabschluss ohne V8-Auswahl"));
+    };
+    let observed = dst.metadata_manifest(path)?;
+    let context_matches = observed.windows_security.as_ref().is_some_and(|security| {
+        security.issue.is_none()
+            && security.namespace == selection.probe_context.namespace
+            && security.owner.as_ref() == Some(&selection.probe_context.owner)
+            && security.group == selection.probe_context.group
+    });
+    if observed.acl != Some(crate::metadata::Acl::WindowsDacl(selection.after.clone()))
+        || !context_matches
+    {
+        return Err(crate::coded_error(
+            io::ErrorKind::InvalidData,
+            if after_mutation {
+                crate::ErrorCode::OutcomeUnclear
+            } else {
+                crate::ErrorCode::PlanDrift
+            },
+            "Früh bestätigte Ordnerrechte oder SID-Kontext änderten sich vor dem Gesamtabschluss",
         ));
     }
     Ok(())
@@ -1234,11 +2461,452 @@ fn finish_cancelled(
     Ok(())
 }
 
+fn preflight_file_dacl(
+    src: &dyn Vfs,
+    src_root: &Path,
+    dst: &dyn Vfs,
+    dst_root: &Path,
+    plan: &SyncPlan,
+    safety: &Safety,
+) -> io::Result<()> {
+    let mut objects = std::collections::BTreeSet::new();
+    for action in &plan.actions {
+        let Action::SetFileDacl {
+            path,
+            source_hash,
+            source_metadata,
+            plan: effect,
+        } = action
+        else {
+            continue;
+        };
+        if !safety.content_sync_permit().is_some_and(|permit| {
+            permit.metadata_profile() == crate::MetadataProfile::NativeBestEffort
+        }) {
+            return Err(invalid_plan("Datei-DACL-Inplace ist ausschließlich für bestätigten NativeBestEffort-Inhaltssync zulässig"));
+        }
+        if !objects.insert((effect.object_namespace, effect.file_id)) {
+            return Err(invalid_plan("Datei-DACL-Objekt wurde mehrfach geplant"));
+        }
+        for alias in &effect.alias_scope.selected_paths {
+            let source_path = checked_join(src_root, alias)?;
+            let target_path = checked_join(dst_root, alias)?;
+            if hash_file_hex(src, &source_path)? != *source_hash
+                || !effect
+                    .target_proof
+                    .matches_identity(&dst.stat(&target_path)?)
+                || hash_file_hex(dst, &target_path)? != *source_hash
+            {
+                return Err(plan_changed(
+                    alias,
+                    "Datei-DACL-Inhalt oder Objekt änderte sich seit der Vorschau",
+                ));
+            }
+            let expected = plan
+                .file_dacl_selections
+                .iter()
+                .find(|selection| selection.path == *alias)
+                .and_then(|selection| selection.source_metadata.as_ref())
+                .unwrap_or(source_metadata);
+            crate::metadata::verify_metadata_manifest(src, &source_path, expected)?;
+            let observed = dst.metadata_manifest(&target_path)?;
+            if observed.acl.as_ref()
+                != Some(&crate::metadata::Acl::WindowsDacl(effect.before.clone()))
+                || observed.named_streams.as_ref() != Some(&effect.streams)
+            {
+                return Err(plan_changed(
+                    alias,
+                    "Datei-DACL oder ADS änderten sich seit der Vorschau",
+                ));
+            }
+        }
+        if !effect.alias_scope.selected_paths.contains(path) {
+            return Err(invalid_plan("Datei-DACL-Hauptpfad fehlt im Aliasumfang"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CreatedSourceOmission {
+    ListingDenied,
+    ListingUnknown,
+    StreamsDenied,
+    StreamsUnknown,
+}
+impl CreatedSourceOmission {
+    fn record(self, report: &mut super::MetadataReport, path: &str) {
+        self.record_for(report, path, false);
+    }
+    fn record_before_children(self, report: &mut super::MetadataReport, path: &str) {
+        self.record_for(report, path, true);
+    }
+    fn record_for(self, report: &mut super::MetadataReport, path: &str, before_children: bool) {
+        let denied = matches!(self, Self::ListingDenied | Self::StreamsDenied);
+        crate::content_sync::record_windows_dacl_omission(
+            report,
+            path,
+            if denied {
+                crate::windows_dacl::WindowsDaclTargetIssue::RequiredAccessDenied
+            } else {
+                crate::windows_dacl::WindowsDaclTargetIssue::OptionalObservation
+            },
+        );
+        if let Some(issue) = report.issues.last_mut() {
+            issue.reason = match (self, before_children) {
+            (Self::ListingDenied, true) => "Die zusätzliche ungefilterte Unterbestandsabfrage des Quellordners wurde verweigert; nur die Rechteänderung wird ausgelassen",
+            (Self::ListingUnknown, true) => "Die zusätzliche vollständige Beobachtung des direkten Quellunterbestands ist nicht verfügbar; nur die Rechteänderung wird ausgelassen",
+            (Self::ListingDenied, false) => "Die zusätzliche Leerheitsabfrage des Quellordners wurde verweigert; nur die Rechteänderung wird ausgelassen",
+            (Self::ListingUnknown, false) => "Die zusätzliche vollständige Leerheitsbeobachtung des Quellordners ist nicht verfügbar; nur die Rechteänderung wird ausgelassen",
+            (Self::StreamsDenied, _) => "Die zusätzliche Beobachtung der Quell-Ordnerdatenströme wurde verweigert; nur die Rechteänderung wird ausgelassen",
+            (Self::StreamsUnknown, _) => "Die zusätzliche vollständige Quellmetadaten- und Ordnerstrombeobachtung ist nicht verfügbar; nur die Rechteänderung wird ausgelassen",
+        }.into();
+        }
+    }
+}
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CreatedSourceFault {
+    ListingDenied,
+    ListingIncomplete,
+    StreamsDenied,
+    KnownStream,
+    Interrupted,
+}
+#[cfg(test)]
+thread_local! {pub(crate) static CREATED_SOURCE_FAULT:std::cell::Cell<Option<(u8,CreatedSourceFault)>>=const{std::cell::Cell::new(None)};pub(crate) static CREATED_SOURCE_CHECKS:std::cell::Cell<u8>=const{std::cell::Cell::new(0)};}
+pub(super) fn validate_created_nonempty_source(
+    src: &dyn Vfs,
+    path: &Path,
+    mtime: Option<i64>,
+    metadata: &MetadataTransfer,
+    proof: &crate::created_directory_dacl::CreatedDirectoryChildrenProof,
+) -> io::Result<Option<CreatedSourceOmission>> {
+    validate_created_source(src, path, mtime, metadata, Some(proof))
+}
+pub(super) fn validate_created_empty_source(
+    src: &dyn Vfs,
+    path: &Path,
+    mtime: Option<i64>,
+    metadata: &MetadataTransfer,
+) -> io::Result<Option<CreatedSourceOmission>> {
+    validate_created_source(src, path, mtime, metadata, None)
+}
+fn validate_created_source(
+    src: &dyn Vfs,
+    path: &Path,
+    mtime: Option<i64>,
+    metadata: &MetadataTransfer,
+    children: Option<&crate::created_directory_dacl::CreatedDirectoryChildrenProof>,
+) -> io::Result<Option<CreatedSourceOmission>> {
+    // Die bestehenden Source-Identitäts-/Manifestprüfungen bleiben zwingend.
+    validate_directory_source(src, path, mtime, metadata)?;
+    #[cfg(test)]
+    let fault = {
+        let count = CREATED_SOURCE_CHECKS.with(|count| {
+            count.set(count.get().saturating_add(1));
+            count.get()
+        });
+        CREATED_SOURCE_FAULT.with(|fault| {
+            if fault.get().is_some_and(|(stage, _)| stage == count) {
+                fault.take().map(|(_, fault)| fault)
+            } else {
+                None
+            }
+        })
+    };
+    #[cfg(test)]
+    if fault == Some(CreatedSourceFault::Interrupted) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Zusätzliche Beobachtung abgebrochen",
+        ));
+    }
+    let listing = src.list_complete(path);
+    #[cfg(test)]
+    let listing = match fault {
+        Some(CreatedSourceFault::ListingDenied) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Synthetische zusätzliche Listingabsage",
+        )),
+        Some(CreatedSourceFault::ListingIncomplete) => listing.map(|mut listing| {
+            listing.complete = false;
+            listing
+        }),
+        _ => listing,
+    };
+    let listing = match listing {
+        Ok(listing) => listing,
+        Err(error)
+            if matches!(
+                crate::error_code(&error),
+                crate::ErrorCode::PlanDrift | crate::ErrorCode::Interrupted
+            ) =>
+        {
+            return Err(error)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Err(crate::real_mode::plan_drift(
+                "Quellordner verschwand während der zusätzlichen Leerheitsprüfung",
+            ))
+        }
+        Err(error) => {
+            return Ok(Some(if error.kind() == io::ErrorKind::PermissionDenied {
+                CreatedSourceOmission::ListingDenied
+            } else {
+                CreatedSourceOmission::ListingUnknown
+            }))
+        }
+    };
+    if children.is_none() && !listing.entries.is_empty() {
+        return Err(crate::real_mode::plan_drift(
+            "Quellordner besitzt inzwischen bekannte Kinder",
+        ));
+    }
+    if !listing.complete {
+        return Ok(Some(CreatedSourceOmission::ListingUnknown));
+    }
+    if let Some(expected) = children {
+        let actual =
+            crate::created_directory_dacl::CreatedDirectoryChildrenProof::from_listing(&listing)
+                .map_err(|_| {
+                    crate::real_mode::plan_drift("Ungefilterter Quellunterbestand änderte sich")
+                })?;
+        if &actual != expected {
+            return Err(crate::real_mode::plan_drift(
+                "Rohe Quellnamen oder Kindtypen änderten sich",
+            ));
+        }
+    }
+    let observed = src.metadata_manifest(path);
+    #[cfg(test)]
+    let observed = match fault {
+        Some(CreatedSourceFault::StreamsDenied) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Synthetische zusätzliche Streamabsage",
+        )),
+        Some(CreatedSourceFault::KnownStream) => observed.and_then(|m| {
+            m.with_named_streams(Some(vec![crate::metadata::NamedBlobSummary {
+                name: b"late".to_vec(),
+                value: crate::metadata::BlobSummary::from_bytes(b"late"),
+            }]))
+        }),
+        _ => observed,
+    };
+    let observed = match observed {
+        Ok(value) => value,
+        Err(error)
+            if matches!(
+                crate::error_code(&error),
+                crate::ErrorCode::PlanDrift | crate::ErrorCode::Interrupted
+            ) =>
+        {
+            return Err(error)
+        }
+        Err(error) => {
+            return Ok(Some(if error.kind() == io::ErrorKind::PermissionDenied {
+                CreatedSourceOmission::StreamsDenied
+            } else {
+                CreatedSourceOmission::StreamsUnknown
+            }))
+        }
+    };
+    if observed
+        .acl
+        .as_ref()
+        .zip(metadata.source.acl.as_ref())
+        .is_some_and(|(actual, planned)| actual != planned)
+        || observed
+            .windows_security
+            .as_ref()
+            .zip(metadata.source.windows_security.as_ref())
+            .is_some_and(|(actual, planned)| {
+                actual.namespace != planned.namespace
+                    || actual
+                        .owner
+                        .as_ref()
+                        .zip(planned.owner.as_ref())
+                        .is_some_and(|(actual, planned)| actual != planned)
+                    || actual
+                        .group
+                        .as_ref()
+                        .zip(planned.group.as_ref())
+                        .is_some_and(|(actual, planned)| actual != planned)
+            })
+    {
+        return Err(crate::real_mode::plan_drift(
+            "Bekannte Quellrechte oder SIDs änderten sich während der Zusatzbeobachtung",
+        ));
+    }
+    if observed
+        .named_streams
+        .as_ref()
+        .is_some_and(|streams| !streams.is_empty())
+    {
+        return Err(crate::real_mode::plan_drift(
+            "Quellordner besitzt inzwischen bekannte Ordnerdatenströme",
+        ));
+    }
+    if observed.named_streams.is_none()
+        || (metadata.source.acl.is_some() && observed.acl.is_none())
+        || observed
+            .windows_security
+            .as_ref()
+            .is_some_and(|security| security.issue.is_some())
+    {
+        return Ok(Some(CreatedSourceOmission::StreamsUnknown));
+    }
+    if observed.digest != metadata.source.digest {
+        return Err(crate::real_mode::plan_drift(
+            "Quellmetadaten änderten sich während der zusätzlichen Leerheitsprüfung",
+        ));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use crate::{Compare, LocalVfs, MetadataProfile, SyncMode, SyncOptions, Vfs};
+
+    #[test]
+    fn omitted_mtime_skips_only_time_fence_without_another_set() {
+        use super::{apply_directory_metadata, DirectoryMetadataRequest, DirectoryMtime};
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let vfs = LocalVfs::new();
+        let wanted = 1_700_000_000;
+        let original = wanted + 100;
+        vfs.set_mtime(&source, wanted).unwrap();
+        vfs.set_mtime(&target, original).unwrap();
+        let metadata = crate::sync::MetadataTransfer {
+            source: vfs.metadata_manifest(&source).unwrap(),
+            target: None,
+            owner: false,
+            acl: false,
+            incompatible_acl_model: false,
+            windows_dacl: None,
+            normal_mode: false,
+            special_mode_bits: false,
+            xattrs: false,
+            resource_fork: false,
+            named_streams: false,
+            directory_streams: None,
+            sparse_extents: false,
+            hardlinks: false,
+        };
+        let request = || DirectoryMetadataRequest {
+            src: &vfs,
+            source_path: &source,
+            dst: &vfs,
+            target_path: &target,
+            source_mtime: Some(wanted),
+            target_mtime: None,
+            metadata: &metadata,
+            is_new: true,
+            permit: None,
+            created_key: None,
+            created_dacl_applied: false,
+        };
+        // Eine als gesetzt bestätigte Zeit muss weiterhin exakt stimmen.
+        assert!(apply_directory_metadata(request(), &DirectoryMtime::Applied).is_err());
+        let error = crate::content_sync::mtime_privilege_omission("Bewiesene OPEN-Absage");
+        let omitted = DirectoryMtime::Omitted(
+            crate::content_sync::mtime_omission_reason(&error)
+                .unwrap()
+                .clone(),
+        );
+        let (mtime, mode) = apply_directory_metadata(request(), &omitted).unwrap();
+        assert_eq!(
+            mtime.unwrap().kind,
+            crate::sync::MetadataIssueKind::PrivilegeFailure
+        );
+        assert!(mode.is_none());
+        assert_eq!(vfs.stat(&target).unwrap().mtime, Some(original));
+        // Die ausgelassene Zeit entbindet weder die Quelle noch den Zieltyp.
+        vfs.set_mtime(&source, wanted + 1).unwrap();
+        assert_eq!(
+            crate::error_code(&apply_directory_metadata(request(), &omitted).unwrap_err()),
+            crate::ErrorCode::PlanDrift
+        );
+        vfs.set_mtime(&source, wanted).unwrap();
+        std::fs::remove_dir(&target).unwrap();
+        std::fs::write(&target, b"fremder Typ").unwrap();
+        assert_eq!(
+            crate::error_code(&apply_directory_metadata(request(), &omitted).unwrap_err()),
+            crate::ErrorCode::PlanDrift
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"fremder Typ");
+    }
+
+    #[test]
+    fn before_children_final_metadata_rejects_replaced_original_before_time_set() {
+        use super::{apply_directory_metadata, DirectoryMetadataRequest, DirectoryMtime};
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let vfs = LocalVfs::new();
+        let wanted = 1_700_000_000;
+        vfs.set_mtime(&source, wanted).unwrap();
+        let original_id = vfs.stat(&target).unwrap().inode.unwrap();
+        let key = crate::created_directory_dacl::CreatedDirectoryEffectKey {
+            origin: crate::created_directory_dacl::CreatedDirectoryOrigin::ExclusiveMinimalCreateBeforeChildren,
+            directory: target.to_string_lossy().into_owned(), file_id: original_id, object_namespace: [3; 32],
+        };
+        let metadata = crate::sync::MetadataTransfer {
+            source: vfs.metadata_manifest(&source).unwrap(),
+            target: None,
+            owner: false,
+            acl: false,
+            incompatible_acl_model: false,
+            windows_dacl: None,
+            normal_mode: false,
+            special_mode_bits: false,
+            xattrs: false,
+            resource_fork: false,
+            named_streams: false,
+            directory_streams: None,
+            sparse_extents: false,
+            hardlinks: false,
+        };
+        std::fs::rename(&target, root.join("original-held")).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        vfs.set_mtime(&target, wanted + 100).unwrap();
+        assert_ne!(vfs.stat(&target).unwrap().inode, Some(original_id));
+        let error = apply_directory_metadata(
+            DirectoryMetadataRequest {
+                src: &vfs,
+                source_path: &source,
+                dst: &vfs,
+                target_path: &target,
+                source_mtime: Some(wanted),
+                target_mtime: None,
+                metadata: &metadata,
+                is_new: true,
+                permit: None,
+                created_key: Some(&key),
+                created_dacl_applied: false,
+            },
+            &DirectoryMtime::Pending,
+        )
+        .unwrap_err();
+        assert_eq!(crate::error_code(&error), crate::ErrorCode::PlanDrift);
+        assert_eq!(vfs.stat(&target).unwrap().mtime, Some(wanted + 100));
+        assert!(root.join("original-held").is_dir());
+    }
 
     #[test]
     fn schwache_hardlink_ersetzung_zaehlt_den_tatsaechlichen_abschluss() {
@@ -1269,7 +2937,19 @@ mod tests {
                 vfs.set_mtime(&path, 1_700_000_000).unwrap();
             }
             crate::local_fs::with_weak_file_capabilities_for_test(&target, || {
-                let prepared = crate::prepare_local_sync_run(
+                let registry_root = tempfile::Builder::new()
+                    .permissions(
+                        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
+                            0o700,
+                        ),
+                    )
+                    .tempdir()
+                    .unwrap();
+                let registry_queue =
+                    crate::OperationQueue::open(registry_root.path().join("operations-queue.json"))
+                        .unwrap();
+                let prepared = crate::prepare_local_sync_run_for_queue(
+                    &registry_queue,
                     &source,
                     &target,
                     SyncOptions {
@@ -1278,6 +2958,7 @@ mod tests {
                         metadata: MetadataProfile::NativeBestEffort,
                         ..Default::default()
                     },
+                    None,
                 )
                 .unwrap();
                 assert!(prepared

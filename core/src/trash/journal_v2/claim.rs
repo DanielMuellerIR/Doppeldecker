@@ -714,6 +714,7 @@ fn directory_evidence(root: &RootHandle, private: bool) -> io::Result<DirectoryE
 fn acl_safe(acl: Option<&Acl>, private: bool) -> bool {
     match acl {
         None => true,
+        Some(Acl::WindowsDacl(_)) => false,
         Some(Acl::Nfs4(acl)) => acl
             .entries
             .iter()

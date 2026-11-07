@@ -9,9 +9,9 @@ import { isTextTarget, isMac } from "./file-clipboard.js";
 const PANE_MENU_ACTIONS = new Set([
   "open", "toggle_hidden", "refresh", "sort_name", "sort_size", "sort_date",
   "swap_panes", "back", "forward", "up", "home", "goto", "quarantine",
-  "sync_mode", "new_folder", "copy_over", "move_over", "rename", "trash",
+  "duplicate", "archive_pack", "archive_extract", "sync_mode", "new_folder", "copy_over", "move_over", "rename", "trash",
   "information", "view_options",
-  "compare_files",
+  "compare_files", "file_preview", "archive_read", "batch_rename",
   "paste_move",
   "files_copy", "files_cut", "files_paste", "files_move",
 ]);
@@ -58,6 +58,10 @@ export function createInputController(actions) {
       return;
     }
 
+    if (modifier && event.shiftKey && !event.altKey && event.code === "KeyF") {
+      actions.showNameSearch(actions.activeSide());
+      return event.preventDefault();
+    }
     if (modifier && !event.altKey && !event.shiftKey && ["KeyC", "KeyX"].includes(event.code) && isTextTarget(event.target)) {
       actions.clipboard.onTextCopy();
       return;
@@ -66,6 +70,10 @@ export function createInputController(actions) {
       && ["KeyC", "KeyX", "KeyV"].includes(event.code) && (!event.altKey || (isMac && event.code === "KeyV"))) {
       if (event.code === "KeyV") void actions.clipboard.paste(isMac && event.altKey);
       else void actions.clipboard.copy(event.code === "KeyX");
+      return event.preventDefault();
+    }
+    if (modifier && !event.altKey && !event.shiftKey && !isTextTarget(event.target) && event.code === "KeyD") {
+      actions.duplicateSelection();
       return event.preventDefault();
     }
     if (modifier && !event.altKey && !event.shiftKey && event.code === "KeyT") {
@@ -217,6 +225,9 @@ export function createInputController(actions) {
       case "F2":
         actions.renameCursor();
         return event.preventDefault();
+      case "F3":
+        actions.showPreview(side);
+        return event.preventDefault();
       case "F5":
         actions.transferToOther("copy");
         return event.preventDefault();
@@ -236,6 +247,9 @@ export function createInputController(actions) {
   }
 
   function onMenu(id) {
+    // Native Menüaktionen erzeugen keinen DOM-Klick, der ein offenes
+    // Kontextmenü schließt. Dialoge brauchen vorher dessen Pane-Fokusrückgabe.
+    actions.hideContextMenu?.(true);
     if (id === "new_window") return actions.newWindow();
     // Die Updateprüfung bleibt bewusst auch während einer laufenden Operation
     // erreichbar. Sie stellt sich aber selbst zurück, solange der gemeinsame
@@ -251,6 +265,9 @@ export function createInputController(actions) {
     const side = actions.activeSide();
     switch (id) {
       case "open": return actions.openCursor(side);
+      case "file_preview": return actions.showPreview(side);
+      case "archive_read": return actions.showArchiveRead(side);
+      case "batch_rename": return actions.showBatchRename(side);
       case "information": return actions.showInformation(side);
       case "compare_files": return actions.compareFiles();
       case "theme_auto": return actions.setTheme("auto");
@@ -274,6 +291,9 @@ export function createInputController(actions) {
       case "import_finder_favorites": return actions.importFinderFavorites();
       case "sync_mode": return actions.syncView.open();
       case "new_folder": return actions.newFolder();
+      case "duplicate": return actions.duplicateSelection();
+      case "archive_pack": return actions.archivePackSelection();
+      case "archive_extract": return actions.archiveExtractSelection(side);
       case "copy_over": return actions.transferToOther("copy");
       case "move_over": return actions.transferToOther("move");
       case "files_copy": return actions.clipboard.copy();

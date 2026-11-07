@@ -1,11 +1,14 @@
 # Produktprinzipien
 
-Stand: 2026-10-18
+Stand: 2026-10-20
 
 ## Identität
 
-Doppeldecker ist zuerst ein praktischer Dual-Pane-Dateimanager. Erwartbare
-Dateiarbeit soll lokal und über unterstützte Provider tatsächlich funktionieren.
+Doppeldecker soll ein komfortabler, umfassender, performanter und effizienter
+Two-Pane-Dateimanager für macOS und Linux sein. Erwartbare Dateiarbeit soll lokal
+und über unterstützte Provider tatsächlich funktionieren. Klare Bedienung, kurze
+Arbeitswege, reaktionsfähige Ansichten und ein angemessener Aufwand für CPU, Speicher
+und Netzwerk gehören zum Produktziel.
 Datenintegrität, Transparenz und Wiederherstellbarkeit erhöhen den Nutzwert; sie
 dürfen nicht als pauschale Begründung dienen, eine übliche Funktion wegzulassen.
 
@@ -45,9 +48,19 @@ Wiederherstellungswege.
 
 ### Interaktive Dateioperationen
 
+Gewöhnliches Kopieren, Verschieben, Ordneranlegen und Umbenennen wird direkt aus
+den Panes gestartet. Eine allgemeine Vorschaupflicht oder ein Sicherheitsassistent
+vor jeder Dateiaktion gehört nicht zum Produktziel. Rückfragen betreffen konkrete
+Kollisionen, Löschungen oder eine erklärungsbedürftige Wirkung. Eine optionale
+Vorschau darf die Arbeit unterstützen; bei Sync und komplexen Stapelaktionen ist
+sie ein eigener Bestandteil des jeweiligen Ablaufs. Das ist keine Zusage, dass
+jede Operation unter allen Umständen ohne Datenverlust gelingt.
+
 - Anlegen, Umbenennen, Kopieren, Verschieben und Upload sollen als Best Effort
   verfügbar bleiben, wenn der Provider den normalen Protokollbefehl unterstützt und
-  der angeforderte Bereich eindeutig gebunden ist.
+  der angeforderte Bereich entsprechend der Ausführungsklasse geprüft ist.
+  Eine atomare Elternbindung ist kein allgemeines Eintrittskriterium; die
+  ausdrücklich akzeptierte SFTP-Ausnahme steht unten.
 - Vorhandene Zielnamen werden unmittelbar vorher ermittelt. Doppeldecker bietet
   Ersetzen, Überspringen, Beide behalten oder Abbrechen entsprechend der
   tatsächlich verfügbaren Wirkung an. Es gibt kein stilles Überschreiben.
@@ -63,29 +76,35 @@ Die konkrete Variante bleibt bei fehlender Garantie mit Grund deaktiviert; norma
 Copy-/Move-Wege behalten ihre vorhandenen Ausführungsklassen. Die UI erfindet keine
 Ausführungspfade oder Planbelege. Details: [Konfliktentscheidungen](conflict-decisions.md).
 
-SFTP-Inhalte besitzen eine eigene begrenzte interaktive Leseklasse: reguläre
-Dateien als geprüfter lokaler Snapshot oder additive lokale Kopie; begrenzte
-Verzeichnisbäume ausschließlich als additive lokale Kopie. Gehaltene
-READ-Handles und vollständiger Inhalts-Readback begrenzen den Transfer, ersetzen
-aber keine atomare Bindung des ersten OPEN beziehungsweise OPENDIR an den Pane-Root. Dieses Restrisiko
-bleibt sichtbar; striktes Sync-VFS und Remote-Mutationen übernehmen die Freigabe
-nicht. Grenzen und Recovery: [SFTP-Inhalte](sftp-contents.md).
+SFTP-Inhalte verwenden eine interaktive Best-Effort-Lesesicht. Normale Snapshots
+lesen jeden Inhalt einmal remote, bilden den Transferhash und prüfen die
+abschließenden Attribute. Eine zusätzliche vollständige Verifikation ist optional.
+Dateigröße, Auswahlzahl, Baumtiefe und Gesamtbytes sind keine festen Produktgrenzen;
+Speicher-, Parser- und Requestgrenzen bleiben sichtbar. „Passiv ansehen“ erhält seine
+entschärfte Formatbehandlung; bewusstes Öffnen und Bearbeiten erhält das Originalformat.
+Explizites Zurückspeichern prüft das Serveroriginal und verwendet die normale Queue.
+Der erste pfadbasierte Zugriff bleibt ohne atomare Elternbindung.
+[Vertrag](sftp-contents.md).
 
-Gewöhnliche lokale Dateiadditionen nach WebDAV verwenden eine private bedingte
-Best-Effort-Zielsicht ohne künstliche Collection-/Löschprobe. Gehaltene Quellen,
-vollständige Inhaltsprüfungen, Tempintents und Readback bleiben erforderlich;
-begrenzte Baumuploads verwenden denselben Vertrag; Ersetzungen und strikter Sync
-übernehmen die Freigabe nicht.
-[Vertrag und Grenzen](webdav-upload.md).
+Für gewöhnliche SFTP-Schreiboperationen ist seit 2026-10-20 ausdrücklich eine eigene
+Best-Effort-Klasse umgesetzt: Benutzerpfade bleiben lexikalisch unter dem gewählten
+Root, beobachtete Symlinks werden abgelehnt, Bestand und Ergebnis werden passend
+zur Wirkung geprüft. Standard-SFTP v3 kann einen gleichzeitig serverseitig
+umgeleiteten Elternpfad jedoch nicht atomar ausschließen. Dieses Restrisiko ist
+akzeptiert und darf normale Uploads, mkdir, Rename, Move sowie bestätigtes Ersetzen
+und Löschen nicht pauschal verhindern. Der Vertrag verspricht keine atomare
+Rootgarantie. Umsetzung und Prüfstand stehen im
+[Schreibvertrag und Stand](sftp-writes.md). Strikter Sync erhält dadurch keine
+pauschale Freigabe.
 
-Eine vollständig atomare WebDAV-Elternbindung ist durch mehrere getaggte
-`If`-Listen nicht belegt: Diese gelten standardgemäß alternativ. Gewöhnliches
-lokales Dateiersetzen erhält daher keine Freigabe für eine scheinbare gemeinsame
-Bindung von Temp, Altziel und allen Eltern. Additionen, mkdir und Rename binden genau den unmittelbaren Elternordner;
-Vorfahrenwechsel bleiben sichtbar Best Effort und melden beobachtete Drift als unklar.
-Strikte WebDAV-Proben erzeugen ohne gemeinsame Root-/Elternbindung keinen Bestand.
-[Mutationsvertrag](webdav-mutation-boundary.md).
-[Tragfähigkeitsgrenze](webdav-replace-boundary.md).
+Gewöhnliche WebDAV-Uploads, Ersetzungen, mkdir, Rename und dauerhaftes Löschen
+verwenden eigene Best-Effort-Verträge ohne künstliche Fähigkeitsproben. Lokale
+Quellen werden während des Transfers gehasht; ein vollständiges Vorhashen ist kein
+Eintrittskriterium. WebDAV-`If`-Listen werden standardgemäß alternativ ausgewertet,
+niemals als gemeinsame atomare Bindung sämtlicher Eltern ausgegeben. Ersetzungen
+binden das Altziel und verwenden eine fertig übertragene Tempdatei; eine fehlende
+Quarantäne wird ausdrücklich angezeigt. Strikter Sync behält seinen eigenen Vertrag.
+[Uploadvertrag](webdav-upload.md), [Mutationsvertrag](webdav-mutation-boundary.md).
 
 ### Löschen und Ersetzen
 
@@ -93,7 +112,8 @@ Strikte WebDAV-Proben erzeugen ohne gemeinsame Root-/Elternbindung keinen Bestan
   bevorzugte Weg.
 - Fehlt ein Wiederherstellungsweg, darf eine klar als dauerhaft bezeichnete
   Operation angeboten werden. Umfang, Ziel und Irreversibilität müssen vorab
-  sichtbar sein; größere Wirkungen verlangen eine stärkere Bestätigung.
+  sichtbar sein. Erst mehr als 1000 Einträge oder 10 GiB bei endgültigem Löschen
+  verlangen zusätzlich eine exakte Phrase; Quarantäneleeren behält seine Phrase.
 - Unvollständige Listings oder unklare Zielidentität sperren rekursive Entfernungen,
   nicht aber unabhängige Lese- oder Additionsfunktionen.
 
@@ -103,8 +123,8 @@ Strikte WebDAV-Proben erzeugen ohne gemeinsame Root-/Elternbindung keinen Bestan
   bestätigt die konkrete Wirkung. Reine Additionen brauchen keine Zufallsphrase
   oder Quarantäneprobe. Ersetzungen verwenden bevorzugt Quarantäne; eine begrenzte
   schwache Zielklasse bestätigt Zahl, Ziele und fehlende Wiederherstellung
-  ausdrücklich als dauerhafte Ersetzung. ContentHash und die Grenze von 100
-  Ersetzungen bleiben erhalten. Datei- und Verzeichnis-Flushzusagen werden getrennt
+  ausdrücklich als dauerhafte Ersetzung. ContentHash bleibt erforderlich;
+  eine feste Grenze von 100 Ersetzungen besteht nicht. Datei- und Verzeichnis-Flushzusagen werden getrennt
   vom atomaren Neunamencommit bewertet und im bestätigten Backendplan gebunden.
   Simulation und echte Ausführung sind getrennte Starts. Vertrag und verbleibende
   lokale Zielgrenzen: [Normaler lokaler Sync](local-sync.md).
@@ -114,10 +134,15 @@ Strikte WebDAV-Proben erzeugen ohne gemeinsame Root-/Elternbindung keinen Bestan
 - Additionen und bestätigte Einzelersetzungen können Best Effort laufen, wenn
   Vorschau, frischer Bestandscheck, Readback und Audit vorhanden sind.
 - Mirror und bidirektionale Löschpropagierung benötigen wegen ihres großen
-  Wirkungsradius weiterhin vollständige Listings, sichtbare Mengengrenzen und eine
-  eindeutige Bestätigung. Fehlt nur für einzelne Aktionen eine starke Garantie,
+  Wirkungsradius weiterhin vollständige Listings, sichtbare Mengenwarnungen und eine
+  eindeutige Wirkungsbestätigung. Auch eine bewusst leere Quelle ist zulässig;
+  Scanfehler werden niemals als leere Quelle gewertet. Fehlt nur für einzelne Aktionen eine starke Garantie,
   soll Doppeldecker den ausführbaren Teil klar vom ausgelassenen Teil trennen, statt
   einen Scheinerfolg oder eine pauschale Absage zu liefern.
+- Normale Sync-Starts verwenden einen Wirkungsdialog ohne Zufallsphrase,
+  externe Backupbehauptung oder zusätzliche Auswahl zwischen Direktstart und Queue.
+  Backendbelege, Driftprüfung und einmalige Permits bleiben erhalten. Git- und
+  HOME-Ziele erhalten konkrete Warnungen; `/` bleibt als Ganzbaumziel gesperrt.
 - Ein Sync ist weiterhin kein Backup. Wo keine Quarantäne verfügbar ist, muss die
   fehlende Wiederherstellbarkeit Teil der Vorschau und Bestätigung sein.
 
@@ -134,16 +159,31 @@ Strikte WebDAV-Proben erzeugen ohne gemeinsame Root-/Elternbindung keinen Bestan
 Best Effort bedeutet nicht „blind weitermachen“. Doppeldecker akzeptiert weiterhin
 keine:
 
-- Mutation außerhalb des ausdrücklich gewählten Roots,
+- bewusst außerhalb des ausdrücklich gewählten Roots adressierte Mutationen;
+  lokal bleiben Root und Eltern descriptor-relativ gebunden. Für die oben
+  beschriebene interaktive SFTP-Klasse gilt die ausdrücklich akzeptierte Ausnahme:
+  lexikalische Pfadgrenze und Symlinkprüfung statt atomarer Rootgarantie bei
+  gleichzeitiger serverseitiger Umleitung,
 - Geheimnisse in Argumenten, URLs, Journalen oder Auditdaten,
 - stillen Überschreibungen oder Löschungen,
 - erfundene Vollständigkeit, Dauerhaftigkeit oder Wiederherstellbarkeit,
 - mutierenden Blind-Retry nach einem Verbindungsabbruch,
 - Erfolgsmeldung ohne passenden Readback beziehungsweise ehrliche Teilbilanz,
-- Fortsetzung nach einem unerwarteten Wechsel von Konto, Server, Share, Zertifikat,
-  Hostkey oder Root.
+- Fortsetzung nach einem unerwarteten oder ungeprüften Identitätswechsel von Konto,
+  Server, Share, Hostkey oder Root. Bei öffentlichem FTPS bestätigt die Prüfung von
+  Zertifikatskette, Gültigkeit und Hostname die Identität; eine dabei gültige
+  Zertifikatserneuerung ist kein unerwarteter Serverwechsel. Bewusst gewählte
+  Pin-Modi verlangen weiterhin den gebundenen Pin. Bereits vorbereitete Läufe
+  behalten ihre eigene Sitzungs- und Planbindung.
 
 ## Produkt- und Entwicklungsregel
+
+Zusätzliche Prüfungen müssen einen konkreten Nutzen für die betreffende Wirkung
+haben. Sie dürfen gewöhnliche Dateioperationen weder unnötig blockieren noch durch
+vermeidbare Scans, doppelte Übertragungen oder Rückfragen unverhältnismäßig
+verteuern. Stärkere optionale Modi ersetzen den praktischen Standard nicht.
+Bestehende Sync- und Recovery-Verträge gelten bis zu ihrer gezielten, geprüften
+Änderung; ihre heutigen Sperren sind keine dauerhaften Produktziele.
 
 Bei einer fehlenden Fähigkeit lautet die erste Frage nicht „Wie sperren wir die
 Funktion?“, sondern:

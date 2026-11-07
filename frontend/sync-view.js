@@ -74,6 +74,9 @@ export function createSyncView({
     fast.parentElement.title = fast.disabled ? "Update und native Profile benötigen den vollständigen Inhaltsvergleich." : "";
     const remote = remoteSyncContext();
     const both = direction === "both";
+    $("#sync-metadata-group").title = remote?.protocol === "content" ? "Portable überträgt Inhalte und am Ziel darstellbare Metadaten. Die Vorschau bilanziert nicht darstellbare Merkmale mit konkretem Grund." : "Portable überträgt Daten, mtime und normale Rechte. Native Profile prüfen zusätzlich alle unterstützten Metadatenklassen.";
+    $("#sync-mirror").nextElementSibling.textContent = remote?.protocol === "content" ? "Zusätzliche Zieldateien entfernen" : "Verwaiste in Quarantäne verschieben";
+    $("#sync-effects-group").title = remote?.protocol === "content" ? "Ergänzen verändert vorhandene Dateien nicht. Aktualisieren und Mirror können vorhandene Versionen dauerhaft ersetzen oder entfernen; die konkrete Wirkung folgt in der Vorschau." : "Ergänzen verändert Vorhandenes nie; Aktualisieren ersetzt ältere Dateien; Verwaiste werden in die Quarantäne verschoben.";
     // Der bidirektionale Request besitzt keine Einwegoptionen. Seine festen
     // Inhalts-/Metadatenbelege dürfen keine hier wirkungslose Auswahl vortäuschen.
     for (const id of ["sync-effects-group", "sync-compare-group", "sync-metadata-group", "sync-metadata-note-title", "btn-real"]) {
@@ -211,11 +214,11 @@ export function createSyncView({
     $("#sync-effects-group").addEventListener("change", () => {
       readEffects();
       // Dieselben zwei Kerninvarianten wie im Metadaten-Handler, nur in der anderen
-      // Richtung. `NativeBestEffort` ist für Mirror gesperrt (core sync/plan.rs), und
+      // Richtung. Der strikte lokale Mirror sperrt `NativeBestEffort`, und
       // native Profile verlangen den vollständigen Inhaltsvergleich. Ohne diese
       // Korrektur bot die Ansicht beide Optionen weiter als gültig an, während jede
       // Vorschau und jeder Lauf danach mit einem Fehler endete.
-      if (mode === "Mirror" && metadata === "NativeBestEffort") {
+      if (mode === "Mirror" && metadata === "NativeBestEffort" && remoteSyncContext()?.protocol !== "content") {
         metadata = "NativeStrict";
         applyMetadata();
       }
@@ -236,7 +239,7 @@ export function createSyncView({
       // Native Profile sind ohne vollständigen Inhaltsvergleich nicht ausführbar.
       // Der Kern prüft dieselbe Invariante unabhängig von dieser sichtbaren Auswahl.
       if (metadata !== "Portable") ensureContentHash();
-      if (metadata === "NativeBestEffort" && mode === "Mirror") {
+      if (metadata === "NativeBestEffort" && mode === "Mirror" && remoteSyncContext()?.protocol !== "content") {
         mode = "Update";
         applyMode();
       }
@@ -244,10 +247,7 @@ export function createSyncView({
       optionChanged();
     });
 
-    $("#sync-preview-remote").addEventListener("click", () => {
-      $("#sync-hint").hidden = true;
-      actions.preview();
-    });
+    $("#sync-preview-remote").addEventListener("click", () => actions.preview());
 
     $("#btn-sync-close").addEventListener("click", () => close());
 

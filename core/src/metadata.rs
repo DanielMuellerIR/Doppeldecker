@@ -32,11 +32,22 @@ pub enum Capability {
     Unknown,
 }
 
+impl Capability {
+    fn unknown() -> Self {
+        Self::Unknown
+    }
+
+    fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
+}
+
 /// ACL-Modelle sind nicht verlustfrei ineinander übersetzbar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AclModel {
     Posix,
     Nfs4,
+    WindowsSid,
     Unsupported,
     Unknown,
 }
@@ -49,6 +60,7 @@ pub enum AclModel {
 pub enum Acl {
     Posix(PosixAcl),
     Nfs4(Nfs4Acl),
+    WindowsDacl(crate::windows_security::WindowsDacl),
 }
 
 /// Vererbung am lokalen Ziel-Elternordner, getrennt von ausdrücklich zu
@@ -114,6 +126,7 @@ impl Acl {
         match self {
             Self::Posix(_) => AclModel::Posix,
             Self::Nfs4(_) => AclModel::Nfs4,
+            Self::WindowsDacl(_) => AclModel::WindowsSid,
         }
     }
 
@@ -123,6 +136,7 @@ impl Acl {
                 validate_posix_entries(&acl.access, false)?;
                 validate_posix_entries(&acl.default, true)
             }
+            Self::WindowsDacl(acl) => acl.validate(),
             Self::Nfs4(acl) => {
                 if acl.entries.len() > 128 {
                     return Err(io::Error::new(
@@ -213,8 +227,18 @@ pub struct MetadataCapabilities {
     pub owner: Capability,
     pub special_mode_bits: Capability,
     pub acl_model: AclModel,
+    #[serde(
+        default = "Capability::unknown",
+        skip_serializing_if = "Capability::is_unknown"
+    )]
+    pub acl: Capability,
     pub xattrs: Capability,
     pub resource_fork: Capability,
+    #[serde(
+        default = "Capability::unknown",
+        skip_serializing_if = "Capability::is_unknown"
+    )]
+    pub named_streams: Capability,
     pub sparse_extents: Capability,
     pub hardlinks: Capability,
 }
@@ -226,8 +250,10 @@ impl MetadataCapabilities {
             owner: Capability::Unknown,
             special_mode_bits: Capability::Unknown,
             acl_model: AclModel::Unknown,
+            acl: Capability::Unknown,
             xattrs: Capability::Unknown,
             resource_fork: Capability::Unknown,
+            named_streams: Capability::Unknown,
             sparse_extents: Capability::Unknown,
             hardlinks: Capability::Unknown,
         }
@@ -263,7 +289,7 @@ impl BlobSummary {
     }
 }
 
-/// xattr-Namen und -Werte bleiben bytegenau; verlustbehaftetes UTF-8 ist unzulässig.
+/// Bytegenauer Name und Zusammenfassung eines xattrs oder benannten Datenstroms.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NamedBlobSummary {
     pub name: Vec<u8>,
@@ -285,6 +311,79 @@ pub struct DataExtent {
     pub length: u64,
 }
 
+/// Beobachteter Windows-Sicherheitskontext, getrennt vom numerischen UID/GID-Owner.
+/// Die SID-Namensräume werden weder übersetzt noch als Schreibfreigabe verwendet.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WindowsSecurityObservation {
+    pub namespace: [u8; 16],
+    pub owner: Option<crate::windows_security::WindowsSid>,
+    pub group: Option<crate::windows_security::WindowsSid>,
+    pub issue: Option<WindowsSecurityReadIssue>,
+    pub invalid_descriptor_digest: Option<[u8; 32]>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WindowsSecurityReadIssue {
+    ReadControlDenied,
+    QueryUnsupported,
+    InvalidDescriptor,
+}
+impl WindowsSecurityReadIssue {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::ReadControlDenied => {
+                "READ_CONTROL für den Windows-Sicherheitsdeskriptor wurde verweigert"
+            }
+            Self::QueryUnsupported => {
+                "Der Server unterstützt die abgefragten Windows-Sicherheitsinformationen nicht"
+            }
+            Self::InvalidDescriptor => {
+                "Der gelieferte Windows-Sicherheitsdeskriptor ist strukturell ungültig"
+            }
+        }
+    }
+}
+impl WindowsSecurityObservation {
+    pub fn validate(&self) -> io::Result<()> {
+        if self.namespace == [0; 16]
+            || (self.issue.is_some() && (self.owner.is_some() || self.group.is_some()))
+            || (self.issue == Some(WindowsSecurityReadIssue::InvalidDescriptor))
+                != self.invalid_descriptor_digest.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Ungültige Windows-Sicherheitsbeobachtung",
+            ));
+        }
+        for sid in self.owner.iter().chain(&self.group) {
+            sid.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Konkrete Auslassung der lesenden SMB-Sparse-Abfrage, niemals eine leere Liste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SparseReadIssue {
+    ServerStatus(u32),
+    BufferLimit,
+    InvalidResponse,
+}
+
+impl SparseReadIssue {
+    pub fn validate(self) -> io::Result<()> {
+        if matches!(self, Self::ServerStatus(status) if !matches!(status,
+            0xc000_0002 | 0xc000_0003 | 0xc000_0010 | 0xc000_000d | 0xc000_0022 | 0xc000_00bb))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Ungültiger optionaler Sparse-Abfragestatus",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Kanonisches Manifest eines Eintrags. Große Werte werden nur über Größe und Digest
 /// gebunden; der eigentliche Datenstrom bleibt außerhalb des UI-Plans.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -293,11 +392,24 @@ pub struct MetadataManifest {
     /// Vollständige POSIX-Rechte einschließlich setuid/setgid/sticky (`0o7777`).
     pub mode: u32,
     pub acl: Option<Acl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_security: Option<WindowsSecurityObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webdav_security: Option<crate::webdav_security::WebDavSecurityObservation>,
     pub xattrs: Vec<NamedBlobSummary>,
     pub resource_fork: Option<BlobSummary>,
+    /// `None` ist unbeobachtet; `Some([])` belegt die vollständige leere Menge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_streams: Option<Vec<NamedBlobSummary>>,
     pub sparse_extents: Option<Vec<DataExtent>>,
     /// Laufbezogene Gruppe; erst der spätere Scanner weist sie anhand Gerät/Inode zu.
     pub hardlink_group: Option<u64>,
+    /// Gemeldete Linkzahl einer regulären Datei; kein Beleg für konkrete Aliasnamen
+    /// oder eine vollständige, volumengebundene Hardlink-Gruppe. SMB meldet u32.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_hard_links: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_read_issue: Option<SparseReadIssue>,
     pub digest: [u8; 32],
 }
 
@@ -326,10 +438,15 @@ impl MetadataManifest {
             owner,
             mode: mode & 0o7777,
             acl,
+            windows_security: None,
+            webdav_security: None,
             xattrs,
             resource_fork,
+            named_streams: None,
             sparse_extents,
             hardlink_group,
+            reported_hard_links: None,
+            sparse_read_issue: None,
             digest: [0; 32],
         };
         manifest.validate_structure()?;
@@ -337,11 +454,65 @@ impl MetadataManifest {
         Ok(manifest)
     }
 
+    pub fn with_windows_security(
+        mut self,
+        observation: Option<WindowsSecurityObservation>,
+    ) -> io::Result<Self> {
+        self.windows_security = observation;
+        self.validate_structure()?;
+        self.digest = self.canonical_digest();
+        Ok(self)
+    }
+
+    pub fn with_webdav_security(
+        mut self,
+        observation: Option<crate::webdav_security::WebDavSecurityObservation>,
+    ) -> io::Result<Self> {
+        self.webdav_security = observation;
+        self.validate_structure()?;
+        self.digest = self.canonical_digest();
+        Ok(self)
+    }
+
+    /// Bindet eine vollständig beobachtete, byteweise kanonische Strommenge.
+    /// Unbeobachtete Legacy-Manifeste behalten ihren bisherigen V2-Digest.
+    pub fn with_named_streams(
+        mut self,
+        mut streams: Option<Vec<NamedBlobSummary>>,
+    ) -> io::Result<Self> {
+        if let Some(streams) = &mut streams {
+            streams.sort_by(|left, right| left.name.cmp(&right.name));
+        }
+        self.named_streams = streams;
+        self.validate_structure()?;
+        self.digest = self.canonical_digest();
+        Ok(self)
+    }
+
     /// Bindet die vom laufbezogenen Scanner vergebene Hardlink-Gruppe neu an den
     /// kanonischen Digest. Die lokale Einzeldatei-Probe kennt diese Gruppe bewusst
     /// noch nicht; erst der vollständige Baumscan kann gleiche Inodes zusammenführen.
     pub fn with_hardlink_group(mut self, group: Option<u64>) -> io::Result<Self> {
         self.hardlink_group = group;
+        self.validate_structure()?;
+        self.digest = self.canonical_digest();
+        Ok(self)
+    }
+
+    pub fn with_reported_hard_links(mut self, count: Option<u32>) -> io::Result<Self> {
+        self.reported_hard_links = count;
+        self.validate_structure()?;
+        self.digest = self.canonical_digest();
+        Ok(self)
+    }
+
+    pub fn with_sparse_observation(
+        mut self,
+        extents: Option<Vec<DataExtent>>,
+        issue: Option<SparseReadIssue>,
+    ) -> io::Result<Self> {
+        self.sparse_extents = extents;
+        self.sparse_read_issue = issue;
         self.validate_structure()?;
         self.digest = self.canonical_digest();
         Ok(self)
@@ -366,6 +537,22 @@ impl MetadataManifest {
     }
 
     fn validate_structure(&self) -> io::Result<()> {
+        if let Some(issue) = self.sparse_read_issue {
+            issue.validate()?;
+            if self.sparse_extents.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Sparse-Bereiche und fehlende Beobachtung widersprechen sich",
+                ));
+            }
+        }
+        if self.hardlink_group.is_some() && self.reported_hard_links.is_some_and(|count| count < 2)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Hardlink-Gruppe widerspricht der gemeldeten Linkzahl",
+            ));
+        }
         if self.mode & !0o7777 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -392,8 +579,44 @@ impl MetadataManifest {
                 "xattr-Namen sind nicht eindeutig byteweise sortiert",
             ));
         }
+        if let Some(streams) = &self.named_streams {
+            for stream in streams {
+                validate_named_stream_name(&stream.name)?;
+            }
+            if streams.windows(2).any(|pair| pair[0].name >= pair[1].name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Datenstromnamen sind nicht eindeutig byteweise sortiert",
+                ));
+            }
+        }
         if let Some(acl) = &self.acl {
             acl.validate()?;
+        }
+        if let Some(observation) = &self.webdav_security {
+            observation.validate()?;
+            if self.windows_security.is_some() || self.acl.is_some() || self.owner.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DAV-Sicherheitsbeobachtung darf keine fremde ACL- oder Owner-Abbildung enthalten",
+                ));
+            }
+        }
+        if let Some(observation) = &self.windows_security {
+            observation.validate()?;
+            if let Some(Acl::WindowsDacl(acl)) = &self.acl {
+                if acl.namespace != observation.namespace || observation.issue.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Windows-DACL und Sicherheitsbeobachtung widersprechen einander",
+                    ));
+                }
+            } else if self.acl.is_some() || observation.issue.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Vollständige Windows-Beobachtung benötigt den beobachteten DACL-Zustand",
+                ));
+            }
         }
         if let Some(extents) = &self.sparse_extents {
             validate_extents(extents)?;
@@ -403,7 +626,23 @@ impl MetadataManifest {
 
     fn canonical_digest(&self) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();
-        hash.update(&[2]); // Manifestformat-Version 2 (typisierte ACLs)
+        // Nur eine konkrete Sparse-Auslassung wählt V7. Ohne neue Felder bleiben
+        // sämtliche bisherigen V2/V3/V4/V5/V6-Belege bytekompatibel.
+        let link_count_format = self.reported_hard_links.is_some();
+        let sparse_issue_format = self.sparse_read_issue.is_some();
+        hash.update(&[if sparse_issue_format {
+            7
+        } else if link_count_format {
+            6
+        } else if self.webdav_security.is_some() {
+            5
+        } else if self.windows_security.is_some() || matches!(self.acl, Some(Acl::WindowsDacl(_))) {
+            4
+        } else if self.named_streams.is_some() {
+            3
+        } else {
+            2
+        }]);
         encode_owner(&mut hash, self.owner);
         hash.update(&(self.mode & 0o7777).to_be_bytes());
         encode_acl(&mut hash, self.acl.as_ref());
@@ -435,8 +674,116 @@ impl MetadataManifest {
                 hash.update(&[0]);
             }
         }
+        let windows_format =
+            self.windows_security.is_some() || matches!(self.acl, Some(Acl::WindowsDacl(_)));
+        let extended_format = windows_format
+            || self.webdav_security.is_some()
+            || link_count_format
+            || sparse_issue_format;
+        if extended_format {
+            hash.update(&[u8::from(self.named_streams.is_some())]);
+        }
+        if let Some(streams) = &self.named_streams {
+            encode_u64(&mut hash, streams.len() as u64);
+            for stream in streams {
+                encode_bytes(&mut hash, &stream.name);
+                encode_blob(&mut hash, &stream.value);
+            }
+        }
+        if extended_format {
+            hash.update(&[u8::from(self.windows_security.is_some())]);
+        }
+        if let Some(observation) = &self.windows_security {
+            hash.update(&observation.namespace);
+            encode_windows_sid(&mut hash, observation.owner.as_ref());
+            encode_windows_sid(&mut hash, observation.group.as_ref());
+            hash.update(&[match observation.issue {
+                None => 0,
+                Some(WindowsSecurityReadIssue::ReadControlDenied) => 1,
+                Some(WindowsSecurityReadIssue::QueryUnsupported) => 2,
+                Some(WindowsSecurityReadIssue::InvalidDescriptor) => 3,
+            }]);
+            if let Some(digest) = observation.invalid_descriptor_digest {
+                hash.update(&digest);
+            }
+        }
+        if self.webdav_security.is_some() || link_count_format || sparse_issue_format {
+            hash.update(&[u8::from(self.webdav_security.is_some())]);
+        }
+        if let Some(observation) = &self.webdav_security {
+            hash.update(&observation.namespace);
+            hash.update(&observation.query_status.to_be_bytes());
+            match observation.resource_status {
+                Some(status) => {
+                    hash.update(&[1]);
+                    hash.update(&status.to_be_bytes());
+                }
+                None => {
+                    hash.update(&[0]);
+                }
+            }
+            encode_webdav_property(&mut hash, &observation.acl);
+            encode_webdav_property(&mut hash, &observation.owner);
+        }
+        if sparse_issue_format {
+            hash.update(&[u8::from(self.reported_hard_links.is_some())]);
+        }
+        if let Some(count) = self.reported_hard_links {
+            hash.update(&count.to_be_bytes());
+        }
+        if let Some(issue) = self.sparse_read_issue {
+            match issue {
+                SparseReadIssue::ServerStatus(status) => {
+                    hash.update(&[1]);
+                    hash.update(&status.to_be_bytes());
+                }
+                SparseReadIssue::BufferLimit => {
+                    hash.update(&[2]);
+                }
+                SparseReadIssue::InvalidResponse => {
+                    hash.update(&[3]);
+                }
+            }
+        }
         *hash.finalize().as_bytes()
     }
+}
+
+fn encode_webdav_property(
+    hash: &mut blake3::Hasher,
+    property: &crate::webdav_security::WebDavPropertyObservation,
+) {
+    use crate::webdav_security::WebDavPropertyObservation;
+    match property {
+        WebDavPropertyObservation::Missing => {
+            hash.update(&[0]);
+        }
+        WebDavPropertyObservation::Unavailable { status } => {
+            hash.update(&[1]);
+            hash.update(&status.to_be_bytes());
+        }
+        WebDavPropertyObservation::Observed { empty, digest } => {
+            hash.update(&[2, u8::from(*empty)]);
+            hash.update(digest);
+        }
+    }
+}
+
+/// Prüft den vom Basispfad getrennten, protokollneutralen Stromnamen.
+/// Provider müssen zusätzlich Kollisionen ihrer eigenen Namensauflösung abweisen.
+pub fn validate_named_stream_name(name: &[u8]) -> io::Result<()> {
+    if name.is_empty()
+        || std::str::from_utf8(name).is_err()
+        || name
+            .iter()
+            .any(|byte| matches!(*byte, 0 | b'/' | b'\\' | b':'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Datenstromname muss nichtleeres UTF-8 ohne Nullbyte, Slash, Backslash oder Doppelpunkt sein",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_extents(extents: &[DataExtent]) -> io::Result<()> {
@@ -505,6 +852,68 @@ fn encode_acl(hash: &mut blake3::Hasher, acl: Option<&Acl>) {
                 hash.update(&entry.flags.to_be_bytes());
             }
         }
+        Some(Acl::WindowsDacl(acl)) => {
+            use crate::windows_security::{WindowsAce, WindowsDaclState};
+            hash.update(&[1, acl_model_byte(AclModel::WindowsSid)]);
+            hash.update(&acl.namespace);
+            hash.update(&acl.control.to_be_bytes());
+            match &acl.state {
+                WindowsDaclState::Absent => {
+                    hash.update(&[0]);
+                }
+                WindowsDaclState::Null => {
+                    hash.update(&[1]);
+                }
+                WindowsDaclState::Acl { revision, aces } => {
+                    hash.update(&[2, *revision]);
+                    encode_u64(hash, aces.len() as u64);
+                    for ace in aces {
+                        match ace {
+                            WindowsAce::Allow { flags, mask, sid }
+                            | WindowsAce::Deny { flags, mask, sid } => {
+                                hash.update(&[
+                                    if matches!(ace, WindowsAce::Allow { .. }) {
+                                        0
+                                    } else {
+                                        1
+                                    },
+                                    *flags,
+                                ]);
+                                hash.update(&mask.to_be_bytes());
+                                encode_windows_sid(hash, Some(sid));
+                            }
+                            WindowsAce::Opaque {
+                                ace_type,
+                                flags,
+                                data,
+                            } => {
+                                hash.update(&[255, *ace_type, *flags]);
+                                encode_bytes(hash, data);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            hash.update(&[0]);
+        }
+    }
+}
+
+fn encode_windows_sid(
+    hash: &mut blake3::Hasher,
+    sid: Option<&crate::windows_security::WindowsSid>,
+) {
+    match sid {
+        Some(sid) => {
+            hash.update(&[1, sid.revision]);
+            encode_u64(hash, sid.authority);
+            encode_u64(hash, sid.sub_authorities.len() as u64);
+            for value in &sid.sub_authorities {
+                hash.update(&value.to_be_bytes());
+            }
+        }
         None => {
             hash.update(&[0]);
         }
@@ -550,6 +959,7 @@ fn acl_model_byte(model: AclModel) -> u8 {
         AclModel::Nfs4 => 2,
         AclModel::Unsupported => 3,
         AclModel::Unknown => 4,
+        AclModel::WindowsSid => 5,
     }
 }
 
@@ -644,6 +1054,102 @@ mod tests {
     fn canonical_tempdir() -> tempfile::TempDir {
         let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         tempfile::tempdir_in(root).unwrap()
+    }
+
+    #[test]
+    fn named_streams_vfs_defaults_sind_explizit_unsupported() {
+        let vfs = LocalVfs::new();
+        let path = Path::new("nicht-geoeffnete-basisdatei");
+        assert_eq!(
+            vfs.open_named_stream_read(path, b"strom")
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::Unsupported,
+        );
+        assert_eq!(
+            vfs.open_named_stream_write_new(path, b"strom")
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::Unsupported,
+        );
+    }
+
+    #[test]
+    fn named_streams_legacy_json_und_v2_digest_bleiben_bytegleich() {
+        let bytes = include_str!("../../fuzz/seeds/metadata_manifest/valid.json");
+        let legacy: MetadataManifest = serde_json::from_str(bytes).unwrap();
+        legacy.validate().unwrap();
+        assert_eq!(legacy.named_streams, None);
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), bytes);
+        let rebuilt = MetadataManifest::new(None, 0o640, None, vec![], None, None, None).unwrap();
+        assert_eq!(legacy, rebuilt);
+        assert_eq!(legacy.clone().with_named_streams(None).unwrap(), legacy);
+        let empty = legacy.clone().with_named_streams(Some(vec![])).unwrap();
+        empty.validate().unwrap();
+        assert_ne!(empty.digest, legacy.digest);
+        assert_eq!(empty.named_streams, Some(vec![]));
+        assert!(serde_json::to_string(&empty)
+            .unwrap()
+            .contains("\"named_streams\":[]"));
+    }
+
+    #[test]
+    fn named_streams_kanonische_menge_und_roundtrip() {
+        let base = MetadataManifest::new(None, 0o644, None, vec![], None, None, None).unwrap();
+        let streams = vec![xattr("ä".as_bytes(), b""), xattr(b"alpha", b"inhalt")];
+        let observed = base
+            .clone()
+            .with_named_streams(Some(streams.clone()))
+            .unwrap();
+        let mut reversed = streams;
+        reversed.reverse();
+        assert_eq!(observed, base.with_named_streams(Some(reversed)).unwrap());
+        assert_eq!(observed.named_streams.as_ref().unwrap()[0].name, b"alpha");
+        let encoded = serde_json::to_string(&observed).unwrap();
+        let decoded: MetadataManifest = serde_json::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, observed);
+        let mut changed = decoded;
+        changed.named_streams.as_mut().unwrap()[0].value.size += 1;
+        assert!(!changed.has_valid_digest());
+        assert!(changed.validate().is_err());
+        changed.digest = changed.canonical_digest();
+        changed.validate().unwrap();
+        changed.named_streams.as_mut().unwrap().reverse();
+        changed.digest = changed.canonical_digest();
+        assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn named_streams_namen_und_duplikate_werden_abgewiesen() {
+        let base = MetadataManifest::new(None, 0o644, None, vec![], None, None, None).unwrap();
+        for name in [b"".as_slice(), b"a\0b", b"a/b", b"a\\b", b"a:b", &[0xff]] {
+            assert!(base
+                .clone()
+                .with_named_streams(Some(vec![xattr(name, b"")]))
+                .is_err());
+        }
+        let duplicate = xattr(b"gleich", b"");
+        assert!(base
+            .clone()
+            .with_named_streams(Some(vec![duplicate.clone(), duplicate.clone()]))
+            .is_err());
+        let mut forged = base;
+        forged.named_streams = Some(vec![duplicate.clone(), duplicate]);
+        forged.digest = forged.canonical_digest();
+        assert!(forged.validate().is_err());
+    }
+
+    #[test]
+    fn named_streams_fehlende_capability_bleibt_unknown_ohne_json_aenderung() {
+        let capabilities = MetadataCapabilities::unknown();
+        let encoded = serde_json::to_string(&capabilities).unwrap();
+        assert!(!encoded.contains("named_streams"));
+        let decoded: MetadataCapabilities = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.named_streams, Capability::Unknown);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
     }
 
     #[test]

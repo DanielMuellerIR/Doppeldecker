@@ -4,6 +4,15 @@
  * Tauri-Mockbrücke. Der Test verändert weder Nutzerdaten noch das echte App-Profil. */
 
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { forwardConfirmationFixture } from "./tests/forward-confirmation-fixture.mjs";
+import { runBatchRenameCases } from "./tests/batch-rename-cases.mjs";
+import { runFilePreviewCases } from "./tests/file-preview-cases.mjs";
+import { runFinderCommentCases } from "./tests/finder-comment-cases.mjs";
+import { runAdministratorCases } from "./tests/administrator-cases.mjs";
+import { runFileFlagCases } from "./tests/file-flag-cases.mjs";
+import { runVisibilityCases } from "./tests/visibility-cases.mjs";
+import { runFinderTagCases } from "./tests/finder-tag-cases.mjs";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
@@ -110,7 +119,7 @@ async function openFtpsConflict(page, theme, key) {
   await target.fill("/to"); await target.press("Enter");
   const left = page.getByRole("listbox", { name: /Linke Dateiliste/ });
   await left.getByRole("option", { name: /remote\.txt/ }).click(); await left.focus(); await page.keyboard.press(key);
-  await page.getByRole("dialog").getByRole("button", { name: "Ersetzen prüfen", exact: true }).waitFor();
+  await page.getByRole("dialog").getByRole("button", { name: "Überspringen", exact: true }).waitFor();
 }
 
 try {
@@ -127,6 +136,419 @@ try {
   const executablePath = process.env.DOPPELDECKER_PLAYWRIGHT_EXECUTABLE || undefined;
   browser = await cleanup.launch(playwright.chromium, { headless: true, executablePath });
 
+
+  for (const theme of ["light", "dark"]) {
+    await runCase(`Neuordnerrechte exakte große V7-IDs · ${theme}`, "", async page => {
+      const fixtureFile = process.env.DOPPELDECKER_TEST_FRONTEND_REPORT_FIXTURE;
+      const key = { origin: "ExclusiveMinimalCreate", directory: "/ziel/neu", object_namespace: Array(32).fill(1) };
+      const fallback = {
+        created: [
+          { effect_key: { ...key, file_id: "9007199254740992" }, ordinary_metadata_applied: false },
+          { effect_key: { ...key, file_id: "9007199254740993" }, ordinary_metadata_applied: true },
+        ],
+        completed: [{ ...key, file_id: "9007199254740993", before_digest: Array(32).fill(2), after_digest: Array(32).fill(3) }],
+        uncertain: [{ ...key, file_id: "18446744073709551615", before_digest: Array(32).fill(2), after_digest: Array(32).fill(3) }],
+      };
+      const report = fixtureFile ? JSON.parse(await readFile(fixtureFile, "utf8")).entries[0].created_directory_dacl_report : fallback;
+      await page.evaluate(async ({ report, theme }) => {
+        const { setTheme } = await import("/theme.js"); setTheme(theme);
+        const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
+        queue.entries = [{ operation_id: "exact-v7-ids", operation: { type: "ContentSync", source: { provider: "Smb", root: "/quelle" }, target: { provider: "Smb", root: "/ziel" }, options: { mode: "Update" } },
+          state: "Interrupted", attempts: 2, created_directory_dacl_recovery: true,
+          created_directory_dacl_report: report, progress: { phase: "interrupted", created_directory_dacl_report: report } }];
+        window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
+        window.__MOCK_EMIT__("sync-progress", { phase: "metadata", current: "/ziel/neu", created_directory_dacl_report: report });
+      }, { report, theme });
+      const dock = page.locator("#dock-summary");
+      assert.match(await dock.innerText(), /2 neue Ordner angelegt · gewöhnliche Metadaten bei 1 bestätigt/);
+      assert.match(await dock.innerText(), /Rechte neuer Ordner: 1 bestätigt · 1 Ausgang unklar/);
+      await page.locator("#btn-queue").click();
+      const row = page.locator('[data-queue-id="exact-v7-ids"]');
+      assert.match(await row.innerText(), /2 neue Ordner angelegt · gewöhnliche Metadaten bei 1 bestätigt/);
+      assert.match(await row.innerText(), /Rechte neuer Ordner: 1 bestätigt · 1 Ausgang unklar/);
+      await row.locator("summary").filter({ hasText: "2 neue Ordner angelegt" }).click();
+      assert.equal(await row.locator("details").filter({ has: page.locator("summary", { hasText: "2 neue Ordner angelegt" }) }).locator("li").count(), 2);
+      if (process.env.DOPPELDECKER_SCREENSHOT_DIR) {
+        await page.screenshot({ path: `${process.env.DOPPELDECKER_SCREENSHOT_DIR}/v7-exact-ids-${theme}.png` });
+      }
+    });
+  }
+  for (const theme of ["light", "dark"]) {
+    await runCase(`DACL-Berichte Fortschritt ersetzen · ${theme}`, "", async page => {
+      await page.setViewportSize({ width: 1000, height: 760 });
+      await page.evaluate(async theme => {
+        const { setTheme } = await import("/theme.js"); setTheme(theme);
+        window.__MOCK_EMIT__("sync-preparation-started", "Dateisync wird vorbereitet");
+        const summary = document.querySelector("#dock-summary");
+        summary.innerHTML = '<span class="retained-progress-context">Laufkontext bleibt</span>' +
+          ["directory-stream-report", "directory-dacl-report", "file-dacl-report", "created-directory-dacl-report"]
+            .flatMap(name => [`<div class="${name}">Alter Bericht 1</div>`, `<div class="${name}">Alter Bericht 2</div>`]).join("");
+      }, theme);
+      for (let index = 0; index < 3; index++) {
+        await page.evaluate(index => {
+          const path = `/aktuell-${index}`;
+          window.__MOCK_EMIT__("sync-progress", {
+            phase: "metadata", current: path, files_total: 3, files_done: index, bytes_total: 0, bytes_done: 0,
+            directory_dacl_report: { completed: [{ directory: `${path}/ordner`, before_digest: [1], after_digest: [2] }], uncertain: [] },
+            file_dacl_report: { completed: [{ file: `${path}/datei`, alias_scope: { selected_paths: [`${path}/datei`], observed_link_count: 1 } }], uncertain: [] },
+            created_directory_dacl_report: { created: [{ effect_key: { origin: "ExclusiveMinimalCreate", directory: `${path}/neu`, file_id: 42 }, ordinary_metadata_applied: true }], completed: [], uncertain: [] },
+          });
+        }, index);
+        for (const selector of [".directory-dacl-report", ".file-dacl-report", ".created-directory-dacl-report"]) {
+          assert.equal(await page.locator(`#dock-summary ${selector}`).count(), 1, `${selector}: genau ein aktueller Bericht`);
+          assert.match(await page.locator(`#dock-summary ${selector}`).textContent(), new RegExp(`/aktuell-${index}`));
+          if (index > 0) assert.doesNotMatch(await page.locator(`#dock-summary ${selector}`).textContent(), new RegExp(`/aktuell-${index - 1}/`));
+        }
+        assert.equal(await page.locator("#dock-summary .directory-stream-report").count(), 0);
+        assert.equal(await page.locator("#dock-summary .retained-progress-context").innerText(), "Laufkontext bleibt");
+        assert.doesNotMatch(await page.locator("#dock-summary").innerText(), /Alter Bericht/);
+      }
+      assert.equal(await page.locator("#dock").isVisible(), true);
+      if (process.env.DOPPELDECKER_SCREENSHOT_DIR) {
+        await page.screenshot({ path: `${process.env.DOPPELDECKER_SCREENSHOT_DIR}/dacl-progress-replacement-${theme}.png` });
+        await page.locator("#dock-summary").evaluate(summary => { summary.scrollTop = summary.scrollHeight; });
+        await page.screenshot({ path: `${process.env.DOPPELDECKER_SCREENSHOT_DIR}/dacl-progress-replacement-${theme}-bottom.png` });
+      }
+      await page.evaluate(() => window.__MOCK_EMIT__("sync-progress", {
+        phase: "metadata", current: "leer", files_total: 3, files_done: 3,
+        directory_dacl_report: { completed: [], uncertain: [] },
+        file_dacl_report: { completed: [], uncertain: [] },
+        created_directory_dacl_report: { created: [], completed: [], uncertain: [] },
+      }));
+      assert.equal(await page.locator("#dock-summary .directory-stream-report, #dock-summary .directory-dacl-report, #dock-summary .file-dacl-report, #dock-summary .created-directory-dacl-report").count(), 0);
+      assert.equal(await page.locator("#dock-summary .retained-progress-context").innerText(), "Laufkontext bleibt");
+    });
+  }
+  for (const theme of ["light", "dark"]) {
+    await runCase(`Neuordnerrechte Vorschau · ${theme}`, "", async page => {
+      await page.setViewportSize({ width: 760, height: 480 });
+      await page.evaluate(async theme => {
+        const { setTheme } = await import("/theme.js"); setTheme(theme);
+        const { confirmContentSync } = await import("/content-sync-ui.js");
+        window.__CREATED_CONFIRM__ = null;
+        void confirmContentSync({ source_provider: "Smb", target_provider: "Smb", source_root: "/quelle", target_root: "/ziel",
+          plan: { actions: [], copy_count: 0, update_count: 0, delete_count: 0, bytes_to_transfer: 0 },
+          created_directory_dacl_effects: [{ directory: "/ziel/Leer<&>🌍", selection: {} }] }).then(value => { window.__CREATED_CONFIRM__ = value; });
+      }, theme);
+      const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+      assert.match(await dialog.innerText(), /Nur tatsächlich neu angelegte, vollständig leere Ordner/);
+      assert.match(await dialog.innerText(), /normale Anlage bleibt erhalten/);
+      await dialog.locator("summary").click(); assert.match(await dialog.innerText(), /Leer<&>🌍/);
+      assert.equal(await dialog.locator("img").count(), 0);
+      await dialog.getByRole("button", { name: "Dauerhafte Änderungen bestätigen", exact: true }).click();
+      assert.deepEqual(await page.evaluate(() => window.__CREATED_CONFIRM__), { effectsConfirmed: true, removalPhrase: null });
+    });
+  }
+  for (const prepared of [false, true]) {
+    await runCase(`Neuordnerrechte Queue und lesende Recovery · Prepared ${prepared}`, "", async page => {
+      await page.evaluate(prepared => {
+        const item = { origin: "ExclusiveMinimalCreate", directory: "/ziel/Leer<&>", file_id: 42, object_namespace: [1], before_digest: [2], after_digest: [3] };
+        const report = { created: [{ effect_key: item, ordinary_metadata_applied: true }], completed: [], uncertain: prepared ? [] : [item] };
+        const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
+        queue.entries = [{ operation_id: "created-dacl", operation: { type: "ContentSync", source: { provider: "Smb", root: "/quelle" }, target: { provider: "Smb", root: "/ziel" }, options: { mode: "Update" } }, state: "Interrupted", attempts: 1, error_code: "outcome_unclear", created_directory_dacl_recovery: true, created_directory_dacl_report: report, progress: { phase: "interrupted", created_directory_dacl_report: report } }];
+        window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
+      }, prepared);
+      await page.locator("#btn-queue").click(); const row = page.locator('[data-queue-id="created-dacl"]');
+      assert.match(await row.innerText(), /1 neue Ordner angelegt/);
+      assert.equal(await row.locator('[data-queue-action="retry"]').count(), 0); assert.equal(await row.locator('[data-queue-action="unclear-ack"]').count(), 0);
+      await row.getByRole("button", { name: "Rechte neuer Ordner prüfen", exact: true }).click();
+      const dialog = page.getByRole("dialog", { name: "Rechte neuer Ordner prüfen und abschließen" });
+      assert.match(await dialog.innerText(), /nur Identität und aktueller Rechtezustand/);
+      assert.match(await dialog.innerText(), /setzt keine Rechte erneut/);
+      await dialog.getByRole("button", { name: "Fortfahren", exact: true }).click();
+      await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].state === "Cancelled");
+      assert.deepEqual(await page.evaluate(() => window.__MOCK_CREATED_DIRECTORY_DACL_ACKS__), [{ operationId: "created-dacl", possibleEffectReviewed: true }]);
+    });
+  }
+  for (const event of ["sync-done", "sync-error"]) {
+    await runCase(`Neuordnerrechte Abschlussbericht · ${event}`, "", async page => {
+      await page.evaluate(event => { window.__MOCK_EMIT__(event, { dry_run: false, cancelled: false, files_copied: 0, files_deleted: 0, metadata_updated: 0, bytes_copied: 0, code: "outcome_unclear", message: "Rechte prüfen", created_directory_dacl_report: { created: [{ effect_key: { origin: "ExclusiveMinimalCreate", directory: "/ziel/Leer<&>", file_id: 42, object_namespace: [1] }, ordinary_metadata_applied: true }], completed: [], uncertain: [{ origin: "ExclusiveMinimalCreate", directory: "/ziel/Leer<&>", file_id: 42, object_namespace: [1], before_digest: [2], after_digest: [3] }] } }); }, event);
+      const summary = page.locator("#dock-summary"); await summary.filter({ hasText: "Rechte neuer Ordner: 0 bestätigt · 1 Ausgang unklar" }).waitFor();
+      assert.match(await summary.innerText(), /1 neue Ordner angelegt/); assert.match(await summary.innerText(), /setzt keine Rechte erneut/);
+    });
+  }
+  for (const theme of ["light", "dark"]) {
+    await runCase(`Frühe nichtleere Ordnerrechte Vorschau · ${theme}`, "", async page => {
+      await page.setViewportSize({ width: 760, height: 480 });
+      await page.evaluate(async theme => {
+        const { setTheme } = await import("/theme.js"); setTheme(theme);
+        const { confirmContentSync } = await import("/content-sync-ui.js");
+        window.__BEFORE_CHILDREN_CONFIRM__ = null;
+        void confirmContentSync({ source_provider: "Smb", target_provider: "Smb", source_root: "/quelle", target_root: "/ziel",
+          plan: { actions: [], copy_count: 2, update_count: 0, delete_count: 0, bytes_to_transfer: 59 },
+          created_directory_before_children_effects: [{ directory: "/ziel/Nichtleer<&>🌍", selection: {} }] }).then(value => { window.__BEFORE_CHILDREN_CONFIRM__ = value; });
+      }, theme);
+      const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+      assert.match(await dialog.innerText(), /Rechte vor den Kindern/);
+      assert.match(await dialog.innerText(), /späteren Kind- oder Metadatenfehler/);
+      assert.doesNotMatch(await dialog.innerText(), /vollständig leere Ordner/);
+      await dialog.locator("summary").click();
+      assert.match(await dialog.innerText(), /Nichtleer<&>🌍/);
+      assert.equal(await dialog.locator("img").count(), 0);
+      const confirm = dialog.getByRole("button", { name: "Dauerhafte Änderungen bestätigen", exact: true });
+      assert.match(await confirm.getAttribute("class"), /danger/);
+      await confirm.click();
+      assert.deepEqual(await page.evaluate(() => window.__BEFORE_CHILDREN_CONFIRM__), { effectsConfirmed: true, removalPhrase: null });
+    });
+  }
+  for (const kind of ["completed", "child-error", "uncertain", "prepared", "prepared-without-history"]) {
+    await runCase(`Frühe Ordnerrechte Queue · ${kind}`, "", async page => {
+      await page.evaluate(kind => {
+        const key = { origin: "ExclusiveMinimalCreateBeforeChildren", directory: "/ziel/Nichtleer<&>", file_id: "42", object_namespace: [1] };
+        const effect = { ...key, before_digest: [2], after_digest: [3] };
+        const report = { created: kind === "prepared-without-history" ? [] : [{ effect_key: key, ordinary_metadata_applied: kind === "completed" }],
+          completed: ["completed", "child-error"].includes(kind) ? [effect] : [], uncertain: kind === "uncertain" ? [effect] : [] };
+        const recovery = ["uncertain", "prepared", "prepared-without-history"].includes(kind);
+        const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
+        queue.entries = [{ operation_id: "before-children", operation: { type: "ContentSync", source: { provider: "Smb", root: "/quelle" }, target: { provider: "Smb", root: "/ziel" }, options: { mode: "Update" },
+          expected_plan: { actions: [{ type: "CreateDir", metadata: { windows_dacl: { CreatedDirectoryBeforeChildrenExact: {} } } }] } },
+          state: kind === "completed" ? "Completed" : kind === "child-error" ? "Failed" : "Interrupted", attempts: 1,
+          error_code: kind === "child-error" ? "plan_drift" : recovery ? "outcome_unclear" : null,
+          created_directory_dacl_recovery: recovery, created_directory_dacl_report: report, progress: { phase: "interrupted", created_directory_dacl_report: report } }];
+        window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
+      }, kind);
+      await page.locator("#btn-queue").click();
+      const row = page.locator('[data-queue-id="before-children"]');
+      assert.equal(await row.locator('[data-queue-action="retry"]').count(), 0);
+      assert.equal(await row.locator('[data-queue-action="unclear-ack"]').count(), 0);
+      if (kind === "prepared-without-history") {
+        assert.match(await row.innerText(), /Früher Rechteabschluss noch zu prüfen/);
+      } else {
+        assert.match(await row.innerText(), /Ordnerrechte vor den Kindern/);
+        assert.match(await row.innerText(), new RegExp(`gewöhnliche Metadaten bei ${kind === "completed" ? 1 : 0} bestätigt`));
+      }
+      assert.doesNotMatch(await row.innerText(), /neuer leerer|\bleeren Ordner/);
+      assert.match(await row.innerText(), /keine Kinderarbeit fort/);
+      assert.equal(await row.locator("img").count(), 0);
+      if (["uncertain", "prepared", "prepared-without-history"].includes(kind)) {
+        await row.getByRole("button", { name: "Rechte neuer Ordner prüfen", exact: true }).click();
+        const dialog = page.getByRole("dialog", { name: "Rechte neuer Ordner prüfen und abschließen" });
+        assert.match(await dialog.innerText(), /keine Kinderarbeit fort/);
+        await dialog.getByRole("button", { name: "Fortfahren", exact: true }).click();
+        assert.deepEqual(await page.evaluate(() => window.__MOCK_CREATED_DIRECTORY_DACL_ACKS__), [{ operationId: "before-children", possibleEffectReviewed: true }]);
+      }
+    });
+  }
+  await runCase("Frühe Ordnerrechte behalten getrennte Objektidentitäten", "", async page => {
+    const html = await page.evaluate(async () => {
+      const { createdDirectoryDaclReportHtml } = await import("/created-directory-dacl-effects.js");
+      const key = { origin: "ExclusiveMinimalCreateBeforeChildren", directory: "/gleich<&>", object_namespace: [1] };
+      return createdDirectoryDaclReportHtml({ created: [{ effect_key: { ...key, file_id: "9007199254740992" }, ordinary_metadata_applied: false }], completed: [], uncertain: [] },
+        { created: [{ effect_key: { ...key, file_id: "9007199254740993" }, ordinary_metadata_applied: true }], completed: [], uncertain: [] });
+    });
+    assert.match(html, /2 neue Ordner angelegt · gewöhnliche Metadaten bei 1 bestätigt/);
+    assert.match(html, /gleich&lt;&amp;&gt;/);
+  });
+  await runCase("Neuordnerrechte alte leere Formen bleiben leer", "", async page => {
+    assert.deepEqual(await page.evaluate(async () => { const { createdDirectoryDaclEffectsHtml: effects, createdDirectoryDaclReportHtml: report } = await import("/created-directory-dacl-effects.js"); return [effects(), report(), report({ completed: [], uncertain: [] })]; }), ["", "", ""]);
+  });
+  for (const theme of ["light", "dark"]) {
+    await runCase(`Objektweite Dateirechte mit ausdrücklicher Namensbestätigung · ${theme}`, "", async page => {
+      await page.setViewportSize({ width: 760, height: 480 });
+      await page.evaluate(async theme => {
+        const { setTheme } = await import("/theme.js"); setTheme(theme);
+        const { confirmContentSync } = await import("/content-sync-ui.js");
+        window.__FILE_SCOPE_CONFIRM__ = null;
+        void confirmContentSync({ source_provider: "Smb", target_provider: "Smb", source_root: "/quelle", target_root: "/ziel",
+          plan: { actions: [], copy_count: 0, update_count: 0, delete_count: 0, bytes_to_transfer: 0 },
+          file_dacl_effects: [{ file: "/ziel/Datei<&>🌍", file_id: 42, object_namespace: [1], before_digest: [2], after_digest: [3], alias_scope: { selected_paths: ["Datei<&>🌍", "zweiter Name"], observed_link_count: 1, all_existing_and_future_names_including_outside_root: true } }] }).then(value => { window.__FILE_SCOPE_CONFIRM__ = value; });
+      }, theme);
+      const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+      await dialog.locator("summary").click();
+      assert.match(await dialog.innerText(), /1 Dateiobjekt.*2 ausgewählte Namen/);
+      assert.match(await dialog.innerText(), /auch außerhalb der ausgewählten Ordner/);
+      assert.match(await dialog.innerText(), /Liste zeigt nur die hier bekannten Namen/);
+      assert.match(await dialog.innerText(), /Anzahl von 1 begrenzt die Wirkung nicht/);
+      assert.match(await dialog.innerText(), /Datei<&>🌍/); assert.equal(await dialog.locator("img").count(), 0);
+      const start = dialog.getByRole("button", { name: "Dauerhafte Änderungen bestätigen" });
+      assert.equal(await start.isDisabled(), true); await dialog.getByRole("checkbox").check(); assert.equal(await start.isEnabled(), true);
+      await dialog.getByRole("checkbox").uncheck(); assert.equal(await start.isDisabled(), true);
+      await dialog.getByRole("checkbox").check(); await start.click();
+      assert.deepEqual(await page.evaluate(() => window.__FILE_SCOPE_CONFIRM__), { effectsConfirmed: true, removalPhrase: null });
+    });
+  }
+  for (const prepared of [false, true]) {
+    await runCase(`Objektweite Dateirechte Queue und Recovery · Prepared ${prepared}`, "", async page => {
+      await page.evaluate(prepared => {
+        const item = { file: "/ziel/Datei<&>", file_id: 42, object_namespace: [1], before_digest: [2], after_digest: [3], alias_scope: { selected_paths: ["Datei<&>", "Alias"], observed_link_count: null, all_existing_and_future_names_including_outside_root: true } };
+        const report = { completed: [], uncertain: prepared ? [] : [item] };
+        const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
+        queue.entries = [{ operation_id: "file-dacl-report", operation: { type: "ContentSync", source: { provider: "Smb", root: "/quelle" }, target: { provider: "Smb", root: "/ziel" }, options: { mode: "Update" } }, state: "Interrupted", attempts: 1, error_code: "outcome_unclear", file_dacl_recovery: true, file_dacl_report: report, progress: { phase: "interrupted", file_dacl_report: report }, temp_recovery_paths: ["/ziel/Datei<&>"] }];
+        window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
+      }, prepared);
+      await page.locator("#btn-queue").click();
+      const row = page.locator('[data-queue-id="file-dacl-report"]');
+      const button = row.getByRole("button", { name: "Objektweite Dateirechte prüfen" }); await button.waitFor();
+      assert.equal(await row.locator('[data-queue-action="retry"]').count(), 0); assert.equal(await row.locator('[data-queue-action="unclear-ack"]').count(), 0);
+      if (!prepared) assert.match(await row.innerText(), /Objektweite Dateirechte: 0 bestätigt · 1 Ausgang unklar/);
+      await button.click(); const dialog = page.getByRole("dialog", { name: "Objektweite Dateirechte prüfen und abschließen" });
+      assert.match(await dialog.innerText(), /setzt keine Rechte erneut/);
+      await dialog.getByRole("button", { name: "Fortfahren", exact: true }).click();
+      await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].state === "Cancelled");
+      assert.deepEqual(await page.evaluate(() => window.__MOCK_FILE_DACL_ACKS__), [{ operationId: "file-dacl-report", possibleEffectReviewed: true }]);
+    });
+  }
+  for (const theme of ["light", "dark"]) {
+    await runCase(`Ordnerrechte Vorschau und klare Dauerwirkung · ${theme}`, "", async page => {
+      await page.setViewportSize({ width: 760, height: 480 });
+      await page.evaluate(async theme => {
+        const { setTheme } = await import("/theme.js"); setTheme(theme);
+        const { confirmContentSync } = await import("/content-sync-ui.js");
+        void confirmContentSync({ source_provider: "Smb", target_provider: "Smb", source_root: "/quelle", target_root: "/ziel",
+          plan: { actions: [], copy_count: 0, update_count: 0, delete_count: 0 },
+          directory_dacl_effects: [{ directory: "/ziel/Belege<&>🌍", before_digest: [1], after_digest: [2] }] });
+      }, theme);
+      const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+      await dialog.locator("summary").click();
+      assert.match(await dialog.innerText(), /Belege<&>🌍/);
+      assert.match(await dialog.innerText(), /dauerhaft, ohne Quarantäne/);
+      assert.match(await dialog.innerText(), /Eigentümer, Gruppe, Ordner und ihre Inhalte bleiben erhalten/);
+      assert.equal(await dialog.locator("img").count(), 0);
+      const start = dialog.getByRole("button", { name: "Dauerhafte Änderungen bestätigen" });
+      assert.equal(await start.getAttribute("class"), "btn danger");
+      assert.equal(await dialog.getByRole("textbox").count(), 0);
+      const box = await dialog.boundingBox(); assert.ok(box && box.x >= 0 && box.x + box.width <= 761);
+      await page.keyboard.press("Escape");
+    });
+  }
+  await runCase("Ordnerrechte Legacy bleibt leer", "", async page => {
+    const html = await page.evaluate(async () => {
+      const { directoryDaclEffectsHtml, directoryDaclReportHtml } = await import("/directory-dacl-effects.js");
+      return [directoryDaclEffectsHtml(), directoryDaclEffectsHtml([]), directoryDaclReportHtml(), directoryDaclReportHtml({ completed: [], uncertain: [] })];
+    });
+    assert.deepEqual(html, ["", "", "", ""]);
+  });
+  for (const prepared of [false, true]) {
+    await runCase(`Ordnerrechte Queue und gebundene Recovery · Prepared ${prepared}`, "", async page => {
+      await page.evaluate(prepared => {
+        const known = { directory: "/ziel/Bekannt<&>", before_digest: [1], after_digest: [2] };
+        const unknown = { directory: "/ziel/Unklar", before_digest: [3], after_digest: [4] };
+        const report = prepared ? { completed: [], uncertain: [] } : { completed: [known], uncertain: [unknown] };
+        const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
+        queue.entries = [{ operation_id: "dacl-report", operation: { type: "ContentSync", source: { provider: "Smb", root: "/quelle" }, target: { provider: "Smb", root: "/ziel" }, options: { mode: "Update" } },
+          state: "Interrupted", attempts: 1, error_code: prepared ? "interrupted" : "outcome_unclear", error: "Rechte prüfen", directory_dacl_recovery: true,
+          directory_dacl_report: report, progress: { phase: "interrupted", directory_dacl_report: report }, temp_recovery_paths: ["/ziel/Unklar"] }];
+        window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
+      }, prepared);
+      await page.locator("#btn-queue").click();
+      const row = page.locator('[data-queue-id="dacl-report"]');
+      const button = row.getByRole("button", { name: "Zugriffsrechte prüfen" });
+      await button.waitFor();
+      assert.equal(await row.locator('[data-queue-action="retry"]').count(), 0);
+      assert.equal(await row.locator('[data-queue-action="unclear-ack"]').count(), 0);
+      if (!prepared) assert.match(await row.innerText(), /Ordnerrechte: 1 bestätigt · 1 Ausgang unklar/);
+      else assert.equal(await row.locator(".directory-dacl-report").count(), 0);
+      await button.click();
+      let dialog = page.getByRole("dialog", { name: "Ordnerrechte prüfen und abschließen" });
+      assert.match(await dialog.innerText(), /ohne erneutes Setzen/);
+      await dialog.getByRole("button", { name: "Abbrechen", exact: true }).click();
+      assert.deepEqual(await page.evaluate(() => window.__MOCK_DACL_ACKS__ || []), []);
+      await button.click();
+      dialog = page.getByRole("dialog", { name: "Ordnerrechte prüfen und abschließen" });
+      await dialog.getByRole("button", { name: "Fortfahren", exact: true }).click();
+      await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].state === "Cancelled");
+      assert.deepEqual(await page.evaluate(() => window.__MOCK_DACL_ACKS__), [{ operationId: "dacl-report", possibleEffectReviewed: true }]);
+      assert.equal(await row.locator('[data-queue-action="dacl-recovery"]').count(), 0);
+      assert.match(await row.innerText(), /abgebrochen/);
+    });
+  }
+  for (const event of ["sync-done", "sync-error"]) {
+    await runCase(`Ordnerrechte Abschlussbericht · ${event}`, "", async page => {
+      await page.evaluate(event => {
+        window.__MOCK_EMIT__(event, { dry_run: false, cancelled: false, files_copied: 0, files_deleted: 0, metadata_updated: 1, bytes_copied: 0,
+          code: "outcome_unclear", message: "Rechte prüfen", directory_dacl_report: {
+            completed: [{ directory: "/ziel/Bekannt<&>", before_digest: [1], after_digest: [2] }],
+            uncertain: [{ directory: "/ziel/Unklar", before_digest: [3], after_digest: [4] }] } });
+      }, event);
+      const summary = page.locator("#dock-summary");
+      await summary.filter({ hasText: "Ordnerrechte: 1 bestätigt · 1 Ausgang unklar" }).waitFor();
+      assert.match(await summary.innerText(), /keine automatische Wiederholung/);
+    });
+  }
+
+  for (const kind of ["add", "replace", "remove"]) {
+    await runCase(`Verzeichnisstreams reine Vorschau: ${kind}`, "", async page => {
+      await page.evaluate(async kind => {
+        const { confirmContentSync } = await import("/content-sync-ui.js");
+        const blob = (name, size) => ({ name: [...new TextEncoder().encode(name)], value: { size, digest: "fixture" } });
+        const effect = { kind, ...(kind !== "add" ? { before: blob("Größe<&>🌍", 0) } : {}), ...(kind !== "remove" ? { after: blob("Größe<&>🌍", 19) } : {}) };
+        void confirmContentSync({ source_provider: "Smb", target_provider: "Smb", source_root: "/quelle", target_root: "/ziel",
+          plan: { actions: [], copy_count: 0, update_count: 0, delete_count: 0 },
+          directory_stream_effects: Array.from({ length: 61 }, (_, index) => ({ directory: `ordner-${index}`, effect })) });
+      }, kind);
+      const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+      await dialog.locator("summary").click();
+      const text = await dialog.innerText();
+      assert.match(text, /0 neu · 0 ersetzen · 0 entfernen/);
+      assert.match(text, /Größe<&>🌍/);
+      assert.match(text, /ordner-60/);
+      assert.equal(await dialog.locator("li").count(), 61);
+      assert.match(text, kind === "replace" ? /0 → 19 Bytes/ : kind === "remove" ? /0 Bytes/ : /19 Bytes/);
+      const button = dialog.getByRole("button", { name: kind === "add" ? "Sync bestätigen und starten" : "Dauerhafte Änderungen bestätigen" });
+      assert.equal(await button.getAttribute("class"), kind === "add" ? "btn primary" : "btn danger");
+      if (kind !== "add") assert.match(text, /dauerhaft, ohne Quarantäne/);
+      if (kind === "replace") assert.match(text, /keinen atomaren Versionsvergleich gegen parallele Änderungen/);
+      await page.keyboard.press("Escape");
+    });
+  }
+  await runCase("Verzeichnisstreams Legacy und leere Wirkung", "", async page => {
+    const html = await page.evaluate(async () => {
+      const { directoryStreamEffectsHtml, directoryStreamReportHtml } = await import("/directory-stream-effects.js");
+      return [directoryStreamEffectsHtml(), directoryStreamEffectsHtml([]), directoryStreamReportHtml(), directoryStreamReportHtml({ completed: [], uncertain: [] })];
+    });
+    assert.deepEqual(html, ["", "", "", ""]);
+    await page.evaluate(async () => {
+      const { confirmContentSync } = await import("/content-sync-ui.js");
+      void confirmContentSync({ source_provider: "Smb", target_provider: "Smb", source_root: "/quelle", target_root: "/ziel", plan: { actions: [], copy_count: 0, update_count: 0, delete_count: 0 } });
+    });
+    const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+    await dialog.getByRole("button", { name: "Sync bestätigen und starten" }).waitFor();
+    assert.equal(await dialog.getByRole("button", { name: "Sync bestätigen und starten" }).count(), 1);
+    assert.doesNotMatch(await dialog.innerText(), /Verzeichnisströme/);
+    await page.keyboard.press("Escape");
+  });
+  for (const state of ["Failed", "Cancelled", "Interrupted"]) {
+    await runCase(`Verzeichnisstreams Queue-Teilbilanz: ${state}`, "", async page => {
+      await page.evaluate(state => {
+        const item = (kind, name, size) => ({ directory: "Ordner<&>", effect: { kind, [kind === "add" ? "after" : "before"]: { name: [...new TextEncoder().encode(name)], value: { size, digest: "fixture" } } } });
+        const known = item("add", "bekannt🌍", 0);
+        const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
+        queue.entries = [{ operation_id: "stream-report", operation: { type: "File", kind: "Copy", items: ["/mock/quelle"], destination: "/mock/ziel", expected_conflicts: [] },
+          created_unix_ms: Date.now(), state, attempts: 2, error: "Teilwirkung prüfen", error_code: "outcome_unclear", attention: null,
+          directory_stream_report: { completed: [known], uncertain: [item("remove", "unklar", 8)] },
+          progress: { directory_stream_report: { completed: [known], uncertain: [] } } }];
+        window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
+      }, state);
+      await page.locator("#btn-queue").click();
+      const row = page.locator('[data-queue-id="stream-report"]');
+      assert.match(await row.innerText(), /Verzeichnisströme: 1 bestätigt · 1 Ausgang unklar/);
+      for (const detail of await row.locator("details").all()) await detail.locator("summary").click();
+      assert.match(await row.innerText(), /bekannt🌍.*0 Bytes/s);
+      assert.match(await row.innerText(), /Dauerhaft entfernen.*unklar.*8 Bytes/s);
+      assert.match(await row.innerText(), /Ordner<&>/);
+      await page.locator("#btn-queue").click();
+      await page.locator("#btn-queue").click();
+      assert.match(await row.innerText(), /1 bestätigt · 1 Ausgang unklar/);
+    });
+  }
+  for (const event of ["sync-done", "sync-error"]) {
+    await runCase(`Verzeichnisstreams Sync-Teilbilanz: ${event}`, "", async page => {
+      await page.evaluate(event => {
+        const outcome = kind => ({ directory: "Belege", effect: { kind, [kind === "add" ? "after" : "before"]: { name: [...new TextEncoder().encode(kind)], value: { size: 0, digest: "fixture" } } } });
+        window.__MOCK_EMIT__(event, { dry_run: false, cancelled: true, files_copied: 0, files_deleted: 0, metadata_updated: 0, bytes_copied: 0,
+          code: "outcome_unclear", message: "Teilwirkung prüfen", directory_stream_report: { completed: [outcome("add")], uncertain: [outcome("remove")] } });
+      }, event);
+      const summary = page.locator("#dock-summary");
+      await summary.filter({ hasText: "1 bestätigt · 1 Ausgang unklar" }).waitFor();
+      await summary.getByText("Bestätigte Einzelwirkungen: 1 Streamwirkung(en)", { exact: true }).click();
+      await summary.getByText("Ungeklärte Einzelversuche: 1 Streamwirkung(en)", { exact: true }).click();
+      assert.match(await summary.innerText(), /Hinzufügen.*0 Bytes.*Dauerhaft entfernen.*0 Bytes/s);
+    });
+  }
+
+  await runFilePreviewCases(runCase);
+  await runBatchRenameCases(runCase);
+
   for (const theme of ["light", "dark"]) for (const key of ["F5", "F6"]) {
     await runCase(`AP22 FTPS-Merge-Skip kopiert neue Kinder ohne Quellentfernung · ${theme} · ${key}`, "?remoteFile=1&ftpsConflictChoice=1&ftpsPartialMerge=1", async page => {
       await openFtpsConflict(page, theme, key);
@@ -142,82 +564,77 @@ try {
   }
 
   for (const theme of ["light", "dark"]) for (const key of ["F5", "F6"]) for (const policy of ["skip", "overwrite", "both", "cancel"]) {
-    await runCase(`AP21 FTPS-Konfliktwahl vor Probe · ${theme} · ${key} · ${policy}`, "?remoteFile=1&ftpsConflictChoice=1", async page => {
+    await runCase(`AP21 ein Remote-Konfliktdialog · ${theme} · ${key} · ${policy}`, "?remoteFile=1&ftpsConflictChoice=1", async page => {
       await openFtpsConflict(page, theme, key);
       const dialog = page.getByRole("dialog");
-      assert.deepEqual(await page.evaluate(() => window.__AP21_POLICIES__), [null]);
-      assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length),0);
-      if (policy === "cancel") { await page.keyboard.press("Escape");await dialog.waitFor({ state:"hidden" });assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length),0);return; }
-      await dialog.getByRole("button", { name: policy === "skip" ? "Überspringen" : policy === "overwrite" ? "Ersetzen prüfen" : "Beide behalten prüfen", exact:true }).click();
-      if (policy !== "skip") {
-        await dialog.getByRole("button", { name: policy === "overwrite" ? "Dauerhaft ersetzen" : "Beide behalten", exact:true }).waitFor();
-        assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length),0);
-        await dialog.getByRole("button", { name: policy === "overwrite" ? "Dauerhaft ersetzen" : "Beide behalten", exact:true }).click();
+      await dialog.getByRole("button", { name: "Dauerhaft ersetzen", exact: true }).waitFor();
+      assert.equal(await dialog.getByRole("button", { name: /prüfen/ }).count(), 0);
+      assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+      if (policy === "cancel") {
+        await page.keyboard.press("Escape");
+        await dialog.waitFor({ state: "hidden" });
+        assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+        return;
       }
-      await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length===1);
-      const state=await page.evaluate(() => ({ policies:window.__AP21_POLICIES__, entry:window.__DOPPELDECKER_MOCK_QUEUE__.entries[0] }));
-      assert.deepEqual(state.policies,[null,policy]);assert.equal(state.entry.operation.overwrite,policy==="overwrite");
-      assert.equal(state.entry.operation.remove_source_best_effort_expected, key==="F6" && policy!=="skip" ? true:null);
-      assert.equal(state.entry.operation.copy_new_best_effort_expected,policy==="overwrite");
-      assert.equal(state.entry.operation.replace_best_effort_expected,policy==="overwrite");
+      await dialog.getByRole("button", { name: policy === "skip" ? "Überspringen" : policy === "overwrite" ? "Dauerhaft ersetzen" : "Beide behalten", exact: true }).click();
+      await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+      assert.equal(await dialog.count(), 0, "Die gewählte Wirkung darf keinen zweiten Konfliktdialog öffnen.");
+      const state = await page.evaluate(() => ({ policies: window.__AP21_POLICIES__, operation: window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].operation }));
+      assert.deepEqual(state.policies, policy === "skip" ? [null, "inspect", "skip"] : [null, "inspect"]);
+      assert.equal(state.operation.overwrite, policy === "overwrite");
+      assert.equal(state.operation.remove_source_best_effort_expected, key === "F6" && policy !== "skip" ? true : null);
+      assert.equal(state.operation.replace_best_effort_expected, policy === "overwrite");
+      assert.equal(Boolean(await page.evaluate(() => window.__LAST_PROVIDER_FILE_REQUEST__.keepBothPreparationId)), policy === "both");
     });
   }
 
   for (const theme of ["light", "dark"]) {
-    await runCase(`AP21 gesperrtes Ersetzen lässt Skip ohne Quellentfernung erreichbar · ${theme}`, "?remoteFile=1&ftpsConflictChoice=1&ftpsReplaceDenied=1", async page => {
-      await openFtpsConflict(page, theme, "F6"); const dialog = page.getByRole("dialog");
-      await dialog.getByRole("button", { name: "Ersetzen prüfen", exact: true }).click();
+    await runCase(`AP21 nicht verfügbares Ersetzen lässt Skip erreichbar · ${theme}`, "?remoteFile=1&ftpsConflictChoice=1&ftpsReplaceDenied=1", async page => {
+      await openFtpsConflict(page, theme, "F6");
+      const dialog = page.getByRole("dialog");
       await dialog.getByText("Ersetzen ist für diese Ordnerauswahl nicht gebunden", { exact: true }).waitFor();
       assert.equal(await dialog.getByRole("button", { name: "Dauerhaft ersetzen", exact: true }).count(), 0);
-      assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
       await dialog.getByRole("button", { name: "Überspringen", exact: true }).click();
       await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
-      const state = await page.evaluate(() => ({ policies: window.__AP21_POLICIES__, operation: window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].operation }));
-      assert.deepEqual(state.policies, [null, "overwrite", "skip"]); assert.equal(state.operation.overwrite, false);
-      assert.equal(state.operation.remove_source_best_effort_expected, null);
+      const operation = await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].operation);
+      assert.equal(operation.overwrite, false);
+      assert.equal(operation.remove_source_best_effort_expected, null);
     });
-    await runCase(`AP21 Wechsel von Ersetzen zu Skip bindet keine Quellentfernung · ${theme}`, "?remoteFile=1&ftpsConflictChoice=1", async page => {
-      await openFtpsConflict(page, theme, "F6"); const dialog = page.getByRole("dialog");
-      await dialog.getByRole("button", { name: "Ersetzen prüfen", exact: true }).click();
-      await dialog.getByRole("button", { name: "Dauerhaft ersetzen", exact: true }).waitFor();
-      assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
-      await dialog.getByRole("button", { name: "Überspringen", exact: true }).click();
-      await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
-      const state = await page.evaluate(() => ({ policies: window.__AP21_POLICIES__, operation: window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].operation }));
-      assert.deepEqual(state.policies, [null, "overwrite", "skip"]);
-      assert.equal(state.operation.overwrite, false); assert.equal(state.operation.remove_source_best_effort_expected, null);
-      assert.equal(state.operation.copy_new_best_effort_expected, false); assert.equal(state.operation.replace_best_effort_expected, false);
-    });
-    await runCase(`AP21 Beide behalten verlangt die konkreten Namen vor Enqueue · ${theme}`, "?remoteFile=1&ftpsConflictChoice=1", async page => {
-      await openFtpsConflict(page, theme, "F5"); const dialog = page.getByRole("dialog");
-      await dialog.getByRole("button", { name: "Beide behalten prüfen", exact: true }).click();
-      await dialog.getByRole("button", { name: "Beide behalten", exact: true }).waitFor();
+    await runCase(`AP21 neue Namen sind vor der einzigen Entscheidung sichtbar · ${theme}`, "?remoteFile=1&ftpsConflictChoice=1", async page => {
+      await openFtpsConflict(page, theme, "F5");
+      const dialog = page.getByRole("dialog");
       await dialog.getByText(/remote \(Kopie\)\.txt/).waitFor();
       assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
-      await page.keyboard.press("Escape"); await dialog.waitFor({ state: "hidden" });
-      assert.deepEqual(await page.evaluate(() => window.__AP21_POLICIES__), [null, "both"]);
-      assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+      await page.keyboard.press("Escape");
+      await dialog.waitFor({ state: "hidden" });
     });
-    await runCase(`AP21 verspätete Wirkungsvorbereitung bleibt nach Navigation wirkungslos · ${theme}`, "?remoteFile=1&ftpsConflictChoice=1", async page => {
-      await openFtpsConflict(page, theme, "F6");
-      await page.evaluate(() => {
-        const invoke = window.__TAURI__.core.invoke;
-        window.__TAURI__.core.invoke = async (command, args) => {
-          if (command === "check_provider_file_operation" && args.choice) {
-            window.__AP21_POLICY_HELD__ = true;
-            await new Promise(resolve => { window.__AP21_RELEASE_POLICY__ = resolve; });
-            const result = await invoke(command, args); window.__AP21_POLICY_RETURNED__ = true; return result;
-          }
-          return invoke(command, args);
-        };
-      });
-      await page.getByRole("dialog").getByRole("button", { name: "Überspringen", exact: true }).click();
-      await page.waitForFunction(() => window.__AP21_POLICY_HELD__);
-      const path = page.locator('[data-side="left"] .path'); await path.fill("/other"); await path.press("Enter");
-      await page.evaluate(() => window.__AP21_RELEASE_POLICY__()); await page.waitForFunction(() => window.__AP21_POLICY_RETURNED__);
-      await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
-      assert.equal(await path.inputValue(), "/other"); assert.equal(await page.getByRole("dialog").count(), 0);
-      assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+  }
+
+  for (const theme of ["light", "dark"]) for (const drift of [false, true]) {
+    await runCase(`Audit Remote-Bearbeitung mit Rückupload · ${theme} · ${drift ? "Drift" : "Erfolg"}`, `?remoteFile=1${drift ? "&remoteEditDrift=1" : ""}`, async page => {
+      await page.setViewportSize({ width: 900, height: 650 });
+      await page.evaluate(async theme => { const { setTheme } = await import("/theme.js"); setTheme(theme); }, theme);
+      await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+      const file = page.getByRole("listbox", { name: /Linke Dateiliste/ }).getByRole("option", { name: /remote\.txt/ });
+      await file.click({ button: "right" });
+      await page.getByRole("menuitem", { name: "Bearbeiten und zurückspeichern", exact: true }).click();
+      await page.locator("#btn-remote-edits").waitFor({ state: "visible" });
+      assert.equal(await page.evaluate(() => window.__LAST_REMOTE_OPEN_MODE__), "edit");
+      await page.locator("#btn-remote-edits").click();
+      const dialog = page.getByRole("dialog");
+      await dialog.getByText(/dauerhaft ohne Quarantäne/).waitFor();
+      await dialog.getByRole("button", { name: "Zurückspeichern", exact: true }).click();
+      if (drift) {
+        await dialog.getByText(/Serverdatei wurde inzwischen verändert/).waitFor();
+        assert.equal(await page.evaluate(() => window.__REMOTE_EDIT_SAVE_REQUEST__ || null), null);
+      } else {
+        await dialog.getByText(/Rückupload in Queue eingereiht/).waitFor();
+        assert.deepEqual(await page.evaluate(() => window.__REMOTE_EDIT_SAVE_REQUEST__), { id: "mock-remote-edit" });
+      }
+      await dialog.getByRole("button", { name: "Bearbeitung beenden", exact: true }).click();
+      await dialog.getByText(/Bearbeitung beendet/).waitFor();
+      await dialog.getByRole("button", { name: "Schließen", exact: true }).click();
+      await page.locator("#btn-remote-edits").waitFor({ state: "hidden" });
     });
   }
 
@@ -1360,7 +1777,7 @@ try {
     assert.deepEqual(saved.selectedNames, ["Langsam.txt"]);
     assert.equal(saved.cursorName, "Langsam.txt");
     assert.equal(saved.anchorName, "Langsam.txt");
-    assert.equal(await left.getByRole("option").count(), 0);
+    assert.equal(await left.getByRole("listbox").getByRole("option").count(), 0);
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "refresh"));
     await left.getByRole("option", { name: /Langsam\.txt/ }).waitFor();
     assert.equal(await left.getByRole("option", { name: /Langsam\.txt/ }).getAttribute("aria-selected"), "true");
@@ -1411,7 +1828,7 @@ try {
     }));
     await left.getByRole("tab").nth(1).click();
     await page.locator("#dock-summary").filter({ hasText: "nicht mehr vorhanden" }).waitFor();
-    assert.equal(await left.getByRole("option").count(), 0);
+    assert.equal(await left.getByRole("listbox").getByRole("option").count(), 0);
     assert.equal(await left.getByRole("tab").count(), 2);
     assert.equal(await page.evaluate(() => window.__MOCK_SCAN_CALLS__().length), before.scans);
     assert.ok(await page.evaluate(() => window.__MOCK_DIRECTORY_SIZES__().cancels.length) > before.cancels);
@@ -1909,10 +2326,10 @@ try {
     await page.evaluate(() => { void window.__MOCK_EMIT__("menu", "check_updates"); });
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
     await page.getByRole("button", { name: "Realmodus" }).click();
-    const realMode = page.getByRole("dialog", { name: "Lokalen Realmodus bestätigen" });
+    const realMode = page.getByRole("dialog", { name: "Sync ausführen" });
     await realMode.waitFor();
     await page.waitForTimeout(180);
-    assert.match(await page.locator("#modal-title").innerText(), /Lokalen Realmodus bestätigen/);
+    assert.match(await page.locator("#modal-title").innerText(), /Sync ausführen/);
     await realMode.getByRole("button", { name: "Vorbereitung verwerfen" }).click();
     const update = page.getByRole("dialog", { name: "Update 0.1.124 verfügbar" });
     await update.waitFor();
@@ -1976,7 +2393,7 @@ try {
     assert.equal(await page.evaluate(() => window.__MOCK_MODAL_DETACHES__), 0);
     assert.equal(await input.evaluate(element => document.activeElement === element), true);
     await owner.getByRole("button", { name: "Abbrechen" }).click();
-    const realMode = page.getByRole("dialog", { name: "Lokalen Realmodus bestätigen" });
+    const realMode = page.getByRole("dialog", { name: "Sync ausführen" });
     await realMode.waitFor();
     await realMode.getByRole("button", { name: "Vorbereitung verwerfen" }).click();
   });
@@ -2047,6 +2464,7 @@ try {
       for (let index = 0; index < selectors.length; index += 1) {
         await dialog.locator(selectors[index]).fill(values[index]);
       }
+      if (protocol === "FTP / FTPS") await dialog.locator("#ftps-policy").selectOption("web_pki_and_pin");
       const primary = dialog.locator(".modal-buttons .primary");
       await primary.click();
       for (const selector of selectors) {
@@ -2177,6 +2595,7 @@ try {
           await dialog.locator("#ftps-name").fill("Neu");
           await dialog.locator("#ftps-host").fill("neu.mock");
           await dialog.locator("#ftps-user").fill("tester");
+          await dialog.locator("#ftps-policy").selectOption("web_pki_and_pin");
         } else if (protocol === "webdav") {
           await dialog.locator("#webdav-name").fill("Neu");
           await dialog.locator("#webdav-origin").fill("https://neu.mock");
@@ -2242,6 +2661,59 @@ try {
       },
     );
   }
+
+  await runCase("SFTP-Agent-Schlüssel nachladen: neue Profile bieten die Anmeldung an", "?holdSftpAgent=1&sftpAgentKeys=1", async page => {
+    await page.locator("#conn-add").click();
+    await page.getByRole("dialog", { name: "Verbindung hinzufügen" })
+      .getByRole("button", { name: /^SFTP/ }).click();
+    const dialog = page.getByRole("dialog", { name: "SFTP-Verbindung hinzufügen" });
+    await page.waitForFunction(() => window.__MOCK_REQUEST_PHASES__().holdSftpAgent?.phase === "pending");
+    const auth = dialog.locator("#sftp-auth");
+    assert.equal(await auth.locator('option[value="agent"]').count(), 0);
+    await page.evaluate(() => window.__MOCK_RELEASE_REQUEST__("holdSftpAgent"));
+    await page.waitForFunction(() => !document.querySelector("#sftp-auth").disabled);
+    assert.equal(await auth.locator('option[value="agent"]').count(), 1);
+    assert.equal(await auth.inputValue(), "password", "Nachladen ändert die gewählte Anmeldung nicht.");
+    assert.equal(await dialog.locator("#sftp-password-row").isVisible(), true);
+    await auth.selectOption("agent");
+    assert.equal(await dialog.locator("#sftp-agent-row").isVisible(), true);
+    assert.equal(await dialog.locator("#sftp-password-row").isVisible(), false);
+    assert.match(await dialog.locator("#sftp-agent").innerText(), /Asynchroner Testschlüssel/);
+    await dialog.locator("#sftp-name").fill("Agentprofil");
+    await dialog.locator("#sftp-host").fill("agent.mock");
+    await dialog.locator("#sftp-user").fill("tester");
+    await dialog.getByRole("button", { name: "Hostkey ermitteln" }).click();
+    await dialog.getByRole("button", { name: "Geprüften Hostkey binden und speichern" }).click();
+    await dialog.waitFor({ state: "detached" });
+    const state = await page.evaluate(() => window.__MOCK_CONNECTION_STATE__());
+    const profile = state.sftpProfiles.find(item => item.name === "Agentprofil");
+    assert.deepEqual(profile.connection.authentication, { type: "ssh_agent", public_key_sha256: Array(32).fill(23) });
+    assert.deepEqual(state.secretTransactions, []);
+    const save = (await page.evaluate(() => window.__MOCK_CONNECTION_ACTIONS__()))
+      .find(action => action.command === "save_sftp_profile");
+    assert.equal(save.secretId, null);
+  });
+
+  await runCase("SFTP-Agent-Schlüssel nachladen: geschlossener Editor verändert keinen Folgedialog", "?holdSftpAgent=1&sftpAgentKeys=1", async page => {
+    await page.locator("#conn-add").click();
+    await page.getByRole("dialog", { name: "Verbindung hinzufügen" })
+      .getByRole("button", { name: /^SFTP/ }).click();
+    const dialog = page.getByRole("dialog", { name: "SFTP-Verbindung hinzufügen" });
+    await page.waitForFunction(() => window.__MOCK_REQUEST_PHASES__().holdSftpAgent?.phase === "pending");
+    await dialog.getByRole("button", { name: "Abbrechen" }).click();
+    await page.evaluate(async () => {
+      const modal = await import("/modal.js");
+      void modal.promptModal("Folgedialog", "unverändert");
+    });
+    const next = page.getByRole("dialog", { name: "Folgedialog" });
+    await next.waitFor();
+    await page.evaluate(() => window.__MOCK_RELEASE_REQUEST__("holdSftpAgent"));
+    await page.waitForFunction(() => window.__MOCK_REQUEST_PHASES__().holdSftpAgent?.phase === "returned");
+    assert.equal(await next.locator("#modal-input").inputValue(), "unverändert");
+    assert.equal(await page.locator("#sftp-auth").count(), 0);
+    assert.deepEqual(await page.evaluate(() => window.__MOCK_CONNECTION_ACTIONS__()), []);
+    await next.getByRole("button", { name: "Abbrechen" }).click();
+  });
 
   await runCase("SFTP-Agentantwort darf ein inzwischen entferntes Profil nicht neu anlegen", "?holdSftpAgent=1&sftpProfileChangesDuringAgent=remove", async page => {
     await page.locator('#connection-list [data-protocol="sftp"] .conn-edit').click();
@@ -2694,7 +3166,7 @@ try {
     await external.getByRole("button", { name: "Backup auswerfen" }).click();
     await page.getByText("Backup ausgeworfen, Pane-Rückfall fehlgeschlagen", { exact: true }).waitFor();
     assert.equal(await pane.locator(".path").inputValue(), "");
-    assert.equal(await pane.getByRole("option").count(), 0);
+    assert.equal(await pane.getByRole("listbox").getByRole("option").count(), 0);
   });
 
   await runCase("Verspäteter Auswurf-Rückfall erhält eine neuere Pane-Navigation", "", async page => {
@@ -3139,6 +3611,235 @@ try {
     await dialog.waitFor({ state: "hidden" });
   });
 
+  await runFinderTagCases(runCase);
+  await runVisibilityCases(runCase);
+  await runFileFlagCases(runCase);
+  await runAdministratorCases(runCase);
+  await runFinderCommentCases(runCase);
+
+  for (const theme of ["light", "dark"]) {
+    await runCase(`Informationen ändern lokale Rechte mit Fehlerbilanz · ${theme}`, "?keyboard=1", async page => {
+      await page.setViewportSize({ width: 650, height: 520 });
+      await page.evaluate(async theme => {
+        const { setTheme } = await import("/theme.js"); setTheme(theme);
+        const original = window.__TAURI__.core.invoke;
+        window.__PERMISSION_CALLS__ = [];
+        window.__TAURI__.core.invoke = async (command, args) => {
+          if (command !== "change_file_permissions") return original(command, args);
+          window.__PERMISSION_CALLS__.push(args);
+          return args.request.names.map(name => ({ name, mode: parseInt(args.request.mode, 8),
+            changed: !window.__PERMISSION_UNCLEAR__, code: window.__PERMISSION_UNCLEAR__ ? "outcome_unclear" : null,
+            message: window.__PERMISSION_UNCLEAR__ ? "Abschluss <img src=x> unklar; prüfen" : "Rechte bestätigt" }));
+        };
+      }, theme);
+      const pane = page.getByRole("listbox", { name: /Linke Dateiliste/ });
+      await pane.getByRole("option", { name: /Alpha.txt/ }).click();
+      await page.keyboard.press("Meta+I");
+      const dialog = page.getByRole("dialog", { name: /Informationen · Alpha.txt/ });
+      await dialog.locator(".file-info-permissions summary").click();
+      await dialog.getByLabel("Unix-Rechte (oktal)").fill("888");
+      await dialog.getByRole("button", { name: "Rechte anwenden" }).click();
+      await dialog.getByRole("status").getByText(/drei Ziffern/).waitFor();
+      assert.deepEqual(await page.evaluate(() => window.__PERMISSION_CALLS__), []);
+      await dialog.getByLabel("Unix-Rechte (oktal)").fill("640");
+      await dialog.getByRole("button", { name: "Rechte anwenden" }).click();
+      await dialog.getByRole("region", { name: "Ergebnis der Rechteänderung" }).getByText(/Rechte bestätigt/).waitFor();
+      assert.match(await dialog.getByText("Berechtigungen", { exact: true }).locator("..").innerText(), /rw-r----- \(640\)/);
+      const calls = await page.evaluate(() => window.__PERMISSION_CALLS__);
+      assert.match(calls[0].request.requestId, /^[a-f0-9-]{36}$/);
+      assert.deepEqual(calls, [{ request: {
+        requestId: calls[0].request.requestId, provider: "local", root: "/mock/quelle", names: ["Alpha.txt"], mode: "640", recursive: false, profileId: null, profileRevision: null,
+      } }]);
+      await dialog.getByRole("button", { name: "Schließen" }).waitFor();
+      await page.waitForFunction(() => document.querySelector("#modal .modal").contains(document.activeElement));
+      assert.equal(await dialog.locator(".file-info-permissions").evaluate(element => element.open), true);
+      assert.equal(await pane.getByRole("option", { name: /Alpha.txt/ }).getAttribute("aria-selected"), "true");
+      await page.evaluate(() => { window.__PERMISSION_UNCLEAR__ = true; });
+      await dialog.getByLabel("Unix-Rechte (oktal)").fill("600");
+      await dialog.getByRole("button", { name: "Rechte anwenden" }).click();
+      await dialog.getByRole("region", { name: "Ergebnis der Rechteänderung" }).getByText(/outcome_unclear/).waitFor();
+      assert.match(await dialog.getByText("Berechtigungen", { exact: true }).locator("..").innerText(), /—/);
+      assert.equal(await dialog.locator(".file-info-permission-report img").count(), 0);
+      assert.equal(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth), true);
+      await dialog.getByRole("button", { name: "Schließen" }).click();
+      await dialog.waitFor({ state: "hidden" });
+    });
+  }
+
+  for (const theme of ["light", "dark"]) {
+    await runCase(`Informationen rekursive Rechte mit gebundenem Abbruch und Ergebnisblättern · ${theme}`, "?keyboard=1", async page => {
+      await page.setViewportSize({ width: 390, height: 760 });
+      await page.evaluate(async theme => {
+        const { setTheme } = await import("/theme.js"); setTheme(theme);
+        const original = window.__TAURI__.core.invoke;
+        window.__PERMISSION_CALLS__ = [];
+        window.__TAURI__.core.invoke = (command, args) => {
+          if (command === "change_file_permissions") {
+            window.__PERMISSION_CALLS__.push({ command, ...args });
+            return new Promise(resolve => { window.__PERMISSION_RESOLVE__ = resolve; });
+          }
+          if (command === "cancel_file_property_edit") {
+            window.__PERMISSION_CALLS__.push({ command, ...args });
+            window.__PERMISSION_RESOLVE__(Array.from({ length: 95 }, (_, index) => ({
+              name: `Bilder/Ordner mit langem Namen/Datei-${index}.txt`, mode: index < 2 ? 0o750 : null,
+              changed: index < 2, code: index < 2 ? null : "interrupted",
+              message: index < 2 ? "Rechte bestätigt" : "Vor dieser Änderung abgebrochen; unverändert",
+            })));
+            return Promise.resolve();
+          }
+          return original(command, args);
+        };
+      }, theme);
+      const pane = page.getByRole("listbox", { name: /Linke Dateiliste/ });
+      await pane.getByRole("option", { name: /Bilder/ }).click();
+      await page.keyboard.press("Meta+I");
+      const dialog = page.getByRole("dialog", { name: "Informationen · Bilder" });
+      await dialog.locator(".file-info-permissions summary").click();
+      await dialog.getByLabel("Unix-Rechte (oktal)").fill("750");
+      const recursive = dialog.getByLabel("Auch auf alle enthaltenen Dateien und Ordner anwenden");
+      assert.equal(await recursive.isChecked(), false);
+      await recursive.check();
+      await dialog.getByRole("button", { name: "Rechte anwenden" }).click();
+      await dialog.getByRole("button", { name: "Änderung abbrechen" }).click();
+      const region = dialog.getByRole("region", { name: "Ergebnis der Rechteänderung" });
+      await region.getByText("2 von 95 bestätigt · Seite 1 von 3").waitFor();
+      const calls = await page.evaluate(() => window.__PERMISSION_CALLS__);
+      assert.equal(calls.length, 2);
+      assert.equal(calls[0].request.recursive, true);
+      assert.deepEqual(calls[0].request.names, ["Bilder"]);
+      assert.equal(calls[1].requestId, calls[0].request.requestId);
+      assert.equal(await region.locator("li").count(), 40);
+      assert.equal(await recursive.isChecked(), true);
+      await region.getByRole("button", { name: "Weiter", exact: true }).click();
+      await region.getByText(/Seite 2 von 3/).waitFor();
+      await region.getByRole("button", { name: "Weiter", exact: true }).click();
+      await region.getByText(/Seite 3 von 3/).waitFor();
+      assert.equal(await region.locator("li").count(), 15);
+      assert.equal(await region.getByRole("button", { name: "Zurück", exact: true }).evaluate(element => document.activeElement === element), true);
+      assert.equal(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth), true);
+      if (process.env.DOPPELDECKER_PERMISSION_SCREENSHOTS) await page.screenshot({ path: `${process.env.DOPPELDECKER_PERMISSION_SCREENSHOTS}/${theme}.png` });
+    });
+  }
+
+  for (const theme of ["light", "dark"]) {
+    await runCase(`Informationen ändern lokale Eigentümer und erhalten beide Entwürfe · ${theme}`, "?keyboard=1", async page => {
+      await page.setViewportSize({ width: 390, height: 760 });
+      await page.evaluate(async theme => {
+        const { setTheme } = await import("/theme.js"); setTheme(theme);
+        const original = window.__TAURI__.core.invoke;
+        window.__OWNER_CALLS__ = [];
+        window.__TAURI__.core.invoke = async (command, args) => {
+          if (command !== "change_file_ownership") return original(command, args);
+          window.__OWNER_CALLS__.push(args.request);
+          if (args.request.owner === "unknown") throw new Error("Lokaler Benutzer nicht gefunden (invalid_input)");
+          return args.request.names.map(name => ({ name, owner: "lokal", group: "staff", uid: 501, gid: 20,
+            specialBitsChanged: true, changed: !window.__OWNER_UNCLEAR__, code: window.__OWNER_UNCLEAR__ ? "outcome_unclear" : null,
+            message: window.__OWNER_UNCLEAR__ ? "Abschluss <img src=x> unklar" : "Eigentümer/Gruppe bestätigt; das System hat Sonderbits geändert" }));
+        };
+      }, theme);
+      const pane = page.getByRole("listbox", { name: /Linke Dateiliste/ });
+      await pane.getByRole("option", { name: /Beta.txt/ }).click();
+      await page.keyboard.press("Meta+I");
+      const dialog = page.getByRole("dialog", { name: "Informationen · Beta.txt" });
+      await dialog.locator(".file-info-permissions summary").click();
+      await dialog.getByLabel("Unix-Rechte (oktal)").fill("632");
+      await dialog.locator(".file-info-owner summary").click();
+      await dialog.getByRole("button", { name: "Eigentümer/Gruppe anwenden" }).click();
+      await dialog.getByRole("status").getByText(/Mindestens Eigentümer oder Gruppe/).waitFor();
+      assert.deepEqual(await page.evaluate(() => window.__OWNER_CALLS__), []);
+      await dialog.getByLabel("Eigentümer (Name oder UID)").fill("lokal");
+      await dialog.getByLabel("Gruppe (Name oder GID)").fill("staff");
+      await dialog.getByRole("button", { name: "Eigentümer/Gruppe anwenden" }).click();
+      const report = dialog.getByRole("region", { name: "Ergebnis der Eigentümeränderung" });
+      await report.getByText(/Sonderbits geändert/).waitFor();
+      const calls = await page.evaluate(() => window.__OWNER_CALLS__);
+      assert.deepEqual(calls, [{ requestId: calls[0].requestId, provider: "local", root: "/mock/quelle", names: ["Beta.txt"], owner: "lokal", group: "staff" }]);
+      assert.match(calls[0].requestId, /^[a-f0-9-]{36}$/);
+      assert.match(await dialog.getByText("Eigentümer", { exact: true }).locator("..").innerText(), /lokal/);
+      assert.match(await dialog.getByText("Gruppe", { exact: true }).locator("..").innerText(), /staff/);
+      assert.equal(await dialog.getByLabel("Unix-Rechte (oktal)").inputValue(), "632");
+      assert.equal(await dialog.getByLabel("Gruppe (Name oder GID)").inputValue(), "staff");
+      assert.equal(await pane.getByRole("option", { name: /Beta.txt/ }).getAttribute("aria-selected"), "true");
+      await dialog.getByLabel("Eigentümer (Name oder UID)").fill("unknown");
+      await dialog.getByRole("button", { name: "Eigentümer/Gruppe anwenden" }).click();
+      await dialog.getByRole("status").getByText(/Lokaler Benutzer nicht gefunden/).waitFor();
+      assert.equal(await dialog.getByLabel("Eigentümer (Name oder UID)").inputValue(), "unknown");
+      assert.equal(await dialog.getByRole("button", { name: "Eigentümer/Gruppe anwenden" }).isEnabled(), true);
+      await dialog.getByLabel("Eigentümer (Name oder UID)").fill("501");
+      await page.evaluate(() => { window.__OWNER_UNCLEAR__ = true; });
+      await dialog.getByRole("button", { name: "Eigentümer/Gruppe anwenden" }).click();
+      await report.getByText(/outcome_unclear/).waitFor();
+      await page.waitForFunction(() => !document.querySelector("[data-file-info-ownership]").disabled);
+      assert.match(await dialog.getByText("Eigentümer", { exact: true }).locator("..").innerText(), /—/);
+      assert.match(await dialog.getByText("Gruppe", { exact: true }).locator("..").innerText(), /—/);
+      assert.equal(await report.locator("img").count(), 0);
+      assert.equal(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth), true);
+      if (process.env.DOPPELDECKER_OWNER_SCREENSHOTS) await page.screenshot({ path: `${process.env.DOPPELDECKER_OWNER_SCREENSHOTS}/${theme}.png`, animations: "disabled" });
+    });
+  }
+
+  await runCase("Informationen Eigentümerabbruch gehört zur aktiven Anfrage", "?keyboard=1", async page => {
+    await page.evaluate(() => {
+      const original = window.__TAURI__.core.invoke;
+      window.__OWNER_CANCEL_CALLS__ = [];
+      window.__TAURI__.core.invoke = (command, args) => {
+        if (command === "change_file_ownership") {
+          window.__OWNER_PENDING__ = args.request;
+          return new Promise(resolve => { window.__OWNER_FINISH__ = resolve; });
+        }
+        if (command === "cancel_file_property_edit") {
+          window.__OWNER_CANCEL_CALLS__.push(args);
+          window.__OWNER_FINISH__([{ name: "Alpha.txt", changed: false, code: "interrupted", message: "Vor der Änderung abgebrochen" }]);
+          return Promise.resolve();
+        }
+        return original(command, args);
+      };
+    });
+    await page.getByRole("listbox", { name: /Linke Dateiliste/ }).getByRole("option", { name: /Alpha.txt/ }).click();
+    await page.keyboard.press("Meta+I");
+    const dialog = page.getByRole("dialog", { name: "Informationen · Alpha.txt" });
+    await dialog.locator(".file-info-owner summary").click();
+    await dialog.getByLabel("Gruppe (Name oder GID)").fill("20");
+    await dialog.getByRole("button", { name: "Eigentümer/Gruppe anwenden" }).click();
+    await dialog.getByRole("button", { name: "Änderung abbrechen" }).click();
+    await dialog.getByRole("region", { name: "Ergebnis der Eigentümeränderung" }).getByText(/Vor der Änderung abgebrochen/).waitFor();
+    assert.deepEqual(await page.evaluate(() => window.__OWNER_CANCEL_CALLS__), [{ requestId: await page.evaluate(() => window.__OWNER_PENDING__.requestId) }]);
+    assert.equal(await dialog.getByRole("button", { name: "Eigentümer/Gruppe anwenden" }).isEnabled(), true);
+  });
+
+  await runCase("Informationen erhalten Rechteentwurf und unklaren Modus bei Größenereignissen", "?keyboard=1", async page => {
+    await page.evaluate(async () => {
+      const { createFileInformationUi } = await import("/file-information.js");
+      const entry = { name: "Baum", is_dir: true, is_file: false, is_symlink: false,
+        mode: 0o755, size: 0, mtime: 0, safely_decoded: true };
+      const pane = { provider: "local", path: "/mock/quelle", profileId: undefined,
+        profileRevision: undefined, sessionGeneration: undefined };
+      const original = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = (command, args) => command === "change_file_permissions"
+        ? Promise.resolve([{ name: "Baum", changed: false, code: "outcome_unclear", message: "Prüfen" }])
+        : original(command, args);
+      window.__INFO_SIZE_UI__ = createFileInformationUi({ panes: { left: pane }, selectedEntries: () => [entry] });
+      window.__INFO_SIZE_UI__.open("left");
+      window.__INFO_SIZE_EVENT__ = () => window.__INFO_SIZE_UI__.onDirectorySizeChange("left", {
+        ...entry, mode: 0o777, directorySize: { status: "complete", bytes: 42, files: 1, directories: 0, limitations: [] },
+      });
+    });
+    const dialog = page.getByRole("dialog", { name: "Informationen · Baum" });
+    await dialog.locator(".file-info-permissions summary").click();
+    const input = dialog.getByLabel("Unix-Rechte (oktal)");
+    await input.fill("600");
+    await dialog.getByRole("button", { name: "Rechte anwenden" }).click();
+    await dialog.getByRole("region", { name: "Ergebnis der Rechteänderung" }).getByText(/outcome_unclear/).waitFor();
+    await input.fill("632");
+    await input.evaluate(element => element.setSelectionRange(1, 2));
+    await page.evaluate(() => window.__INFO_SIZE_EVENT__());
+    assert.equal(await input.inputValue(), "632");
+    assert.deepEqual(await input.evaluate(element => [element.selectionStart, element.selectionEnd, document.activeElement === element]), [1, 2, true]);
+    assert.equal(await dialog.locator(".file-info-permissions").evaluate(element => element.open), true);
+    assert.match(await dialog.getByText("Berechtigungen", { exact: true }).locator("..").innerText(), /—/);
+    assert.doesNotMatch(await dialog.getByText("Berechtigungen", { exact: true }).locator("..").innerText(), /777/);
+  });
+
   await runCase("Informationen zeigen lokale Metadaten und berechnen Ordner erst auf Klick", "?keyboard=1&sizeDelay=40", async page => {
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "units_decimal"));
     const pane = page.locator('.pane[data-side="left"]');
@@ -3255,7 +3956,7 @@ try {
     await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
     const pane = page.locator('.pane[data-side="left"]');
     await pane.getByRole("button", { name: "2 ausgelassene Einträge anzeigen" }).click();
-    assert.equal(await pane.getByRole("option").count(), 0);
+    assert.equal(await pane.getByRole("listbox").getByRole("option").count(), 0);
     assert.equal(await pane.locator(".empty").textContent(), "Keine anzeigbaren Einträge");
     assert.match(await pane.getByRole("textbox", { name: "Ausgelassene Einträge" }).inputValue(), /keinen belegten Dateityp/);
   });
@@ -3323,6 +4024,54 @@ try {
     const summary = await dialog.getByText("Größe", { exact: true }).locator("..").innerText();
     assert.match(summary, /≈.*bekannt · Best Effort · 1 Datei ohne Größenangabe/);
     assert.doesNotMatch(summary, /vollständig erfasst/);
+  });
+
+  for (const [provider, revision, theme] of [["sftp", 11, "light"], ["ftps", 21, "dark"]]) {
+    await runCase(`Informationen ändern entfernte Rechte mit Profilbindung · ${provider}`, "?remoteMissingMode=1", async page => {
+      await page.setViewportSize({ width: 390, height: 650 });
+      await page.evaluate(async theme => { const { setTheme } = await import("/theme.js"); setTheme(theme); }, theme);
+      await page.locator(`#connection-list [data-protocol="${provider}"][data-id="mock_${provider}"]`).click();
+      const folder = page.locator('.pane[data-side="left"] .row.dir', { hasText: "remote" });
+      await folder.click({ button: "right" });
+      await page.locator("#context-menu").getByRole("menuitem", { name: /Informationen/ }).click();
+      const dialog = page.getByRole("dialog", { name: /Informationen · remote/ });
+      await dialog.locator(".file-info-permissions summary").click();
+      assert.match(await dialog.locator(".file-info-permissions").innerText(), /Best Effort/);
+      assert.equal(await dialog.locator(".file-info-owner").count(), 0);
+      await page.evaluate(() => {
+        const original = window.__TAURI__.core.invoke;
+        window.__REMOTE_MODE_REQUESTS__ = [];
+        window.__TAURI__.core.invoke = async (command, args) => {
+          if (command !== "change_file_permissions") return original(command, args);
+          window.__REMOTE_MODE_REQUESTS__.push(args.request);
+          return [{ name: args.request.names[0], changed: false, code: "outcome_unclear", message: "Antwort verloren; Bestand vor neuem Versuch prüfen" },
+            { name: `${args.request.names[0]}/file`, changed: false, code: "interrupted", message: "Nicht begonnen" }];
+        };
+      });
+      await dialog.getByLabel("Unix-Rechte (oktal)").fill("750");
+      await dialog.getByLabel("Auch auf alle enthaltenen Dateien und Ordner anwenden").check();
+      if (process.env.DOPPELDECKER_REMOTE_MODE_SCREENSHOTS) await page.screenshot({ path: `${process.env.DOPPELDECKER_REMOTE_MODE_SCREENSHOTS}/${provider}-${theme}.png`, animations: "disabled" });
+      await dialog.getByRole("button", { name: "Rechte anwenden" }).click();
+      await dialog.getByRole("region", { name: "Ergebnis der Rechteänderung" }).getByText(/Antwort verloren/).waitFor();
+      const [request] = await page.evaluate(() => window.__REMOTE_MODE_REQUESTS__);
+      assert.deepEqual({ ...request, requestId: "bound" }, { requestId: "bound", provider, root: "/", names: ["remote"], mode: "750", recursive: true, profileId: `mock_${provider}`, profileRevision: revision });
+      assert.match(await dialog.getByText("Berechtigungen", { exact: true }).locator("..").innerText(), /—/);
+      assert.equal(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth), true);
+      assert.equal(await folder.getAttribute("aria-selected"), "true");
+    });
+  }
+
+  await runCase("Informationen übernehmen die Editorfreigabe ausschließlich aus Backendfähigkeiten", "?keyboard=1", async page => {
+    await page.evaluate(() => {
+      const original = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = (command, args) => command === "get_file_property_capabilities"
+        ? Promise.resolve({ permissions: false, recursivePermissions: false, ownership: false, limitations: ["Gezielt nicht verfügbar"] }) : original(command, args);
+    });
+    await page.getByRole("listbox", { name: /Linke Dateiliste/ }).getByRole("option", { name: /Alpha.txt/ }).click();
+    await page.keyboard.press("Meta+I");
+    const dialog = page.getByRole("dialog", { name: "Informationen · Alpha.txt" });
+    await dialog.getByText("Gezielt nicht verfügbar").waitFor();
+    assert.equal(await dialog.locator(".file-info-editor").count(), 0);
   });
 
   await runCase("FTPS-Informationen verwenden die panegebundene Remote-Größenmessung", "?sizeDelay=40&remoteMissingMode=1", async page => {
@@ -3539,6 +4288,110 @@ try {
     assert.equal(offsets.date[0], offsets.date[1], "Datumsspalte von Kopf und Zeile verschoben.");
   });
 
+  await runCase("Schnellfilter findet Unicode-Normalformen und erhält Aktionsnamen", "?unicodeFilter=1", async page => {
+    const pane = page.locator('.pane[data-side="left"]');
+    const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
+    const filter = pane.getByRole("searchbox", { name: "Name oder Endung links filtern" });
+    const sourceRoot = await pane.locator(".path").inputValue();
+    await filter.fill("CAFÉ");
+    assert.equal(await list.getByRole("option").count(), 1);
+    await list.getByRole("option").click();
+    await list.focus();
+    await page.keyboard.press("F5");
+    await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].operation.items[0]), `${sourceRoot}/Cafe\u0301.txt`);
+    await filter.fill("U\u0308BER");
+    assert.equal(await list.getByRole("option").count(), 1);
+    assert.match(await list.getByRole("option").innerText(), /Überblick/);
+  });
+
+  await runCase("Schnellfilter bindet Auswahl und Dateiaktionen an sichtbare Einträge", "?mixedSort=1", async page => {
+    const pane = page.locator('.pane[data-side="left"]');
+    const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
+    const filter = pane.getByRole("searchbox", { name: "Name oder Endung links filtern" });
+    const kind = pane.getByRole("combobox", { name: "Dateityp links filtern" });
+    const initialCalls = await page.evaluate(() => window.__MOCK_SCAN_CALLS__().length);
+    await list.focus();
+    await page.keyboard.press("Control+A");
+    await filter.fill(".TXT");
+    assert.equal(await list.getByRole("option").count(), 1);
+    assert.match(await list.getByRole("option", { selected: true }).innerText(), /Mitte.txt/);
+    assert.match(await pane.locator(".count").innerText(), /1 von 3 Einträgen/);
+    assert.equal(await page.evaluate(() => window.__MOCK_SCAN_CALLS__().length), initialCalls);
+    await list.focus();
+    await page.keyboard.press("F5");
+    await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+    const operation = await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].operation);
+    assert.equal(operation.items.length, 1);
+    assert.match(operation.items[0], /\/Mitte\.txt$/);
+    await kind.selectOption("folders");
+    await list.getByText("Keine Treffer im geladenen Ordner").waitFor();
+    assert.equal(await list.getByRole("option").count(), 0);
+    await list.focus();
+    await page.keyboard.press("F5");
+    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 1);
+    await filter.fill("");
+    assert.equal(await list.getByRole("option").count(), 2);
+    await pane.locator('.col-name').click();
+    assert.equal(await list.getByRole("option").count(), 2);
+    if (process.env.DOPPELDECKER_UI_EVIDENCE_DIR) await page.screenshot({ path: `${process.env.DOPPELDECKER_UI_EVIDENCE_DIR}/pane-filter-light-review.png` });
+    await filter.press("Escape");
+    assert.equal(await kind.inputValue(), "all");
+    assert.equal(await list.getByRole("option").count(), 3);
+    assert.equal(await list.evaluate(element => document.activeElement === element), true);
+    await filter.fill("kein Treffer");
+    await pane.getByRole("button", { name: "Linken Filter leeren" }).click();
+    assert.equal(await list.getByRole("option").count(), 3);
+    await kind.selectOption("folders");
+    await pane.locator(".path").fill("/mock/anderer-ordner");
+    await pane.locator(".path").press("Enter");
+    await page.waitForFunction(() => document.querySelector('.pane[data-side="left"] .pane-filter-kind').value === "all");
+    assert.equal(await filter.inputValue(), "");
+  });
+
+  await runCase("Schnellfilter erhält die sichere Objektidentität bei gleich aussehenden Namen", "?unsafe=1", async page => {
+    const pane = page.locator('.pane[data-side="left"]');
+    const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
+    await list.locator(".row:not(.unsafe-name)").click();
+    await pane.getByRole("searchbox").fill(".txt");
+    await pane.locator(".col-size").click();
+    await pane.locator(".col-size").click();
+    const selected = list.getByRole("option", { selected: true });
+    assert.equal(await selected.count(), 1);
+    assert.equal(await selected.locator(".unsafe-name-badge").count(), 0);
+    await list.focus();
+    await page.keyboard.press("F5");
+    await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].operation.items.length), 1);
+  });
+
+  await runCase("Schnellfilter bleibt bei großen Listen virtualisiert und je Pane getrennt", "?entries=5000", async page => {
+    const pane = page.locator('.pane[data-side="left"]');
+    const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
+    const filter = pane.getByRole("searchbox", { name: "Name oder Endung links filtern" });
+    await filter.fill("Datei-0");
+    assert.equal(await list.getAttribute("data-virtualized"), "true");
+    assert.ok(await list.locator(".row").count() < 100);
+    await list.focus();
+    await page.keyboard.press("End");
+    await filter.fill("05000");
+    assert.equal(await list.getAttribute("data-virtualized"), "false");
+    assert.equal(await list.getByRole("option").count(), 1);
+    assert.match(await list.getByRole("option").innerText(), /Datei-05000.txt/);
+    const active = await list.getAttribute("aria-activedescendant");
+    assert.equal(await page.locator(`#${active}`).count(), 1);
+    assert.equal(await page.getByRole("searchbox", { name: "Name oder Endung rechts filtern" }).inputValue(), "");
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "theme_dark"));
+    assert.equal(await page.locator("html").getAttribute("data-resolved-theme"), "dark");
+    await page.setViewportSize({ width: 1040, height: 700 });
+    const controlRects = await pane.locator(".pane-filter input, .pane-filter select, .pane-filter button").evaluateAll(elements => elements.map(el => {
+      const r = el.getBoundingClientRect(); return { width: r.width, height: r.height, right: r.right };
+    }));
+    assert.ok(controlRects.every(r => r.width >= 28 && r.height >= 28));
+    assert.ok(controlRects.at(-1).right <= (await pane.boundingBox()).x + (await pane.boundingBox()).width);
+    if (process.env.DOPPELDECKER_UI_EVIDENCE_DIR) await page.screenshot({ path: `${process.env.DOPPELDECKER_UI_EVIDENCE_DIR}/pane-filter-dark-review.png` });
+  });
+
   await runCase("Virtualisierung eines großen Ordners", "?entries=5000", async page => {
     const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
     assert.ok(await list.locator('[role="option"]').count() < 100, "Zu viele Zeilen liegen gleichzeitig im DOM.");
@@ -3547,6 +4400,37 @@ try {
     const selected = page.locator('[role="option"][aria-selected="true"]');
     assert.match(await selected.innerText(), /Datei-05000\.txt/);
     assert.equal(await selected.getAttribute("aria-setsize"), "5000");
+  });
+
+  await runCase("Linux-Menüs folgen Hell, Dunkel und dem lebenden Systemmodus", "", async page => {
+    await page.emulateMedia({ colorScheme: "dark" });
+    await page.evaluate(() => {
+      document.documentElement.dataset.platform = "linux";
+      window.__NATIVE_THEMES__ = [];
+      const original = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = async (command, args) => {
+        if (command === "sync_native_theme") window.__NATIVE_THEMES__.push(args);
+        return original(command, args);
+      };
+    });
+    for (const [preference, dark] of [["light", false], ["dark", true], ["auto", true]]) {
+      await page.evaluate(value => window.__MOCK_EMIT__("menu", `theme_${value}`), preference);
+      await page.waitForFunction(({ preference, dark }) => {
+        const last = window.__NATIVE_THEMES__.at(-1);
+        return last?.preference === preference && last.dark === dark;
+      }, { preference, dark });
+    }
+    await page.emulateMedia({ colorScheme: "light" });
+    await page.waitForFunction(() => window.__NATIVE_THEMES__.at(-1)?.preference === "auto"
+      && window.__NATIVE_THEMES__.at(-1)?.dark === false);
+    assert.equal(await page.locator("html").getAttribute("data-resolved-theme"), "light");
+    await page.evaluate(async () => {
+      document.documentElement.dataset.platform = "macos";
+      window.__NATIVE_THEMES__ = [];
+      const { setTheme } = await import("/theme.js");
+      setTheme("dark", false);
+    });
+    assert.equal(await page.evaluate(() => window.__NATIVE_THEMES__.length), 0);
   });
 
   await runCase("Theme-Persistenz über das native Menü", "", async page => {
@@ -3816,11 +4700,11 @@ try {
     });
     await page.waitForFunction(() => typeof window.__RELEASE_REAL__ === "function");
     await page.evaluate(() => window.__RELEASE_REAL__());
-    await page.getByRole("dialog", { name: "Lokalen Realmodus bestätigen" })
+    await page.getByRole("dialog", { name: "Sync ausführen" })
       .getByRole("button", { name: "Vorbereitung verwerfen" }).click();
     await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 25)));
     assert.equal(await page.evaluate(() => window.__REAL_PREPARATIONS__), 1);
-    assert.equal(await page.getByRole("dialog", { name: "Lokalen Realmodus bestätigen" }).count(), 0);
+    assert.equal(await page.getByRole("dialog", { name: "Sync ausführen" }).count(), 0);
   });
 
   await runCase("Sync serialisiert alte Remoteantwort und Discard vor neuer Vorbereitung", "?remoteFile=1", async page => {
@@ -3831,11 +4715,11 @@ try {
       let held = false;
       window.__REMOTE_PREPARATION_ORDER__ = [];
       window.__TAURI__.core.invoke = async (command, args) => {
-        if (command === "prepare_ftps_sync" || command === "discard_ftps_sync") {
+        if (command === "prepare_content_sync" || command === "discard_content_sync") {
           window.__REMOTE_PREPARATION_ORDER__.push(command);
         }
         const result = await invoke(command, args);
-        if (command === "prepare_ftps_sync" && !held) {
+        if (command === "prepare_content_sync" && !held) {
           held = true;
           await new Promise(resolve => { window.__RELEASE_REMOTE__ = resolve; });
         }
@@ -3849,10 +4733,10 @@ try {
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
     await page.locator("#sync-preview-remote").click();
     await page.evaluate(() => window.__RELEASE_REMOTE__());
-    await page.waitForFunction(() => window.__REMOTE_PREPARATION_ORDER__.filter(name => name === "prepare_ftps_sync").length === 2);
+    await page.waitForFunction(() => window.__REMOTE_PREPARATION_ORDER__.filter(name => name === "prepare_content_sync").length === 2);
     await page.locator("#real-mode-banner").waitFor({ state: "visible" });
     assert.deepEqual(await page.evaluate(() => window.__REMOTE_PREPARATION_ORDER__), [
-      "prepare_ftps_sync", "discard_ftps_sync", "prepare_ftps_sync",
+      "prepare_content_sync", "discard_content_sync", "prepare_content_sync",
     ]);
     assert.doesNotMatch(await page.locator("#dock-summary").innerText(), /noch belegt|busy/i);
   });
@@ -3975,135 +4859,461 @@ try {
     await page.clock.pauseAt(new Date("2026-10-19T12:00:01Z"));
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
     await page.getByRole("button", { name: "Realmodus" }).dispatchEvent("click");
-    const dialog = page.getByRole("dialog", { name: "Lokalen Realmodus bestätigen" });
+    const dialog = page.getByRole("dialog", { name: "Sync ausführen" });
     await dialog.waitFor();
     await page.clock.runFor(200);
     await page.clock.resume();
-    await dialog.locator("#real-phrase").fill("REAL ziel K7M4Q2");
-    await dialog.getByRole("button", { name: "Einmalig real starten" }).click();
-    await page.waitForFunction(() => document.documentElement.dataset.realConfirmation === "REAL ziel K7M4Q2", null, { timeout: 3000 });
+    await dialog.getByRole("button", { name: "Sync starten" }).click();
+    await page.waitForFunction(() => document.documentElement.dataset.realConfirmation === "true", null, { timeout: 3000 });
   });
 
-  await runCase("Realmodus-Phrasengate und Modal-Fokus", "", async page => {
+  await runCase("Sync-Wirkungsdialog ohne Phrase hält Fokus und verwirft mit Escape", "", async page => {
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
     const trigger = page.getByRole("button", { name: "Realmodus" });
     await trigger.click();
-    const dialog = page.getByRole("dialog", { name: "Lokalen Realmodus bestätigen" });
+    const dialog = page.getByRole("dialog", { name: "Sync ausführen" });
     await dialog.waitFor();
-    const phrase = dialog.locator("#real-phrase");
-    const start = dialog.getByRole("button", { name: "Einmalig real starten" });
-    assert.equal(await start.isDisabled(), true);
-    await phrase.fill("falsch");
-    assert.equal(await start.isDisabled(), true);
-    await phrase.fill("REAL ziel K7M4Q2");
-    assert.equal(await start.isEnabled(), true);
-    await phrase.press("Escape");
+    assert.equal(await dialog.locator("input").count(), 0);
+    assert.match(await dialog.innerText(), /Quelle.*Ziel.*Wirkung/s);
+    assert.equal(await dialog.getByRole("button", { name: "Sync starten" }).isEnabled(), true);
+    await page.keyboard.press("Escape");
     assert.equal(await page.evaluate(() => document.activeElement?.id), await trigger.getAttribute("id"));
+    assert.equal(await page.locator("html").getAttribute("data-real-confirmation"), null);
     await trigger.click();
-    await dialog.waitFor();
-    await dialog.locator("#real-phrase").fill("REAL ziel K7M4Q2");
-    await dialog.getByRole("button", { name: "Einmalig real starten" }).click();
-    await page.waitForFunction(() => document.documentElement.dataset.realConfirmation === "REAL ziel K7M4Q2");
-    assert.equal(await page.locator("html").getAttribute("data-real-confirmation"), "REAL ziel K7M4Q2");
+    await dialog.getByRole("button", { name: "Sync starten" }).click();
+    await page.waitForFunction(() => document.documentElement.dataset.realConfirmation === "true");
   });
 
-  await runCase("SFTP-Realmodus bindet Remote-Identität und Einmalphrase", "", async page => {
-    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-    await page.locator("#btn-sync").click();
-    const execution = page.getByRole("dialog", { name: "SFTP-Ausführung" });
-    await execution.waitFor();
-    await execution.getByRole("button", { name: "Direkt bestätigen" }).click();
-    const confirmation = page.getByRole("dialog", { name: "SFTP-Realmodus bestätigen" });
-    await confirmation.waitFor();
-    assert.match(await confirmation.innerText(), /Hostkey .* Sitzung 1/);
-    await confirmation.locator("#real-phrase").fill("REAL remote K7M4Q2");
-    await confirmation.getByRole("button", { name: "Einmalig real starten" }).click();
-    assert.equal(await page.locator("html").getAttribute("data-sftp-confirmation"), "REAL remote K7M4Q2");
-    await page.locator("#dock-summary .pill.ok").filter({ hasText: "Sync ausgeführt" }).waitFor();
+  for (const theme of ["light", "dark"]) {
+    await runCase(`Sync-Bereichswarnung bleibt bei kleinem Fenster erreichbar: ${theme}`, "", async page => {
+      await page.setViewportSize({ width: 760, height: 480 });
+      await page.evaluate(async theme => {
+        const { setTheme } = await import("/theme.js"); setTheme(theme, false);
+        const invoke = window.__TAURI__.core.invoke;
+        window.__TAURI__.core.invoke = async (command, args) => {
+          const result = await invoke(command, args);
+          if (command === "prepare_real_sync") result.scope_warnings = ["HOME-Ziel: Der interne Sicherungsbereich .doppeldecker-quarantine bleibt auf beiden Seiten vom Sync ausgeschlossen."];
+          return result;
+        };
+      }, theme);
+      await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+      await page.getByRole("button", { name: "Realmodus" }).click();
+      const dialog = page.getByRole("dialog", { name: "Sync ausführen" });
+      const warning = dialog.getByText(/HOME-Ziel:/);
+      await warning.scrollIntoViewIfNeeded();
+      assert.equal(await warning.isVisible(), true);
+      const start = dialog.getByRole("button", { name: "Sync starten" });
+      await start.scrollIntoViewIfNeeded();
+      const bounds = await start.boundingBox();
+      assert.ok(bounds && bounds.y >= 0 && bounds.y + bounds.height <= 480);
+      await page.keyboard.press("Escape");
+    });
+  }
+
+  await runCase("ContentSync Abbruch bilanziert tatsächliche Runtime-Dateizeitauslassung", "", async page => {
+    await page.evaluate(() => window.__MOCK_EMIT__("sync-done", {
+      dry_run: false, cancelled: true, execution_class: "best_effort", files_copied: 1,
+      files_deleted: 0, metadata_updated: 0, bytes_copied: 12, quarantine: null,
+      metadata_report: { profile: "Portable", classes: [{ class: "Mtime", transferred: 0, omitted: 1 }],
+        issues: [{ path: "bericht.txt", class: "Mtime", kind: "Unsupported", reason: "Server hat die Dateizeit beim Versuch nicht exakt übernommen" }] },
+    }));
+    await page.locator("#dock-summary").filter({ hasText: "Best-Effort-Sync abgebrochen" }).waitFor();
+    const text = await page.locator("#dock-summary").innerText();
+    assert.match(text, /1 Dateizeit ausgelassen/); assert.doesNotMatch(text, /Rechte ausgelassen|Sync ausgeführt/);
   });
-
-  await runCase("Remote-zu-Remote nutzt generische Provider-Queue", "", async page => {
+  await runCase("ContentSync SFTP-Navigation meldet gewöhnlichen Sync verfügbar", "", async page => {
     await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-    await page.getByRole("listbox", { name: /Rechte Dateiliste/ }).click();
-    await page.locator('#connection-list [data-protocol="webdav"][data-id="mock_webdav"]').click();
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-    await page.locator("#btn-sync").click();
-    const execution = page.getByRole("dialog", { name: "REMOTE↔REMOTE-Ausführung" });
-    await execution.waitFor();
-    assert.match(await execution.innerText(), /Plan ist vollständig gebunden/);
-    await execution.getByRole("button", { name: "In Queue" }).click();
-    await page.locator("#queue-count").filter({ hasText: "1" }).waitFor();
-    await page.locator("#btn-queue").click();
-    assert.match(await page.locator("#queue-popover").innerText(), /Provider AddOnly · Sftp .* → WebDav/s);
+    await page.locator("#dock-summary").filter({ hasText: "Gewöhnlicher Dateisync ist verfügbar" }).waitFor();
+    const text = await page.locator("#dock-summary").innerText();
+    assert.match(text, /Bidirektionaler Dateisync ist als Best Effort ebenfalls verfügbar/);
+    assert.match(text, /Strikter Sync mit atomarer Rootbindung.*strikter bidirektionaler Sync.*Providerquarantäne/s);
+    assert.doesNotMatch(text, /Sync und Providerquarantäne bleiben gesperrt/);
   });
-
-  await runCase("Provider-Enqueuefehler behält exakt dieselbe Vorbereitung für Retry", "?providerEnqueueFailsOnce=1", async page => {
-    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-    await page.getByRole("listbox", { name: /Rechte Dateiliste/ }).click();
-    await page.locator('#connection-list [data-protocol="webdav"][data-id="mock_webdav"]').click();
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-
-    await page.locator("#btn-sync").click();
-    let execution = page.getByRole("dialog", { name: "REMOTE↔REMOTE-Ausführung" });
-    await execution.getByRole("button", { name: "In Queue" }).click();
-    await page.getByText(/Provider-Mock-Enqueue ist vor dem Commit belegt/).waitFor();
-
-    await page.locator("#btn-sync").click();
-    execution = page.getByRole("dialog", { name: "REMOTE↔REMOTE-Ausführung" });
-    await execution.getByRole("button", { name: "In Queue" }).click();
-    await page.locator("#queue-count").filter({ hasText: "1" }).waitFor();
-    const state = await page.evaluate(() => window.__MOCK_PREPARATION_ACTIONS__());
-    assert.deepEqual(state.calls.map(call => call.command), [
-      "prepare_provider_sync",
-      "enqueue_provider_sync",
-      "enqueue_provider_sync",
-    ]);
-    assert.equal(state.pendingProvider, false);
-  });
-
-  await runCase("Remote-zu-Remote verbraucht direkt eine Provider-Einmalphrase", "", async page => {
-    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-    await page.getByRole("listbox", { name: /Rechte Dateiliste/ }).click();
-    await page.locator('#connection-list [data-protocol="webdav"][data-id="mock_webdav"]').click();
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-    await page.locator("#btn-sync").click();
-    const execution = page.getByRole("dialog", { name: "REMOTE↔REMOTE-Ausführung" });
-    await execution.getByRole("button", { name: "Direkt bestätigen" }).click();
-    const confirmation = page.getByRole("dialog", { name: "REMOTE↔REMOTE-Realmodus bestätigen" });
-    await confirmation.locator("#real-phrase").fill("REAL provider K7M4Q2");
-    await confirmation.getByRole("button", { name: "Einmalig real starten" }).click();
-    assert.equal(await page.locator("html").getAttribute("data-provider-confirmation"), "REAL provider K7M4Q2");
-    await page.locator("#dock-summary .pill.ok").filter({ hasText: "Sync ausgeführt" }).waitFor();
-  });
-
-  await runCase("Provider-Startfehler behält Protokoll und Vorbereitung für Retry", "?providerRunFailsOnce=1", async page => {
-    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-    await page.getByRole("listbox", { name: /Rechte Dateiliste/ }).click();
-    await page.locator('#connection-list [data-protocol="webdav"][data-id="mock_webdav"]').click();
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (const effect of ["permanent", "quarantine", "source_best_effort", "zero"]) {
+    await runCase(`ContentSync Abschluss meldet tatsächliche Absicherung und Entfernung: ${effect}`, "", async page => {
+      if (effect === "source_best_effort") await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+      await page.evaluate(effect => {
+        window.__MOCK_EMIT__("sync-done", {
+          dry_run: false, cancelled: false, files_copied: 1, bytes_copied: 12, metadata_updated: 0,
+          files_deleted: ["permanent", "quarantine"].includes(effect) ? 1 : 0,
+          quarantine: effect === "quarantine" ? "/mock/.doppeldecker-quarantine/run-1" : null,
+          execution_class: ["permanent", "source_best_effort"].includes(effect) ? "best_effort" : undefined,
+          local_execution: ["quarantine", "source_best_effort"].includes(effect)
+            ? { new_file_commit: "assured", file_flush: true, directory_flush: true, irreversible_replacements: 0 } : null,
+        });
+      }, effect);
+      await page.locator("#dock-summary").filter({ hasText: "Sync ausgeführt" }).waitFor();
+      const text = await page.locator("#dock-summary").innerText();
+      if (effect === "permanent") { assert.match(text, /1 dauerhaft entfernt/); assert.doesNotMatch(text, /in Quarantäne|Wiederherstellung/); }
+      if (effect === "quarantine") { assert.match(text, /Abgesicherter Sync ausgeführt.*1 in Quarantäne.*Wiederherstellung:.*run-1/s); assert.doesNotMatch(text, /dauerhaft entfernt/); }
+      if (effect === "source_best_effort") { assert.match(text, /Best-Effort-Sync ausgeführt/); assert.doesNotMatch(text, /Abgesicherter Sync/); }
+      if (effect === "zero") { assert.match(text, /0 entfernt/); assert.doesNotMatch(text, /in Quarantäne|dauerhaft entfernt/); }
+    });
+  }
+  for (const code of ["sandbox_violation", "permission_denied", "connection_lost"]) {
+    for (const trigger of ["preview", "run"]) {
+      await runCase(`ContentSync Preparefehler erlaubt erneute Vorschau und Start: ${code} ${trigger}`, `?contentPrepareFails=${code}`, async page => {
+        await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+        await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+        const preview = page.locator("#sync-preview-remote"); await preview.waitFor({ state: "visible" });
+        await page.locator(trigger === "preview" ? "#sync-preview-remote" : "#btn-sync").click();
+        await page.locator("#dock-summary").filter({ hasText: "vorübergehende Testursache" }).waitFor();
+        assert.equal(await page.locator("#sync-view").isVisible(), true);
+        assert.equal(await preview.isVisible(), true);
+        assert.equal(await preview.isEnabled(), true);
+        assert.equal(await page.locator("#btn-sync").isEnabled(), true);
+        assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+        await page.evaluate(() => window.__MOCK_REPAIR_CONTENT_PREPARATION__());
+        await preview.click();
+        await page.locator("#sync-summary .pill").first().waitFor();
+        assert.equal(await page.locator("#sync-hint").isVisible(), false);
+        await page.locator("#btn-sync").click();
+        await page.getByRole("dialog", { name: "Dateisync ausführen" }).getByRole("button", { name: "Sync bestätigen und starten" }).click();
+        await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+        const calls = await page.evaluate(() => window.__MOCK_CONTENT_SYNC_STATE__().calls);
+        assert.equal(calls.filter(call => call.command === "prepare_content_sync").length, 2);
+        assert.equal(calls.filter(call => call.command === "enqueue_content_sync").length, 1);
+      });
+    }
+  }
+  for (const mode of ["Update", "Mirror"]) {
+    await runCase(`ContentSync lokales Ziel erhält Quarantäne: ${mode}`, "?contentQuarantine=1", async page => {
+      await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+      await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+      await page.locator(mode === "Update" ? "#sync-update" : "#sync-mirror").check();
       await page.locator("#btn-sync").click();
-      const execution = page.getByRole("dialog", { name: "REMOTE↔REMOTE-Ausführung" });
-      await execution.getByRole("button", { name: "Direkt bestätigen" }).click();
-      const confirmation = page.getByRole("dialog", { name: "REMOTE↔REMOTE-Realmodus bestätigen" });
-      await confirmation.locator("#real-phrase").fill("REAL provider K7M4Q2");
-      await confirmation.getByRole("button", { name: "Einmalig real starten" }).click();
-      if (attempt === 0) {
-        await page.getByText(/Provider-Mock-Start ist vor der Entnahme belegt/).waitFor();
+      const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" }); await dialog.waitFor();
+      assert.match(await dialog.innerText(), /Doppeldecker-Quarantäne.*gesichert.*wiederherstellbar.*run-mock-geprüft/s);
+      assert.doesNotMatch(await dialog.innerText(), /dauerhaft ersetzt|dauerhaft entfernt|Keine Doppeldecker-Quarantäne|keine automatische Wiederherstellung/);
+      assert.equal(await dialog.locator("input").count(), 0);
+      await dialog.getByRole("button", { name: "Änderungen mit Quarantäne bestätigen" }).click();
+      await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+    });
+  }
+  await runCase("ContentSync zeigt benannte Datenströme in Plan und Bestätigung", "", async page => {
+    await page.locator('#connection-list [data-protocol="smb"][data-id="mock_smb"]').click();
+    await page.evaluate(() => {
+      const invoke = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = async (command, args) => {
+        const result = await invoke(command, args);
+        if (command === "prepare_content_sync") {
+          result.plan.actions = [
+            { type: "CopyFile", path: "Datei.txt", metadata: { named_streams: true } },
+            { type: "CreateDir", path: "Ordner", metadata: { named_streams: false } },
+          ];
+          result.plan.comparison = null;
+          result.plan.metadata_report = { profile: "NativeBestEffort", classes: [{ class: "NamedStreams", transferred: 1, omitted: 1 }], issues: [{ path: "Ordner", class: "NamedStreams", reason: "SMB-Verzeichnisströme werden hier nicht beobachtet" }] };
+        }
+        return result;
+      };
+      window.__MOCK_EMIT__("menu", "sync_mode");
+    });
+    await page.locator('#sync-metadata-group [value="NativeBestEffort"]').check();
+    await page.locator("#btn-sync").click();
+    const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+    await dialog.waitFor();
+    assert.match(await dialog.innerText(), /Ordner.*Benannte Datenströme.*SMB-Verzeichnisströme werden hier nicht beobachtet/s);
+    assert.match(await page.locator("#sync-actions").innerText(), /Benannte Datenströme/);
+    assert.doesNotMatch(await dialog.innerText(), /NamedStreams|Metadatenmerkmal ·/);
+    await page.keyboard.press("Escape");
+    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+  });
+  await runCase("SMB-Wirkung zeigt Profilroot und ausgewählten Unterpfad", "", async page => {
+    const displayed = await page.evaluate(async () => {
+      const { identityDisplay, confirmContentSync } = await import("/content-sync-ui.js");
+      const identity = (canonical, virtual, host = "smb.invalid", port = 445) => ({ provider: "Smb", identity: {
+        server: { host, port, share: "Team", canonical_root: canonical }, virtual_root: virtual,
+      } });
+      const cases = [["/", "/"], ["/", "/eingang"], ["/team", "/"], ["/team", "/eingang"],
+        ["/team", "/eingang", "smb.invalid", 1445], ["/team", "/eingang", "::1", 1445]];
+      const preview = {
+        source_provider: "Smb", target_provider: "Smb",
+        source_identity: identity("/team", "/eingang"), target_identity: identity("/archiv", "/2026"),
+        plan: { actions: [], copy_count: 0, update_count: 0, delete_count: 0, bytes_to_transfer: 0 },
+        limitations: ["SMB-Quelle: Zugriffe auf benannte Datenströme halten die gewählte Wurzel und ihre Unterordner. Darüberliegende Ordner werden frisch geprüft; ihre serverseitige Pfadauflösung bleibt Best Effort."],
+      };
+      void confirmContentSync(preview);
+      return cases.map(parts => identityDisplay(identity(...parts)));
+    });
+    assert.deepEqual(displayed, [
+      "smb://smb.invalid/Team/", "smb://smb.invalid/Team/eingang",
+      "smb://smb.invalid/Team/team", "smb://smb.invalid/Team/team/eingang",
+      "smb://smb.invalid:1445/Team/team/eingang", "smb://[::1]:1445/Team/team/eingang",
+    ]);
+    const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+    await dialog.waitFor();
+    assert.match(await dialog.innerText(), /smb:\/\/smb.invalid\/Team\/team\/eingang/);
+    assert.match(await dialog.innerText(), /smb:\/\/smb.invalid\/Team\/archiv\/2026/);
+    assert.match(await dialog.innerText(), /Darüberliegende Ordner.*Best Effort/);
+    await page.keyboard.press("Escape");
+    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+  });
+  await runCase("Forward-Bidir benennt ausgelassene Datenströme im Wirkungsdetail", "", async page => {
+    const preview = forwardConfirmationFixture();
+    preview.effects = preview.effects.slice(-1);
+    preview.effects[0].plan.metadata_report.issues = [{ path: "Datei.txt", class: "NamedStreams", reason: "Beobachtete Zielströme gehen beim Ersetzen verloren" }];
+    await page.evaluate(async preview => {
+      const { confirmForwardBidirectional } = await import("/forward-bidirectional-ui.js");
+      void confirmForwardBidirectional(preview, { pairName: "SMB-Paar" });
+    }, preview);
+    const dialog = page.getByRole("dialog");
+    await dialog.waitFor();
+    assert.match(await dialog.innerText(), /Datei.txt.*Benannte Datenströme.*Beobachtete Zielströme gehen beim Ersetzen verloren/s);
+    assert.doesNotMatch(await dialog.innerText(), /NamedStreams/);
+    await page.keyboard.press("Escape");
+  });
+  await runCase("ContentSync große Änderungs- und Metadatenlisten bleiben begrenzt", "", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.evaluate(() => {
+      const invoke = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = async (command, args) => {
+        const result = await invoke(command, args);
+        if (command === "prepare_content_sync") {
+          result.plan.actions = Array.from({ length: 200 }, (_, index) => ({ type: "UpdateFile", path: `Datei-${index}.txt` }));
+          result.plan.metadata_report = { profile: "Portable", classes: [{ class: "Mtime", transferred: 0, omitted: 200 }], issues: Array.from({ length: 200 }, (_, index) => ({ path: `Datei-${index}.txt`, class: "Mtime", reason: "Ziel stellt diese Dateizeit nicht exakt dar" })) };
+        }
+        return result;
+      };
+      window.__MOCK_EMIT__("menu", "sync_mode");
+    });
+    await page.locator("#btn-sync").click();
+    const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" }); await dialog.waitFor();
+    assert.equal(await dialog.locator("li").count(), 100);
+    assert.match(await page.locator("#sync-metadata-note-title").innerText(), /Dateizeiten.*ausgelassen/);
+    assert.match(await dialog.innerText(), /150 weitere Änderungen.*Planliste/s);
+    assert.match(await dialog.innerText(), /150 weitere Metadatenhinweise.*Planliste/s);
+    assert.match(await dialog.innerText(), /Dateiversion ersetzen.*Dateizeit/s);
+    assert.doesNotMatch(await dialog.innerText(), /UpdateFile|NormalMode|Mtime/);
+    await page.keyboard.press("Escape");
+  });
+  await runCase("ContentSync Vorbereitung kann mit Escape abgebrochen werden", "?contentPrepareDelay=1", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+    await page.locator("#btn-sync").click();
+    await page.locator("#btn-cancel").waitFor({ state: "visible" });
+    await page.keyboard.press("Escape");
+    await page.locator("#dock-summary").filter({ hasText: "abgebrochen" }).waitFor();
+    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+    assert.equal(await page.getByRole("dialog", { name: "Dateisync ausführen" }).count(), 0);
+  });
+  for (const large of [false, true]) {
+    await runCase(`ContentSync Mirror bestätigt dauerhafte Entfernung: ${large ? "groß mit Phrase" : "klein ohne Phrase"}`, large ? "?contentLargeRemove=1" : "", async page => {
+      await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+      await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+      await page.locator("#sync-mirror").check();
+      assert.match(await page.locator("#sync-effects-group").innerText(), /Zusätzliche Zieldateien entfernen/);
+      if (!large) {
+        await page.locator('#sync-metadata-group [value="NativeBestEffort"]').check();
+        assert.equal(await page.locator("#sync-mirror").isChecked(), true);
+      }
+      await page.locator("#btn-sync").click();
+      const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+      assert.match(await dialog.innerText(), /Einträge.*dauerhaft entfernt.*Keine Doppeldecker-Quarantäne/s);
+      const start = dialog.getByRole("button", { name: "Dauerhafte Änderungen bestätigen" });
+      if (large) {
+        const phrase = dialog.getByRole("textbox", { name: "Exakten Entfernungstext eingeben" });
+        assert.equal(await start.isEnabled(), false);
+        await phrase.fill("FALSCH"); assert.equal(await start.isEnabled(), false);
+        await phrase.fill("ENTFERNEN 1001 MOCK");
+      } else assert.equal(await dialog.locator("input").count(), 0);
+      await start.click();
+      await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+      const args = await page.evaluate(() => window.__MOCK_CONTENT_SYNC_STATE__().calls.find(call => call.command === "enqueue_content_sync").args);
+      assert.equal(args.removalPhrase, large ? "ENTFERNEN 1001 MOCK" : null);
+    });
+  }
+  await runCase("ContentSync verspätete Einreihantwort erhält den echten Abschluss", "", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.evaluate(() => {
+      const invoke = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = async (command, args) => {
+        const result = await invoke(command, args);
+        if (command === "enqueue_content_sync") {
+          window.__MOCK_EMIT__("sync-done", { operationId: result, attempt: 0, dry_run: false,
+            files_copied: 1, files_deleted: 0, metadata_updated: 0, bytes_copied: 12 });
+          await new Promise(resolve => { window.__RELEASE_CONTENT_ENQUEUE__ = resolve; });
+        }
+        return result;
+      };
+      window.__MOCK_EMIT__("menu", "sync_mode");
+    });
+    await page.locator("#btn-sync").click();
+    await page.getByRole("dialog", { name: "Dateisync ausführen" }).getByRole("button", { name: "Sync bestätigen und starten" }).click();
+    await page.waitForFunction(() => typeof window.__RELEASE_CONTENT_ENQUEUE__ === "function");
+    await page.locator("#dock-summary").filter({ hasText: "Sync ausgeführt" }).waitFor();
+    const completed = await page.locator("#dock-summary").innerText();
+    await page.evaluate(async () => { window.__RELEASE_CONTENT_ENQUEUE__(); await new Promise(resolve => setTimeout(resolve, 0)); });
+    assert.equal(await page.locator("#dock-summary").innerText(), completed);
+  });
+  for (const theme of ["light", "dark"]) {
+    await runCase(`ContentSync frische Queue-Wirkung und Digest nach Reopen: ${theme}`, "?contentReopen=1", async page => {
+      await page.setViewportSize({ width: 760, height: 480 });
+      await page.evaluate(async theme => { const { setTheme } = await import("/theme.js"); setTheme(theme, false); }, theme);
+      await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+      await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+      await page.locator("#btn-sync").click();
+      await page.getByRole("dialog", { name: "Dateisync ausführen" }).getByRole("button", { name: "Sync bestätigen und starten" }).click();
+      await page.locator("#btn-queue").click();
+      await page.getByRole("button", { name: "Plan bestätigen" }).click();
+      const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+      assert.match(await dialog.innerText(), /2 vorhandene Dateiversion.*dauerhaft ersetzt/s);
+      assert.match(await dialog.innerText(), /frisch-geändert.txt/);
+      assert.equal(await dialog.locator("input").count(), 0);
+      const start = dialog.getByRole("button", { name: "Dauerhafte Änderungen bestätigen" });
+      await start.scrollIntoViewIfNeeded();
+      const bounds = await start.boundingBox();
+      assert.ok(bounds && bounds.y >= 0 && bounds.y + bounds.height <= 480);
+      await page.keyboard.press("Escape");
+      assert.equal(await page.locator("#queue-popover").isVisible(), true);
+      assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].state), "AwaitingConfirmation");
+      await page.getByRole("button", { name: "Plan bestätigen" }).click();
+      await dialog.getByRole("button", { name: "Dauerhafte Änderungen bestätigen" }).click();
+      await page.waitForFunction(() => window.__MOCK_CONTENT_SYNC_STATE__().calls.some(call => call.command === "approve_content_sync_queue_entry"));
+      const approval = await page.evaluate(() => window.__MOCK_CONTENT_SYNC_STATE__().calls.find(call => call.command === "approve_content_sync_queue_entry").args);
+      assert.deepEqual(approval.preparationDigest, Array(32).fill(9));
+      assert.equal(approval.effectsConfirmed, true);
+      assert.equal(await page.locator("#queue-popover").isVisible(), true);
+    });
+  }
+  await runCase("ContentSync verspätete Vorbereitung nach Scopewechsel wird verworfen", "", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.evaluate(() => {
+      const invoke = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = async (command, args) => {
+        const result = await invoke(command, args);
+        if (command === "prepare_content_sync") await new Promise(resolve => { window.__RELEASE_CONTENT__ = resolve; });
+        return result;
+      };
+      window.__MOCK_EMIT__("menu", "sync_mode");
+    });
+    await page.locator("#btn-sync").click();
+    await page.waitForFunction(() => typeof window.__RELEASE_CONTENT__ === "function");
+    await page.locator("#sync-update").check();
+    await page.evaluate(() => window.__RELEASE_CONTENT__());
+    await page.waitForFunction(() => window.__MOCK_CONTENT_SYNC_STATE__().calls.some(call => call.command === "discard_content_sync"));
+    assert.equal(await page.getByRole("dialog", { name: "Dateisync ausführen" }).count(), 0);
+    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+  });
+  for (const mode of ["normal", "vertauscht", "recovery-queue"]) {
+    await runCase(`Forward-Bidir vollständige Wirkungsbilanz und Pfade: ${mode}`, "", async page => {
+      const preview = forwardConfirmationFixture();
+      if (mode === "recovery-queue") preview.recovery = { warning: "Vorheriger Lauf unterbrochen" };
+      await page.setViewportSize({ width: 760, height: 480 });
+      await page.evaluate(async ({ preview, mode }) => {
+        const { confirmForwardBidirectional } = await import("/forward-bidirectional-ui.js");
+        window.__FORWARD_CONFIRMATION_RESULT__ = undefined;
+        confirmForwardBidirectional(preview, { pairName: "Großes Konfliktpaar", queued: mode === "recovery-queue",
+          visibleRoles: mode === "vertauscht" ? { left: "right", right: "left" } : { left: "left", right: "right" },
+        }).then(value => { window.__FORWARD_CONFIRMATION_RESULT__ = value; });
+      }, { preview, mode });
+      const dialog = page.getByRole("dialog");
+      await dialog.waitFor();
+      const text = await dialog.innerText();
+      assert.match(text, /22 hinzufügen · 5 ersetzen · 11 Entfernungsaktionen/);
+      assert.match(text, /3 Dateiversion\(en\) werden dauerhaft ersetzt/);
+      assert.match(text, /7 Einträge werden dauerhaft entfernt/);
+      assert.match(text, /2 alte Dateiversion\(en\) und 4 zusätzliche Einträge/);
+      assert.match(text, /2 Metadatenhinweise/);
+      const roots = await dialog.locator(".real-grid .real-card").allTextContents();
+      assert.match(roots[0], mode === "vertauscht" ? /paar-rechts/ : /paar-links/);
+      assert.match(roots[1], mode === "vertauscht" ? /paar-links/ : /paar-rechts/);
+      const effectsSummary = dialog.getByText("Alle 24 Teilwirkungen", { exact: true });
+      const actionsSummary = dialog.getByText("Alle 55 Planaktionen und Pfade", { exact: true });
+      if (mode === "normal") {
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+          if (await effectsSummary.evaluate(element => document.activeElement === element)) break;
+          await page.keyboard.press("Tab");
+        }
+        assert.equal(await effectsSummary.evaluate(element => document.activeElement === element), true);
+        await page.keyboard.press("Enter");
+        await page.keyboard.press("Tab");
+        assert.equal(await actionsSummary.evaluate(element => document.activeElement === element), true);
+        await page.keyboard.press("Space");
+        await page.keyboard.press("Tab");
+        assert.equal(await dialog.getByRole("button", { name: "Abbrechen" }).evaluate(element => document.activeElement === element), true);
+        await page.keyboard.press("Shift+Tab");
+        assert.equal(await actionsSummary.evaluate(element => document.activeElement === element), true);
+      } else {
+        await effectsSummary.click();
+        await actionsSummary.click();
+      }
+      assert.match(await dialog.innerText(), /Dateizeit.*Ziel unterstützt keine prüfbare Dateizeit/s);
+      assert.match(await dialog.innerText(), /letzter-ordner\/rechte.txt.*ACL.*ACL-Modell ist nicht darstellbar <Details>/s);
+      const paths = await dialog.innerText();
+      const sourceSide = mode === "vertauscht" ? "Rechts" : mode === "recovery-queue" ? "Paarseite links" : "Links";
+      const targetSide = mode === "vertauscht" ? "Links" : mode === "recovery-queue" ? "Paarseite rechts" : "Rechts";
+      assert.ok(paths.includes(`${sourceSide}: konflikt-53/ä.txt → ${targetSide}: konflikt-53/ä-Kopie.txt`));
+      assert.match(paths, /dauerhaft-entfernen.txt/);
+      assert.doesNotMatch(paths, /Nicht darstellbarer Pfad/);
+      if (process.env.DOPPELDECKER_SCREENSHOT_DIR) await page.screenshot({ path: `${process.env.DOPPELDECKER_SCREENSHOT_DIR}/forward-complete-${mode}.png` });
+      const start = dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" });
+      assert.equal(await start.isEnabled(), true);
+      const bounds = await start.boundingBox();
+      assert.ok(bounds && bounds.y >= 0 && bounds.y + bounds.height <= 480);
+      await start.click();
+      await page.waitForFunction(() => window.__FORWARD_CONFIRMATION_RESULT__ !== undefined);
+      assert.deepEqual(await page.evaluate(() => window.__FORWARD_CONFIRMATION_RESULT__), {
+        effectsConfirmed: true, preparationDigest: preview.digest, removalPhrases: [],
+      });
+    });
+  }
+  for (const provider of ["sftp", "ftps", "webdav", "smb"]) {
+    for (const direction of ["upload", "download"]) {
+      for (const mode of ["AddOnly", "Update"]) {
+        await runCase(`ContentSync ${provider} ${direction} ${mode} verwendet die Fensterqueue`, "", async page => {
+          if (direction === "upload") await page.getByRole("listbox", { name: /Rechte Dateiliste/ }).click();
+          await page.locator(`#connection-list [data-protocol="${provider}"][data-id="mock_${provider}"]`).click();
+          await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+          if (mode === "Update") await page.locator("#sync-update").check();
+          await page.locator("#btn-sync").click();
+          const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+          await dialog.waitFor();
+          assert.match(await dialog.innerText(), /Quelle.*Ziel.*Best Effort/s);
+          assert.equal(await dialog.locator("input").count(), 0);
+          if (mode === "Update") assert.match(await dialog.innerText(), /dauerhaft ersetzt.*Keine Doppeldecker-Quarantäne.*keine automatische Wiederherstellung/s);
+          await dialog.getByRole("button", { name: mode === "Update" ? "Dauerhafte Änderungen bestätigen" : "Sync bestätigen und starten" }).click();
+          await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.some(entry => entry.operation.type === "ContentSync"));
+          const state = await page.evaluate(() => window.__MOCK_CONTENT_SYNC_STATE__());
+          const request = state.calls.find(call => call.command === "prepare_content_sync").args.request;
+          assert.equal(request.source.provider, direction === "upload" ? "local" : provider);
+          assert.equal(request.target.provider, direction === "upload" ? provider : "local");
+          if (mode === "Update") assert.equal(request.options.compare, "ContentHash");
+          assert.equal(state.calls.filter(call => call.command === "enqueue_content_sync").length, 1);
+          if (provider === "sftp" && direction === "upload" && mode === "AddOnly") {
+            await page.evaluate(() => {
+              const queue = window.__DOPPELDECKER_MOCK_QUEUE__; queue.entries[0].state = "Running";
+              window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
+            });
+            assert.match(await page.locator("#dock-summary").innerText(), /Best-Effort-Sync-Ausführung/);
+            assert.match(await page.locator("#prog-text").innerText(), /Sync-Ausführung startet/);
+          }
+        });
       }
     }
-    await page.locator("#dock-summary .pill.ok").filter({ hasText: "Sync ausgeführt" }).waitFor();
-    const state = await page.evaluate(() => window.__MOCK_PREPARATION_ACTIONS__());
-    assert.deepEqual(state.calls.map(call => call.command), [
-      "prepare_provider_sync",
-      "run_provider_sync",
-      "run_provider_sync",
-    ]);
-    assert.equal(state.pendingProvider, false);
+  }
+  await runCase("ContentSync Remote-zu-Remote bestätigt die Wirkung einmal", "", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.getByRole("listbox", { name: /Rechte Dateiliste/ }).click();
+    await page.locator('#connection-list [data-protocol="webdav"][data-id="mock_webdav"]').click();
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+    await page.locator("#btn-sync").click();
+    await page.getByRole("dialog", { name: "Dateisync ausführen" }).getByRole("button", { name: "Sync bestätigen und starten" }).click();
+    await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+    const state = await page.evaluate(() => window.__MOCK_CONTENT_SYNC_STATE__());
+    assert.deepEqual(state.calls.map(call => call.command), ["prepare_content_sync", "enqueue_content_sync"]);
   });
-
+  await runCase("ContentSync Startfehler behält die Vorbereitung für Retry", "?providerRunFailsOnce=1", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await page.locator("#btn-sync").click();
+      await page.getByRole("dialog", { name: "Dateisync ausführen" }).getByRole("button", { name: "Sync bestätigen und starten" }).click();
+      if (!attempt) await page.getByText(/Provider-Mock-Start ist vor der Entnahme belegt/).waitFor();
+    }
+    await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+    const state = await page.evaluate(() => window.__MOCK_CONTENT_SYNC_STATE__());
+    assert.deepEqual(state.calls.map(call => call.command), ["prepare_content_sync", "enqueue_content_sync", "enqueue_content_sync"]);
+  });
   for (const theme of ["light", "dark"]) {
     await runCase(`AP05 WebDAV-Ordnervertrag ist vor dem Namen sichtbar: ${theme}`, "", async page => {
       await page.setViewportSize({ width: 760, height: 480 });
@@ -4686,7 +5896,7 @@ try {
     await page.waitForFunction(() =>
       document.documentElement.dataset.lastRemoteOpened === "/remote.txt");
     assert.match(await page.locator("#dock-summary").innerText(), /Lokale Momentaufnahme/);
-    assert.match(await page.locator("#dock-summary").innerText(), /nicht zum Server zurückgeschrieben/);
+    assert.match(await page.locator("#dock-summary").innerText(), /nicht automatisch zum Server zurückgeschrieben/);
   });
 
   await runCase("Best-Effort-Ziel zeigt Einschränkung und reiht die Kopie ein", "?remoteFile=1", async page => {
@@ -4846,8 +6056,8 @@ try {
       assert.equal((await report.inputValue()).split("\n").length,81);
       await page.keyboard.press("Tab"); assert.equal(await report.evaluate(el=>el===document.activeElement),true);
       await page.keyboard.press("PageDown"); await page.waitForFunction(()=>document.querySelector('[aria-label="Quellgrenzen und Auslassungen"]').scrollTop>0);
-      await page.getByText("Ausgelassene Metadaten anzeigen",{exact:true}).click();
-      await page.getByRole("textbox",{name:"Ausgelassene Zielmetadaten"}).focus();
+      await page.getByText("Zielhinweise anzeigen",{exact:true}).click();
+      await page.getByRole("textbox",{name:"Zielhinweise"}).focus();
       assert.equal(await page.getByRole("button",{name:"Schließen",exact:true}).isVisible(),true);
       assert.equal(await page.locator("#dock").evaluate(el=>el.getBoundingClientRect().bottom<=innerHeight),true);
       assert.equal(await page.locator("#dock-summary").evaluate(el=>el.scrollHeight>el.clientHeight),true);
@@ -4871,25 +6081,36 @@ try {
     await page.locator("#queue-count").filter({ hasText: "1" }).waitFor();
   });
 
-  await runCase("AP11 Metadatenbilanz bleibt vollständig tastaturbedienbar und escaped", "", async page => {
+  await runCase("AP11 Zielhinweise bleiben eindeutig, tastaturbedienbar und escaped", "", async page => {
     await page.setViewportSize({ width: 800, height: 600 });
     await page.evaluate(() => window.__MOCK_EMIT__("fileop-done", {
       files: 100, bytes: 12345, target_copy_new_best_effort: true,
-      target_write_limitations: Array.from({ length: 100 }, (_, i) => `/pane/Datei-${i}-<img src=x onerror=window.ap11Injected=true>.txt: Rechte und Metadaten ausgelassen`),
+      target_write_limitations: [
+        ...Array(2).fill("Keine dauerhafte Temp-Recovery: Privater Recoveryindex fehlt <Recovery & Prüfung>. </textarea><img src=x onerror=window.ap11Injected=true>"),
+        ...Array.from({ length: 100 }, (_, i) => `/pane/Datei-${i}-<img src=x onerror=window.ap11Injected=true>.txt: Rechte und Metadaten ausgelassen`),
+      ],
     }));
     const summary = page.locator("#dock-summary");
-    assert.match(await summary.innerText(), /100 Einträge ohne native Zielmetadaten/);
-    const toggle = summary.locator("summary", { hasText: "Ausgelassene Metadaten anzeigen" });
+    assert.match(await summary.innerText(), /101 Zielhinweise/);
+    assert.doesNotMatch(await summary.innerText(), /Einträge ohne native Zielmetadaten/);
+    const toggle = summary.locator("summary", { hasText: "Zielhinweise anzeigen" });
     await toggle.focus(); await page.keyboard.press("Space");
-    const report = page.getByRole("textbox", { name: "Ausgelassene Zielmetadaten" });
-    await report.waitFor(); assert.equal((await report.inputValue()).split("\n").length, 100);
-    assert.equal(await report.locator("img").count(), 0);
+    const report = page.getByRole("textbox", { name: "Zielhinweise" });
+    await report.waitFor();
+    const notes = (await report.inputValue()).split("\n");
+    assert.equal(notes.length, 101);
+    assert.match(notes[0], /^Keine dauerhafte Temp-Recovery:.*<Recovery & Prüfung>/);
+    assert.equal(notes.filter(note => note.startsWith("Keine dauerhafte Temp-Recovery:")).length, 1);
+    assert.match(notes[1], /^\/pane\/Datei-0-<img/);
+    assert.match(notes.at(-1), /^\/pane\/Datei-99-<img/);
+    assert.equal(await report.evaluate(el => el.readOnly), true);
+    assert.equal(await page.locator("#dock img").count(), 0);
     assert.equal(await page.evaluate(() => window.ap11Injected ?? false), false);
     await page.keyboard.press("Tab"); assert.equal(await report.evaluate(el => el === document.activeElement), true);
+    if (process.env.DOPPELDECKER_SCREENSHOT_DIR) await page.locator("#dock").screenshot({ path: `${process.env.DOPPELDECKER_SCREENSHOT_DIR}/ap11-target-notes.png` });
     await page.keyboard.press("PageDown");
-    await page.waitForFunction(() => document.querySelector('[aria-label="Ausgelassene Zielmetadaten"]').scrollTop > 0);
+    await page.waitForFunction(() => document.querySelector('[aria-label="Zielhinweise"]').scrollTop > 0);
     assert.equal(await report.evaluate(el => el.scrollWidth <= el.clientWidth + 1), true);
-    if (process.env.DOPPELDECKER_SCREENSHOT_DIR) await page.screenshot({ path: `${process.env.DOPPELDECKER_SCREENSHOT_DIR}/ap11-metadata-report.png` });
   });
 
   await runCase("Best-Effort-Quellentfernung bleibt als F6 gebunden", "?remoteFile=1&bestEffortSource=1", async page => {
@@ -5154,6 +6375,35 @@ try {
     assert.ok(scans.length >= 4, "Start, zweite Pane und beide Abschluss-Reloads müssen sichtbar sein.");
   });
 
+  await runCase("Native Kopierauslassungen nennen erhaltene Quellen und bleiben in der Queue sichtbar", "", async page => {
+    await page.setViewportSize({ width: 1000, height: 750 });
+    const path = "/mock/<Quelle>&-mit-Resource-Fork.txt";
+    await page.evaluate(path => window.__MOCK_EMIT__("fileop-done", {
+      files: 1, bytes: 29, cancelled: false, incomplete_resource_forks: 1,
+      retained_source_paths: [path], target_write_limitations: ["Resource Fork nicht übertragen"],
+    }), path);
+    const dock = page.locator("#dock-summary");
+    await dock.getByText("Mit Auslassungen", { exact: true }).waitFor();
+    assert.ok((await dock.innerText()).includes("Verschieben unvollständig"));
+    assert.equal(await dock.locator("code").innerText(), path);
+    assert.equal(await dock.locator("quelle").count(), 0);
+    if (process.env.DOPPELDECKER_SCREENSHOT_DIR) await page.screenshot({ path: `${process.env.DOPPELDECKER_SCREENSHOT_DIR}/native-copy-partial-dock.png` });
+    await page.evaluate(() => {
+      const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
+      queue.entries.push({ operation_id: "partial-native-copy", state: "Completed", file_incomplete: true,
+        operation: { type: "File", kind: "Move", items: ["/mock/source"], destination: "/mock/target" },
+        profile_bindings: [], attempts: 1, progress: { phase: "done", files_done: 1, bytes_done: 29 },
+        error: null, attention: null, created_unix_ms: Date.now() });
+      queue.revision += 1; window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
+    });
+    await page.locator("#btn-queue").click();
+    const row = page.locator('[data-queue-id="partial-native-copy"]');
+    await row.getByText(/mit Auslassungen abgeschlossen/).waitFor();
+    assert.ok((await row.innerText()).includes("betroffene Quellen erhalten"));
+    assert.equal(await row.getByRole("button", { name: /erneut|wiederholen/i }).count(), 0);
+    if (process.env.DOPPELDECKER_SCREENSHOT_DIR) await page.screenshot({ path: `${process.env.DOPPELDECKER_SCREENSHOT_DIR}/native-copy-partial-queue.png` });
+  });
+
   await runCase("Temp-Recoverypfade bleiben in Abschluss und Queue sichtbar", "", async page => {
     const recoveryPath = "/mock/<temp>&-recovery.tmp";
     await page.evaluate(path => window.__MOCK_EMIT__("fileop-done", {
@@ -5273,23 +6523,39 @@ try {
     assert.equal(await page.locator(".queue-row", { hasText: "Dauerhaft löschen" }).count(), 0);
     await page.locator("#queue-popover-close").click();
 
-    // WebDAV besitzt im Mock keinen Restorepfad und verlangt deshalb die exakte
-    // irreversible Phrase, die Provider, Profil, Root und Wirkung bindet.
+    // Gewöhnliches endgültiges Löschen braucht eine Wirkungsentscheidung.
     await page.locator('#connection-list [data-protocol="webdav"][data-id="mock_webdav"]').click();
     list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
     await list.getByRole("option", { name: /remote\.txt/ }).click();
     await list.focus();
     await page.keyboard.press("Control+Backspace");
-    const input = page.locator("#modal-input");
-    await input.waitFor();
-    const title = await page.locator("#modal-title").innerText();
-    const phrase = title.match(/DAUERHAFT LÖSCHEN WEBDAV [^“]+/)?.[0];
-    assert.ok(phrase);
-    await input.fill(phrase);
-    await page.locator("#modal .modal-buttons").getByRole("button", { name: "OK" }).click();
+    const deletion = page.getByRole("dialog");
+    await deletion.getByText(/Es gibt keinen Papierkorb/).waitFor();
+    assert.equal(await deletion.locator("input").count(), 0);
+    await deletion.getByRole("button", { name: "Dauerhaft löschen", exact: true }).click();
     await page.locator("#queue-count").filter({ hasText: "2" }).waitFor();
     operation = await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.at(-1).operation);
     assert.equal(operation.mode, "permanent");
+  });
+
+  await runCase("Große endgültige Remote-Löschung zeigt Umfang und Providergrenzen vor der Phrase", "?remoteFile=1&largeRemoteDelete=1", async page => {
+    await page.locator('#connection-list [data-protocol="webdav"][data-id="mock_webdav"]').click();
+    const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
+    await list.getByRole("option", { name: /remote\.txt/ }).click();
+    await list.focus();
+    await page.keyboard.press("Control+Backspace");
+    const dialog = page.getByRole("dialog");
+    const description = dialog.getByRole("region", { name: "Wirkung und Einschränkungen" });
+    await description.waitFor();
+    assert.match(await description.innerText(), /1 ausgewählte Einträge, 1 Objekte und 8 Byte/);
+    assert.match(await description.innerText(), /keine Wiederherstellung durch Doppeldecker/);
+    assert.match(await description.innerText(), /Collection-DELETE bleibt Best Effort; <fremder>/);
+    assert.equal(await description.locator("fremder").count(), 0);
+    if (process.env.DOPPELDECKER_UI_EVIDENCE_DIR) await page.screenshot({ path: `${process.env.DOPPELDECKER_UI_EVIDENCE_DIR}/remote-delete-large-review.png` });
+    await dialog.locator("input").fill("falsche Phrase");
+    await dialog.getByRole("button", { name: "OK", exact: true }).click();
+    await page.waitForFunction(() => document.querySelector("#modal").hidden);
+    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
   });
 
   await runCase("Fehlgeschlagener Endpunktwechsel hinterlässt keine fremde Dateiliste", "?remoteScanError=1", async page => {
@@ -5523,7 +6789,7 @@ try {
       await dialog.getByRole("button", { name: "Abbrechen", exact: true }).click();
       assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
     });
-    await runCase(`AP04R neue Baumwirkung verlangt richtige Phrase bei langer Auslassungsliste: ${theme}`, "", async page => {
+    await runCase(`AP04R neue Baumwirkung bestätigt den Umfang ohne Phrase bei langer Auslassungsliste: ${theme}`, "", async page => {
       await page.setViewportSize({ width: 760, height: 480 });
       await page.evaluate(async theme => {
         const { setTheme } = await import("/theme.js"); setTheme(theme, false);
@@ -5538,21 +6804,23 @@ try {
       await row.getByRole("button", { name: "Plan bestätigen" }).click();
       let dialog = page.getByRole("dialog", { name: "Quellbaumumfang bestätigen" });await dialog.waitFor();
       assert.match(await dialog.innerText(), /80 Eintrag.*ausgelassen/);
-      assert.equal(await dialog.getByRole("button", { name: "OK", exact: true }).isVisible(), true);
+      assert.equal(await dialog.getByRole("button", { name: "Fortfahren", exact: true }).isVisible(), true);
       assert.equal(await dialog.evaluate(node => node.getBoundingClientRect().height <= window.innerHeight - 20), true);
       const explanation = dialog.getByRole("region", { name: "Wirkung und Einschränkungen", exact: true });
       assert.equal(await explanation.evaluate(node => node.scrollHeight > node.clientHeight), true);
       assert.match(await explanation.innerText(), /79\.txt/);
       await explanation.focus();await explanation.press("PageDown");
       await page.waitForFunction(() => document.querySelector('[role="region"][aria-label="Wirkung und Einschränkungen"]').scrollTop > 0);
-      const inputBounds = await page.locator("#modal-input").boundingBox();
-      assert.ok(inputBounds && inputBounds.y >= 0 && inputBounds.y + inputBounds.height <= 480);
+      assert.equal(await dialog.locator("input").count(), 0);
+      const startBounds = await dialog.getByRole("button", { name: "Fortfahren", exact: true }).boundingBox();
+      assert.ok(startBounds && startBounds.y >= 0 && startBounds.y + startBounds.height <= 480);
       if (process.env.AP04R_EVIDENCE_DIR) await page.screenshot({ path: `${process.env.AP04R_EVIDENCE_DIR}/tree-confirm-${theme}.png` });
-      await page.locator("#modal-input").fill("falsch"); await dialog.getByRole("button", { name: "OK", exact: true }).click();
+      await dialog.getByRole("button", { name: "Abbrechen", exact: true }).click();
       assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].state), "AwaitingConfirmation");
       if (await page.locator("#queue-popover").isHidden()) await page.locator("#btn-queue").click();
-      await row.getByRole("button", { name: "Plan bestätigen" }).click();dialog = page.getByRole("dialog", { name: "Quellbaumumfang bestätigen" });
-      await page.locator("#modal-input").fill("BAUM MOCK 83");await dialog.getByRole("button", { name: "OK", exact: true }).click();
+      await row.getByRole("button", { name: "Plan bestätigen" }).click();
+      dialog = page.getByRole("dialog", { name: "Quellbaumumfang bestätigen" });
+      await dialog.getByRole("button", { name: "Fortfahren", exact: true }).click();
       await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].state === "Pending");
       assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].operation.source_tree_expected.omitted.length), 80);
     });
@@ -5613,7 +6881,7 @@ try {
     assert.match(pathTitle || "", /SFTP-Pane-Listing · pfadbasiertes Best Effort/);
     assert.match(
       await page.locator("#dock-summary").innerText(),
-      /Reguläre Dateien.*Momentaufnahme.*Verzeichnisbäume.*additiv lokal.*OPENDIR und OPEN nicht atomar/s,
+      /Dateiaktionen.*Upload.*Verschieben.*Ersetzen.*Dauerlöschen.*verfügbar.*umgeleitete Elternpfade/s,
     );
 
     const status = await page.evaluate(() => window.__TAURI__.core.invoke(
@@ -5627,7 +6895,7 @@ try {
     });
     const quarantine = page.locator("#btn-quarantine");
     assert.equal(await quarantine.isDisabled(), true);
-    assert.match(await quarantine.getAttribute("title") || "", /Quarantäneverwaltung gesperrt/);
+    assert.match(await quarantine.getAttribute("title") || "", /keine Providerquarantäne.*Dauerhaftes Löschen/s);
     await quarantine.click({ force: true });
     const quarantineCalls = await page.evaluate(() => window.__MOCK_QUARANTINE_CALLS__());
     assert.equal(
@@ -5711,6 +6979,166 @@ try {
     assert.doesNotMatch(text, /Best Effort/, "Die Klasse steht nur als Zusatz, nicht falsch");
   });
 
+  for (const provider of ["sftp", "ftps", "webdav", "smb"]) {
+    await runCase(`Forward-Bidir ${provider} drei Dateien verwendet eigene Fensterqueue`, "", async page => {
+      await page.locator(`#connection-list [data-protocol="${provider}"][data-id="mock_${provider}"]`).click();
+      await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+      await page.getByLabel("In beide Richtungen", { exact: true }).check();
+      await page.locator("#btn-sync").click();
+      const dialog = page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }); await dialog.waitFor();
+      assert.match(await dialog.innerText(), /kein universelles automatisches Rollback/);
+      assert.match(await dialog.innerText(), /eins.txt.*zwei.txt.*drei.txt/s);
+      assert.equal(await dialog.locator("input").count(), 0);
+      await dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
+      await page.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
+      const entries = await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries);
+      assert.equal(entries.length, 1); assert.equal(entries[0].operation.type, "BidirectionalForward"); assert.equal(entries[0].state, "Completed");
+      const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
+      assert.equal(calls.filter(call => call.command === "enqueue_forward_bidirectional_sync").length, 1);
+      assert.deepEqual(calls.find(call => call.command === "enqueue_forward_bidirectional_sync").args.preparationDigest, Array(32).fill(42));
+    });
+  }
+  for (const theme of ["light", "dark"]) {
+    await runCase(`Forward-Bidir Wirkungsdialog Quarantäne und Dauerwirkung bleibt erreichbar: ${theme}`, "?forwardReplace=1", async page => {
+      await page.setViewportSize({ width: 760, height: 480 });
+      await page.evaluate(async theme => { const { setTheme } = await import("/theme.js"); setTheme(theme, false); }, theme);
+      await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+      await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+      await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
+      const dialog = page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }); await dialog.waitFor();
+      assert.match(await dialog.innerText(), /lokalen Quarantäne gesichert/); assert.match(await dialog.innerText(), /dauerhaft ersetzt/);
+      assert.match(await dialog.innerText(), /kein universelles automatisches Rollback/);
+      const start = dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" }); await start.scrollIntoViewIfNeeded();
+      const bounds = await start.boundingBox(); assert.ok(bounds && bounds.y >= 0 && bounds.y + bounds.height <= 480);
+      if (process.env.DOPPELDECKER_SCREENSHOT_DIR) await page.screenshot({ path: `${process.env.DOPPELDECKER_SCREENSHOT_DIR}/forward-${theme}.png` });
+      await page.keyboard.press("Escape");
+      await page.waitForFunction(() => !window.__MOCK_FORWARD_STATE__().pending);
+      assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+    });
+  }
+  await runCase("Forward-Bidir Startupjournal führt zu frischem Neuabgleich", "?forwardStartup=1", async page => {
+    await page.locator("#btn-queue").click(); await page.getByRole("button", { name: "Neu abgleichen", exact: true }).click();
+    await page.getByRole("dialog", { name: "Neu abgleichen · Forward-Startpaar" }).getByRole("button", { name: "Neu abgleichen", exact: true }).click();
+    await page.getByRole("dialog", { name: "Neu abgeglichenen Sync bestätigen" }).getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
+    await page.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
+    const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
+    assert.deepEqual(calls.find(call => call.command === "prepare_forward_bidirectional_queue_recovery").args.resolutions, []);
+    assert.equal(calls.filter(call => call.command === "approve_forward_bidirectional_queue_entry").length, 1);
+  });
+  await runCase("Forward-Bidir Completionjournal bietet nur Baselineabschluss", "?forwardCompletion=1", async page => {
+    await page.locator("#btn-queue").click();
+    assert.equal(await page.getByRole("button", { name: "Neu abgleichen", exact: true }).count(), 0);
+    await page.getByRole("button", { name: "Abschluss prüfen", exact: true }).click();
+    await page.locator("#dock-summary").filter({ hasText: "Baselineabschluss bestätigt" }).waitFor();
+    const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
+    assert.deepEqual(calls.map(call => call.command), ["finish_forward_bidirectional_queue_completion"]);
+  });
+  await runCase("Forward-Bidir Profilwechsel verwirft alte Konflikt- und Laufvorbereitung", "", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.evaluate(() => {
+      const invoke = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = async (command, args) => {
+        const result = await invoke(command, args);
+        if (command === "prepare_forward_bidirectional_sync") await new Promise(resolve => { window.__RELEASE_FORWARD_PROFILE__ = resolve; });
+        return result;
+      };
+      window.__MOCK_EMIT__("menu", "sync_mode");
+    });
+    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
+    await page.waitForFunction(() => typeof window.__RELEASE_FORWARD_PROFILE__ === "function");
+    await page.evaluate(() => {
+      window.__MOCK_SET_PROFILE_REVISION__("sftp", "mock_sftp", 12);
+      window.__MOCK_EMIT__("connections-updated", { protocol: "sftp", profileId: "mock_sftp", revision: 12, change: "saved" });
+    });
+    await page.evaluate(() => window.__RELEASE_FORWARD_PROFILE__());
+    await page.waitForFunction(() => !window.__MOCK_FORWARD_STATE__().pending);
+    assert.equal(await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).count(), 0);
+    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+  });
+  await runCase("Forward-Bidir zweites Fenster behält Vorbereitung nach Discard im ersten", "?forwardPrepareDelay=1", async page => {
+    const other = await page.context().newPage(); const errors = []; other.on("pageerror", error => errors.push(error.message));
+    try {
+      await other.goto(page.url(), { waitUntil: "networkidle" });
+      for (const target of [page, other]) {
+        await target.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+        await target.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+        await target.getByLabel("In beide Richtungen", { exact: true }).check(); await target.locator("#btn-sync").click();
+      }
+      await page.locator("#btn-sync-close").click();
+      const dialog = other.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }); await dialog.waitFor();
+      await dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
+      await other.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
+      assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+      assert.equal(await other.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 1);
+      assert.deepEqual(errors, []);
+    } finally { await other.close(); }
+  });
+  await runCase("Forward-Bidir Konfliktentscheidung bleibt an unresolved Digest gebunden", "?bidirectionalConflict=1", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
+    await page.getByRole("dialog", { name: "Konflikt 1 von 1" }).getByRole("button", { name: "Links behalten", exact: true }).click();
+    await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
+    await page.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
+    const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
+    const preparations = calls.filter(call => call.command === "prepare_forward_bidirectional_sync");
+    assert.equal(preparations.length, 2); assert.equal(preparations[1].args.request.resolutions.length, 1);
+    assert.deepEqual(preparations[1].args.request.expectedUnresolvedDigest, Array(32).fill(41));
+    assert.deepEqual(calls.find(call => call.command === "enqueue_forward_bidirectional_sync").args.preparationDigest, Array(32).fill(43));
+  });
+  await runCase("Forward-Bidir Teilfehler bietet frischen Neuabgleich gegen B0", "?forwardPartial=1", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
+    await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
+    await page.locator("#dock-summary").filter({ hasText: "B0 bleibt erhalten" }).waitFor();
+    await page.locator("#btn-queue").click();
+    const queue = page.locator("#queue-popover");
+    assert.equal(await queue.getByRole("button", { name: "Erneut versuchen", exact: true }).count(), 0);
+    await queue.getByRole("button", { name: "Neu abgleichen", exact: true }).click();
+    await page.getByRole("dialog", { name: /Neu abgleichen ·/ }).getByRole("button", { name: "Neu abgleichen", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "Neu abgeglichenen Sync bestätigen" });
+    assert.match(await dialog.innerText(), /B0 blieb unverändert.*alte Konfliktentscheidungen wurden verworfen/s);
+    assert.equal(await dialog.getByRole("button", { name: "Rollback", exact: true }).count(), 0);
+    await dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
+    await page.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
+    const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
+    assert.deepEqual(calls.find(call => call.command === "prepare_forward_bidirectional_queue_recovery").args.resolutions, []);
+    assert.deepEqual(calls.find(call => call.command === "approve_forward_bidirectional_queue_entry").args.preparationDigest, Array(32).fill(45));
+  });
+  await runCase("Forward-Bidir ungestartete Queuevorbereitung lässt sich sauber verwerfen", "?forwardReopen=1", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
+    await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
+    await page.locator("#btn-queue").click(); await page.getByRole("button", { name: "Verwerfen", exact: true }).click();
+    await page.getByRole("dialog", { name: "Operation verwerfen" }).getByRole("button", { name: "Fortfahren", exact: true }).click();
+    await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].state === "Cancelled");
+    assert.equal(await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls.some(call => call.command === "approve_forward_bidirectional_queue_entry")), false);
+  });
+  await runCase("Forward-Bidir Reopen verlangt neuen Previewdigest", "?forwardReopen=1", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
+    await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
+    await page.locator("#btn-queue").click(); await page.getByRole("button", { name: "Plan bestätigen" }).click();
+    const dialog = page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" });
+    assert.match(await dialog.innerText(), /Neue Wirkung nach Neustart: frischer Digest/);
+    await dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
+    await page.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
+    const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
+    assert.deepEqual(calls.find(call => call.command === "approve_forward_bidirectional_queue_entry").args.preparationDigest, Array(32).fill(44));
+  });
+  await runCase("Forward-Bidir Scopewechsel verwirft verspätete Vorbereitung", "?forwardPrepareDelay=1", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
+    await page.locator("#btn-cancel").waitFor({ state: "visible" }); await page.locator("#btn-sync-close").click();
+    await page.waitForFunction(() => window.__MOCK_FORWARD_STATE__().calls.some(call => call.command === "discard_forward_bidirectional_sync") && !window.__MOCK_FORWARD_STATE__().pending && document.querySelector("#btn-cancel").hidden);
+    assert.equal(await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).count(), 0);
+    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+  });
+
   await runCase("Bidirektionale Paarvorbereitung bleibt dauerhaft und abbrechbar", "", async page => {
     // Bidirektional ist im Sync-Modus die dritte Richtungsoption.
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
@@ -5718,7 +7146,7 @@ try {
     await page.locator("#btn-sync").click();
     const dialog = page.getByRole("dialog", { name: "Bidirektional · quelle ↔ ziel" });
     await dialog.waitFor();
-    assert.match(await dialog.innerText(), /vollständigen Bäume.*Baseline.*Plan-Digest/s);
+    assert.match(await dialog.innerText(), /Beide Bäume.*Baseline.*erneut geprüft/s);
     const preparation = await page.evaluate(() => window.__MOCK_PREPARATION_ACTIONS__());
     assert.equal(preparation.calls[0]?.command, "register_bidirectional_pair",
       "Die prozessweite Paarregistrierung muss vor jeder Vorbereitung im Backend liegen.");
@@ -5781,12 +7209,7 @@ try {
     await page.getByLabel("In beide Richtungen").check();
     await page.locator("#btn-sync").click();
     await page.getByRole("dialog", { name: "Bidirektional · quelle ↔ ziel" })
-      .getByRole("button", { name: "Direkt bestätigen" }).click();
-    const title = await page.locator("#modal-title").innerText();
-    const phrase = title.match(/BEIDE [^“]+/)?.[0];
-    assert.ok(phrase);
-    await page.locator("#modal-input").fill(phrase);
-    await page.getByRole("dialog").getByRole("button", { name: "OK" }).click();
+      .getByRole("button", { name: "Sync starten" }).click();
 
     await page.locator("#app.operation-running").waitFor();
     const path = page.locator('.pane[data-side="left"] .path');
@@ -5811,11 +7234,7 @@ try {
       await page.getByRole("button", { name: "Recovery" }).click();
       await page.getByRole("dialog", { name: "Recovery · Recovery-Paar" })
         .getByRole("button", { name: "Fortsetzen" }).click();
-      const title = await page.locator("#modal-title").innerText();
-      const phrase = title.match(/BEIDE [^“]+/)?.[0];
-      assert.ok(phrase);
-      await page.locator("#modal-input").fill(phrase);
-      await page.getByRole("dialog").getByRole("button", { name: "OK" }).click();
+    await page.getByRole("dialog", { name: "Bidirektionalen Sync fortsetzen" }).getByRole("button", { name: "Fortsetzen" }).click();
     };
     await startResume();
     await page.getByText(/Mock-Start ist vor der Entnahme belegt/).waitFor();
@@ -5834,11 +7253,7 @@ try {
       await page.getByRole("button", { name: "Recovery" }).click();
       await page.getByRole("dialog", { name: "Recovery · Recovery-Paar" })
         .getByRole("button", { name: "Rollback" }).click();
-      const title = await page.locator("#modal-title").innerText();
-      const phrase = title.match(/ROLLBACK [^“]+/)?.[0];
-      assert.ok(phrase);
-      await page.locator("#modal-input").fill(phrase);
-      await page.getByRole("dialog").getByRole("button", { name: "OK" }).click();
+    await page.getByRole("dialog", { name: "Vorherigen Bestand wiederherstellen" }).getByRole("button", { name: "Wiederherstellung starten" }).click();
     };
     await startRollback();
     await page.getByText(/Mock-Rollbackstart ist belegt/).waitFor();
@@ -5856,12 +7271,7 @@ try {
     await page.getByLabel("In beide Richtungen").check();
     await page.locator("#btn-sync").click();
     await page.getByRole("dialog", { name: "Bidirektional · quelle ↔ ziel" })
-      .getByRole("button", { name: "Direkt bestätigen" }).click();
-    const title = await page.locator("#modal-title").innerText();
-    const phrase = title.match(/BEIDE [^“]+/)?.[0];
-    assert.ok(phrase);
-    await page.locator("#modal-input").fill(phrase);
-    await page.getByRole("dialog").getByRole("button", { name: "OK" }).click();
+      .getByRole("button", { name: "Sync starten" }).click();
     await page.getByText(/Bidirektional fertig/).waitFor();
     await page.waitForTimeout(50);
     assert.match(await page.locator("#dock").innerText(), /Bidirektional fertig/);
@@ -5873,11 +7283,7 @@ try {
     await page.getByRole("button", { name: "Recovery" }).click();
     await page.getByRole("dialog", { name: "Recovery · Recovery-Paar" })
       .getByRole("button", { name: "Fortsetzen" }).click();
-    const title = await page.locator("#modal-title").innerText();
-    const phrase = title.match(/BEIDE [^“]+/)?.[0];
-    assert.ok(phrase);
-    await page.locator("#modal-input").fill(phrase);
-    await page.getByRole("dialog").getByRole("button", { name: "OK" }).click();
+    await page.getByRole("dialog", { name: "Bidirektionalen Sync fortsetzen" }).getByRole("button", { name: "Fortsetzen" }).click();
     await page.getByText(/Bidirektional fertig/).waitFor();
     await page.waitForTimeout(50);
     assert.match(await page.locator("#dock").innerText(), /Bidirektional fertig/);
@@ -5889,11 +7295,7 @@ try {
     await page.getByRole("button", { name: "Recovery" }).click();
     await page.getByRole("dialog", { name: "Recovery · Recovery-Paar" })
       .getByRole("button", { name: "Rollback" }).click();
-    const title = await page.locator("#modal-title").innerText();
-    const phrase = title.match(/ROLLBACK [^“]+/)?.[0];
-    assert.ok(phrase);
-    await page.locator("#modal-input").fill(phrase);
-    await page.getByRole("dialog").getByRole("button", { name: "OK" }).click();
+    await page.getByRole("dialog", { name: "Vorherigen Bestand wiederherstellen" }).getByRole("button", { name: "Wiederherstellung starten" }).click();
     await page.getByText(/Rollback fertig/).waitFor();
     await page.waitForTimeout(50);
     assert.match(await page.locator("#dock").innerText(), /Rollback fertig/);
@@ -5903,10 +7305,8 @@ try {
   await runCase("Schnelle Queue-Freigabe verwirft ihre ältere Command-Antwort", "?bidirectionalFastApproveBeforeResponse=1", async page => {
     await page.locator("#btn-queue").click();
     await page.getByRole("button", { name: "Plan bestätigen" }).click();
-    await page.getByRole("dialog", { name: "Unabhängiges Backup bestätigen" })
+    await page.getByRole("dialog", { name: "Sync ausführen" })
       .getByRole("button", { name: "Fortfahren" }).click();
-    await page.locator("#modal-input").fill("BEIDE SCHNELL 0011223344556677");
-    await page.getByRole("dialog").getByRole("button", { name: "OK" }).click();
     await page.waitForTimeout(50);
     assert.match(await page.locator("#dock").innerText(), /Bidirektional fertig/);
     assert.doesNotMatch(await page.locator("#dock").innerText(), /Neu bestätigt/);
@@ -5981,62 +7381,6 @@ try {
     });
   }
 
-  for (const terminal of [false, true]) {
-    await runCase(`Sync-Review bidirektionale Einreihantwort erhält ${terminal ? "Abschluss" : "Rückfrage"}`, "", async page => {
-      await page.evaluate(terminal => {
-        const original = window.__TAURI__.core.invoke;
-        window.__TAURI__.core.invoke = async (command, args) => {
-          const result = await original(command, args);
-          if (command === "enqueue_bidirectional_sync") {
-            const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
-            const entry = queue.entries.at(-1);
-            entry.attempts = 1;
-            entry.state = terminal ? "Completed" : "AwaitingConfirmation";
-            if (!terminal) entry.attention = { type: "RemoteRun", reason: "Wirkung erneut bestätigen", confirmation: "BACKEND ONLY" };
-            window.__MOCK_EMIT__(terminal ? "bidirectional-done" : "bidirectional-ready", terminal
-              ? { operationId: entry.operation_id, attempt: 1, baseline_generation: 17 }
-              : "Bidirektionaler Lauf ist geprüft; Queue öffnen und Laufphrase bestätigen");
-            window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
-            await new Promise(resolve => { window.__BIDI_REPLY_RELEASE__ = resolve; });
-          }
-          return result;
-        };
-      }, terminal);
-      await page.evaluate(() => { window.__MOCK_EMIT__("menu", "sync_mode"); });
-      await page.getByLabel("In beide Richtungen").check();
-      await page.locator("#btn-sync").click();
-      await page.getByRole("dialog", { name: "Bidirektional · quelle ↔ ziel" }).getByRole("button", { name: "In Queue", exact: true }).click();
-      await page.waitForFunction(() => typeof window.__BIDI_REPLY_RELEASE__ === "function");
-      const latest = await page.locator("#dock-summary").innerText();
-      assert.match(latest, terminal ? /Bidirektional fertig/ : /Bidirektional geprüft/);
-      await page.evaluate(async () => { window.__BIDI_REPLY_RELEASE__(); await new Promise(resolve => setTimeout(resolve, 0)); });
-      assert.equal(await page.locator("#dock-summary").innerText(), latest, "Die spätere Empfangsbestätigung darf den neueren Queuezustand nicht ersetzen");
-      assert.equal(await page.locator("#queue-count").innerText(), terminal ? "0" : "1");
-    });
-  }
-
-  await runCase("Bidirektionales Enqueue retryt dieselbe Backendvorbereitung", "?bidirectionalEnqueueFailsOnce=1", async page => {
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-    await page.getByLabel("In beide Richtungen").check();
-    await page.locator("#btn-sync").click();
-    let execution = page.getByRole("dialog", { name: "Bidirektional · quelle ↔ ziel" });
-    await execution.getByRole("button", { name: "In Queue" }).click();
-    await page.getByText(/Bidirektionales Mock-Enqueue ist vor dem Commit belegt/).waitFor();
-
-    await page.locator("#btn-sync").click();
-    execution = page.getByRole("dialog", { name: "Bidirektional · quelle ↔ ziel" });
-    await execution.getByRole("button", { name: "In Queue" }).click();
-    await page.locator("#queue-count").filter({ hasText: "1" }).waitFor();
-    const state = await page.evaluate(() => window.__MOCK_PREPARATION_ACTIONS__());
-    assert.deepEqual(state.calls.map(call => call.command), [
-      "register_bidirectional_pair",
-      "prepare_bidirectional_sync",
-      "enqueue_bidirectional_sync",
-      "register_bidirectional_pair",
-      "enqueue_bidirectional_sync",
-    ]);
-    assert.equal(state.pendingBidirectional, false);
-  });
 
   await runCase("Bidirektionaler Start retryt nach Busy dieselbe Vorbereitung", "?bidirectionalRunFailsOnce=1", async page => {
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
@@ -6044,13 +7388,7 @@ try {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       await page.locator("#btn-sync").click();
       const execution = page.getByRole("dialog", { name: "Bidirektional · quelle ↔ ziel" });
-      await execution.getByRole("button", { name: "Direkt bestätigen" }).click();
-      const phrase = page.getByRole("dialog").locator("#modal-input");
-      const title = await page.locator("#modal-title").innerText();
-      const expected = title.match(/BEIDE [^“]+/)?.[0];
-      assert.ok(expected);
-      await phrase.fill(expected);
-      await page.getByRole("dialog").getByRole("button", { name: "OK" }).click();
+      await execution.getByRole("button", { name: "Sync starten" }).click();
       if (attempt === 0) {
         await page.getByText(/Bidirektionaler Mock-Start ist vor der Entnahme belegt/).waitFor();
       }
@@ -6071,12 +7409,7 @@ try {
     await page.getByLabel("In beide Richtungen").check();
     await page.locator("#btn-sync").click();
     const execution = page.getByRole("dialog", { name: "Bidirektional · quelle ↔ ziel" });
-    await execution.getByRole("button", { name: "Direkt bestätigen" }).click();
-    const title = await page.locator("#modal-title").innerText();
-    const phrase = title.match(/BEIDE [^“]+/)?.[0];
-    assert.ok(phrase);
-    await page.locator("#modal-input").fill(phrase);
-    await page.getByRole("dialog").getByRole("button", { name: "OK" }).click();
+    await execution.getByRole("button", { name: "Sync starten" }).click();
     await page.getByText(/offenen Teilcommit/).waitFor();
     await page.locator("#btn-queue").click();
     const row = page.locator('[data-queue-id="mock-1"]');
@@ -6089,12 +7422,7 @@ try {
     await page.getByLabel("In beide Richtungen").check();
     await page.locator("#btn-sync").click();
     const execution = page.getByRole("dialog", { name: "Bidirektional · quelle ↔ ziel" });
-    await execution.getByRole("button", { name: "Direkt bestätigen" }).click();
-    const title = await page.locator("#modal-title").innerText();
-    const phrase = title.match(/BEIDE [^“]+/)?.[0];
-    assert.ok(phrase);
-    await page.locator("#modal-input").fill(phrase);
-    await page.getByRole("dialog").getByRole("button", { name: "OK" }).click();
+    await execution.getByRole("button", { name: "Sync starten" }).click();
 
     await page.getByText(/Datenwirkung ist abgeschlossen/).waitFor();
     await page.waitForTimeout(100);
@@ -6153,7 +7481,7 @@ try {
       await page.getByRole("button", { name: "Recovery" }).click();
       await page.getByRole("dialog", { name: "Recovery · Recovery-Paar" })
         .getByRole("button", { name: "Fortsetzen" }).click();
-      await page.getByRole("dialog", { name: "Unabhängiges Backup bestätigen" })
+      await page.getByRole("dialog", { name: "Bidirektionalen Sync fortsetzen" })
         .getByRole("button", { name: "Abbrechen" }).click();
       await page.getByText(/Mock-Recovery-Discard scheiterte vor Zustellung/).waitFor();
       let state = await page.evaluate(() => window.__MOCK_PREPARATION_ACTIONS__());
@@ -6164,7 +7492,7 @@ try {
       await page.getByRole("button", { name: "Recovery" }).click();
       await page.getByRole("dialog", { name: "Recovery · Recovery-Paar" })
         .getByRole("button", { name: "Fortsetzen" }).click();
-      await page.getByRole("dialog", { name: "Unabhängiges Backup bestätigen" })
+      await page.getByRole("dialog", { name: "Bidirektionalen Sync fortsetzen" })
         .getByRole("button", { name: "Abbrechen" }).click();
       await page.waitForFunction(() => !window.__MOCK_PREPARATION_ACTIONS__().pendingBidirectional);
       state = await page.evaluate(() => window.__MOCK_PREPARATION_ACTIONS__());
@@ -6199,16 +7527,15 @@ try {
   );
 
   await runCase(
-    "Recovery-Discard nach falscher Phrase zeigt den Transportfehler",
+    "Recovery-Discard nach Wirkungsabbruch zeigt den Transportfehler",
     "?bidiRecovery=1&bidirectionalRecoveryDiscardBeforeDeliveryFailures=1",
     async page => {
       await page.locator("#btn-queue").click();
       await page.getByRole("button", { name: "Recovery" }).click();
       await page.getByRole("dialog", { name: "Recovery · Recovery-Paar" })
         .getByRole("button", { name: "Fortsetzen" }).click();
-      const confirmation = page.getByRole("dialog").locator("#modal-input");
-      await confirmation.fill("falsche Phrase");
-      await page.getByRole("dialog").getByRole("button", { name: "OK" }).click();
+      await page.getByRole("dialog", { name: "Bidirektionalen Sync fortsetzen" })
+        .getByRole("button", { name: "Abbrechen" }).click();
       await page.getByText(/Mock-Recovery-Discard scheiterte vor Zustellung/).waitFor();
       const state = await page.evaluate(() => window.__MOCK_PREPARATION_ACTIONS__());
       assert.equal(state.pendingBidirectional, false);
@@ -6219,21 +7546,19 @@ try {
     },
   );
 
-  await runCase("Mirror-Bestätigung verwendet den sichtbaren Zielnamen", "?realEnabled=1&mirrorDelete=1", async page => {
+  await runCase("Mirror bestätigt die sichtbare Richtung und Quarantänewirkung einmal", "?realEnabled=1&mirrorDelete=1", async page => {
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
     await page.getByLabel("Verwaiste in Quarantäne verschieben").check();
     await page.locator("#btn-sync").click();
-    const impact = page.getByRole("dialog", { name: "Zielbestand wird verändert" });
-    await impact.waitFor();
-    await impact.getByRole("button", { name: "Fortfahren" }).click();
-    const phrase = page.getByRole("dialog", { name: "Zur Bestätigung Zielnamen „ziel“ eingeben" });
-    await phrase.waitFor();
-    await phrase.locator("#modal-input").fill("ziel");
-    await phrase.getByRole("button", { name: "OK" }).click();
-    await page.locator("#queue-count").filter({ hasText: "1" }).waitFor();
+    const dialog = page.getByRole("dialog", { name: "Sync ausführen" });
+    await dialog.waitFor();
+    assert.match(await dialog.innerText(), /Quelle.*\/mock\/quelle.*Ziel.*\/mock\/ziel.*quarantänisieren/s);
+    assert.equal(await dialog.locator("input").count(), 0);
+    await dialog.getByRole("button", { name: "Verschieben in Quarantäne bestätigen und starten" }).click();
+    await page.waitForFunction(() => document.documentElement.dataset.realConfirmation === "true");
   });
 
-  await runCase("Queue-Pause, Driftphrase und Entfernen", "", async page => {
+  await runCase("Queue-Pause, Driftwirkung und Entfernen", "", async page => {
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
     await page.locator("#btn-sync-simulate").click();
     await page.locator("#queue-count").filter({ hasText: "1" }).waitFor();
@@ -6247,20 +7572,13 @@ try {
     const approve = page.getByRole("button", { name: "Plan bestätigen" });
     await approve.waitFor();
     await approve.click();
-    let title = await page.locator("#modal-title").innerText();
-    let phrase = title.match(/PLAN [^“]+/)?.[0];
-    assert.ok(phrase, "Queue-Phrase fehlt im Dialogtitel.");
-    await page.locator("#modal-input").fill("falsch");
-    await page.getByRole("button", { name: "OK" }).click();
-    await page.locator("#btn-queue").click();
+    let dialog = page.getByRole("dialog", { name: "Queue-Wirkung bestätigen" });
+    assert.equal(await dialog.locator("input").count(), 0);
+    await dialog.getByRole("button", { name: "Abbrechen" }).click();
     assert.match(await page.locator("#queue-popover").innerText(), /neue Bestätigung nötig/);
     await page.getByRole("button", { name: "Plan bestätigen" }).click();
-    title = await page.locator("#modal-title").innerText();
-    phrase = title.match(/PLAN [^“]+/)?.[0];
-    assert.ok(phrase);
-    await page.locator("#modal-input").fill(phrase);
-    await page.getByRole("button", { name: "OK" }).click();
-    await page.locator("#btn-queue").click();
+    dialog = page.getByRole("dialog", { name: "Queue-Wirkung bestätigen" });
+    await dialog.getByRole("button", { name: "Fortfahren" }).click();
     const remove = page.getByRole("button", { name: "Entfernen" });
     await remove.waitFor();
     await remove.click();
@@ -6268,7 +7586,7 @@ try {
   });
 
   for (const attentionType of ["LocalFileCommit", "BestEffortCommitDowngrade"]) {
-    await runCase(`${attentionType}: Best-Effort-Bestätigung trennt Risiko und Eingabe`, "", async page => {
+    await runCase(`${attentionType}: Best-Effort-Wirkungsdialog bleibt scrollbar und ohne Phrase`, "", async page => {
       await page.setViewportSize({ width: 800, height: 600 });
       await page.evaluate(attentionType => {
         const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
@@ -6288,26 +7606,58 @@ try {
       await dialog.waitFor();
       assert.match(await dialog.locator(".modal-description").innerText(), /Ziel: \/mock\/<fremd>/);
       assert.equal(await dialog.locator("fremd").count(), 0, "Zieltext darf kein Markup erzeugen");
-      const input = dialog.getByLabel('Exakt „BEST EFFORT local-proof“ eingeben');
+      assert.equal(await dialog.locator("input").count(), 0);
       const title = await dialog.locator(".modal-title").boundingBox();
-      const confirm = await dialog.getByRole("button", { name: "OK", exact: true }).boundingBox();
-      const inputBounds = await input.boundingBox();
+      const confirm = await dialog.getByRole("button", { name: "Fortfahren", exact: true }).boundingBox();
       assert.ok(title && title.height < 50, "Der Titel darf nicht die lange Risikobilanz aufnehmen");
       assert.ok(confirm && confirm.y >= 0 && confirm.y + confirm.height <= 600, "Bestätigung bleibt im Fenster erreichbar");
-      assert.ok(inputBounds && inputBounds.y >= 0 && inputBounds.y + inputBounds.height <= 600, "Das fokussierte Eingabefeld bleibt erreichbar");
-      await input.press("Shift+Tab");
       const explanation = dialog.getByRole("region", { name: "Wirkung und Einschränkungen", exact: true });
-      assert.ok(await explanation.evaluate(element => element === document.activeElement));
+      await explanation.focus();
       await explanation.press("PageDown");
       await page.waitForFunction(() => document.querySelector(".modal-description-scroll").scrollTop > 0);
-      await explanation.press("Tab");
-      assert.ok(await input.evaluate(element => element === document.activeElement));
-      await input.fill("falsch");
-      await input.press("Enter");
+      await dialog.getByRole("button", { name: "Abbrechen", exact: true }).click();
       const queue = await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__);
       assert.equal(queue.entries[0].state, "AwaitingConfirmation");
     });
   }
+
+  await runCase("Queue-Wirkungsdialog verwirft veralteten Plan bei gleicher Backendphrase", "", async page => {
+    await page.evaluate(() => {
+      const queue = window.__DOPPELDECKER_MOCK_QUEUE__; queue.paused = true;
+      const plan = { copy_count: 1, update_count: 0, metadata_count: 0, delete_count: 0, actions: [] };
+      queue.entries = [{ operation_id: "stale-attention", operation: { type: "Sync", source: "/mock/quelle", target: "/mock/ziel", options: { mode: "AddOnly" }, expected_plan: plan }, state: "AwaitingConfirmation", attempts: 1, progress: {}, attention: { type: "PlanChanged", reason: "Ein neuer Pfad", confirmation: "gleiche-phrase", current_plan: plan } }];
+      const invoke = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = async (command, args) => {
+        if (command === "approve_queue_entry") window.__QUEUE_EFFECT_ARGS__ = structuredClone(args);
+        return invoke(command, args);
+      };
+      window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
+    });
+    await page.locator("#btn-queue").click();
+    await page.getByRole("button", { name: "Plan bestätigen" }).click();
+    let dialog = page.getByRole("dialog", { name: "Queue-Wirkung bestätigen" });
+    assert.match(await dialog.innerText(), /1 neu/);
+    assert.equal(await dialog.locator("input").count(), 0);
+    await page.evaluate(() => {
+      const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
+      queue.entries[0].attention.current_plan = { ...queue.entries[0].attention.current_plan, copy_count: 7 };
+      window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
+    });
+    await dialog.getByRole("button", { name: "Fortfahren" }).click();
+    await page.getByText(/Die Queue-Rückfrage hat sich seit der Anzeige geändert/).waitFor();
+    let state = await page.evaluate(() => ({ entry: window.__DOPPELDECKER_MOCK_QUEUE__.entries[0], args: window.__QUEUE_EFFECT_ARGS__ }));
+    assert.equal(state.entry.state, "AwaitingConfirmation");
+    assert.equal(state.args.expectedAttention.current_plan.copy_count, 1);
+    assert.equal(state.args.effectsConfirmed, true);
+    assert.equal(Object.hasOwn(state.args, "confirmation"), false);
+    await page.getByRole("button", { name: "Plan bestätigen" }).click();
+    dialog = page.getByRole("dialog", { name: "Queue-Wirkung bestätigen" });
+    assert.match(await dialog.innerText(), /7 neu/);
+    await dialog.getByRole("button", { name: "Fortfahren" }).click();
+    state = await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0]);
+    assert.equal(state.state, "Pending");
+    assert.equal(state.operation.expected_plan.copy_count, 7);
+  });
 
   await runCase("Nicht gestarteter WebDAV-Altplan lässt sich typisiert verwerfen", "?legacyWebdav=failed", async page => {
     await page.locator("#btn-queue").click();
@@ -6333,7 +7683,7 @@ try {
     assert.equal(await popover.getByRole("button", { name: "Neu prüfen" }).count(), 0);
   });
 
-  await runCase("Backup-Abbruch hält das offene Queue-Popover und seinen Fokus", "", async page => {
+  await runCase("Sync-Abbruch hält das offene Queue-Popover und seinen Fokus", "", async page => {
     await page.evaluate(() => {
       const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
       queue.entries = [{
@@ -6357,7 +7707,7 @@ try {
     const popover = page.getByRole("dialog", { name: "Operations-Queue" });
     const approve = popover.getByRole("button", { name: "Plan bestätigen" });
     await approve.click();
-    await page.getByRole("dialog", { name: "Unabhängiges Backup bestätigen" })
+    await page.getByRole("dialog", { name: "Sync ausführen" })
       .getByRole("button", { name: "Abbrechen" }).click();
     await popover.waitFor();
     assert.equal(await page.locator("#queue-popover").getAttribute("hidden"), null);
@@ -6431,6 +7781,40 @@ try {
     await page.locator("#queue-count").filter({ hasText: "1" }).waitFor();
     assert.match(await page.locator("#dock").innerText(), /Queue bleibt pausiert/i);
   });
+
+  for (const theme of ["light", "dark"]) for (const width of [800, 390]) {
+    await runCase(`Entfernter Dateinamenzyklus zeigt Recovery ohne Retry · ${theme} · ${width}`, "", async page => {
+      await page.evaluate(theme => {
+        document.documentElement.dataset.theme=theme;
+        const queue=window.__DOPPELDECKER_MOCK_QUEUE__;
+        const id="0123456789abcdef0123456789abcdef";
+        queue.entries=[{operation_id:id,state:"Interrupted",attempts:1,created_unix_ms:Date.now(),progress:{},attention:null,
+          error_code:"outcome_unclear",error:"Namenstausch teilweise ausgeführt; prüfen.",temp_recovery_paths:["/pane/.doppeldecker-rename-"+id],
+          operation:{type:"RenameCycleRecovery",record:{id,root:"/pane",identity:{provider:"Ftps",identity:{server:{host:"test.example",port:2121}}},
+            old_names:["ab","aab","aaab"],new_names:["aab","aaab","ab"],current_names:[".doppeldecker-rename-"+id,"aab","aaab"],
+            temp_name:".doppeldecker-rename-"+id,pending:{member:2,from:"aaab",to:"ab"},finished:false}}}];
+        window.__MOCK_EMIT__("queue-updated",structuredClone(queue));
+      },theme);
+      await page.setViewportSize({width,height:600});
+      await page.locator("#btn-queue").click();
+      const popover=page.getByRole("dialog",{name:"Operations-Queue"});
+      const row=popover.locator('[data-queue-id="0123456789abcdef0123456789abcdef"]');
+      await row.getByText(/Entfernten Namenstausch prüfen · FTPS · test.example:2121 · \/pane/).waitFor();
+      assert.equal(await row.getByRole("button",{name:"Neu prüfen"}).count(),0);
+      await row.getByText(/^Namenslage ·/).click();
+      const names=row.getByRole("textbox",{name:"Gespeicherte Namenslage des Dateinamenzyklus"});
+      assert.match(await names.inputValue(),/"aaab" → Ziel "ab"; letzter Stand: "aaab" oder "ab" \(Ausgang unklar\)/);
+      assert.match(await row.innerText(),/manuell prüfen/);
+      assert.equal(await names.getAttribute("readonly"),"");
+      assert.equal(await row.evaluate(element=>element.scrollWidth<=element.clientWidth),true);
+      await row.getByRole("button",{name:"Wirkung geprüft und schließen"}).click();
+      const dialog=page.getByRole("dialog",{name:"Unklaren Ausgang schließen"});
+      assert.match(await dialog.innerText(),/Zwischenname bleibt erhalten/);
+      await dialog.getByRole("button",{name:"Abbrechen"}).click();
+      await row.waitFor();
+      assert.equal(await page.evaluate(()=>window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].state),"Interrupted");
+    });
+  }
 
   for (const theme of ["light", "dark"]) {
     await runCase(`FTPS-Probenrest zeigt Server und Root ohne Wiederholung: ${theme}`, "", async page => {
@@ -6622,6 +8006,38 @@ try {
     assert.equal(await page.locator("html").getAttribute("data-quit-after-queue-warning"), "true");
     await page.waitForFunction(() =>
       document.documentElement.dataset.quitAfterQueueToken === "exit-mock-2");
+  });
+
+  await runCase("Beenden bei unlesbarer Queue erhält das Journal und erfindet keine Einträge", "", async page => {
+    await page.evaluate(() => window.__MOCK_EMIT__("queue-exit-requested", {
+      token: "exit-unlesbar", openEntries: 0, unreadableQueues: ["main"],
+    }));
+    const dialog = page.getByRole("dialog", { name: "Doppeldecker beenden?" });
+    await dialog.waitFor();
+    const text = await dialog.innerText();
+    assert.match(text, /nicht gelesen.*main.*Arbeitsstand ist unbekannt.*unverändert erhalten/s);
+    assert.doesNotMatch(text, /[01] offene/);
+    await dialog.getByRole("button", { name: "Hier bleiben" }).click();
+    assert.equal(await page.locator("html").getAttribute("data-quit-after-queue-warning"), null);
+    await page.evaluate(() => window.__MOCK_EMIT__("queue-exit-requested", {
+      token: "exit-unlesbar-neu", openEntries: 0, unreadableQueues: ["main"],
+    }));
+    await dialog.waitFor();
+    await dialog.getByRole("button", { name: "Trotzdem beenden" }).click();
+    await page.waitForFunction(() => document.documentElement.dataset.quitAfterQueueToken === "exit-unlesbar-neu");
+  });
+
+  await runCase("Beenden trennt offene Einträge von unlesbaren Fensterqueues", "", async page => {
+    await page.setViewportSize({ width: 520, height: 780 });
+    await page.evaluate(() => window.__MOCK_EMIT__("queue-exit-requested", {
+      token: "exit-gemischt", openEntries: 2, unreadableQueues: ["window-<img>"],
+    }));
+    const dialog = page.getByRole("dialog", { name: "Doppeldecker beenden?" });
+    await dialog.waitFor();
+    assert.match(await dialog.innerText(), /2 offene.*nicht gelesen.*window-<img>/s);
+    assert.equal(await dialog.locator("img").count(), 0);
+    await dialog.getByRole("button", { name: "Trotzdem beenden" }).click();
+    await page.waitForFunction(() => document.documentElement.dataset.quitAfterQueueToken === "exit-gemischt");
   });
 
   await runCase("Beenden verwendet ausschließlich den neuesten fachlichen Token", "", async page => {
@@ -6961,8 +8377,8 @@ try {
     await page.setViewportSize({ width: 760, height: 480 });
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
     await page.getByRole("button", { name: "Realmodus" }).click();
-    const dialog = page.getByRole("dialog", { name: "Lokalen Realmodus bestätigen" });
-    const lastAction = dialog.getByRole("button", { name: "Einmalig real starten" });
+    const dialog = page.getByRole("dialog", { name: "Sync ausführen" });
+    const lastAction = dialog.getByRole("button", { name: "Sync starten" });
     await lastAction.waitFor();
     const box = await lastAction.boundingBox();
     assert.ok(box && box.y >= 0 && box.y + box.height <= 480,
@@ -7578,6 +8994,72 @@ try {
     ]);
     await page.keyboard.press("Escape");
   });
+
+  await runCase("FTPS-Zertifikat: öffentlicher Standard speichert nach Prüfung ohne Pin", "", async page => {
+    await page.locator("#conn-add").click();
+    await page.getByRole("dialog", { name: "Verbindung hinzufügen" }).locator('[data-pick="ftps"]').click();
+    const dialog = page.getByRole("dialog", { name: "FTP-/FTPS-Verbindung hinzufügen" });
+    assert.equal(await dialog.locator("#ftps-policy").inputValue(), "web_pki");
+    await dialog.locator("#ftps-name").fill("Öffentlich");
+    await dialog.locator("#ftps-host").fill("public.mock.test");
+    await dialog.locator("#ftps-user").fill("tester");
+    await captureNativeSecret(dialog);
+    await dialog.getByRole("button", { name: "Prüfen und speichern" }).click();
+    await dialog.waitFor({ state: "detached" });
+    const actions = await page.evaluate(() => window.__MOCK_CONNECTION_ACTIONS__());
+    assert.equal(actions.filter(action => action.command === "verify_ftps_certificate").length, 1);
+    assert.equal(actions.filter(action => action.command === "discover_ftps_certificate").length, 0);
+    const state = await page.evaluate(() => window.__MOCK_CONNECTION_STATE__());
+    const saved = state.ftpsProfiles.find(profile => profile.name === "Öffentlich");
+    assert.equal(saved.connection.certificate_policy, "web_pki");
+    assert.equal(saved.connection.certificate, null);
+  });
+
+  for (const rejected of [false, true]) {
+    await runCase(`FTPS-Zertifikat: Bestandsprofil auf öffentliche Prüfung umstellen ${rejected ? "Fehler" : "Erfolg"}`, rejected ? "?ftpsPublicVerifyError=1" : "", async page => {
+      const before = await page.evaluate(() => window.__MOCK_CONNECTION_STATE__());
+      await page.locator('#connection-list [data-id="mock_ftps"] .conn-edit').click();
+      const dialog = page.getByRole("dialog", { name: "FTP-/FTPS-Verbindung bearbeiten" });
+      assert.equal(await dialog.locator("#ftps-policy").inputValue(), "pinned_certificate");
+      await dialog.locator("#ftps-policy").selectOption("web_pki");
+      if (rejected) await captureNativeSecret(dialog);
+      await dialog.getByRole("button", { name: "Prüfen und speichern" }).click();
+      if (rejected) {
+        await page.getByText("Öffentliche Zertifikatsprüfung fehlgeschlagen", { exact: false }).waitFor();
+        assert.equal(await dialog.locator("#ftps-policy").inputValue(), "web_pki");
+        const after = await page.evaluate(() => window.__MOCK_CONNECTION_STATE__());
+        assert.deepEqual(after.ftpsProfiles, before.ftpsProfiles);
+        assert.deepEqual(after.secretTransactions, before.secretTransactions);
+        assert.equal(after.pendingSecretCount, 1, "Eine fehlgeschlagene TLS-Probe darf den nativen Einmalwert nicht verbrauchen.");
+        await dialog.getByRole("button", { name: "Abbrechen" }).click();
+      } else {
+        await dialog.waitFor({ state: "detached" });
+        const after = await page.evaluate(() => window.__MOCK_CONNECTION_STATE__());
+        assert.equal(after.ftpsProfiles[0].id, "mock_ftps");
+        assert.equal(after.ftpsProfiles[0].connection.certificate, null);
+        assert.equal(after.ftpsProfiles[0].connection.certificate_policy, "web_pki");
+        assert.deepEqual(after.ftpsProfiles[0].connection.password_reference, before.ftpsProfiles[0].connection.password_reference);
+      }
+    });
+  }
+
+  for (const policy of ["web_pki_and_pin", "pinned_certificate", "unverified_certificate"]) {
+    await runCase(`FTPS-Zertifikat: Pin erneuern bewahrt Prüfstufe ${policy}`, "?ftpsRenewedCertificate=1", async page => {
+      await page.locator('#connection-list [data-id="mock_ftps"] .conn-edit').click();
+      const dialog = page.getByRole("dialog", { name: "FTP-/FTPS-Verbindung bearbeiten" });
+      await dialog.locator("#ftps-policy").selectOption(policy);
+      await dialog.getByRole("button", { name: "Zertifikat neu ermitteln" }).click();
+      await dialog.getByRole("button", { name: "Neues Zertifikat binden und speichern" }).waitFor();
+      assert.match(await dialog.locator("#ftps-certificate").innerText(), /Bisheriger Fingerabdruck:.*Neu ermittelter Fingerabdruck:/s);
+      assert.equal(await dialog.locator("#ftps-policy").inputValue(), policy);
+      assert.deepEqual((await page.evaluate(() => window.__MOCK_CONNECTION_STATE__())).ftpsProfiles[0].connection.certificate.sha256, Array(32).fill(7));
+      await dialog.getByRole("button", { name: "Neues Zertifikat binden und speichern" }).click();
+      await dialog.waitFor({ state: "detached" });
+      const saved = (await page.evaluate(() => window.__MOCK_CONNECTION_STATE__())).ftpsProfiles[0];
+      assert.equal(saved.connection.certificate_policy, policy);
+      assert.deepEqual(saved.connection.certificate.sha256, Array(32).fill(9));
+    });
+  }
 
   await runCase("Bestehende Verbindungen lassen sich mit gleicher ID umbenennen", "", async page => {
     const cases = [

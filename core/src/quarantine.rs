@@ -285,9 +285,14 @@ impl QuarantineScope {
             )
         })?;
         let parent = std::fs::canonicalize(parent)?;
+        let quarantine_parent = if crate::real_mode::is_home_root(&target)? {
+            &target
+        } else {
+            &parent
+        };
         Ok(Self {
             vfs: LocalVfs::rooted(&parent)?,
-            base: parent.join(".doppeldecker-quarantine"),
+            base: quarantine_parent.join(".doppeldecker-quarantine"),
             sandbox: None,
             expected_target: Some(target),
         })

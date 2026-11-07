@@ -61,7 +61,9 @@ pub(crate) fn local_sync_vfs(
             let target = LocalVfs::rooted(target).map_err(AppError::from)?;
             Ok(vfs.with_file_commit_root(&target))
         }
-        None => Ok(LocalVfs::new()),
+        None => LocalVfs::new()
+            .with_sync_scope(source, target)
+            .map_err(AppError::from),
     }
 }
 
@@ -131,7 +133,7 @@ pub(crate) fn safety_info(
     let real_mode_pending = window_state.pending_real.lock_recover().is_some();
     Ok(SafetyInfo {
         real_enabled: sandbox.is_some(),
-        real_mode_available: sandbox.is_none(),
+        real_mode_available: true,
         real_mode_pending,
         sandbox: sandbox.map(|path| path.to_string_lossy().into_owned()),
         max_delete_entries: MAX_DELETE_ENTRIES,
@@ -149,12 +151,7 @@ pub(crate) fn prepare_real_sync(
     target: String,
     options: SyncOptions,
 ) -> Result<RealRunPreview, AppError> {
-    if sandbox_root()?.is_some() {
-        return Err(AppError::new(
-            "app",
-            "Realmodus und markierte Test-Sandbox sind technisch getrennt; Sandbox zuerst beenden",
-        ));
-    }
+    let sandbox = sandbox_root()?;
     // Auch der lokale Realmodus schreibt und entfernt eine zufällige Restore-Probe.
     // Die bisherige Vorab-Abfrage ließ zwischen Prüfung und Probe ein Rennen offen.
     let label = window.label();
@@ -178,10 +175,12 @@ pub(crate) fn prepare_real_sync(
         }
         let mut pending = window_state.pending_real.lock_recover();
         *pending = None;
-        let prepared = doppeldecker_core::prepare_local_real_run(
+        let prepared = doppeldecker_core::prepare_local_real_run_for_queue(
+            &queue,
             &expand_home_path(&source),
             &expand_home_path(&target),
             options,
+            sandbox.as_deref(),
         )
         .map_err(AppError::from)?;
         let preview = prepared.preview().clone();
@@ -216,8 +215,7 @@ pub(crate) fn run_real_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
     state: State<AppState>,
-    confirmation: String,
-    backup_confirmed: bool,
+    effects_confirmed: bool,
 ) -> Result<(), AppError> {
     let label = window.label().to_owned();
     let window_state = state.window(&label);
@@ -232,14 +230,11 @@ pub(crate) fn run_real_sync(
         &window_state,
         &window_state.pending_real,
         "Keine backend-gehaltene Realmodus-Vorbereitung vorhanden",
-        |prepared| {
-            let preview = prepared.preview();
-            if confirmation != preview.confirmation_phrase
-                || (preview.backup_confirmation_required && !backup_confirmed)
-            {
+        |_prepared| {
+            if !effects_confirmed {
                 return Err(AppError::new(
                     "confirmation_mismatch",
-                    "Lokale Realmodus-Bestätigung stimmt nicht exakt überein",
+                    "Die angezeigte Sync-Wirkung wurde nicht bestätigt",
                 ));
             }
             Ok(())
@@ -249,12 +244,8 @@ pub(crate) fn run_real_sync(
         let progress_window = window.clone();
         let mut last = Instant::now();
         let mut terminal_progress = None;
-        let result = prepared.confirm_and_execute_with_audit(
-            &confirmation,
-            backup_confirmed,
-            &audit_path,
-            &cancel,
-            &mut |progress| {
+        let result = prepared.confirm_effects(effects_confirmed).and_then(|run| {
+            run.execute_with_audit(&audit_path, &cancel, &mut |progress| {
                 let terminal = progress.phase == "done" || progress.phase == "cancelled";
                 if terminal {
                     terminal_progress = Some(progress.clone());
@@ -262,8 +253,8 @@ pub(crate) fn run_real_sync(
                     last = Instant::now();
                     let _ = crate::emit_to_window(&progress_window, "sync-progress", progress);
                 }
-            },
-        );
+            })
+        });
         finish_operation(&app, &label, || {
             if let Some(progress) = terminal_progress {
                 let _ = crate::emit_to_window(&window, "sync-progress", progress);

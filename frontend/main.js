@@ -1,9 +1,15 @@
+import { createArchiveExtractUi } from "./archive-extract-ui.js";
+import { metadataClassLabels } from "./metadata-labels.js";
+import { createArchiveReadUi } from "./archive-read-ui.js";
+import { createArchivePackUi } from "./archive-pack-ui.js";
 import { wireFileDrops } from "./file-drops.js";
+import { createDuplicateActions } from "./duplicate-actions.js";
 // Doppeldecker — Frontend-Logik (Grundgerüst: Navigation, Auswahl, Sortierung,
 // Type-ahead, versteckte Dateien, native Menü-Events + Sync-Vorschau/Testlauf).
 // Nutzt ES-Module ohne Bundler; Tauri stellt die native API weiterhin global bereit.
 
 import { invoke } from "./tauri-api.js";
+import { createBatchRenameUi } from "./batch-rename-ui.js";
 import { createBidirectionalUi } from "./bidirectional-ui.js";
 import { createContextMenu } from "./context-menu.js";
 import { createConnectionsUi } from "./connections-ui.js";
@@ -11,6 +17,8 @@ import { createDevicesUi } from "./devices-ui.js";
 import { createConnectionEditors } from "./connection-editors.js";
 import { createFileActions } from "./file-actions.js";
 import { createFileClipboard, isMac } from "./file-clipboard.js";
+import { createFilePreviewUi } from "./file-preview.js";
+import { createNameSearchUi } from "./name-search-ui.js";
 import { createFileInformationUi } from "./file-information.js";
 import { createFavoritesUi } from "./favorites-ui.js";
 import { createEventController } from "./event-controller.js";
@@ -26,6 +34,7 @@ import { initTheme, setTheme, themePreference } from "./theme.js";
 import { createPlanView } from "./plan-view.js";
 import { createQueueUi } from "./queue-ui.js";
 import { createQuarantineUi } from "./quarantine-ui.js";
+import { createRemoteEditUi } from "./remote-edit-ui.js";
 import { createRealModeUi } from "./real-mode-ui.js";
 import { initSidebarSections } from "./sidebar-sections.js";
 import { initSplitter } from "./splitter.js";
@@ -146,8 +155,9 @@ async function offerCliInstall() {
   }
 }
 
+let bidirectionalUi = null;
 function discardRealPreparation() {
-  return Promise.all([realModeUi?.discard(), localSyncUi?.discard()]);
+  return Promise.all([realModeUi?.discard(), localSyncUi?.discard(), bidirectionalUi?.discard()]);
 }
 
 const syncView = createSyncView({
@@ -322,6 +332,16 @@ const fileActions = createFileActions({
   showError,
 });
 const selectedEntries = (side) => fileActions.selectedEntries(side);
+const duplicateActions = createDuplicateActions({ panes, activeSide: () => activeSide,
+  selectedEntries, blocked: isBrowsingBlocked, showDock, showError });
+const duplicateSelection = side => duplicateActions.duplicate(side);
+const archivePackUi = createArchivePackUi({ panes, activeSide: () => activeSide, selectedEntries,
+  blocked: isBrowsingBlocked, showDock, showError });
+const archivePackSelection = side => archivePackUi.open(side);
+const archiveExtractUi = createArchiveExtractUi({ panes, activeSide: () => activeSide, selectedEntries,
+  blocked: isBrowsingBlocked, showDock, showError });
+const archiveExtractSelection = side => archiveExtractUi.open(side);
+
 const refreshBothPanes = context => fileActions.refreshBothPanes(context);
 const transferToOther = (kind) => fileActions.transferToOther(kind);
 const trashSelection = () => fileActions.trashSelection();
@@ -334,6 +354,8 @@ fileInformationUi = createFileInformationUi({
   panes,
   selectedEntries,
   requestDirectorySizes: startDirectorySizes,
+  refreshPane: side => loadPane(side, panes[side].path, { push: false, preserveView: true }),
+  showDock,
 });
 const showInformation = side => fileInformationUi.open(side);
 const showViewOptions = side => openViewOptions(side);
@@ -344,6 +366,20 @@ function paneEndpoint(pane) {
     : { provider: pane.provider, profileId: pane.profileId,
       profileRevision: pane.profileRevision, root: pane.path };
 }
+
+const filePreviewUi = createFilePreviewUi({ panes, selectedEntries, endpointFor: paneEndpoint, showDock, showError });
+const showPreview = side => filePreviewUi.open(side);
+const archiveReadUi = createArchiveReadUi({ panes, selectedEntries, showDock, blocked: isBrowsingBlocked, extractSelectionReady: (side, response) => archiveExtractUi.openPrepared(side, response) });
+const showArchiveRead = side => archiveReadUi.open(side);
+const nameSearchUi = createNameSearchUi({
+  panes, endpoint: paneEndpoint, activate: setActive,
+  revealHit: (side, parent, name, isHidden) => paneController.revealEntry(side, parent, name, isHidden),
+});
+for (const side of ["left", "right"]) {
+  $(`.pane[data-side="${side}"] .pane-search`).addEventListener("click", () => nameSearchUi.open(side));
+}
+const batchRenameUi = createBatchRenameUi({ panes, selectedEntries, endpointFor: paneEndpoint, showDock, refreshPanes: refreshBothPanes });
+const showBatchRename = side => batchRenameUi.open(side);
 
 function selectedDiffFile(side) {
   const pane = panes[side];
@@ -489,7 +525,7 @@ const {
   showModal: showQuarantineModal,
 } = quarantineUi;
 
-const bidirectionalUi = createBidirectionalUi({
+bidirectionalUi = createBidirectionalUi({
   panes,
   dockRevision,
   syncScope,
@@ -518,6 +554,8 @@ const {
   showModal: showQuarantineModal,
   startFileProgress: startOpUi,
   startSyncProgress: startProgressUi,
+  resumeGeneratedUpload: entry => fileActions.resumeGeneratedUpload(entry),
+  showGeneratedSource: path => setPaneLocation(activeSide, { provider: "local", path }),
 });
 
 // Ein einziger Handler am Container statt eines Handlers je Meldung: `showDock`
@@ -525,8 +563,9 @@ const {
 // Handler überlebt nur, solange dieselbe Fehleranzeige ihn neu setzt — rendert
 // eine andere Stelle das Dock neu, bliebe ein sichtbarer, aber toter Knopf übrig.
 $("#dock-summary").addEventListener("click", event => {
-  if (event.target.closest("[data-dock-action=\"open-queue\"]")) {
-    void openQueueManager();
+  const queueButton = event.target.closest("[data-dock-action=\"open-queue\"]");
+  if (queueButton) {
+    void openQueueManager(queueButton.dataset.operationId || null);
   }
 });
 
@@ -537,8 +576,14 @@ const contextMenu = createContextMenu({
   selectedEntries,
   pane: (side) => panes[side],
   open: openCursor,
+  preview: showPreview,
+  archiveRead: showArchiveRead,
+  batchRename: showBatchRename,
   addFavorite,
   transfer: transferToOther,
+  duplicate: duplicateSelection,
+  archivePack: archivePackSelection,
+  archiveExtract: archiveExtractSelection,
   clipboardCopy: side => fileClipboard.copy(false, side),
   clipboardCut: side => fileClipboard.copy(true, side),
   clipboardPaste: (side, move = false) => fileClipboard.paste(move, side),
@@ -576,6 +621,9 @@ const { onKeyDown, onMenu } = createInputController({
   newFolder,
   newWindow,
   openCursor,
+  showPreview,
+  showArchiveRead,
+  showBatchRename,
   openQuarantineManager,
   optionId,
   pageSize,
@@ -592,16 +640,23 @@ const { onKeyDown, onMenu } = createInputController({
   showPreferences: () => settingsUi?.open(),
   showContextMenu,
   showInformation,
+  showNameSearch: side => nameSearchUi.open(side),
   showViewOptions,
   swapPanes,
   syncView,
   toggleHidden,
   transferToOther,
+  duplicateSelection,
+  archivePackSelection,
+  archiveExtractSelection,
   trashSelection,
   typeAhead,
 });
 
+const remoteEditUi = createRemoteEditUi({ showDock, showError, refreshQueue });
+
 const eventController = createEventController({
+  onRemoteOpened: snapshot => remoteEditUi.onOpened(snapshot),
   onOperationContext: context => fileClipboard.onContext(context),
   onFileOperationDone: (summary, failed) => fileClipboard.onDone(summary, failed),
   acceptOperationEvent,
@@ -647,30 +702,11 @@ function remoteSyncContext() {
   const current = currentSourceTarget();
   const remoteCount = [current.sourcePane, current.targetPane].filter((pane) => pane.provider !== "local").length;
   if (remoteCount === 0) return null;
-  if (remoteCount === 2) {
-    const endpoint = pane => ({
-      provider: pane.provider,
-      profileId: pane.profileId,
-      profileRevision: pane.profileRevision,
-      root: pane.path,
-    });
-    return {
-      protocol: "provider",
-      source: endpoint(current.sourcePane),
-      target: endpoint(current.targetPane),
-    };
-  }
-  const upload = current.targetPane.provider !== "local";
-  const remotePane = upload ? current.targetPane : current.sourcePane;
-  const localPane = upload ? current.sourcePane : current.targetPane;
-  return {
-    profileId: remotePane.profileId,
-    profileRevision: remotePane.profileRevision,
-    direction: upload ? "Upload" : "Download",
-    localRoot: localPane.path,
-    remoteRoot: remotePane.path,
-    protocol: remotePane.provider,
-  };
+  const endpoint = pane => pane.provider === "local"
+    ? { provider: "local", root: pane.path }
+    : { provider: pane.provider, profileId: pane.profileId,
+      profileRevision: pane.profileRevision, root: pane.path };
+  return { protocol: "content", source: endpoint(current.sourcePane), target: endpoint(current.targetPane) };
 }
 function syncOptions() {
   return syncView.options();
@@ -691,23 +727,18 @@ function syncScope() {
   });
 }
 
-const metadataClassLabels = {
-  Owner: "Eigentümer/Gruppe",
-  Acl: "ACL",
-  NormalMode: "normale Rechte",
-  SpecialModeBits: "Sonderbits",
-  Xattrs: "Extended Attributes",
-  ResourceFork: "Ressourcen-Fork",
-  SparseExtents: "Sparse-Struktur",
-  Hardlinks: "Hardlinks",
-};
-
 function metadataReportHtml(report) {
   if (!report) return "";
   const transferred = (report.classes || []).reduce((sum, item) => sum + item.transferred, 0);
   const omitted = (report.classes || []).reduce((sum, item) => sum + item.omitted, 0);
   if (report.profile === "Portable") {
-    return omitted ? `<span class="pill delete">${omitted} Rechte ausgelassen</span>` : "";
+    const count = name => (report.classes || []).filter(item => item.class === name).reduce((sum, item) => sum + item.omitted, 0);
+    const times = count("Mtime");
+    const rights = count("NormalMode");
+    const other = omitted - times - rights;
+    return (rights ? `<span class="pill delete">${rights} Rechte ausgelassen</span>` : "") +
+      (times ? `<span class="pill delete">${times} ${times === 1 ? "Dateizeit" : "Dateizeiten"} ausgelassen</span>` : "") +
+      (other ? `<span class="pill delete">${other} weitere Metadatenmerkmale ausgelassen</span>` : "");
   }
   let html = `<span class="pill update">${transferred} native Merkmale</span>`;
   if (omitted) html += `<span class="pill delete">${omitted} nicht exakt darstellbar</span>`;
@@ -723,13 +754,16 @@ function updateMetadataNote(report = null) {
   const title = $("#sync-metadata-note-title");
   if (syncView.metadata() === "Portable") {
     const omittedRights = (report?.classes || []).some(item => item.class === "NormalMode" && item.omitted > 0);
-    title.textContent = omittedRights
-      ? "Überträgt Inhalt und Änderungszeit. Normale Rechte sind auf diesem Ziel nicht exakt darstellbar und werden ausgelassen."
-      : "Überträgt Inhalt, Änderungszeit und normale Rechte (rwx), soweit am Ziel darstellbar.";
+    const omittedTime = (report?.classes || []).some(item => item.class === "Mtime" && item.omitted > 0);
+    title.textContent = omittedTime
+      ? `Überträgt Inhalt. Dateizeiten sind auf diesem Ziel nicht exakt darstellbar und werden ausgelassen. ${omittedRights ? "Normale Rechte werden ebenfalls ausgelassen." : "Normale Rechte werden soweit darstellbar übertragen."}`
+      : omittedRights
+        ? "Überträgt Inhalt und Änderungszeit. Normale Rechte sind auf diesem Ziel nicht exakt darstellbar und werden ausgelassen."
+        : "Überträgt Inhalt, Änderungszeit und normale Rechte (rwx), soweit am Ziel darstellbar.";
   } else if (syncView.metadata() === "NativeBestEffort") {
     title.textContent = "Überträgt zusätzlich native Merkmale; nicht Darstellbares wird einzeln bilanziert.";
   } else if (report && report.strict_verified) {
-    title.textContent = "Metadaten strikt geprüft; Realmodus mit Restore-Probe verfügbar.";
+    title.textContent = "Metadaten strikt geprüft. Der konkrete Wiederherstellungsweg steht in der Ausführungsvorschau.";
   } else {
     title.textContent = "Alle Merkmale exakt; die vollständige Prüfung läuft mit der Vorschau.";
   }
@@ -748,6 +782,7 @@ updateMetadataNote();
 
 realModeUi = createRealModeUi({
   currentSourceTarget,
+  dockRevision,
   syncScope,
   endProgress: endProgressUi,
   ensureContentHash: syncView.ensureContentHash,
@@ -780,6 +815,7 @@ const oneWaySyncUi = createOneWaySyncUi({
   remoteSyncContext,
   runRemote: doRemoteSync,
   runLocal: current => localSyncUi.run(current),
+  runMirror: () => realModeUi.run(),
   running: isRunning,
   showDock,
   showError,

@@ -78,6 +78,59 @@ fn create(endpoint: &ProviderEndpoint, name: &str) -> io::Result<DirectoryCreate
 }
 
 #[test]
+fn normales_webdav_mkdir_akzeptiert_eigene_elternversion() {
+    let server = Server::new();
+    let parent = server.root.path().join("pane");
+    std::fs::write(parent.join("neighbor"), b"Erhalten").unwrap();
+    filetime::set_file_mtime(
+        &parent,
+        filetime::FileTime::from_unix_time(1_700_000_000, 0),
+    )
+    .unwrap();
+    server.state.lock().unwrap().changing_collection_tokens = true;
+    let result = create(&server.endpoint(), "Neu");
+    assert!(result.is_ok(), "{result:?}");
+    assert!(parent.join("Neu").is_dir());
+    assert_eq!(std::fs::read(parent.join("neighbor")).unwrap(), b"Erhalten");
+    let state = server.state.lock().unwrap();
+    assert_eq!(
+        state.requests.iter().filter(|(m, _)| m == "MKCOL").count(),
+        1
+    );
+    assert!(!state
+        .requests
+        .iter()
+        .any(|(m, _)| matches!(m.as_str(), "PUT" | "MOVE" | "DELETE")));
+}
+
+#[test]
+fn normales_webdav_mkdir_meldet_fremde_bestandsaenderung_nach_anlage_als_unklar() {
+    for fault in [
+        Fault::SiblingAddedAfterMkdir,
+        Fault::SiblingRemovedAfterMkdir,
+        Fault::SiblingChangedAfterMkdir,
+    ] {
+        let server = Server::new();
+        let parent = server.root.path().join("pane");
+        std::fs::write(parent.join("neighbor"), b"Alt").unwrap();
+        server.state.lock().unwrap().changing_collection_tokens = true;
+        server.state.lock().unwrap().fault = fault;
+        let error = create(&server.endpoint(), "Neu").unwrap_err();
+        assert_eq!(error_code(&error), ErrorCode::OutcomeUnclear);
+        assert!(parent.join("Neu").is_dir());
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state.requests.iter().filter(|(m, _)| m == "MKCOL").count(),
+            1
+        );
+        assert!(!state
+            .requests
+            .iter()
+            .any(|(m, _)| matches!(m.as_str(), "PUT" | "MOVE" | "DELETE")));
+    }
+}
+
+#[test]
 fn normales_webdav_mkdir_toleriert_fehlende_anlege_etag_mit_sichtbarem_readback_vertrag() {
     let server = Server::new();
     server.state.lock().unwrap().fault = Fault::NoCreatedEtag;
@@ -140,8 +193,8 @@ fn normales_webdav_mkdir_erhaelt_kollisionen_und_bilanziert_spaeten_elterntausch
         if fault == Fault::LateCollision {
             assert_eq!(std::fs::read(&target).unwrap(), b"Fremd");
         } else if fault == Fault::ParentSwapAtMkdir {
-            assert_eq!(error_code(&error), ErrorCode::PlanDrift);
-            assert!(!target.exists());
+            assert_eq!(error_code(&error), ErrorCode::OutcomeUnclear);
+            assert!(target.is_dir());
             assert_eq!(
                 std::fs::read(server.root.path().join("pane/Fremd.txt")).unwrap(),
                 b"Fremder Elternordner"

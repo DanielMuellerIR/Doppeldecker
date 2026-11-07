@@ -16,7 +16,7 @@ smb2 = { path = "vendor/smb2" }
 
 # Gemeinsame Metadaten, damit Version/Edition an einer Stelle stehen.
 [workspace.package]
-version = "0.1.124"
+version = "0.1.125"
 edition = "2021"
 license = "MIT"
 

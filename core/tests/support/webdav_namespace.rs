@@ -47,13 +47,26 @@ pub(crate) enum Fault {
     LateCollision,
     NonemptyCreated,
     MissingParentChild,
+    SiblingAddedAfterMkdir,
+    SiblingRemovedAfterMkdir,
+    SiblingChangedAfterMkdir,
     LostAfterMove,
+    NoopMoveAcknowledgement,
+    SiblingAddedAfterMove,
+    SiblingRemovedAfterMove,
+    SiblingChangedAfterMove,
+    SiblingMetadataAfterMove,
+    MissingSiblingEtag,
+    WeakSiblingEtag,
+    AncestorChangedAfterMove,
+    PauseAfterMove,
     ParentSwapAtMove,
     ProfileRootSwapAtMove,
     SourceSwapAtMove,
     LateMoveCollision,
     ErrorAfterMove,
     WrongReadbackEtag,
+    NewEtagAfterMove,
     LostAfterPut,
     ErrorAfterPut,
     MissingPutEtag,
@@ -74,8 +87,22 @@ pub(crate) enum Fault {
 
 #[derive(Default)]
 pub(crate) struct State {
+    pub(crate) reject_collection_conditions: bool,
+    // Künstliche Namensgruppen brauchen auch auf case-insensitivem APFS
+    // getrennte, vom lokalen Dateisystem unabhängige Listingressourcen.
+    pub(crate) download_aliases: Vec<(PathBuf, String, String)>,
+    pub(crate) download_body: Option<Vec<u8>>,
+    pub(crate) change_before_get: Option<PathBuf>,
+    pub(crate) cancel_on_get: Option<doppeldecker_core::Cancel>,
+    pub(crate) get_if_match_headers: Vec<String>,
     pub(crate) depth_zero_delays: VecDeque<Duration>,
     pub(crate) allow_file_overwrite: bool,
+    pub(crate) parallel_puts: usize,
+    pub(crate) arrived_puts: usize,
+    pub(crate) xoc_mtime_behavior: u8,
+    pub(crate) put_mtime_headers: Vec<(String, Option<i64>)>,
+    pub(crate) mtime_behavior: u8, // 0: protected, 1: exakt, 2: ignoriert
+
     pub(crate) deny_collection_probes: bool,
     pub(crate) changing_collection_tokens: bool,
     pub(crate) mkdir_if_headers: Vec<String>,
@@ -234,8 +261,29 @@ impl Server {
                                     })
                                     .await;
                                 }
+                                if request.method() == "PUT" {
+                                    let required = {
+                                        let mut current = state.lock().unwrap();
+                                        current.arrived_puts += 1;
+                                        current.parallel_puts
+                                    };
+                                    let deadline =
+                                        std::time::Instant::now() + Duration::from_secs(5);
+                                    while required > 0
+                                        && state.lock().unwrap().arrived_puts < required
+                                    {
+                                        if std::time::Instant::now() >= deadline {
+                                            return Err(io::Error::new(
+                                                io::ErrorKind::TimedOut,
+                                                "zweiter paralleler PUT fehlt",
+                                            ));
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(5)).await;
+                                    }
+                                }
                                 let (parts, body) = request.into_parts();
-                                let bytes = if parts.method == "PUT" {
+                                let bytes = if parts.method == "PUT" || parts.method == "PROPPATCH"
+                                {
                                     body.collect()
                                         .await
                                         .map_err(io::Error::other)?
@@ -329,8 +377,13 @@ fn etag(path: &Path, state: &Mutex<State>) -> String {
         }
         format!("\"folder-{}-{}\"", meta.dev(), meta.ino())
     } else {
+        let moved = {
+            let state = state.lock().unwrap();
+            state.fault == Fault::NewEtagAfterMove && state.created.as_deref() == Some(path)
+        };
         format!(
-            "\"file-{}\"",
+            "\"{}-{}\"",
+            if moved { "moved" } else { "file" },
             blake3::hash(&std::fs::read(path).unwrap()).to_hex()
         )
     }
@@ -345,12 +398,43 @@ fn resource(path: &Path, href: &str, state: &Mutex<State>) -> String {
             parts.push(part);
         }
     }
-    let kind = if path.is_dir() {
-        "<D:resourcetype><D:collection/></D:resourcetype>".to_owned()
-    } else {
-        format!("<D:resourcetype/><D:getcontentlength>{}</D:getcontentlength><D:getlastmodified>Sun, 18 Oct 2026 00:00:00 GMT</D:getlastmodified>", path.metadata().unwrap().len())
+    let metadata_changed = {
+        let state = state.lock().unwrap();
+        state.fault == Fault::SiblingMetadataAfterMove
+            && state.created.is_some()
+            && path.file_name().is_some_and(|name| name == "neighbor")
     };
-    format!("<D:response><D:href>{}</D:href><D:propstat><D:prop>{kind}<D:getetag>{}</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>", url.path(), etag(path, state))
+    let actual_modified;
+    let use_actual_mtime = {
+        let state = state.lock().unwrap();
+        state.mtime_behavior != 0 || state.xoc_mtime_behavior != 0
+    };
+    let modified = if use_actual_mtime {
+        actual_modified = httpdate::fmt_http_date(path.metadata().unwrap().modified().unwrap());
+        actual_modified.as_str()
+    } else if metadata_changed {
+        "Mon, 19 Oct 2026 00:00:00 GMT"
+    } else {
+        "Sun, 18 Oct 2026 00:00:00 GMT"
+    };
+    let kind = if path.is_dir() {
+        format!("<D:resourcetype><D:collection/></D:resourcetype><D:getlastmodified>{modified}</D:getlastmodified>")
+    } else {
+        format!("<D:resourcetype/><D:getcontentlength>{}</D:getcontentlength><D:getlastmodified>{modified}</D:getlastmodified>", path.metadata().unwrap().len())
+    };
+    let fault = state.lock().unwrap().fault;
+    let token = if path.file_name().is_some_and(|name| name == "neighbor")
+        && fault == Fault::MissingSiblingEtag
+    {
+        String::new()
+    } else if path.file_name().is_some_and(|name| name == "neighbor")
+        && fault == Fault::WeakSiblingEtag
+    {
+        format!("<D:getetag>W/{}</D:getetag>", etag(path, state))
+    } else {
+        format!("<D:getetag>{}</D:getetag>", etag(path, state))
+    };
+    format!("<D:response><D:href>{}</D:href><D:propstat><D:prop>{kind}{token}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>", url.path())
 }
 
 fn respond(
@@ -499,7 +583,11 @@ fn respond(
             let first = rest.find('[').unwrap() + 1;
             let last = rest[first..].find(']').unwrap() + first;
             let path = local_path(root, url.path()).unwrap();
-            matches.push(path.exists() && etag(&path, state) == rest[first..last]);
+            matches.push(
+                path.exists()
+                    && !(path.is_dir() && state.lock().unwrap().reject_collection_conditions)
+                    && etag(&path, state) == rest[first..last],
+            );
             rest = &rest[last + 1..];
         }
         // Unterstützt die vom Produkt erzeugte Teilsyntax mit einer ETag je
@@ -509,12 +597,32 @@ fn respond(
             return Ok(response(StatusCode::PRECONDITION_FAILED, ""));
         }
     }
+    if method == "GET" {
+        let mut current = state.lock().unwrap();
+        current.get_if_match_headers.push(
+            request
+                .headers()
+                .get("if-match")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .into(),
+        );
+        if let Some(path) = current.change_before_get.take() {
+            std::fs::write(path, b"Geaenderter Inhalt").unwrap();
+        }
+        if let Some(cancel) = current.cancel_on_get.take() {
+            cancel.cancel();
+        }
+    }
     if let Some(value) = request
         .headers()
         .get("if-match")
         .and_then(|v| v.to_str().ok())
     {
-        if !local.exists() || etag(&local, state) != value {
+        if !local.exists()
+            || (local.is_dir() && state.lock().unwrap().reject_collection_conditions)
+            || etag(&local, state) != value
+        {
             return Ok(response(StatusCode::PRECONDITION_FAILED, ""));
         }
     }
@@ -618,6 +726,27 @@ fn respond(
                     resources.push_str(&child_resource);
                 }
             }
+            if request
+                .headers()
+                .get("depth")
+                .is_some_and(|value| value == "1")
+            {
+                let aliases = state.lock().unwrap().download_aliases.clone();
+                for (parent, name, token) in aliases {
+                    if parent == local {
+                        let href = format!("{}/{}", decoded.trim_end_matches('/'), name);
+                        let mut url = url::Url::parse("https://webdav-test.invalid/").unwrap();
+                        {
+                            let mut parts = url.path_segments_mut().unwrap();
+                            parts.clear();
+                            for part in href.split('/').filter(|part| !part.is_empty()) {
+                                parts.push(part);
+                            }
+                        }
+                        resources.push_str(&format!("<D:response><D:href>{}</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>1</D:getcontentlength><D:getlastmodified>Sun, 18 Oct 2026 00:00:00 GMT</D:getlastmodified><D:getetag>{token}</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>", url.path()));
+                    }
+                }
+            }
             if fault == Fault::ParentSwapAfterList
                 && local == root.join("pane")
                 && request
@@ -639,6 +768,18 @@ fn respond(
         "MKCOL" => {
             std::fs::create_dir(&local).unwrap();
             state.lock().unwrap().created = Some(local.clone());
+            match fault {
+                Fault::SiblingAddedAfterMkdir => {
+                    std::fs::write(local.parent().unwrap().join("Fremd.txt"), b"Fremd").unwrap();
+                }
+                Fault::SiblingRemovedAfterMkdir => {
+                    std::fs::remove_file(local.parent().unwrap().join("neighbor")).unwrap();
+                }
+                Fault::SiblingChangedAfterMkdir => {
+                    std::fs::write(local.parent().unwrap().join("neighbor"), b"Neu").unwrap();
+                }
+                _ => {}
+            }
             if fault == Fault::NonemptyCreated {
                 std::fs::write(local.join("Fremd.txt"), b"Erhalten").unwrap();
             }
@@ -659,12 +800,40 @@ fn respond(
             };
             result.body(Full::new(hyper::body::Bytes::new())).unwrap()
         }
+        "PROPPATCH" => {
+            if local.is_file() && request.headers().get("if-match").is_none() {
+                return Ok(response(StatusCode::PRECONDITION_FAILED, ""));
+            }
+            let behavior = state.lock().unwrap().mtime_behavior;
+            if matches!(behavior, 1 | 3 | 4) {
+                let body = std::str::from_utf8(request.body()).unwrap();
+                let value = body
+                    .split("<D:getlastmodified>")
+                    .nth(1)
+                    .unwrap()
+                    .split("</D:getlastmodified>")
+                    .next()
+                    .unwrap();
+                let time = httpdate::parse_http_date(value).unwrap();
+                std::fs::File::open(&local)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(time))
+                    .unwrap();
+            }
+            if behavior == 3 {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "synthetischer Zeitantwortverlust",
+                ));
+            }
+            let status = if behavior == 0 { 403 } else { 200 };
+            response(StatusCode::MULTI_STATUS,format!("<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>{raw}</D:href><D:propstat><D:prop><D:getlastmodified/></D:prop><D:status>HTTP/1.1 {status} Result</D:status></D:propstat></D:response></D:multistatus>"))
+        }
         "PUT" => {
             if request
                 .headers()
                 .get("if-none-match")
                 .is_none_or(|v| v != "*")
-                || request.headers().get("if").is_none()
             {
                 return Ok(response(StatusCode::PRECONDITION_FAILED, ""));
             }
@@ -680,6 +849,22 @@ fn respond(
                 Err(error) => return Err(error),
             };
             std::io::Write::write_all(&mut file, request.body())?;
+            let hint = request
+                .headers()
+                .get("x-oc-mtime")
+                .map(|value| value.to_str().unwrap().parse::<i64>().unwrap());
+            let behavior = {
+                let mut state = state.lock().unwrap();
+                state.put_mtime_headers.push((raw.into(), hint));
+                state.xoc_mtime_behavior
+            };
+            if let Some(value) = hint.filter(|_| matches!(behavior, 1 | 3)) {
+                let value = if behavior == 3 { value / 2 * 2 } else { value };
+                file.set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(value as u64)),
+                )?;
+            }
             if let Some(cancel) = state.lock().unwrap().cancel_on_put.take() {
                 cancel.cancel();
             }
@@ -700,6 +885,11 @@ fn respond(
                 return Ok(response(StatusCode::INTERNAL_SERVER_ERROR, ""));
             }
             let builder = Response::builder().status(StatusCode::CREATED);
+            let builder = if behavior != 0 {
+                builder.header("X-OC-MTime", "accepted")
+            } else {
+                builder
+            };
             let builder = match fault {
                 Fault::MissingPutEtag => builder,
                 Fault::WeakPutEtag => builder.header("etag", format!("W/{}", etag(&local, state))),
@@ -725,14 +915,21 @@ fn respond(
         "GET" if local.is_file() => Response::builder()
             .status(StatusCode::OK)
             .header("etag", etag(&local, state))
-            .body(Full::new(std::fs::read(&local).unwrap().into()))
+            .body(Full::new(
+                state
+                    .lock()
+                    .unwrap()
+                    .download_body
+                    .clone()
+                    .unwrap_or_else(|| std::fs::read(&local).unwrap())
+                    .into(),
+            ))
             .unwrap(),
         "MOVE" => {
             let replace = request.headers().get("overwrite").is_some_and(|v| v == "T")
                 && state.lock().unwrap().allow_file_overwrite;
             if (request.headers().get("overwrite").is_none_or(|v| v != "F") && !replace)
-                || request.headers().get("if-match").is_none()
-                || request.headers().get("if").is_none()
+                || (local.is_file() && request.headers().get("if-match").is_none())
             {
                 return Ok(response(StatusCode::PRECONDITION_FAILED, ""));
             }
@@ -764,8 +961,38 @@ fn respond(
             if !target.parent().unwrap().is_dir() {
                 return Ok(response(StatusCode::CONFLICT, ""));
             }
+            if fault == Fault::NoopMoveAcknowledgement {
+                return Ok(response(StatusCode::CREATED, ""));
+            }
             std::fs::rename(&local, &target).unwrap();
+            if state.lock().unwrap().mtime_behavior == 4 {
+                std::fs::File::open(&target)
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new().set_modified(
+                            std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_001),
+                        ),
+                    )
+                    .unwrap();
+            }
             state.lock().unwrap().created = Some(target);
+            match fault {
+                Fault::SiblingAddedAfterMove => {
+                    std::fs::write(local.parent().unwrap().join("unexpected"), b"fremd").unwrap()
+                }
+                Fault::SiblingRemovedAfterMove => {
+                    std::fs::remove_file(local.parent().unwrap().join("neighbor")).unwrap()
+                }
+                Fault::SiblingChangedAfterMove => {
+                    std::fs::write(local.parent().unwrap().join("neighbor"), b"X").unwrap()
+                }
+                Fault::AncestorChangedAfterMove => {
+                    std::fs::write(root.join("foreign-root-child"), b"fremd").unwrap()
+                }
+                Fault::PauseAfterMove => state.lock().unwrap().hold_parent_list = true,
+                _ => {}
+            }
+
             if fault == Fault::LostAfterMove {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
@@ -801,7 +1028,6 @@ fn respond(
         "DELETE"
             if local.is_file()
                 && request.headers().get("if-match").is_some()
-                && request.headers().get("if").is_some()
                 && request.headers().get("depth").is_none() =>
         {
             if fault != Fault::DeleteLeavesFile {

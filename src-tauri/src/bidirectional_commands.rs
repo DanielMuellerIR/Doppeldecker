@@ -4,6 +4,7 @@
 //! Kern. Diese Datei hält nur nicht serialisierbare Vorbereitungen im RAM, leitet
 //! Events weiter und legt den app-eigenen Baseline-Pfad fest.
 
+use crate::frontend_payload::FrontendQueueSnapshot;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -13,12 +14,14 @@ use std::time::{Duration, Instant};
 use doppeldecker_core::bidirectional::{bind_bidirectional_endpoint, RemoteEndpointBinding};
 use doppeldecker_core::{
     bind_bidirectional_endpoint_compatibility, prepare_bidirectional_queue_entry,
-    prepare_local_bidirectional_rollback, prepare_provider_bidirectional_rollback,
-    prepare_resume_local_bidirectional, prepare_resume_provider_bidirectional,
-    BidirectionalQueueEndpoint, BidirectionalQueuePreparation, ConflictResolution, EndpointBinding,
-    EndpointSide, LocalBidirectionalPreview, LocalBidirectionalRollbackPreview, OperationQueue,
-    PairId, PreparedLocalBidirectionalRun, Progress, ProviderEndpoint, QueueEntry,
-    QueueExecutionResult, QueueOperation, QueueSnapshot, QueueState,
+    prepare_local_bidirectional_rollback_for_queue_operation,
+    prepare_provider_bidirectional_rollback_for_queue_operation,
+    prepare_resume_local_bidirectional_for_queue_operation,
+    prepare_resume_provider_bidirectional_for_queue_operation, BidirectionalQueueEndpoint,
+    BidirectionalQueuePreparation, ConflictResolution, EndpointBinding, EndpointSide,
+    LocalBidirectionalPreview, LocalBidirectionalRollbackPreview, OperationQueue, PairId,
+    PreparedLocalBidirectionalRun, Progress, ProviderEndpoint, QueueEntry, QueueExecutionResult,
+    QueueOperation, QueueState,
 };
 use tauri::{Manager, State, WebviewWindow};
 
@@ -60,7 +63,7 @@ struct BidirectionalRunQueueOwner {
 }
 
 enum BidirectionalRunQueueIntent {
-    Direct(QueueOperation),
+    Direct(Box<QueueOperation>),
     Recovery(String),
 }
 
@@ -121,13 +124,13 @@ fn recovery_discard_decision(
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PrepareBidirectionalRequest {
-    pair_id: PairId,
-    pair_name: String,
-    left: BidirectionalEndpointRequest,
-    right: BidirectionalEndpointRequest,
-    resolutions: Vec<ConflictResolution>,
+    pub(crate) pair_id: PairId,
+    pub(crate) pair_name: String,
+    pub(crate) left: BidirectionalEndpointRequest,
+    pub(crate) right: BidirectionalEndpointRequest,
+    pub(crate) resolutions: Vec<ConflictResolution>,
     #[serde(default)]
-    expected_unresolved_digest: Option<[u8; 32]>,
+    pub(crate) expected_unresolved_digest: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -187,10 +190,10 @@ struct StoredBidirectionalPair {
 }
 
 #[derive(Clone)]
-struct BoundRegistryEndpoint {
-    endpoint: BidirectionalEndpointRequest,
-    binding: EndpointBinding,
-    compatible_bindings: Vec<EndpointBinding>,
+pub(crate) struct BoundRegistryEndpoint {
+    pub(crate) endpoint: BidirectionalEndpointRequest,
+    pub(crate) binding: EndpointBinding,
+    pub(crate) compatible_bindings: Vec<EndpointBinding>,
 }
 
 // Lese- und Schreibgrenze müssen gleich bleiben, damit jeder neue Bestand wieder
@@ -248,7 +251,7 @@ fn normalized_registry_root(root: &str) -> Result<String, AppError> {
     })
 }
 
-fn normalize_registry_endpoint(
+pub(crate) fn normalize_registry_endpoint(
     mut endpoint: BidirectionalEndpointRequest,
 ) -> Result<(String, BidirectionalEndpointRequest), AppError> {
     let root = normalized_registry_root(endpoint.root())?;
@@ -420,7 +423,7 @@ fn registry_pair_key(
     })
 }
 
-fn endpoint_with_bound_root(
+pub(crate) fn endpoint_with_bound_root(
     mut endpoint: BidirectionalEndpointRequest,
     binding: &EndpointBinding,
 ) -> Result<BidirectionalEndpointRequest, AppError> {
@@ -681,7 +684,7 @@ fn ensure_pair_registry_loaded(
     Ok(())
 }
 
-fn register_bidirectional_pair_at(
+pub(crate) fn register_bidirectional_pair_at(
     registry: &mut BidirectionalPairRegistry,
     path: &Path,
     first: BoundRegistryEndpoint,
@@ -853,7 +856,7 @@ fn register_bidirectional_pair_at(
     })
 }
 
-fn validate_registered_pair_at(
+pub(crate) fn validate_registered_pair_at(
     registry: &mut BidirectionalPairRegistry,
     path: &Path,
     request: &PrepareBidirectionalRequest,
@@ -889,7 +892,7 @@ fn validate_registered_pair_at(
     Ok(())
 }
 
-fn pair_registry_path(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
+pub(crate) fn pair_registry_path(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
     Ok(app_config_dir(app)?
         .join("bidirectional")
         .join("pairs.json"))
@@ -1194,12 +1197,19 @@ mod endpoint_request_tests {
         for root in [&left, &right] {
             std::fs::write(root.join("gleich.txt"), b"vorher").unwrap();
         }
-        let prepared = doppeldecker_core::bidirectional::prepare_local_bidirectional(
+        let queue = doppeldecker_core::OperationQueue::open(
+            area.path().join("config/operations-queue.json"),
+        )
+        .unwrap();
+        let prepared = doppeldecker_core::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+            &queue,
             doppeldecker_core::PairId([61; 16]),
             "Fehlerweitergabe",
             &left,
             &right,
             &area.path().join("baseline.json"),
+            &[],
+            None,
         )
         .unwrap();
         let phrase = prepared.preview().confirmation_phrase.clone();
@@ -1862,7 +1872,10 @@ pub(crate) fn validate_endpoint_request_root(
     Ok(normalized)
 }
 
-fn baseline_path(app: &tauri::AppHandle, pair_id: PairId) -> Result<std::path::PathBuf, AppError> {
+pub(crate) fn baseline_path(
+    app: &tauri::AppHandle,
+    pair_id: PairId,
+) -> Result<std::path::PathBuf, AppError> {
     let id: String = pair_id.0.iter().map(|byte| format!("{byte:02x}")).collect();
     Ok(app_config_dir(app)?
         .join("bidirectional")
@@ -2028,6 +2041,21 @@ fn execute_profile_bound<T>(
     execute().map_err(AppError::from)
 }
 
+fn interrupt_bidirectional_app_error(
+    queue: &OperationQueue,
+    operation_id: &str,
+    progress: Progress,
+    error: &AppError,
+) -> std::io::Result<()> {
+    let code = serde_json::from_value(serde_json::Value::String(error.code.clone()))
+        .unwrap_or(doppeldecker_core::ErrorCode::Io);
+    let recovery_error = doppeldecker_core::error::with_recovery_paths(
+        doppeldecker_core::coded_error(std::io::ErrorKind::Other, code, error.message.clone()),
+        &error.recovery_paths,
+    );
+    queue.interrupt_bidirectional_coded(operation_id, progress, &recovery_error)
+}
+
 fn ensure_bidirectional_preparation_active(
     cancel: &doppeldecker_core::Cancel,
 ) -> Result<(), AppError> {
@@ -2072,6 +2100,7 @@ pub(crate) async fn prepare_bidirectional_sync(
             }
             validate_registry_profile(&app, &normalized_left)?;
             validate_registry_profile(&app, &normalized_right)?;
+            let queue = operation_queue(&app, &window_state, label)?;
             let (left_endpoint, left_queue, left_profiles) =
                 resolve_endpoint(&app, &state, &normalized_left)?;
             let (right_endpoint, right_queue, right_profiles) =
@@ -2090,7 +2119,8 @@ pub(crate) async fn prepare_bidirectional_sync(
             )?;
             let baseline = baseline_path(&app, request.pair_id)?;
             let prepared = if request.left.is_local() && request.right.is_local() {
-                doppeldecker_core::bidirectional::prepare_local_bidirectional_with_decisions_bound(
+                doppeldecker_core::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                    &queue,
                     request.pair_id,
                     &request.pair_name,
                     Path::new(request.left.root()),
@@ -2100,7 +2130,8 @@ pub(crate) async fn prepare_bidirectional_sync(
                     request.expected_unresolved_digest,
                 )
             } else {
-                doppeldecker_core::bidirectional::prepare_provider_bidirectional_with_decisions_bound(
+                doppeldecker_core::bidirectional::prepare_provider_bidirectional_with_decisions_bound_for_queue(
+                    &queue,
                     request.pair_id,
                     &request.pair_name,
                     left_endpoint,
@@ -2182,7 +2213,7 @@ pub(crate) fn enqueue_bidirectional_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
     state: State<AppState>,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label();
     let window_state = state.window(label);
     let queue = with_queue_extension(&state, &window_state, || {
@@ -2244,7 +2275,7 @@ pub(crate) fn enqueue_bidirectional_sync(
     })?;
     emit_queue_snapshot(&app, label, &queue);
     start_queue_worker(app, label.to_owned());
-    Ok(queue.snapshot())
+    Ok(queue.snapshot().into())
 }
 
 #[tauri::command]
@@ -2277,14 +2308,18 @@ pub(crate) async fn prepare_bidirectional_resume(
                 let prepared = if matches!(&left, BidirectionalQueueEndpoint::Local { .. })
                     && matches!(&right, BidirectionalQueueEndpoint::Local { .. })
                 {
-                    prepare_resume_local_bidirectional(
+                    prepare_resume_local_bidirectional_for_queue_operation(
+                        &queue,
+                        &operation_id,
                         &pair_name,
                         Path::new(left.root()),
                         Path::new(right.root()),
                         &baseline,
                     )
                 } else {
-                    prepare_resume_provider_bidirectional(
+                    prepare_resume_provider_bidirectional_for_queue_operation(
+                        &queue,
+                        &operation_id,
                         &pair_name,
                         left.connect(std::sync::Arc::new(crate::sftp_commands::KeyringResolver))?,
                         right
@@ -2403,8 +2438,7 @@ pub(crate) fn run_bidirectional_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
     state: State<AppState>,
-    confirmation: String,
-    backup_confirmed: bool,
+    effects_confirmed: bool,
 ) -> Result<(), AppError> {
     let label = window.label().to_owned();
     let window_state = state.window(&label);
@@ -2413,16 +2447,10 @@ pub(crate) fn run_bidirectional_sync(
         let pending = pending_slot
             .as_ref()
             .ok_or_else(|| AppError::new("app", "Bidirektionale Vorbereitung fehlt im RAM"))?;
-        if pending.prepared.preview().confirmation_phrase != confirmation {
+        if !effects_confirmed {
             return Err(AppError::new(
                 "confirmation_mismatch",
-                "Bidirektionale Laufphrase stimmt nicht exakt überein",
-            ));
-        }
-        if pending.prepared.preview().backup_confirmation_required && !backup_confirmed {
-            return Err(AppError::new(
-                "confirmation_mismatch",
-                "Bidirektionaler Lauf benötigt ein bestätigtes unabhängiges Backup",
+                "Die angezeigte bidirektionale Wirkung wurde nicht bestätigt",
             ));
         }
         crate::queue_runtime::ensure_profile_bindings_current(&app, &pending.profile_bindings)?;
@@ -2432,12 +2460,14 @@ pub(crate) fn run_bidirectional_sync(
         let owner_intent = if let Some(operation_id) = pending.recovery_operation_id.clone() {
             BidirectionalRunQueueIntent::Recovery(operation_id)
         } else {
-            BidirectionalRunQueueIntent::Direct(pending.operation.clone().ok_or_else(|| {
-                AppError::new(
-                    "app",
-                    "Direkter bidirektionaler Lauf besitzt keine Queue-Absicht",
-                )
-            })?)
+            BidirectionalRunQueueIntent::Direct(Box::new(pending.operation.clone().ok_or_else(
+                || {
+                    AppError::new(
+                        "app",
+                        "Direkter bidirektionaler Lauf besitzt keine Queue-Absicht",
+                    )
+                },
+            )?))
         };
         let queue = operation_queue(&app, &window_state, &label)?;
         let cancel = reserve_operation(&window_state)?;
@@ -2449,7 +2479,7 @@ pub(crate) fn run_bidirectional_sync(
             },
             BidirectionalRunQueueIntent::Direct(operation) => {
                 match queue.enqueue_claimed_with_profile_bindings(
-                    operation,
+                    *operation,
                     pending.profile_bindings.clone(),
                 ) {
                     Ok(entry) => BidirectionalRunQueueOwner {
@@ -2474,7 +2504,17 @@ pub(crate) fn run_bidirectional_sync(
         let result = execute_profile_bound(
             || crate::queue_runtime::ensure_profile_bindings_current(&app, &profile_bindings),
             || {
-                let run = prepared.confirm(&confirmation, backup_confirmed)?;
+                let prepared = if queue_owner.direct {
+                    doppeldecker_core::queue::reprepare_direct_bidirectional_queue_run(
+                        &queue_owner.queue,
+                        &queue_owner.operation_id,
+                        std::sync::Arc::new(crate::sftp_commands::KeyringResolver),
+                        prepared,
+                    )?
+                } else {
+                    prepared
+                };
+                let run = prepared.confirm_effects(effects_confirmed)?;
                 if queue_owner.direct {
                     queue_owner.queue.mark_running(&queue_owner.operation_id)?;
                 }
@@ -2497,9 +2537,19 @@ pub(crate) fn run_bidirectional_sync(
                     phase: "done".into(),
                     ..Progress::default()
                 });
+                let paths = stats
+                    .runs
+                    .iter()
+                    .flat_map(|run| run.temp_recovery_paths.iter().cloned())
+                    .collect::<Vec<_>>();
                 let queue_result = queue_owner
                     .queue
-                    .finish_bidirectional_after_effect(&queue_owner.operation_id, false, progress)
+                    .finish_bidirectional_after_effect_with_paths(
+                        &queue_owner.operation_id,
+                        false,
+                        progress,
+                        &paths,
+                    )
                     .and_then(|()| {
                         queue_owner
                             .queue
@@ -2535,14 +2585,13 @@ pub(crate) fn run_bidirectional_sync(
                 // Auch ein Resume startet aus `Interrupted`. Scheitert erst der
                 // mutationslose Core-Journalabschluss, muss derselbe Eintrag auf
                 // Completion-Recovery wechseln und darf nicht Rollback anbieten.
-                let queue_error = queue_owner
-                    .queue
-                    .interrupt_bidirectional(
-                        &queue_owner.operation_id,
-                        terminal_progress.clone().unwrap_or_default(),
-                        error.message.clone(),
-                    )
-                    .err();
+                let queue_error = interrupt_bidirectional_app_error(
+                    &queue_owner.queue,
+                    &queue_owner.operation_id,
+                    terminal_progress.clone().unwrap_or_default(),
+                    &error,
+                )
+                .err();
                 finish_operation(&app, &label, || {
                     emit_queue_snapshot(&app, &label, &queue_owner.queue);
                     if let Some(queue_error) = queue_error {
@@ -2608,7 +2657,7 @@ pub(crate) fn prepare_queue_entry(
             }
             QueueTerminalEvent::message(
                 "bidirectional-ready",
-                "Bidirektionaler Lauf ist geprüft; Queue öffnen und Laufphrase bestätigen",
+                "Bidirektionaler Lauf ist geprüft; Queue öffnen und die sichtbare Wirkung bestätigen",
             )
         }
         Ok(BidirectionalQueuePreparation::AwaitingConfirmation { reason }) => {
@@ -2634,9 +2683,8 @@ pub(crate) fn approve_bidirectional_queue_entry(
     window: WebviewWindow,
     state: State<AppState>,
     operation_id: String,
-    confirmation: String,
-    backup_confirmed: bool,
-) -> Result<QueueSnapshot, AppError> {
+    effects_confirmed: bool,
+) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label().to_owned();
     let window_state = state.window(&label);
     let queue = operation_queue(&app, &window_state, &label)?;
@@ -2661,16 +2709,10 @@ pub(crate) fn approve_bidirectional_queue_entry(
                     "Bidirektionale Queue-Vorbereitung gehört zu einem anderen Eintrag",
                 ));
             }
-            if prepared.prepared.preview().confirmation_phrase != confirmation {
+            if !effects_confirmed {
                 return Err(AppError::new(
                     "confirmation_mismatch",
-                    "Bidirektionale Laufphrase stimmt nicht exakt überein",
-                ));
-            }
-            if prepared.prepared.preview().backup_confirmation_required && !backup_confirmed {
-                return Err(AppError::new(
-                    "confirmation_mismatch",
-                    "Bidirektionaler Lauf benötigt ein bestätigtes unabhängiges Backup",
+                    "Die angezeigte bidirektionale Wirkung wurde nicht bestätigt",
                 ));
             }
             Ok(())
@@ -2687,11 +2729,10 @@ pub(crate) fn approve_bidirectional_queue_entry(
         let result = execute_profile_bound(
             || crate::queue_runtime::ensure_profile_bindings_current(&app, &profile_bindings),
             || {
-                doppeldecker_core::execute_prepared_bidirectional_queue_entry(
+                doppeldecker_core::execute_prepared_bidirectional_queue_entry_effects(
                     &queue_for_worker,
                     prepared,
-                    &confirmation,
-                    backup_confirmed,
+                    effects_confirmed,
                     &cancel,
                     &mut |progress| {
                         let terminal = matches!(progress.phase.as_str(), "done" | "cancelled");
@@ -2744,7 +2785,7 @@ pub(crate) fn approve_bidirectional_queue_entry(
             }
         });
     });
-    Ok(queue.snapshot())
+    Ok(queue.snapshot().into())
 }
 
 #[tauri::command]
@@ -2781,14 +2822,18 @@ pub(crate) async fn prepare_bidirectional_rollback(
                 let prepared = if matches!(&left, BidirectionalQueueEndpoint::Local { .. })
                     && matches!(&right, BidirectionalQueueEndpoint::Local { .. })
                 {
-                    prepare_local_bidirectional_rollback(
+                    prepare_local_bidirectional_rollback_for_queue_operation(
+                        &queue,
+                        &operation_id,
                         &pair_name,
                         Path::new(left.root()),
                         Path::new(right.root()),
                         &baseline,
                     )
                 } else {
-                    prepare_provider_bidirectional_rollback(
+                    prepare_provider_bidirectional_rollback_for_queue_operation(
+                        &queue,
+                        &operation_id,
                         &pair_name,
                         left.connect(std::sync::Arc::new(crate::sftp_commands::KeyringResolver))?,
                         right
@@ -2836,7 +2881,7 @@ pub(crate) fn run_bidirectional_rollback(
     app: tauri::AppHandle,
     window: WebviewWindow,
     state: State<AppState>,
-    confirmation: String,
+    effects_confirmed: bool,
 ) -> Result<(), AppError> {
     let label = window.label().to_owned();
     let window_state = state.window(&label);
@@ -2846,10 +2891,10 @@ pub(crate) fn run_bidirectional_rollback(
         &window_state.pending_bidirectional_rollback,
         "Rollback-Vorbereitung fehlt im RAM",
         |pending| {
-            if pending.prepared.preview().confirmation_phrase != confirmation {
+            if !effects_confirmed {
                 return Err(AppError::new(
                     "confirmation_mismatch",
-                    "Rollback-Phrase stimmt nicht exakt überein",
+                    "Die angezeigte Wiederherstellung wurde nicht bestätigt",
                 ));
             }
             let queue = operation_queue(&app, &window_state, &label)?;
@@ -2861,12 +2906,21 @@ pub(crate) fn run_bidirectional_rollback(
     std::thread::spawn(move || {
         let result = execute_profile_bound(
             || crate::queue_runtime::ensure_profile_bindings_current(&app, &profile_bindings),
-            || prepared.confirm(&confirmation)?.execute(&cancel),
+            || {
+                prepared
+                    .confirm_effects(effects_confirmed)?
+                    .execute(&cancel)
+            },
         );
         match result {
             Ok(stats) => {
                 let queue_result = queue
-                    .finish_bidirectional_after_effect(&operation_id, true, Progress::default())
+                    .finish_bidirectional_after_effect_with_paths(
+                        &operation_id,
+                        true,
+                        Progress::default(),
+                        &stats.rollback_quarantines,
+                    )
                     .and_then(|()| {
                         // Der erste Schritt hat den Rollback bereits terminal in der
                         // Queue gebunden. Erst jetzt darf der mutationslose Core-Marker
@@ -2895,7 +2949,22 @@ pub(crate) fn run_bidirectional_rollback(
                 });
             }
             Err(error) => {
+                let queue_error = interrupt_bidirectional_app_error(
+                    &queue,
+                    &operation_id,
+                    Progress::default(),
+                    &error,
+                )
+                .err();
                 finish_operation(&app, &label, || {
+                    emit_queue_snapshot(&app, &label, &queue);
+                    if let Some(queue_error) = queue_error {
+                        let _ = crate::emit_to_window(
+                            &window,
+                            "queue-error",
+                            AppError::from(queue_error),
+                        );
+                    }
                     let _ = crate::emit_to_window(&window, "bidirectional-error", error);
                 });
             }
@@ -2913,7 +2982,7 @@ pub(crate) fn finish_bidirectional_completion_recovery(
     window: WebviewWindow,
     state: State<AppState>,
     operation_id: String,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label();
     let window_state = state.window(label);
     let queue = with_queue_extension(&state, &window_state, || {
@@ -2925,7 +2994,7 @@ pub(crate) fn finish_bidirectional_completion_recovery(
     })?;
     emit_queue_snapshot(&app, label, &queue);
     start_queue_worker(app, label.to_owned());
-    Ok(queue.snapshot())
+    Ok(queue.snapshot().into())
 }
 
 /// Recovery-Pfade stammen ausschließlich aus dem backend-seitig persistierten

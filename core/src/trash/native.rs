@@ -381,7 +381,6 @@ fn parent_proof(
                 .all(|entry| entry.kind == crate::metadata::Nfs4AceKind::Deny),
             #[cfg(target_os = "linux")]
             Some(crate::metadata::Acl::Posix(_)) => true,
-            #[cfg(target_os = "macos")]
             _ => false,
         };
         if !safe_acl

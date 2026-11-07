@@ -6,7 +6,9 @@
 //! Quarantäne; Provider ohne geprüften Restorepfad dürfen nur den ausdrücklich
 //! bestätigten endgültigen Modus verwenden.
 
-use std::io::{self, Read};
+use std::io;
+#[cfg(test)]
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{coded_error, error_code, with_context, with_recovery_context, ErrorCode};
@@ -19,6 +21,8 @@ use crate::vfs::{BoundContentDigest, BoundParentsRenameRequest, MutationFailure,
 use crate::{Cancel, Progress, RootIdentity, Vfs};
 
 const QUARANTINE_NAME: &str = ".doppeldecker-quarantine";
+// Entspricht dem bestehenden 64-MiB-Rahmen des Queuejournals, unabhängig von Dateibytes.
+const MAX_DELETE_PLAN_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -212,6 +216,7 @@ pub fn plan_remote_delete(
     selected.dedup();
 
     let mut items = Vec::with_capacity(selected.len());
+    let mut remaining_plan_bytes = MAX_DELETE_PLAN_BYTES;
     for path in selected {
         let name = path
             .file_name()
@@ -228,15 +233,17 @@ pub fn plan_remote_delete(
                 )
             })?;
         let mut records = Vec::new();
-        scan_entry(vfs, &path, proof, &mut records).map_err(|error| {
-            with_context(
-                error,
-                format!(
-                    "Remote-Löschauswahl {} konnte nicht gebunden werden",
-                    path.display()
-                ),
-            )
-        })?;
+        scan_entry(vfs, &path, proof, &mut records, &mut remaining_plan_bytes).map_err(
+            |error| {
+                with_context(
+                    error,
+                    format!(
+                        "Remote-Löschauswahl {} konnte nicht gebunden werden",
+                        path.display()
+                    ),
+                )
+            },
+        )?;
         if matches!(&root_identity, RootIdentity::WebDav(_)) {
             for record in &records {
                 crate::webdav::confirmed_delete_etag(record.provider_token.as_deref()).map_err(
@@ -247,6 +254,17 @@ pub fn plan_remote_delete(
                         )
                     },
                 )?;
+            }
+        }
+        if vfs.supports_best_effort_permanent_delete() {
+            for record in &records {
+                if let Some(reason) = vfs.best_effort_permanent_delete_blocker(record.is_dir) {
+                    return Err(coded_error(
+                        io::ErrorKind::Unsupported,
+                        ErrorCode::Unsupported,
+                        format!("{}: {reason}", record.path),
+                    ));
+                }
             }
         }
         let entries = records.len() as u64;
@@ -299,59 +317,76 @@ fn scan_entry(
     path: &Path,
     proof: &ProofListEntry,
     records: &mut Vec<RemoteDeleteRecord>,
+    remaining_plan_bytes: &mut usize,
 ) -> io::Result<()> {
-    let entry = &proof.entry;
-    if entry.is_symlink || (!entry.is_file && !entry.is_dir) {
-        return Err(invalid(format!(
-            "Remote-Löschen überspringt Symlinks und Spezialeinträge: {}",
-            path.display()
-        )));
-    }
-    records.push(RemoteDeleteRecord {
-        path: path.to_string_lossy().into_owned(),
-        is_dir: entry.is_dir,
-        size: entry.size,
-        provider_token: proof.provider_token.clone(),
-        content_digest: if entry.is_file {
-            let mut reader = vfs.open_read(path)?;
-            let mut hasher = blake3::Hasher::new();
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let count = reader.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..count]);
-            }
-            Some(*hasher.finalize().as_bytes())
-        } else {
-            None
-        },
-    });
-    if !entry.is_dir {
-        return Ok(());
-    }
-    let listing = vfs.list_complete(path)?;
-    if !listing.complete {
-        return Err(invalid(format!(
-            "Remote-Unterordner wurde nicht vollständig gelistet: {}",
-            path.display()
-        )));
-    }
-    let mut children = listing.entries;
-    children.sort_by(|left, right| left.raw_name.cmp(&right.raw_name));
-    for child in children {
-        if !child.safely_decoded {
+    // Expliziter Stack verhindert einen Prozess-Stacküberlauf bei tiefen Bäumen.
+    let mut pending = vec![(path.to_path_buf(), proof.clone())];
+    let mut pending_bytes = delete_scan_bytes(path, proof);
+    while let Some((path, proof)) = pending.pop() {
+        pending_bytes = pending_bytes.saturating_sub(delete_scan_bytes(&path, &proof));
+        let entry = &proof.entry;
+        if entry.is_symlink || (!entry.is_file && !entry.is_dir) {
             return Err(invalid(format!(
-                "Remote-Unterordner enthält einen nicht eindeutig dekodierbaren Namen: {}",
+                "Remote-Löschen überspringt Symlinks und Spezialeinträge: {}",
                 path.display()
             )));
         }
-        let name = std::str::from_utf8(&child.raw_name)
-            .map_err(|_| invalid("Remote-Listing enthält keinen eindeutigen UTF-8-Namen"))?;
-        scan_entry(vfs, &path.join(name), &child, records)?;
+        let record = RemoteDeleteRecord {
+            path: path.to_string_lossy().into_owned(),
+            is_dir: entry.is_dir,
+            size: entry.size,
+            provider_token: proof.provider_token.clone(),
+            content_digest: if entry.is_file && !vfs.supports_best_effort_permanent_delete() {
+                Some(*crate::atomic_file::hash_vfs_file(vfs, &path)?.as_bytes())
+            } else {
+                None
+            },
+        };
+        let record_bytes = serde_json::to_vec(&record).map_err(io::Error::other)?.len();
+        *remaining_plan_bytes = remaining_plan_bytes.checked_sub(record_bytes).ok_or_else(|| invalid("Remote-Löschplan überschreitet den 64-MiB-Rahmen des Queuejournals; Auswahl aufteilen"))?;
+        records.push(record);
+        if !entry.is_dir {
+            continue;
+        }
+        let listing = vfs.list_complete(&path)?;
+        if !listing.complete {
+            return Err(invalid(format!(
+                "Remote-Unterordner wurde nicht vollständig gelistet: {}",
+                path.display()
+            )));
+        }
+        let mut children = listing.entries;
+        children.sort_by(|left, right| left.raw_name.cmp(&right.raw_name));
+        for child in children.into_iter().rev() {
+            if !child.safely_decoded {
+                return Err(invalid(format!(
+                    "Remote-Unterordner enthält einen nicht eindeutig dekodierbaren Namen: {}",
+                    path.display()
+                )));
+            }
+            let name = std::str::from_utf8(&child.raw_name)
+                .map_err(|_| invalid("Remote-Listing enthält keinen eindeutigen UTF-8-Namen"))?;
+            let child_path = path.join(name);
+            pending_bytes = pending_bytes
+                .checked_add(delete_scan_bytes(&child_path, &child))
+                .ok_or_else(|| invalid("Remote-Löschscan überschreitet den Speicherbereich"))?;
+            if pending_bytes > MAX_DELETE_PLAN_BYTES {
+                return Err(invalid("Ausstehender Remote-Löschscan überschreitet den 64-MiB-Arbeitsspeicherrahmen; Auswahl aufteilen"));
+            }
+            pending.push((child_path, child));
+        }
     }
     Ok(())
+}
+
+fn delete_scan_bytes(path: &Path, proof: &ProofListEntry) -> usize {
+    std::mem::size_of::<(PathBuf, ProofListEntry)>()
+        + path.as_os_str().len()
+        + proof.raw_name.len()
+        + proof.entry.name.len()
+        + proof.provider_token.as_ref().map_or(0, Vec::len)
+        + proof.entry.owner.as_ref().map_or(0, String::len)
+        + proof.entry.group.as_ref().map_or(0, String::len)
 }
 
 fn digest_records(records: &[RemoteDeleteRecord]) -> io::Result<[u8; 32]> {
@@ -370,7 +405,10 @@ pub fn execute_remote_delete(
     cancel: &Cancel,
     on_progress: &mut dyn FnMut(&Progress),
 ) -> io::Result<RemoteDeleteStats> {
-    if mode == RemoteDeleteMode::Permanent && !vfs.supports_remove_if_matches() {
+    if mode == RemoteDeleteMode::Permanent
+        && !vfs.supports_remove_if_matches()
+        && !vfs.supports_best_effort_permanent_delete()
+    {
         return Err(coded_error(
             io::ErrorKind::Unsupported,
             ErrorCode::Unsupported,
@@ -414,6 +452,100 @@ pub fn execute_remote_delete(
             execute_permanent(vfs, expected, cancel, &mut progress, on_progress)
         }
     }
+}
+
+/// Privater Inhaltssync verwendet denselben Blatt-/Leerordnerkern. Der Parent
+/// darf sich durch eigene vorherige Kopien verändert haben; die bestätigten
+/// Löschobjekte selbst werden vollständig und inhaltsgebunden neu verglichen.
+pub(crate) fn plan_content_sync_delete(
+    vfs: &dyn Vfs,
+    root: &Path,
+    selected: &[PathBuf],
+    cancel: &Cancel,
+) -> io::Result<RemoteDeletePlan> {
+    if cancel.is_cancelled() {
+        return Err(coded_error(
+            io::ErrorKind::Interrupted,
+            ErrorCode::Interrupted,
+            "Mirror-Löschplanung abgebrochen",
+        ));
+    }
+    let mut plan = plan_remote_delete(vfs, root, selected)?;
+    for item in &mut plan.items {
+        for record in &mut item.records {
+            if cancel.is_cancelled() {
+                return Err(coded_error(
+                    io::ErrorKind::Interrupted,
+                    ErrorCode::Interrupted,
+                    "Mirror-Löschplanung abgebrochen",
+                ));
+            }
+            if !record.is_dir {
+                use std::io::Read;
+                let mut reader = vfs.open_read(Path::new(&record.path))?;
+                let mut hasher = blake3::Hasher::new();
+                let mut buffer = vec![0; crate::atomic_file::COPY_BUFFER_BYTES];
+                loop {
+                    if cancel.is_cancelled() {
+                        return Err(coded_error(
+                            io::ErrorKind::Interrupted,
+                            ErrorCode::Interrupted,
+                            "Mirror-Löschplanung abgebrochen",
+                        ));
+                    }
+                    let read = reader.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                record.content_digest = Some(*hasher.finalize().as_bytes());
+            }
+        }
+        item.digest = digest_records(&item.records)?;
+    }
+    plan.digest =
+        *blake3::hash(&serde_json::to_vec(&plan.items).map_err(io::Error::other)?).as_bytes();
+    Ok(plan)
+}
+
+pub(crate) fn execute_content_sync_permanent(
+    vfs: &dyn Vfs,
+    expected: &RemoteDeletePlan,
+    cancel: &Cancel,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> io::Result<RemoteDeleteStats> {
+    let selected = expected
+        .items
+        .iter()
+        .map(|item| PathBuf::from(&item.path))
+        .collect::<Vec<_>>();
+    let current = plan_content_sync_delete(vfs, Path::new(&expected.root), &selected, cancel)?;
+    let same_namespace = match (&expected.root_identity, &current.root_identity) {
+        (RootIdentity::WebDav(left), RootIdentity::WebDav(right)) => {
+            left.server == right.server
+                && left.virtual_root == right.virtual_root
+                && left.session_generation == right.session_generation
+        }
+        _ => expected.root_identity == current.root_identity,
+    };
+    if !same_namespace
+        || expected.items != current.items
+        || expected.digest != current.digest
+        || expected.entries != current.entries
+        || expected.bytes != current.bytes
+    {
+        return Err(crate::real_mode::plan_drift(
+            "Bestätigte Mirror-Entfernungsobjekte änderten sich; nichts weiter entfernt",
+        ));
+    }
+    let mut progress = Progress {
+        files_total: expected.entries,
+        bytes_total: expected.bytes,
+        phase: "delete".into(),
+        ..Progress::default()
+    };
+    execute_permanent(vfs, expected, cancel, &mut progress, on_progress)
 }
 
 /// Ein Queue-Claim verbindet absichtlich frisch und beginnt dadurch wieder bei einer
@@ -854,7 +986,14 @@ fn bind_quarantine_source(
         ));
     }
     let mut records = Vec::new();
-    scan_entry(vfs, source, &current, &mut records)?;
+    let mut remaining_plan_bytes = MAX_DELETE_PLAN_BYTES;
+    scan_entry(
+        vfs,
+        source,
+        &current,
+        &mut records,
+        &mut remaining_plan_bytes,
+    )?;
     if records != item.records || digest_records(&records)? != item.digest {
         return Err(coded_error(
             io::ErrorKind::InvalidData,
@@ -902,7 +1041,8 @@ fn verify_parked_item(vfs: &dyn Vfs, target: &Path, item: &RemoteDeleteItem) -> 
         ));
     }
     let mut records = Vec::new();
-    scan_entry(vfs, target, &proof, &mut records)?;
+    let mut remaining_plan_bytes = MAX_DELETE_PLAN_BYTES;
+    scan_entry(vfs, target, &proof, &mut records, &mut remaining_plan_bytes)?;
     let source = Path::new(&item.path);
     for record in &mut records {
         let moved = Path::new(&record.path);
@@ -998,7 +1138,11 @@ fn execute_permanent(
                 .unwrap_or_default();
             on_progress(progress);
             let verified_after_reconnect = matches!(
-                delete_permanent_record(vfs, record)?,
+                delete_permanent_record(vfs, record).map_err(|error| {
+                    if stats.entries == 0 { error } else {
+                        delete_unclear(path, &format!("Bereits {} Einträge dauerhaft entfernt; weiterer Schritt scheiterte", stats.entries), error)
+                    }
+                })?,
                 PermanentDeleteOutcome::RemovedAfterReconnect
             );
             if !record.is_dir {
@@ -1088,24 +1232,25 @@ fn delete_permanent_record(
             ),
         ));
     }
-    // Der Plan-Token muss bis in dieselbe Providerwirkung reichen, die den Namen
-    // entfernt. Ein frisches `stat` gefolgt von pfadbasiertem DELETE schließt einen
-    // Austausch in der Zwischenzeit nicht und ist für diesen irreversiblen Pfad
-    // deshalb kein Best-Effort-Fallback.
-    let mutation = vfs.remove_if_matches(
-        path,
-        &ProofListEntry {
-            entry: current,
-            raw_name: path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::as_bytes)
-                .map(Vec::from)
-                .unwrap_or_default(),
-            safely_decoded: path.file_name().and_then(|name| name.to_str()).is_some(),
-            provider_token: record.provider_token.clone(),
-        },
-    );
+    let proof = ProofListEntry {
+        entry: current,
+        raw_name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::as_bytes)
+            .map(Vec::from)
+            .unwrap_or_default(),
+        safely_decoded: path.file_name().and_then(|name| name.to_str()).is_some(),
+        provider_token: record.provider_token.clone(),
+    };
+    // Auch Best Effort erhält den bestätigten Token. Provider mit bedingtem
+    // DELETE dürfen ihn nicht durch eine erst nach der Bestätigung gelesene
+    // Version ersetzen. SFTP behält seinen ausdrücklich akzeptierten Pfadwettlauf.
+    let mutation = if vfs.supports_best_effort_permanent_delete() {
+        vfs.remove_permanent_best_effort_if_matches(path, &proof)
+    } else {
+        vfs.remove_if_matches(path, &proof)
+    };
     match mutation {
         Ok(()) => {
             // Auch eine erfolgreiche Serverantwort beweist die Wirkung nicht. Ein
@@ -1161,10 +1306,29 @@ fn delete_record_matches(
     if record.is_dir {
         return Ok(record.content_digest.is_none());
     }
+    if vfs.supports_best_effort_permanent_delete() {
+        if let Some(expected_token) = &record.provider_token {
+            let parent = Path::new(&record.path)
+                .parent()
+                .ok_or_else(|| invalid("Löschpfad ohne Eltern"))?;
+            let name = Path::new(&record.path)
+                .file_name()
+                .ok_or_else(|| invalid("Löschpfad ohne Namen"))?;
+            let listing = vfs.list_complete(parent)?;
+            crate::fileops::require_complete_safe_listing(&listing, "Remote-Löschidentität")?;
+            let current = listing
+                .entries
+                .iter()
+                .find(|p| p.raw_name == name.as_encoded_bytes());
+            if current.is_none_or(|p| p.provider_token.as_ref() != Some(expected_token)) {
+                return Ok(false);
+            }
+        }
+    }
     let Some(expected_digest) = record.content_digest else {
-        // Alte direkte Unit-Test-Records besitzen keinen Hash. Produktive Pläne
-        // tragen ihn für jede Datei; `execute_remote_delete` replante sie ohnehin
-        // unmittelbar vorher und würde einen fehlenden Wert als Drift erkennen.
+        // Die ausdrücklich schwache interaktive SFTP-Klasse bindet Typ und Größe
+        // statt vor einer gewöhnlichen Löschung sämtliche Dateibytes zu laden.
+        // Strikte Providerpläne tragen weiterhin vollständige Inhaltsdigests.
         return Ok(true);
     };
     let actual = crate::atomic_file::hash_vfs_file(vfs, Path::new(&record.path))?;

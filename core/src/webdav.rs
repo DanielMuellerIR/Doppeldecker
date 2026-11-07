@@ -1,8 +1,9 @@
 //! HTTPS-WebDAV mit gepinntem Zertifikat und strengem `Depth: 1`-Listing.
 //!
 //! Der Provider behandelt Multi-Status niemals als „best effort": Pflichtmetadaten
-//! müssen erfolgreich, eindeutig und vollständig sein. Nur eine separat mit 404 als
-//! fehlend gemeldete optionale `creationdate` wird als `None` übernommen. Dateien
+//! müssen erfolgreich, eindeutig und vollständig sein. Eine mit 404 fehlende
+//! optionale `creationdate` bleibt `None`; Collections benötigen keine Inhaltslänge.
+//! Fehlende oder fehlerhafte Pflichtangaben regulärer Dateien bleiben Fehler. Dateien
 //! benötigen eine starke ETag; schwache oder fehlende ETags sperren den Plan.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,12 +46,18 @@ use crate::vfs::{entry_extension, CompleteDirectoryListing, Entry, ProofListEntr
 
 #[path = "webdav_folder.rs"]
 mod interactive_folder;
+#[path = "webdav_read.rs"]
+mod interactive_read;
+pub(crate) use interactive_read::WEBDAV_CONTENT_READ_LIMITATION;
+#[path = "webdav_mtime.rs"]
+mod content_mtime;
 #[path = "webdav_upload.rs"]
 mod interactive_upload;
+#[path = "webdav_security_read.rs"]
+mod security_read;
 
-pub(crate) const FILE_REPLACE_BLOCKER: &str = "WebDAV-Dateiersetzen ist hier nicht ausführbar: Ein einzelnes MOVE kann Temp-Version, bestätigte Altzielversion und sämtliche Elternversionen nicht gemeinsam mit UND binden. Getaggte If-Listen verschiedener Ressourcen gelten laut RFC 4918 als ODER; ein passender Elterntoken kann ein ausgetauschtes Ziel freigeben. Vorhandene Ziele bleiben erhalten; neue Dateien können separat additiv kopiert werden.";
 pub(crate) const STRICT_MUTATION_BLOCKER: &str = "Strikte WebDAV-Mutationen sind nicht ausführbar: Standardbedingungen binden höchstens eine Elternressource zusätzlich zur Request-Version, nicht die vollständige Root-/Elternkette. Deshalb keine künstliche Schreib-/Löschprobe, allgemeine VFS-Schreibfreigabe, Quellentfernung oder Quarantäne. Gewöhnliche additive Uploads, Ordneranlage und Umbenennung behalten ihre eigene bestätigte Best-Effort-Klasse.";
-pub(crate) const NAMESPACE_BINDING_LIMITATION: &str = "Eine einzelne WebDAV-If-Bedingung bindet den unmittelbaren Elternordner; weitere Elternlisten würden sie durch ODER abschwächen. Die übrige Kette bis zum Profilroot wird nur vor und nach jeder Wirkung geprüft. Ein später Wechsel eines Vorfahren kann bereits wirken, bevor der Readback den Ausgang als unklar meldet. Es gibt keinen automatischen Rücktausch oder Wiederholversuch.";
+pub(crate) const NAMESPACE_BINDING_LIMITATION: &str = "Gewöhnliches WebDAV ist Best Effort: Collections und Eltern werden vor und nach der Wirkung frisch geprüft, nicht über eine bei Sabre/Nextcloud wirkungslose Collection-ETag-Bedingung gebunden. Ein gleichzeitiger serverseitiger Pfadtausch kann auf andere Inhalte desselben Kontos umleiten und ist nicht atomar ausgeschlossen. Wirksame Dateibedingungen bleiben erhalten; unklare Wirkungen werden nicht wiederholt oder automatisch zurückgetauscht.";
 
 pub(crate) fn ensure_ordinary_upload_profile_current(
     queue: &Path,
@@ -149,6 +156,10 @@ pub struct WebDavInteractiveDirectoryListing {
 }
 
 impl WebDavVfs {
+    pub(crate) fn connection_config(&self) -> &WebDavConnectionConfig {
+        &self.config
+    }
+
     pub fn connect(
         config: WebDavConnectionConfig,
         secrets: Arc<dyn SecretResolver>,
@@ -555,13 +566,30 @@ impl Vfs for WebDavVfs {
         require_strict_mutation_contract()
     }
 
+    fn metadata_manifest(&self, path: &Path) -> io::Result<crate::metadata::MetadataManifest> {
+        let (binding, remote) = self.bind_listing(path)?;
+        security_read::manifest(&binding.session, &remote, || {
+            let state = lock(&self.state);
+            if state.generation != binding.generation
+                || state.session.identity != binding.session.identity
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "WebDAV-Sitzung wechselte während der Sicherheitsbeobachtung",
+                ));
+            }
+            Ok(())
+        })
+    }
     fn metadata_capabilities(&self, _root: &Path) -> io::Result<MetadataCapabilities> {
         Ok(MetadataCapabilities {
             owner: Capability::Unsupported,
             special_mode_bits: Capability::Unsupported,
             acl_model: AclModel::Unsupported,
+            acl: crate::metadata::Capability::Unknown,
             xattrs: Capability::Unsupported,
             resource_fork: Capability::Unsupported,
+            named_streams: Capability::Unsupported,
             sparse_extents: Capability::Unsupported,
             hardlinks: Capability::Unsupported,
         })
@@ -660,8 +688,9 @@ fn put_stream_and_readback(
     reader: UnixStream,
     owned_files: Arc<Mutex<BTreeMap<String, String>>>,
     timeout: Duration,
+    mtime_hint: Option<i64>,
 ) -> io::Result<(String, blake3::Hash)> {
-    let response = with_parent_condition(
+    let request = with_parent_condition(
         authenticated(
             session
                 .http
@@ -672,12 +701,17 @@ fn put_stream_and_readback(
         &session.identity.origin,
         &parents,
         &remote,
+        WebDavRequestClass::OrdinaryFile,
     )?
     .header(IF_NONE_MATCH, "*")
     .timeout(timeout)
-    .body(Body::new(reader))
-    .send()
-    .map_err(http_error)?;
+    .body(Body::new(reader));
+    let request = if let Some(mtime) = mtime_hint {
+        request.header("X-OC-MTime", mtime.to_string())
+    } else {
+        request
+    };
+    let response = request.send().map_err(http_error)?;
     require_status(response.status(), &[StatusCode::CREATED], "WebDAV-PUT")?;
     let etag = require_strong_etag(response.headers(), "WebDAV-PUT")?;
     lock(&owned_files).insert(remote.clone(), etag.clone());
@@ -711,11 +745,24 @@ fn require_strict_mutation_contract<T>() -> io::Result<T> {
     ))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WebDavRequestClass {
+    Strict,
+    OrdinaryFile,
+    OrdinaryCollection,
+}
+
+const COLLECTION_DELETE_LIMITATION: &str = "WebDAV-Collection-DELETE wirkt rekursiv. Ein frischer Leercheck kann neu hinzukommende Kinder während des Requests nicht schützen; diese Ordnerentfernung wird ausgelassen, bestätigte Dateien bleiben einzeln entfernbar";
+fn ordinary_delete_blocker(directory: bool) -> Option<String> {
+    directory.then(|| COLLECTION_DELETE_LIMITATION.to_owned())
+}
+
 fn with_parent_condition(
     request: RequestBuilder,
     origin: &str,
     identities: &[WebDavResourceIdentity],
     child: &str,
+    class: WebDavRequestClass,
 ) -> io::Result<RequestBuilder> {
     let parent = parent_server_path(child)?;
     let mut selected = None;
@@ -733,6 +780,12 @@ fn with_parent_condition(
         }
     }
     let etag = selected.ok_or_else(|| invalid("Der unmittelbare WebDAV-Elternbeleg fehlt"))?;
+    // Gewöhnliche Wirkungen prüfen Eltern vor und nach dem Request frisch.
+    // Collection-ETags sind insbesondere bei Sabre/Nextcloud keine auswertbare
+    // If-Bedingung. Nur der getrennte strikte Vertrag verlangt sie weiter.
+    if class != WebDavRequestClass::Strict {
+        return Ok(request);
+    }
     // Genau eine Tagged-list: Weitere wahre Listen könnten eine falsche
     // Elternversion nach RFC 4918 §10.4.3 überdecken. Die restliche Kette bleibt
     // ausschließlich durch die getrennten Vorher-/Nachherprüfungen beobachtet.
@@ -779,6 +832,7 @@ fn move_request(
     to: &str,
     etag: &str,
     parent_identities: &[WebDavResourceIdentity],
+    class: WebDavRequestClass,
 ) -> io::Result<reqwest::blocking::Response> {
     let destination = resource_url(origin, to)?;
     let request = with_parent_condition(
@@ -790,11 +844,46 @@ fn move_request(
         origin,
         parent_identities,
         to,
+        class,
     )?
     .header("Destination", destination.as_str())
-    .header("Overwrite", "F")
-    .header(IF_MATCH, etag);
+    .header("Overwrite", "F");
+    let request = if class == WebDavRequestClass::OrdinaryCollection {
+        request
+    } else {
+        request.header(IF_MATCH, etag)
+    };
     request.timeout(TLS_IO_TIMEOUT).send().map_err(http_error)
+}
+
+fn move_replace_request(
+    http: &WebDavHttp,
+    origin: &str,
+    from: &str,
+    to: &str,
+    temp_etag: &str,
+    target_etag: &str,
+) -> io::Result<reqwest::blocking::Response> {
+    validate_strong_etag(temp_etag)?;
+    validate_strong_etag(target_etag)?;
+    let destination = resource_url(origin, to)?;
+    // If-Match gilt für die Request-Tempdatei. Genau eine getaggte If-Liste
+    // verlangt die bestätigte Altzielversion. Keine Elternliste hinzufügen:
+    // Die Listen wären ODER und könnten ein inzwischen fremdes Ziel freigeben.
+    let condition = HeaderValue::from_str(&format!("<{destination}> ([{target_etag}])"))
+        .map_err(|_| invalid("WebDAV-Altzielbedingung ist ungültig"))?;
+    authenticated(
+        http.mutation_client
+            .request(custom_method(b"MOVE")?, resource_url(origin, from)?),
+        http,
+    )
+    .header("Destination", destination.as_str())
+    .header("Overwrite", "T")
+    .header(IF_MATCH, temp_etag)
+    .header(HeaderName::from_static("if"), condition)
+    .timeout(TLS_IO_TIMEOUT)
+    .send()
+    .map_err(http_error)
 }
 
 /// Entfernt ausschließlich die eigene, beim PUT per starkem ETag belegte Temp-Datei.
@@ -811,7 +900,15 @@ fn delete_owned(
     parent_identities: &[WebDavResourceIdentity],
     readback: impl FnOnce() -> io::Result<ProofListEntry>,
 ) -> io::Result<()> {
-    let response = delete_request(http, origin, path, Some(etag), None, parent_identities)?;
+    let response = delete_request(
+        http,
+        origin,
+        path,
+        Some(etag),
+        None,
+        parent_identities,
+        WebDavRequestClass::OrdinaryFile,
+    )?;
     if response.status() == StatusCode::PRECONDITION_FAILED {
         return Err(coded_error(
             io::ErrorKind::Interrupted,
@@ -839,7 +936,15 @@ fn delete_request(
     etag: Option<&str>,
     depth: Option<&str>,
     parent_identities: &[WebDavResourceIdentity],
+    class: WebDavRequestClass,
 ) -> io::Result<reqwest::blocking::Response> {
+    if class == WebDavRequestClass::OrdinaryCollection {
+        return Err(coded_error(
+            io::ErrorKind::Unsupported,
+            ErrorCode::Unsupported,
+            COLLECTION_DELETE_LIMITATION,
+        ));
+    }
     let mut request = with_parent_condition(
         authenticated(
             http.mutation_client
@@ -849,6 +954,7 @@ fn delete_request(
         origin,
         parent_identities,
         path,
+        class,
     )?;
     if let Some(etag) = etag {
         request = request.header(IF_MATCH, etag);
@@ -1218,6 +1324,7 @@ fn parse_multistatus(payload: &[u8]) -> io::Result<Vec<DavResource>> {
     let mut propstat_status_error: Option<String> = None;
     let mut propstat_index = 0usize;
     let mut response_semantic_errors = Vec::<String>::new();
+    let mut absent_length_propstats = Vec::<usize>::new();
     let mut multistatus_semantic_errors = Vec::<String>::new();
     loop {
         let (namespace, event) = reader
@@ -1328,6 +1435,7 @@ fn parse_multistatus(payload: &[u8]) -> io::Result<Vec<DavResource>> {
                         }
                         current = Some(DavResource::default());
                         response_semantic_errors.clear();
+                        absent_length_propstats.clear();
                         propstat_index = 0;
                     }
                     b"propstat" => {
@@ -1676,9 +1784,15 @@ fn parse_multistatus(payload: &[u8]) -> io::Result<Vec<DavResource>> {
                                 }
                                 Some(404)
                                     if !propstat_properties.is_empty()
-                                        && propstat_properties.iter().all(|property| {
-                                            property.as_slice() == b"creationdate"
-                                        }) => {}
+                                        && propstat_properties.iter().all(|property| property.as_slice() == b"creationdate") => {}
+                                Some(404)
+                                    if !propstat_properties.is_empty()
+                                        && propstat_properties.iter().all(|property| matches!(property.as_slice(), b"creationdate" | b"getcontentlength")) => {
+                                            // RFC 4918 §15.4 bindet die Länge an GET-Inhalt.
+                                            // Erst am response-Ende steht der erfolgreiche
+                                            // Ressourcentyp unabhängig von der propstat-Reihenfolge fest.
+                                            absent_length_propstats.push(propstat_index);
+                                        }
                                 Some(status) => semantic_errors.push(format!(
                                     "Status {status} ist für eine Pflichtmetadatenklasse nicht erfolgreich"
                                 )),
@@ -1720,6 +1834,11 @@ fn parse_multistatus(payload: &[u8]) -> io::Result<Vec<DavResource>> {
                             } else {
                                 resource.href.clone()
                             };
+                            if resource.successful_resourcetype != Some(true) {
+                                for index in &absent_length_propstats {
+                                    response_semantic_errors.push(format!("propstat {index}: Status 404 für getcontentlength ist nur bei einer bestätigten Collection zulässig"));
+                                }
+                            }
                             if let Err(error) = validate_resource(&resource) {
                                 response_semantic_errors.push(error.to_string());
                             }
@@ -2322,6 +2441,48 @@ mod tests {
     </D:multistatus>"#;
 
     #[test]
+    fn strict_parent_if_bleibt_erhalten_ordinary_prueft_ohne_collection_header() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::new();
+        let parents = [WebDavResourceIdentity {
+            remote: "/dav".into(),
+            etag: "\"parent\"".into(),
+        }];
+        for class in [
+            WebDavRequestClass::Strict,
+            WebDavRequestClass::OrdinaryFile,
+            WebDavRequestClass::OrdinaryCollection,
+        ] {
+            let request = with_parent_condition(
+                client.put("https://dav.test/dav/file"),
+                "https://dav.test",
+                &parents,
+                "/dav/file",
+                class,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            if class == WebDavRequestClass::Strict {
+                assert_eq!(
+                    request.headers().get("if").unwrap(),
+                    "<https://dav.test/dav> ([\"parent\"])"
+                );
+            } else {
+                assert!(!request.headers().contains_key("if"));
+            }
+            assert!(with_parent_condition(
+                client.put("https://dav.test/dav/file"),
+                "https://dav.test",
+                &[],
+                "/dav/file",
+                class
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn slash_redirect_bleibt_exakt_an_origin_und_kodierten_pfad_gebunden() {
         let url = resource_url("https://dav.test", "/literal%2F name").unwrap();
         for location in [
@@ -2432,6 +2593,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(escaped[0].entry.name, "datei&mehr.txt");
+    }
+
+    #[test]
+    fn collection_ohne_getcontentlength_akzeptiert_nextcloud_propstat_in_beiden_reihenfolgen() {
+        let collection = "<D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:getlastmodified>Sun, 12 Jul 2026 20:00:00 GMT</D:getlastmodified><D:getetag>\"ordner\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>";
+        for missing in [
+            "<D:getcontentlength/>",
+            "<D:creationdate/><D:getcontentlength/>",
+        ] {
+            let absent = format!("<D:propstat><D:prop>{missing}</D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>");
+            for groups in [
+                format!("{collection}{absent}"),
+                format!("{absent}{collection}"),
+            ] {
+                let xml = format!("<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/dav/</D:href>{groups}</D:response></D:multistatus>");
+                let resources = parse_multistatus(xml.as_bytes()).unwrap();
+                assert_eq!(resources.len(), 1);
+                assert!(resources[0].is_collection);
+                assert_eq!(resources[0].length, None);
+            }
+        }
+    }
+
+    #[test]
+    fn fehlende_laenge_bleibt_fuer_dateien_pflicht_und_andere_ordnerfehler_bleiben_fehler() {
+        let collection = "<D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:getlastmodified>Sun, 12 Jul 2026 20:00:00 GMT</D:getlastmodified><D:getetag>\"stark\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>";
+        let absent = "<D:propstat><D:prop><D:getcontentlength/></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>";
+        for (success, failure) in [
+            (collection.replace("<D:collection/>", ""), absent.to_owned()),
+            (
+                collection.replace("<D:collection/>", "").replace(
+                    "</D:resourcetype>",
+                    "</D:resourcetype><D:getcontentlength>4</D:getcontentlength>",
+                ),
+                absent.to_owned(),
+            ),
+            (
+                collection.to_owned(),
+                absent.replace("404 Not Found", "403 Forbidden"),
+            ),
+            (
+                collection.to_owned(),
+                absent.replace("<D:getcontentlength/>", "<D:getcontentlength/><D:getetag/>"),
+            ),
+            (
+                collection.replace("<D:resourcetype><D:collection/></D:resourcetype>", ""),
+                absent.to_owned(),
+            ),
+        ] {
+            let xml = format!("<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/dav/</D:href>{failure}{success}</D:response></D:multistatus>");
+            assert!(parse_multistatus(xml.as_bytes()).is_err(), "{xml}");
+        }
     }
 
     #[test]
@@ -3219,3 +3432,6 @@ mod tests {
         assert_eq!(url.as_str(), "https://dav.test/dav/literal%252F.txt");
     }
 }
+
+#[path = "webdav_delete.rs"]
+mod interactive_delete;

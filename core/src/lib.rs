@@ -26,62 +26,102 @@
 //! - [`progress`]  — Fortschritts-Meldung und Abbruch-Signal für lang laufende Vorgänge.
 
 mod acl;
+pub mod archive_extract;
+pub mod archive_pack;
+pub mod archive_read;
+pub mod archive_upload;
 mod atomic_file;
 mod atomic_write;
+pub mod batch_rename;
 pub mod bidirectional;
 pub mod connections;
+pub mod content_sync;
+pub mod created_directory_dacl;
+mod created_directory_dacl_queue;
+mod created_directory_dacl_registry;
+pub mod directory_dacl;
+pub mod directory_dacl_queue;
 pub mod directory_size;
+pub mod directory_streams;
 pub mod error;
 pub mod favorites;
+pub mod file_dacl;
+pub mod file_dacl_queue;
+pub mod generated_source;
+pub use created_directory_dacl_queue::acknowledge_created_directory_dacl_outcome;
+mod file_dacl_registry;
+pub mod file_properties;
 pub mod fileops;
 pub mod finder_favorites;
+pub mod ftp_batch_rename;
 pub mod ftps;
 mod local_fs;
 mod local_read;
 mod local_staging;
 pub mod metadata;
+pub mod name_search;
 pub mod network_discovery;
 pub mod path;
+pub mod preview;
 pub mod progress;
 pub mod quarantine;
 pub mod queue;
 pub mod real_mode;
 pub mod remote;
+mod remote_batch_rename;
 pub mod remote_delete;
+pub mod remote_edit;
 pub mod remote_real_mode;
 pub mod remote_rename;
+pub mod remote_rename_cycle;
 pub mod remote_snapshot;
 mod rename_interaction;
 pub mod sftp;
+pub mod sftp_batch_rename;
 pub mod smb;
+pub mod smb_batch_rename;
+mod staging_guard;
 pub mod sync;
 pub mod system_mounts;
 pub mod trash;
 mod tree_measure;
 pub mod vfs;
 pub mod webdav;
+pub mod webdav_batch_rename;
 
 pub use bidirectional::{
     bind_bidirectional_endpoint_compatibility, build_tree_snapshot,
     discard_unchanged_bidirectional_run, generate_conflict_path, load_bidirectional_run_journal,
-    plan_bidirectional, plan_provider_bidirectional, prepare_local_bidirectional,
-    prepare_local_bidirectional_rollback, prepare_local_bidirectional_with_decisions,
-    prepare_provider_bidirectional_rollback, prepare_provider_bidirectional_with_decisions,
-    prepare_resume_local_bidirectional, prepare_resume_provider_bidirectional,
-    prepare_resume_sftp_bidirectional, prepare_sftp_bidirectional_rollback,
-    prepare_sftp_bidirectional_with_decisions, resolve_conflicts, BaselineStore,
-    BidirectionalAction, BidirectionalBaseline, BidirectionalPlan, BidirectionalProjectionJournal,
-    BidirectionalProjectionKind, BidirectionalProjectionState, BidirectionalRollbackPhase,
-    BidirectionalRollbackQuarantine, BidirectionalRollbackStep, BidirectionalRunJournal,
-    BidirectionalRunState, BidirectionalTypeSwapPhase, BidirectionalTypeSwapStep,
-    BinaryRelativePath, ConflictCopyPath, ConflictDecision, ConflictKind, ConflictResolution,
-    EndpointBinding, EndpointSide, LocalBidirectionalPreview, LocalBidirectionalRollback,
-    LocalBidirectionalRollbackPreview, LocalBidirectionalRollbackStats, LocalBidirectionalRun,
-    LocalBidirectionalStats, PairId, PreparedLocalBidirectionalRollback,
-    PreparedLocalBidirectionalRun, PreparedProviderBidirectionalRollback,
-    PreparedProviderBidirectionalRun, ProviderBidirectionalPlanPreview,
-    ProviderBidirectionalRollback, ProviderBidirectionalRollbackStats, ProviderBidirectionalRun,
-    ProviderBidirectionalStats, SnapshotLimits, SyncDirection, TreeSnapshot,
+    plan_bidirectional, plan_provider_bidirectional, plan_provider_bidirectional_for_queue,
+    prepare_local_bidirectional, prepare_local_bidirectional_rollback,
+    prepare_local_bidirectional_rollback_for_queue,
+    prepare_local_bidirectional_rollback_for_queue_operation,
+    prepare_local_bidirectional_with_decisions,
+    prepare_local_bidirectional_with_decisions_bound_for_queue,
+    prepare_local_bidirectional_with_decisions_bound_for_queue_operation,
+    prepare_provider_bidirectional_rollback, prepare_provider_bidirectional_rollback_for_queue,
+    prepare_provider_bidirectional_rollback_for_queue_operation,
+    prepare_provider_bidirectional_with_decisions,
+    prepare_provider_bidirectional_with_decisions_bound_for_queue,
+    prepare_provider_bidirectional_with_decisions_bound_for_queue_operation,
+    prepare_resume_local_bidirectional, prepare_resume_local_bidirectional_for_queue,
+    prepare_resume_local_bidirectional_for_queue_operation, prepare_resume_provider_bidirectional,
+    prepare_resume_provider_bidirectional_for_queue,
+    prepare_resume_provider_bidirectional_for_queue_operation, prepare_resume_sftp_bidirectional,
+    prepare_sftp_bidirectional_rollback, prepare_sftp_bidirectional_with_decisions,
+    resolve_conflicts, BaselineStore, BidirectionalAction, BidirectionalBaseline,
+    BidirectionalPlan, BidirectionalProjectionJournal, BidirectionalProjectionKind,
+    BidirectionalProjectionState, BidirectionalRollbackPhase, BidirectionalRollbackQuarantine,
+    BidirectionalRollbackStep, BidirectionalRunJournal, BidirectionalRunState,
+    BidirectionalTypeSwapPhase, BidirectionalTypeSwapStep, BinaryRelativePath, ConflictCopyPath,
+    ConflictDecision, ConflictKind, ConflictResolution, EndpointBinding, EndpointSide,
+    LocalBidirectionalPreview, LocalBidirectionalRollback, LocalBidirectionalRollbackPreview,
+    LocalBidirectionalRollbackStats, LocalBidirectionalRun, LocalBidirectionalStats, PairId,
+    PreparedLocalBidirectionalRollback, PreparedLocalBidirectionalRun,
+    PreparedProviderBidirectionalRollback, PreparedProviderBidirectionalRun,
+    ProviderBidirectionalPlanPreview, ProviderBidirectionalRollback,
+    ProviderBidirectionalRollbackStats, ProviderBidirectionalRun, ProviderBidirectionalStats,
+    SnapshotLimits, SyncDirection, TreeSnapshot,
 };
 pub use connections::{
     latest_ftps_profile_revision, latest_sftp_profile_revision, latest_smb_profile_revision,
@@ -98,6 +138,10 @@ pub use connections::{
     save_smb_profile_versioned_if_current, save_webdav_profile, save_webdav_profile_versioned,
     save_webdav_profile_versioned_if_current, FtpsProfile, ProfileMutation, RemoteProfileBinding,
     RemoteProfileProtocol, SftpProfile, SmbProfile, VersionedProfile, WebDavProfile,
+};
+pub use content_sync::{
+    prepare_content_sync, prepare_content_sync_for_queue, validate_content_sync_options,
+    ContentSyncPreview, ContentSyncRun, PreparedContentSync,
 };
 pub use directory_size::{
     DirectorySizeIssue, DirectorySizeIssueKind, DirectorySizeMode, DirectorySizeResult,
@@ -119,11 +163,13 @@ pub use fileops::{
     validate_interactive_rename_request, FileConflictProof, FileOperationRequest, OpStats,
     OverwritePolicy,
 };
-pub use ftps::{discover_ftps_certificate, FtpsInteractiveDirectoryListing, FtpsVfs};
+pub use ftps::{
+    discover_ftps_certificate, verify_ftps_certificate, FtpsInteractiveDirectoryListing, FtpsVfs,
+};
 pub use metadata::{
-    Acl, AclModel, BlobSummary, Capability, DataExtent, ForkKind, MetadataCapabilities,
-    MetadataManifest, MetadataProfile, NamedBlobSummary, Nfs4AceKind, Nfs4Acl, Nfs4AclEntry, Owner,
-    PosixAcl, PosixAclEntry, PosixAclTag, XattrValue,
+    validate_named_stream_name, Acl, AclModel, BlobSummary, Capability, DataExtent, ForkKind,
+    MetadataCapabilities, MetadataManifest, MetadataProfile, NamedBlobSummary, Nfs4AceKind,
+    Nfs4Acl, Nfs4AclEntry, Owner, PosixAcl, PosixAclEntry, PosixAclTag, XattrValue,
 };
 pub use network_discovery::{
     discover_network_services, DiscoveredNetworkService, NetworkServiceProtocol,
@@ -140,17 +186,21 @@ pub use quarantine::{
 };
 pub use queue::{
     execute_local_queue_entry, execute_prepared_bidirectional_queue_entry,
-    execute_prepared_sftp_queue_entry, execute_provider_delete_queue_entry,
-    execute_provider_file_queue_entry, prepare_bidirectional_queue_entry, prepare_ftps_queue_entry,
+    execute_prepared_bidirectional_queue_entry_effects, execute_prepared_content_sync_queue_entry,
+    execute_prepared_content_sync_queue_entry_with_removal_phrase,
+    execute_prepared_sftp_queue_entry, execute_prepared_sftp_queue_entry_effects,
+    execute_provider_delete_queue_entry, execute_provider_file_queue_entry,
+    prepare_bidirectional_queue_entry, prepare_content_sync_queue_entry, prepare_ftps_queue_entry,
     prepare_provider_queue_entry, prepare_sftp_queue_entry, prepare_smb_queue_entry,
-    prepare_webdav_queue_entry, BidirectionalQueueEndpoint, BidirectionalQueuePreparation,
-    FileQueueKind, LocalQueueExecution, OperationQueue, OperationQueueProcessLock,
-    PreparedBidirectionalQueueRun, PreparedSftpQueueRun, QueueAttention, QueueEntry,
-    QueueExecutionResult, QueueOperation, QueueOperationClass, QueueSnapshot, QueueState,
-    SftpQueueDirection, SftpQueuePreparation, QUEUE_JOURNAL_VERSION,
+    prepare_webdav_queue_entry, reprepare_direct_bidirectional_queue_run,
+    BidirectionalQueueEndpoint, BidirectionalQueuePreparation, FileQueueKind, LocalQueueExecution,
+    OperationQueue, OperationQueueProcessLock, PreparedBidirectionalQueueRun, PreparedSftpQueueRun,
+    QueueAttention, QueueEntry, QueueExecutionResult, QueueOperation, QueueOperationClass,
+    QueueSnapshot, QueueState, SftpQueueDirection, SftpQueuePreparation, QUEUE_JOURNAL_VERSION,
 };
 pub use real_mode::{
-    prepare_local_real_run, prepare_local_sync_run, prepare_local_sync_run_with_sandbox,
+    prepare_local_real_run, prepare_local_real_run_for_queue, prepare_local_real_run_with_sandbox,
+    prepare_local_sync_run, prepare_local_sync_run_for_queue, prepare_local_sync_run_with_sandbox,
     ListingError, ListingProof, LocalRealRun, PreparedLocalRealRun, PreparedLocalSyncRun,
     RealRunImpact, RealRunPreview, RootIdentity, REAL_PERMIT_LIFETIME,
 };
@@ -169,9 +219,9 @@ pub use remote_delete::{
 };
 pub use remote_real_mode::{
     interactive_file_preparation_notice, prepare_ftps_download, prepare_ftps_upload,
-    prepare_provider_transfer, prepare_sftp_download, prepare_sftp_upload, prepare_smb_download,
-    prepare_smb_upload, prepare_webdav_download, prepare_webdav_upload,
-    validate_interactive_file_transfer_request, InteractiveFileContexts,
+    prepare_provider_transfer, prepare_provider_transfer_for_queue, prepare_sftp_download,
+    prepare_sftp_upload, prepare_smb_download, prepare_smb_upload, prepare_webdav_download,
+    prepare_webdav_upload, validate_interactive_file_transfer_request, InteractiveFileContexts,
     InteractiveListingOmission, PreparedProviderRealRun, PreparedSftpRealRun,
     ProviderDeleteCapabilities, ProviderEndpoint, ProviderFileCapabilities,
     ProviderFileTargetPreparation, ProviderFileTargetProbe, ProviderInteractiveEntry,
@@ -183,7 +233,9 @@ pub use remote_rename::{
     SOURCE_PATH_BINDING_LIMITATION,
 };
 pub use remote_snapshot::{
-    cleanup_remote_snapshots, download_remote_snapshot, RemoteSnapshot, SNAPSHOT_RETENTION,
+    cleanup_remote_snapshots, download_remote_snapshot, download_remote_snapshot_with_options,
+    verify_remote_original, RemoteOriginalProof, RemoteSnapshot, SnapshotOpenMode, SnapshotOptions,
+    SnapshotVerification, SNAPSHOT_RETENTION,
 };
 pub use rename_interaction::{
     ordinary_rename_contract, validate_ordinary_rename_class, validate_ordinary_rename_request,
@@ -210,3 +262,9 @@ pub use vfs::{Entry, LocalMountIdentity, LocalRootIdentity, LocalVfs, Vfs};
 pub use webdav::{discover_webdav_certificate, WebDavInteractiveDirectoryListing, WebDavVfs};
 
 pub mod conflict_view;
+
+pub mod webdav_security;
+pub mod windows_security;
+pub use webdav_security::{WebDavPropertyObservation, WebDavSecurityObservation};
+
+pub mod windows_dacl;

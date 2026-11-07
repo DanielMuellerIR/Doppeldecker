@@ -12,7 +12,9 @@ let leaseSequence = 0;
 function focusables() {
   return $$(
     '#modal .modal button:not([disabled]), #modal .modal input:not([disabled]):not([type="hidden"]), ' +
-    '#modal .modal select:not([disabled]), #modal .modal a[href], #modal .modal [tabindex]:not([tabindex="-1"])',
+    '#modal .modal select:not([disabled]), #modal .modal a[href], ' +
+    '#modal .modal details > summary:first-of-type:not([tabindex="-1"]), ' +
+    '#modal .modal [tabindex]:not([tabindex="-1"])',
   ).filter((element) => !element.hidden && element.getClientRects().length > 0);
 }
 

@@ -203,7 +203,7 @@ fn upload_antwortverlust_und_schwache_put_belege_bleiben_ohne_retry_erhalten() {
 }
 
 #[test]
-fn einzelne_elternbedingung_verhindert_put_in_ausgetauschtem_elternordner() {
+fn upload_ohne_collectionbedingung_bilanziert_den_erlaubten_elternpfad_race() {
     for swap in [false, true] {
         let case = Case::new(b"Inhalt");
         {
@@ -213,38 +213,24 @@ fn einzelne_elternbedingung_verhindert_put_in_ausgetauschtem_elternordner() {
                 state.fault = server::Fault::ParentSwapAtPut;
             }
         }
-        let (queue, result) = case.run(&Cancel::new(), &mut |_| {});
+        let (_, result) = case.run(&Cancel::new(), &mut |_| {});
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(case.count("MOVE"), 1);
+        assert_eq!(case.count("DELETE"), 0);
+        assert_eq!(
+            std::fs::read(case.server.root.path().join("pane/Datei.txt")).unwrap(),
+            b"Inhalt"
+        );
         if swap {
-            assert_eq!(error_code(&result.unwrap_err()), ErrorCode::OutcomeUnclear);
-            assert_eq!(case.count("MOVE"), 0);
-            assert_eq!(case.count("DELETE"), 0);
             assert_eq!(
                 std::fs::read(case.server.root.path().join("pane/Fremd.txt")).unwrap(),
                 b"Fremder Elternordner"
             );
-            assert!(case
-                .leftovers()
-                .iter()
-                .all(|name| !name.contains("fileop-tmp")));
             assert_eq!(
                 std::fs::read_dir(case.server.root.path().join("pane-before-swap"))
                     .unwrap()
                     .count(),
                 0
-            );
-            let id = queue.snapshot().entries[0].operation_id.clone();
-            drop(queue);
-            let queue = OperationQueue::open(case.config.path().join("queue.json")).unwrap();
-            assert_eq!(
-                error_code(&queue.retry(&id).unwrap_err()),
-                ErrorCode::OutcomeUnclear
-            );
-        } else {
-            assert!(result.is_ok(), "{result:?}");
-            assert_eq!(case.count("MOVE"), 1);
-            assert_eq!(
-                std::fs::read(case.server.root.path().join("pane/Datei.txt")).unwrap(),
-                b"Inhalt"
             );
         }
         assert_eq!(case.count("PUT"), 1);
@@ -310,8 +296,7 @@ fn upload_spaete_kollision_erhaelt_fremdes_ziel_und_bereinigt_nur_den_eigenen_te
         .chain(&state.delete_if_headers)
     {
         assert!(!conditions.contains(&format!("<{}/> ", case.server.config.origin)));
-        assert_eq!(conditions.matches("> ([").count(), 1);
-        assert!(conditions.contains(&format!("<{}/pane> ", case.server.config.origin)));
+        assert!(conditions.is_empty());
     }
 }
 #[test]
@@ -333,6 +318,7 @@ fn upload_geaenderte_quelle_gleicher_groesse_und_zeit_wird_vor_move_erkannt() {
 fn upload_abbruch_vor_und_waehrend_des_stroms_erhaelt_die_quelle() {
     for after_bytes in [false, true] {
         let case = Case::new(&vec![0x5a; 512 * 1024]);
+        case.server.state.lock().unwrap().changing_collection_tokens = true;
         let cancel = Cancel::new();
         if !after_bytes {
             cancel.cancel();
@@ -429,9 +415,18 @@ fn upload_parent_und_profilrootwechsel_bleiben_ohne_retry_mit_ehrlicher_wirkungs
         }
         case.server.state.lock().unwrap().fault = fault;
         let (_, result) = case.run(&Cancel::new(), &mut |_| {});
-        assert!(result.is_err());
+        // Dieselbe Pane kann unter einem ersetzten Profilroot weitergeführt
+        // werden. Collection-ETags beweisen nach eigener Wirkung keine stabile
+        // Elternidentität; der Best-Effort-Readback bestätigt hier den Inhalt.
+        let continued_pane = matches!(
+            fault,
+            server::Fault::ParentSwapAtPut
+                | server::Fault::ProfileRootSwapAtPut
+                | server::Fault::ProfileRootSwapAtMove
+        );
+        assert_eq!(result.is_ok(), continued_pane, "{result:?}");
         assert_eq!(case.count("PUT"), 1);
-        assert!(case.count("MOVE") <= 1);
+        assert_eq!(case.count("MOVE"), 1);
         assert_eq!(case.count("DELETE"), 0);
         case.assert_no_probes();
         assert_eq!(
@@ -448,7 +443,7 @@ fn upload_parent_und_profilrootwechsel_bleiben_ohne_retry_mit_ehrlicher_wirkungs
                 "pane"
             },
         );
-        if fault == server::Fault::ProfileRootSwapAtMove {
+        if continued_pane {
             assert_eq!(
                 std::fs::read(newroot.join("Datei.txt")).unwrap(),
                 b"Original"
@@ -512,7 +507,11 @@ fn upload_queue_reopen_verlangt_frische_wirkungsbestaetigung() {
 fn upload_abbruch_nach_put_loescht_nur_eigene_datei_und_meldet_abgebrochen() {
     let case = Case::new(b"Original");
     let cancel = Cancel::new();
-    case.server.state.lock().unwrap().cancel_on_put = Some(cancel.clone());
+    {
+        let mut state = case.server.state.lock().unwrap();
+        state.cancel_on_put = Some(cancel.clone());
+        state.changing_collection_tokens = true;
+    }
     let (queue, result) = case.run(&cancel, &mut |_| {});
     let QueueExecutionResult::File(stats) = result.unwrap() else {
         panic!()
@@ -617,8 +616,10 @@ fn upload_private_sicht_lockert_keine_strikten_faehigkeiten_und_bilanziert_metad
     .unwrap();
     assert_eq!(stats.files, 1);
     assert!(stats.target_copy_new_best_effort);
-    assert_eq!(stats.target_write_limitations.len(), 1);
-    assert!(stats.target_write_limitations[0].contains("/pane/Datei.txt"));
+    assert!(stats
+        .target_write_limitations
+        .iter()
+        .any(|note| note.contains("/pane/Datei.txt")));
     assert!(!target.current_transfer_capabilities().add_only);
 }
 #[test]
@@ -719,7 +720,14 @@ fn upload_mehrdateiabbruch_erhaelt_bereits_fertige_addition_und_restquellen() {
     };
     assert!(stats.cancelled);
     assert_eq!(stats.files, 1);
-    assert_eq!(stats.target_write_limitations.len(), 1);
+    assert!(stats
+        .target_write_limitations
+        .iter()
+        .any(|note| note.contains("/pane/Datei.txt")));
+    assert!(!stats
+        .target_write_limitations
+        .iter()
+        .any(|note| note.contains("/pane/Zweite.txt")));
     assert_eq!(case.count("PUT"), 2);
     assert_eq!(case.count("MOVE"), 1);
     assert_eq!(case.count("DELETE"), 1);
@@ -1171,4 +1179,101 @@ fn webdav_baum_mit_zwei_ebenen_und_leerem_ordner_ohne_loeschprobe() {
             .count(),
         0
     );
+}
+
+#[test]
+fn move_mit_neuer_ziel_etag_verifiziert_inhalt_und_schliesst_intent() {
+    let case = Case::new(b"Inhalt mit frischer Zielversion");
+    case.server.state.lock().unwrap().fault = server::Fault::NewEtagAfterMove;
+    let (queue, result) = case.run(&Cancel::new(), &mut |_| {});
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(queue.snapshot().entries[0].state, QueueState::Completed);
+    assert!(queue.snapshot().entries[0].temp_recovery_paths.is_empty());
+    assert_eq!(
+        std::fs::read(case.server.root.path().join("pane/Datei.txt")).unwrap(),
+        b"Inhalt mit frischer Zielversion"
+    );
+    assert_eq!(case.count("MOVE"), 1);
+    assert_eq!(case.leftovers(), vec!["Datei.txt"]);
+    assert!(!std::fs::read_dir(case.config.path())
+        .unwrap()
+        .any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".recovery.json")));
+}
+
+#[test]
+fn eigene_put_move_wirkungen_duerfen_collection_etags_aendern() {
+    let case = Case::new(b"Inhalt bei wechselnden Collectionversionen");
+    case.server.state.lock().unwrap().changing_collection_tokens = true;
+    let (queue, result) = case.run(&Cancel::new(), &mut |_| {});
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(queue.snapshot().entries[0].state, QueueState::Completed);
+    assert!(queue.snapshot().entries[0].temp_recovery_paths.is_empty());
+    assert_eq!(
+        std::fs::read(case.server.root.path().join("pane/Datei.txt")).unwrap(),
+        b"Inhalt bei wechselnden Collectionversionen"
+    );
+    assert_eq!(case.count("PUT"), 1);
+    assert_eq!(case.count("MOVE"), 1);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_copy_webdav_preserves_plain_content_and_reports_unsupported_resource_and_attributes() {
+    use std::io::Write;
+    let case = Case::new(b"Original content");
+    let path = case.source_root.join("Datei.txt");
+    let local = LocalVfs::rooted(&case.source_root).unwrap();
+    let mut attributes = local.read_xattrs(&path).unwrap();
+    attributes.push(XattrValue {
+        name: b"com.doppeldecker.test".to_vec(),
+        value: b"native attribute".to_vec(),
+    });
+    attributes.sort_by(|left, right| left.name.cmp(&right.name));
+    local.write_xattrs_exact(&path, &attributes).unwrap();
+    {
+        let mut fork = local
+            .open_fork_write_new(&path, ForkKind::Resource)
+            .unwrap();
+        fork.write_all(b"native resource content").unwrap();
+    }
+    let (queue, result) = case.run(&Cancel::new(), &mut |_| {});
+    let QueueExecutionResult::File(stats) = result.unwrap() else {
+        panic!()
+    };
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.incomplete_resource_forks, 1);
+    assert!(queue.snapshot().entries[0].file_incomplete);
+    drop(queue);
+    let reopened = OperationQueue::open(case.config.path().join("queue.json")).unwrap();
+    assert_eq!(reopened.snapshot().entries[0].state, QueueState::Completed);
+    assert!(reopened.snapshot().entries[0].file_incomplete);
+    let audit = std::fs::read_to_string(case.config.path().join("queue-audit.jsonl")).unwrap();
+    let final_record: serde_json::Value =
+        serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+    assert_eq!(final_record["status"], "completed_with_omissions");
+    assert!(stats
+        .target_write_limitations
+        .iter()
+        .any(|note| note.contains("Ressourcen-Fork")));
+    assert!(stats
+        .target_write_limitations
+        .iter()
+        .any(|note| note.contains("xattrs")));
+    assert_eq!(
+        std::fs::read(case.server.root.path().join("pane/Datei.txt")).unwrap(),
+        b"Original content"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"Original content");
+    assert_eq!(
+        std::fs::read(path.join("..namedfork/rsrc")).unwrap(),
+        b"native resource content"
+    );
+    assert_eq!(case.count("PUT"), 1);
+    assert_eq!(case.count("MOVE"), 1);
+    assert_eq!(case.count("DELETE"), 0);
+    case.assert_no_probes();
 }

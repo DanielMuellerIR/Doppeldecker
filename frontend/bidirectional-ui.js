@@ -1,5 +1,6 @@
+import { confirmForwardBidirectional } from "./forward-bidirectional-ui.js";
 import { conflictChoiceModal } from "./conflict-dialog.js";
-import { choiceModal, confirmIndependentBackup, executionChoiceModal, promptModal } from "./modal.js";
+import { choiceModal } from "./modal.js";
 import { invoke } from "./tauri-api.js";
 import { escapeHtml } from "./ui-utils.js";
 
@@ -51,6 +52,16 @@ function impactOf(preview) {
   return counts;
 }
 
+function impactHtml(preview) {
+  const impact = impactOf(preview);
+  return `<p><b>${impact.copies}</b> additive Pfade · <b>${impact.replacements}</b> Ersetzungen/Typwechsel · ` +
+    `<b>${impact.deletes}</b> Löschpropagierungen in Quarantäne · <b>${impact.conflictCopies}</b> Konfliktkopien.</p>`;
+}
+
+function warningsHtml(preview) {
+  return (preview.scope_warnings || []).map(warning => `<p class="real-warning">${escapeHtml(warning)}</p>`).join("");
+}
+
 /** Kapselt ausschließlich Assistent, Bestätigung und Recovery-Bedienung. Alle
  * Snapshots, Digests, Capability-Gates und Mutationen bleiben GUI-frei im Kern. */
 export function createBidirectionalUi({
@@ -67,11 +78,13 @@ export function createBidirectionalUi({
   let pendingAction = null;
   let pendingRecovery = null;
   let starting = false;
+  let generation = 0;
+  let preparingForward = false;
 
   async function discardPendingAction() {
     if (!pendingAction) return true;
     try {
-      await invoke("discard_bidirectional_sync");
+      await invoke(pendingAction.forward ? "discard_forward_bidirectional_sync" : "discard_bidirectional_sync");
       pendingAction = null;
       return true;
     } catch (_) {
@@ -80,7 +93,7 @@ export function createBidirectionalUi({
     }
   }
 
-  async function decideConflicts(preview, visibleRoles, current) {
+  async function decideConflicts(preview, visibleRoles, current, forward = false, operationId = null) {
     const resolutions = [];
     let conflicts = preview.conflict_details;
     const total = conflicts?.length || 0;
@@ -116,7 +129,9 @@ export function createBidirectionalUi({
       resolutions.push({ path: conflict.path, decision: conflict.choices[value].decision });
       index += 1;
       if (conflicts.length > 1) {
-        conflicts = await invoke("preview_bidirectional_conflicts", { resolutions, expectedPlanDigest: preview.plan.plan_digest });
+        conflicts = forward
+          ? await invoke("preview_forward_bidirectional_conflicts", { resolutions, expectedUnresolvedDigest: preview.unresolved_digest, operationId })
+          : await invoke("preview_bidirectional_conflicts", { resolutions, expectedPlanDigest: preview.plan.plan_digest });
         if (!current()) return null;
       } else conflicts = [];
     }
@@ -165,7 +180,46 @@ export function createBidirectionalUi({
     return { confirmed: false, hadError: true };
   }
 
+  async function recoverForwardEntry(entry) {
+    if (entry.bidirectional_completion_recovery) {
+      try {
+        await invoke("finish_forward_bidirectional_queue_completion", { operationId: entry.operation_id });
+        showDock('<span class="pill ok">Baselineabschluss bestätigt</span>Der bereits ausgeführte Lauf wurde ohne erneute Dateioperation abgeschlossen.', { closable: true });
+        return true;
+      } catch (error) { showError("Bidirektionalen Abschluss prüfen", error); return false; }
+    }
+    let preview;
+    const operationId = entry.operation_id;
+    const discardQueuePreparation = () => invoke("discard_forward_bidirectional_queue_preparation", { operationId });
+    try {
+      if (entry.state === "AwaitingConfirmation") {
+        preview = await invoke("forward_bidirectional_queue_preview", { operationId });
+      } else {
+        const replan = await choiceModal(`Neu abgleichen · ${entry.operation.pair_name}`,
+          "Der unterbrochene Lauf kann beide Seiten bereits verändert haben. Der neue Abgleich liest beide Seiten gegen die letzte gemeinsame Baseline. Alte Konfliktentscheidungen werden verworfen; es gibt kein universelles Rollback und keinen blinden Retry.",
+          [{ label: "Abbrechen", value: false, cls: "ghost" }, { label: "Neu abgleichen", value: true, cls: "danger" }]);
+        if (!replan) return false;
+        preview = await invoke("prepare_forward_bidirectional_queue_recovery", { operationId, resolutions: [], expectedUnresolvedDigest: null });
+      }
+      if (preview.plan.conflicts > 0) {
+        const resolutions = await decideConflicts(preview, { left: "left", right: "right" }, () => true, true, operationId);
+        if (!resolutions) { await discardQueuePreparation(); return false; }
+        preview = await invoke("prepare_forward_bidirectional_queue_recovery", { operationId, resolutions, expectedUnresolvedDigest: preview.unresolved_digest });
+      }
+      if (preview.stage_blocker) {
+        await discardQueuePreparation();
+        showDock(`<span class="pill delete">Neuabgleich gesperrt</span>${escapeHtml(preview.stage_blocker)}`, { closable: true });
+        return false;
+      }
+      const confirmation = await confirmForwardBidirectional(preview, { pairName: entry.operation.pair_name, left: entry.operation.left, right: entry.operation.right, queued: true });
+      if (!confirmation) { await discardQueuePreparation(); return false; }
+      await invoke("approve_forward_bidirectional_queue_entry", { operationId, ...confirmation });
+      return true;
+    } catch (error) { showError("Bidirektionales Recovery", error); return false; }
+  }
+
   async function recoverQueueEntry(entry) {
+    if (entry.operation.type === "BidirectionalForward") return recoverForwardEntry(entry);
     if (entry.bidirectional_completion_recovery) {
       try {
         await invoke("finish_bidirectional_completion_recovery", {
@@ -214,19 +268,16 @@ export function createBidirectionalUi({
       if (!discarded.confirmed || discarded.hadError) return;
       return showDock(`<span class="pill delete">Recovery gesperrt</span>${escapeHtml(preview.stage_blocker)}`, { closable: true });
     }
-    let backupConfirmed = true;
-    if (decision === "resume" && preview.backup_confirmation_required) {
-      backupConfirmed = await confirmIndependentBackup();
-    }
-    if (!backupConfirmed) {
-      await discardRecovery(recoveryIdentity);
-      return;
-    }
-    const typed = await promptModal(
-      `${decision === "resume" ? "Fortsetzen" : `Rollback von ${preview.committed_projections} Teilprojektion(en)`}: Exakt „${preview.confirmation_phrase}“ eingeben`,
-      "",
+    const confirmed = await choiceModal(
+      decision === "resume" ? "Bidirektionalen Sync fortsetzen" : "Vorherigen Bestand wiederherstellen",
+      `<p>${escapeHtml(entry.operation.pair_name)} · ` +
+        `${escapeHtml(entry.operation.left?.root || "links")} ↔ ${escapeHtml(entry.operation.right?.root || "rechts")}</p>` +
+        (decision === "resume" ? impactHtml(preview) : `<p>${preview.committed_projections} bereits ausgeführte Teilprojektion(en) werden rückwärts wiederhergestellt. Vorhandene neuere Ziele werden geschützt.</p>`) +
+        warningsHtml(preview),
+      [{ label: "Abbrechen", value: false, cls: "ghost" },
+        { label: decision === "resume" ? "Fortsetzen" : "Wiederherstellung starten", value: true, cls: "danger" }],
     );
-    if (typed !== preview.confirmation_phrase) {
+    if (!confirmed) {
       const discarded = await discardRecovery(recoveryIdentity);
       if (!discarded.confirmed || discarded.hadError) return;
       return showDock("<span class=\"pill none\">Recovery nicht bestätigt</span>Journal und Queue-Sperre bleiben unverändert erhalten.", { closable: true });
@@ -235,9 +286,9 @@ export function createBidirectionalUi({
     startRun("Bidirektionales Recovery läuft …");
     try {
       if (decision === "resume") {
-        await invoke("run_bidirectional_sync", { confirmation: typed, backupConfirmed });
+        await invoke("run_bidirectional_sync", { effectsConfirmed: true });
       } else {
-        await invoke("run_bidirectional_rollback", { confirmation: typed });
+        await invoke("run_bidirectional_rollback", { effectsConfirmed: true });
       }
       // Der Worker kann sein Terminalevent schon vor der Command-Antwort senden.
       // Der Starttext stammt deshalb ausschließlich aus `startRun`; nach `await`
@@ -253,7 +304,8 @@ export function createBidirectionalUi({
     if (running() || realRunActive() || starting) return;
     starting = true;
     const scope = syncScope();
-    const current = () => scope === syncScope();
+    const owner = generation;
+    const current = () => scope === syncScope() && owner === generation;
     try {
       return await runCurrent(scope, current);
     } finally {
@@ -266,13 +318,17 @@ export function createBidirectionalUi({
   async function runCurrent(scope, current) {
     const left = endpointFromPane(panes.left);
     const right = endpointFromPane(panes.right);
+    const forward = left.provider !== "local" || right.provider !== "local";
+    const prepareCommand = forward ? "prepare_forward_bidirectional_sync" : "prepare_bidirectional_sync";
+    const discardCommand = forward ? "discard_forward_bidirectional_sync" : "discard_bidirectional_sync";
+    let recovery = false;
     let pair;
     let roles;
     try {
       // Paar-ID und Rollen stammen aus einer appweiten Backend-Transaktion. Zwei
       // Fenster und ein Pane-Tausch können deshalb niemals getrennte Baselines
       // oder Locks für dieselbe ungeordnete Endpunktmenge erzeugen.
-      pair = await invoke("register_bidirectional_pair", { left, right });
+      pair = await invoke(forward ? "register_forward_bidirectional_pair" : "register_bidirectional_pair", { left, right });
       if (!current()) {
         await discardPendingAction();
         return;
@@ -281,7 +337,24 @@ export function createBidirectionalUi({
     } catch (error) {
       return showError("Bidirektionaler Sync gesperrt", error);
     }
-    let request = { ...pair, resolutions: [] };
+    if (forward) {
+      try {
+        const status = await invoke("forward_bidirectional_pair_status", { pairId: pair.pairId });
+        if (!current()) return;
+        if (status?.baseline_completion_available) {
+          if (await choiceModal("Baselineabschluss prüfen", "Die Dateiwirkung wurde bereits ausgeführt. Dieser Schritt schließt ausschließlich die gemeinsame Baseline ab und wiederholt keine Dateioperation.", [{ label: "Abbrechen", value: false, cls: "ghost" }, { label: "Baseline abschließen", value: true, cls: "primary" }]) && current()) {
+            await invoke("finish_forward_bidirectional_pair_completion", { pairId: pair.pairId });
+            showDock('<span class="pill ok">Baseline abgeschlossen</span>Der Dateibestand wurde nicht erneut verändert.', { closable: true });
+          }
+          return;
+        }
+        if (status) {
+          recovery = await choiceModal("Bidirektionalen Bestand neu abgleichen", "Der vorherige Lauf kann bereits Änderungen enthalten. Der neue Abgleich liest beide Seiten gegen die letzte gemeinsame Baseline. Alte Konfliktentscheidungen werden verworfen; es gibt kein universelles Rollback und keinen blinden Retry.", [{ label: "Abbrechen", value: false, cls: "ghost" }, { label: "Neu abgleichen", value: true, cls: "danger" }]);
+          if (!recovery || !current()) return;
+        }
+      } catch (error) { return showError("Bidirektionales Recovery gesperrt", error); }
+    }
+    let request = { ...pair, resolutions: [], ...(forward ? { recovery } : {}) };
     let actionKey = JSON.stringify(request);
     let preview = pendingAction?.key === actionKey && pendingAction.scope === scope
       ? pendingAction.preview : null;
@@ -296,19 +369,21 @@ export function createBidirectionalUi({
           throw new Error("Die vorige bidirektionale Backendvorbereitung konnte nicht verworfen werden");
         }
         if (!current()) return;
-        preview = await invoke("prepare_bidirectional_sync", { request });
-        pendingAction = { key: actionKey, request, preview, scope };
+        preparingForward = forward;
+        try { preview = await invoke(prepareCommand, { request }); } finally { preparingForward = false; }
+        pendingAction = { key: actionKey, request, preview, scope, forward };
       }
       if (!await checkCurrent()) return;
       if (preview.plan.conflicts > 0) {
-        const resolutions = await decideConflicts(preview, roles, current);
-        await invoke("discard_bidirectional_sync");
+        const resolutions = await decideConflicts(preview, roles, current, forward);
+        await invoke(discardCommand);
         pendingAction = null;
         if (!resolutions || !current()) return;
-        request = { ...request, resolutions, expectedUnresolvedDigest: preview.plan.plan_digest };
+        request = { ...request, resolutions, expectedUnresolvedDigest: forward ? preview.unresolved_digest : preview.plan.plan_digest };
         actionKey = JSON.stringify(request);
-        preview = await invoke("prepare_bidirectional_sync", { request });
-        pendingAction = { key: actionKey, request, preview, scope };
+        preparingForward = forward;
+        try { preview = await invoke(prepareCommand, { request }); } finally { preparingForward = false; }
+        pendingAction = { key: actionKey, request, preview, scope, forward };
         if (!await checkCurrent()) return;
       }
     } catch (error) {
@@ -318,54 +393,31 @@ export function createBidirectionalUi({
       await discardPendingAction();
       return showDock(`<span class="pill delete">Gesperrt</span>${escapeHtml(preview.stage_blocker)}`, { closable: true });
     }
-    const impact = impactOf(preview);
-    const execution = await executionChoiceModal(
+    const confirmed = forward ? await confirmForwardBidirectional(preview, { pairName: pair.pairName, left, right, visibleRoles: roles }) : await choiceModal(
       `Bidirektional · ${pair.pairName}`,
       `<div class="sync-bound-roots"><b>Links:</b> <code>${escapeHtml(left.root)}</code><br>` +
-        `<b>Rechts:</b> <code>${escapeHtml(right.root)}</code></div><br>` +
-        `<b>${impact.copies}</b> additive Pfade · <b>${impact.replacements}</b> Ersetzungen/Typwechsel · ` +
-        `<b>${impact.deletes}</b> Löschpropagierungen · <b>${impact.conflictCopies}</b> Konfliktkopien.<br><br>` +
-        "Beide vollständigen Bäume, die dauerhafte Baseline und jede Entscheidung sind im Plan-Digest gebunden.",
+        `<b>Rechts:</b> <code>${escapeHtml(right.root)}</code></div>` + impactHtml(preview) + warningsHtml(preview) +
+        "<p>Bestehende Fassungen und entfernte Einträge werden in Quarantäne gesichert. Beide Bäume und die Baseline werden vor der Ausführung erneut geprüft.</p>",
+      [{ label: "Abbrechen", value: false, cls: "ghost" },
+        { label: "Sync starten", value: true, cls: "danger" }],
     );
     if (!await checkCurrent()) return;
-    if (execution === "queue") {
+    if (!confirmed) {
+      await discardPendingAction();
+      return;
+    }
+    if (forward) {
+      const presentation = dockRevision();
       try {
-        const presentation = dockRevision();
-        await invoke("enqueue_bidirectional_sync");
+        await invoke("enqueue_forward_bidirectional_sync", confirmed);
         pendingAction = null;
-        // Die Queue kann schon vor der Antwort eine Rückfrage oder einen
-        // Abschluss melden. Beides gehört weiterhin zur neueren Anzeige.
-        if (current() && dockRevision() === presentation) {
-          showDock("<span class=\"pill copy\">Bidirektional eingereiht</span>Die Queue scannt beide Bäume frisch und fordert danach eine neue Laufphrase an.", { closable: true });
-        }
-      } catch (error) {
-        showError("Bidirektionale Queue", error);
-      }
-      return;
-    }
-    if (execution !== "direct") {
-      await discardPendingAction();
-      return;
-    }
-    let backupConfirmed = true;
-    if (preview.backup_confirmation_required) {
-      backupConfirmed = await confirmIndependentBackup();
-      if (!await checkCurrent()) return;
-    }
-    if (!backupConfirmed) {
-      await discardPendingAction();
-      return;
-    }
-    const phrase = preview.confirmation_phrase;
-    const typed = await promptModal(`Exakt „${phrase}“ eingeben`, "");
-    if (!await checkCurrent()) return;
-    if (typed !== phrase) {
-      await discardPendingAction();
-      return showDock("<span class=\"pill none\">Nicht bestätigt</span>Es wurde nichts verändert.", { closable: true });
+        if (current() && dockRevision() === presentation) showDock('<span class="pill copy">Eingereiht</span>Bestätigter bidirektionaler Sync wartet in der Fensterqueue.', { closable: true });
+        return true;
+      } catch (error) { return showError("Bidirektionaler Start", error); }
     }
     startRun("Bidirektionaler Sync läuft …");
     try {
-      await invoke("run_bidirectional_sync", { confirmation: typed, backupConfirmed });
+      await invoke("run_bidirectional_sync", { effectsConfirmed: true });
       pendingAction = null;
       // Siehe Recovery-Pfad oben: Das Terminalevent darf schneller als diese
       // Antwort sein und bleibt dann die neueste sichtbare Zustandsmeldung.
@@ -375,5 +427,11 @@ export function createBidirectionalUi({
     }
   }
 
-  return { recoverQueueEntry, run };
+  async function discard() {
+    generation += 1;
+    if (preparingForward) await invoke("discard_forward_bidirectional_sync");
+    return discardPendingAction();
+  }
+
+  return { discard, recoverQueueEntry, run };
 }

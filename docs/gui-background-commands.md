@@ -28,7 +28,7 @@ unterbrochen. Eine abgebrochene frische Vorbereitung verwirft ihr eigenes
 mutationsloses Journal vor der Rückgabe; Resume und Rollback behalten ihre
 bestehenden Recovery-Journale. Profilrevisionen, Paarbindung und nicht
 serialisierbare Pending-/Permitbelege folgen weiterhin dem bisherigen Vertrag.
-Die Antwortformate bleiben gleich. [Nativer Gegenlauf](release-validation.md).
+Die Antwortformate bleiben gleich. [Nativer Gegenlauf](code-review-2026-10-19-bidi-hintergrund.md).
 
 ## Remote-Dateiöffnung
 

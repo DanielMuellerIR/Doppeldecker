@@ -1,123 +1,107 @@
 # Dokumentationsindex
 
-Stand: 2026-10-19
-
-Dieser Index ist der kanonische Einstieg in die dauerhafte Projektdokumentation.
-Kurzlebige Aufgabenverläufe und Historienarchive gehören nicht hierher.
+Stand: 2026-11-07. Produktüberblick im [README](../README.de.md), offene Arbeit im
+[Backlog](../backlog.md). Dieser Index führt zu den jeweiligen Verträgen.
 
 ## Produkt- und Releaseplanung
 
-- [Produktprinzipien](product-principles.md) — praktische Dateiarbeit,
-  abgestufte Garantien und die Grenze zwischen Best Effort und echter Absage.
-- [Roadmap](roadmap.md) — Produktziele und Voraussetzungen für Version 1.0.
-- [Produkt- und Performancechancen](product-opportunities.md) — geordnete
-  Ausbauideen mit vorhandenem Anknüpfungspunkt, Sicherheitsgrenze und Messplan.
-- [Release- und Plattformplan](release-plan.md) — unterstützte Systeme,
-  Paketgrenzen und Release-Gates.
-- [Manueller Updatekanal](update-design.md) — zweistufige Bedienung,
-  Signaturbindung, Fenstergrenzen und Release-Manifest.
-- [Einstellungen, Sitzung und Dateivergleich](settings-session-diff.md) — globale
-  Optionen, persistierte Fensterzustände und externe Diff-Werkzeuge.
-- [Pane-Tabs](pane-tabs.md) — getrennte Tab-Leisten, Navigation, Bedienung und
-  Sitzungsformat 2; native macOS-Abnahme einschließlich App-Neustart belegt.
-- [Finder→FTPS](finder-ftps-gui.md) — native Drop-Übergabe, Pane-Ziel,
-  Konflikte, Fortschritt, Abbruch und sichtbare Fehler mit künstlichem TLS-Server.
-- [GUI-Hintergrundarbeit](gui-background-commands.md) — SFTP-Worker, abbrechbare
-  Remote-Dateiöffnung und Reihenfolge der Fensterereignisse.
-- [Headless-CLI](headless-cli.md) — Bedienvertrag, JSONL-Protokoll und sichere
-  Realmodus-Ausführung ohne GUI.
+- [Alltagstauglichkeit und Prüfkosten](usability-audit-2026-10-20.md)
+- [Produktprinzipien](product-principles.md)
+- [Roadmap](roadmap.md)
+- [Dateieigenschaften und Finder-Metadaten](file-properties.md)
+- [Metadaten gewöhnlicher Kopien](copy-metadata.md)
+- [Metadaten-Parität](forklift-parity.md)
+- [Produkt- und Performancechancen](product-opportunities.md)
+- [Release- und Plattformplan](release-plan.md)
+- [Linux: Funktionen, Installation und Updates](linux.md)
+- [Preview 0.1.125](release-notes-0.1.125.md)
+- [Weitere Entwicklung](release-notes-next.md)
+- [Manueller Updatekanal](update-design.md)
+- [Einstellungen, Sitzung und Dateivergleich](settings-session-diff.md)
+- [Integrierte Dateivorschau](file-preview.md)
+- [Rekursive Namenssuche](name-search.md)
+- [Stapelumbenennung](batch-rename.md)
+- [Lokale ZIP-Erzeugung](archive-pack.md)
+- [ZIP zu einem entfernten Ziel](remote-pack.md)
+- [ZIP-Inhalt anzeigen](archive-read.md)
+- [ZIP-Archive entpacken](archive-extract.md)
+- [Lokal duplizieren](duplicate.md)
+- [Pane-Tabs](pane-tabs.md)
+- [Finder→FTPS](finder-ftps-gui.md)
+- [GUI-Hintergrundarbeit](gui-background-commands.md)
+- [Headless-CLI](headless-cli.md)
 
 ## Sicherheits- und Datenverträge
 
-- [WebDAV-Mutationsbedingungen](webdav-mutation-boundary.md) — einzelne unmittelbare
-  Elternbedingung, passive strikte Sperren und begrenztes reguläres Temp-Cleanup.
-
-- [WebDAV-Ersetzungsgrenze](webdav-replace-boundary.md) — HTTPS-Gegenbeleg zur
-  ODER-Semantik getaggter If-Listen, konkrete Absage und korrigierte Elternzusage.
-
-- [Additive WebDAV-Dateiuploads](webdav-upload.md) — gewöhnliche F5-Dateikopien,
-  bedingtes PUT/MOVE ohne Collection-/Löschprobe und phasengenaue Temp-Recovery.
-
-- [Gewöhnliche WebDAV-Umbenennung](webdav-rename.md) — bedingte Einzelwirkung,
-  bestätigte Best-Effort-Klasse und Readback ohne künstliche Löschprobe.
-
-- [Normaler lokaler Sync](local-sync.md) — wirkungsbezogener AddOnly-/Update-Start,
-  klare Simulation, RAM-Vorbereitung und erneut bestätigte Queue-Recovery.
-- [Lokaler Realmodus](real-mode-design.md) — Identitäts-, Permit-, Audit- und
-  Mirror-Schranken für echte lokale Schreibläufe.
-- [Operations-Queue](operations-queue-design.md) — persistenter Zustandsautomat,
-  Recovery, Driftprüfung und Bestätigung.
-- [Hintergrundarbeit und Datei-Zwischenablage](background-file-work.md) —
-  unabhängige Navigation, laufbezogene Ereignisse und native Dateiübergaben.
-- [Konfliktentscheidungen](conflict-decisions.md) — vergleichbare Endpunkte, zulässige
-  Erstbaseline-Entscheidungen, Konfliktkopien und klare Simulations-/Ausführungszustände.
-- [Bidirektionaler Sync](bidirectional-sync-design.md) — Baselines, Konflikte,
-  Tombstones, Teilcommits, Resume und Rollback.
-- [Metadaten Stufe 2](metadata-stage2-design.md) — Fähigkeiten, Manifestbindung und
-  Übertragung nativer Metadatenklassen.
-- [Lokale Metadatenfähigkeiten](local-metadata-mounts.md) — Mountabfrage und
-  tatsächliche APFS-/ext4-/exFAT-Gegenläufe.
-- [Sicherer Papierkorb](trash-toctou-design.md) — descriptor-relative Claims,
-  Identitätsprüfung und Crash-Recovery; Zielvertrag für private Claims und Journal v2.
-- [Privater Papierkorb-Kern](trash-private-claim.md) — sichere Anlage, Claim, Transfer,
-  Recovery und Cleanup mit nativen macOS-/XDG-Adaptern; gemeinsame macOS-GUI-Abnahme belegt.
-- [Papierkorb-Journal v2](trash-journal-v2-codec.md) — strikter Bytepfad-Codec,
-  Phasen-/Identitätsbelege und konservative Altjournal-Recovery.
-- [Recoverybilanz](recovery-aggregation.md) — erhaltene Pfade über mehrere
-  Teilaktionen, Fehler und Queue-Journalabschlüsse.
-- [Funktionsaudit](function-audit.md) — pflegbare Matrix aller Datei- und
-  Sync-Operationen je Provider: heutiges Verhalten, Zielklasse und Stand.
+- [WebDAV-Mutationsbedingungen](webdav-mutation-boundary.md)
+- [WebDAV-Ersetzungsgrenze](webdav-replace-boundary.md)
+- [Gewöhnliche WebDAV-Uploads und Ersetzungen](webdav-upload.md)
+- [Gewöhnliche WebDAV-Umbenennung](webdav-rename.md)
+- [Normaler lokaler Sync](local-sync.md)
+- [Gewöhnlicher Inhaltssync](content-sync.md)
+- [Lokaler Realmodus](real-mode-design.md)
+- [Operations-Queue](operations-queue-design.md)
+- [Hintergrundarbeit und Datei-Zwischenablage](background-file-work.md)
+- [Konfliktentscheidungen](conflict-decisions.md)
+- [Bidirektionaler Sync](bidirectional-sync-design.md)
+- [Bidirektionaler Best-Effort-Sync](bidirectional-forward.md)
+- [Metadaten Stufe 2](metadata-stage2-design.md)
+- [Lokale Metadatenfähigkeiten](local-metadata-mounts.md)
+- [Sicherer Papierkorb](trash-toctou-design.md)
+- [Privater Papierkorb-Kern](trash-private-claim.md)
+- [Papierkorb-Journal v2](trash-journal-v2-codec.md)
+- [Recoverybilanz](recovery-aggregation.md)
+- [Funktionsaudit](function-audit.md)
 
 ## Remote-Provider und Plattformadapter
 
-- [FTP-/FTPS-STOU](ftps-stou-transport.md) — belegter TCP-Reset beim vorzeitigen
-  Datenkanal-Drop, geprüfter Abschluss, wirkungsbezogene Vorbereitung und dauerhafte
-  fenstergebundene Proben-/STOU-Intents mit manueller Recovery.
-
-- [Remote-Provider](remote-providers-design.md) — gemeinsamer Datenintegritäts- und
-  Capability-Vertrag sowie sichtbare Transportstufen; SFTP bietet interaktives
-  Best-Effort-Listing und begrenzte interaktive Inhalte. Übrige Richtungen folgen
-  der aktuellen Funktionsmatrix.
-- [SFTP-Anzeigelisting](sftp-listing.md) — benannte Auslassungen und unabhängige
-  gültige Dateien mit panegebundener Textbilanz.
-- [SFTP-Inhalte](sftp-contents.md) — geprüfte lokale Momentaufnahmen, additive
-  Baumdownloads, Pfadrisiko, Grenzen und Queue-Recovery.
-- [WebDAV-Ordneranlage](webdav-folder.md) — gewöhnliches bedingtes MKCOL als
-  Best Effort ohne künstliche Löschprobe; Namenskollisionen und unklarer Ausgang.
-- [ACL-Adapter-Spike](acl-adapter-spike.md) — descriptor-relative ACL-Grundlage auf
-  macOS und Linux.
+- [FTP-/FTPS-STOU](ftps-stou-transport.md)
+- [Remote-Provider](remote-providers-design.md)
+- [SFTP-Anzeigelisting](sftp-listing.md)
+- [SFTP-Schreibaktionen](sftp-writes.md)
+- [Additive SMB-Downloads](smb-contents.md)
+- [Additive WebDAV-Downloads](webdav-contents.md)
+- [Additive FTP-/FTPS-Downloads](ftp-contents.md)
+- [SFTP-Inhalte](sftp-contents.md)
+- [WebDAV-Ordneranlage](webdav-folder.md)
+- [ACL-Adapter-Spike](acl-adapter-spike.md)
 
 ## Verbindliche UI-Verträge
 
-- [Beobachtete SFTP-Ordnergrößen](sftp-directory-sizes.md) — begrenzte frische
-  Metadatenbilanz ohne Inhaltsübertragung oder Freigabe strikter Listings.
+- [Beobachtete SFTP-Ordnergrößen](sftp-directory-sizes.md)
+- [Goal: Mehrere Fenster](goal-mehrere-fenster.md)
+- [Goal: Panes-Spalten und Seitenleiste](goal-spalten-seitenleiste.md)
 
-- [Goal: Mehrere Fenster](goal-mehrere-fenster.md) — verbindliche Produktanforderung
-  vom 2026-08-03 und beschlossener Vertrag vom 2026-08-06: gemeinsamer
-  Verbindungspool, eigene Queue/Permits je Fenster, Parallelität, Kollisionen und
-  gezielte Ereignisse. Vor jeder Arbeit an Fenstern, `AppState` oder Queue lesen.
-- [Goal: Panes-Spalten und Seitenleiste](goal-spalten-seitenleiste.md) — beschlossener
-  Ausbau auf das Niveau ausgereifter Desktop-Dateimanager: Spalten-Splitter, fixe
-  Größen-/dynamische Datumsspalte, Darstellungsoptionen, Ordnergrößen,
-  Dateiinformationen, Geräte-Seitenleiste und Discovery.
+Vor Arbeiten an Fenstern, `AppState` oder Queue den Vertrag zu mehreren Fenstern lesen.
 
 ## Umgesetzte Entscheidungen und Grenzen
 
-- [Lokale Temp- und Sicherungsreste](decision-lokale-restbereinigung.md) — drei
-  Varianten für das Aufräumen lokaler Zwischennamen. Die freigegebene Variante C2
-  ist integriert: privater Laufkontext, explizite ACL-Vererbung, getrennte
-  Erfolgs-/Sicherungsbilanz und fail-closed Recovery. Grenzen und Prüfkriterien
-  stehen im Entscheidungsdokument.
-  Betrifft die historischen Backlog-Punkte 1 und 10; der aktuelle Vertrag und seine
-  Prüfbelege sind umgesetzt. Die damalige Recoverybilanz-Lücke ist behoben.
+- [Lokale Temp- und Sicherungsreste](decision-lokale-restbereinigung.md)
 
-## Releaseprüfung
+<details>
+<summary>Prüfberichte und historische Belege</summary>
 
-- [Prüfumfang und Grenzen](release-validation.md) — Plattformgates, künstliche
-  Testdaten, native Bedienung und Grenzen der ersten Preview.
+- [Korrekturen 2026-11-02](code-review-2026-11-02.md)
+- [Korrekturen 2026-11-01](code-review-2026-11-01.md)
+
+- [Korrekturen 2026-10-31](code-review-2026-10-31.md)
+- [Roadmap-Schnitte 2026-10-24](roadmap-2026-10-24.md)
+- [Review-Korrekturen und Schnellfilter 2026-10-22](code-review-2026-10-22.md)
+- [Gemeinsame Remote-Verträge 2026-10-19](code-review-2026-10-19-remote.md)
+- [Deltareview: Dateioperationen und Sync 2026-10-19](code-review-2026-10-19.md)
+- [SMB-Vollreview 2026-10-19](code-review-2026-10-19-smb.md)
+- [Review und Alltagstauglichkeit 2026-10-16](code-review-2026-10-16.md)
+- [Review-Korrekturen 2026-10-13](code-review-2026-10-13.md)
+- [Vollreview ab 2026-10-07](code-review-2026-10-07.md)
+- [Dokumentationsabgleich 2026-10-07](documentation-audit-2026-10-07.md)
+- [Review 2026-10-02](code-review-2026-10-02.md)
+- [Korrekturen 2026-10-03](code-review-2026-10-03.md)
+- [Prüfstabilität](test-stability-2026-10-06.md)
+
+</details>
 
 ## Übergeordnete Einstiege
 
-- [Projektprofil](../AGENTS.md) — Architektur, Sicherheitsregeln und aktueller Stand.
-- [Öffentliche Übersicht](../README.md) — Produktumfang und Bedien-/Build-Einstieg.
-- [Änderungsprotokoll](../CHANGELOG.md) — Versionen und freigegebene Änderungen.
+- [Projektprofil](../AGENTS.md)
+- [Öffentliche Übersicht](../README.md)
+- [Änderungsprotokoll](../CHANGELOG.md)

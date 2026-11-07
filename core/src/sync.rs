@@ -17,11 +17,15 @@ use crate::metadata::{MetadataManifest, MetadataProfile};
 use crate::vfs::{Entry, ProofListEntry, Vfs};
 
 mod atomic;
+mod directory_streams;
 mod exclude;
 mod execute;
 mod metadata;
 mod plan;
 mod safety;
+mod sparse;
+#[cfg(test)]
+mod windows_dacl_tests;
 
 use atomic::{
     copy_one, create_hardlink_one, current_optional_copy_snapshot, hash_file_hex, hash_tree,
@@ -30,6 +34,7 @@ use atomic::{
     HardlinkRequest, RemoveOrQuarantineRequest,
 };
 pub use execute::{execute, ExecuteRequest};
+pub(crate) use metadata::verify_metadata_observations;
 use metadata::{
     summarize_xattrs, transfer_planned_metadata, validate_metadata_transfer,
     verify_planned_metadata, verify_selected_metadata, verify_temp_metadata,
@@ -38,6 +43,7 @@ use metadata::{
 #[cfg(test)]
 use plan::build_metadata_report;
 pub use plan::plan;
+pub(crate) use plan::plan_content_with_cancel;
 use plan::planned_fork_bytes;
 pub(crate) use safety::canonical_existing;
 #[cfg(debug_assertions)]
@@ -196,13 +202,16 @@ pub struct MetadataTransfer {
     /// Numerischen Nutzer und Gruppe vor allen rechteabhängigen Metadaten setzen.
     #[serde(default)]
     pub owner: bool,
-    /// ACL nach Owner und vor den gekoppelten Modusbits exakt anwenden.
+    /// ACL nach Owner exakt anwenden. POSIX-/NFSv4-ACLs sind an Modusbits,
+    /// Windows-DACLs an ihren getrennten Zielkontext gebunden.
     #[serde(default)]
     pub acl: bool,
     /// Die Quelle besitzt eine ACL, deren Modell am Ziel nicht verlustfrei
     /// darstellbar ist. BestEffort bilanziert dies, Strict lehnt den Plan ab.
     #[serde(default)]
     pub incompatible_acl_model: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_dacl: Option<crate::windows_dacl::WindowsDaclTransfer>,
     /// Normale `rwx`-Bits nach Owner und xattrs exakt setzen.
     #[serde(default)]
     pub normal_mode: bool,
@@ -211,6 +220,10 @@ pub struct MetadataTransfer {
     pub special_mode_bits: bool,
     pub xattrs: bool,
     pub resource_fork: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub named_streams: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_streams: Option<crate::directory_streams::DirectoryStreamPlan>,
     #[serde(default)]
     pub sparse_extents: bool,
     /// Das Quellmanifest trägt eine laufbezogene Hardlink-Gruppe. Der eigentliche
@@ -225,12 +238,14 @@ pub struct MetadataTransfer {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub enum MetadataClass {
+    Mtime,
     Owner,
     Acl,
     NormalMode,
     SpecialModeBits,
     Xattrs,
     ResourceFork,
+    NamedStreams,
     SparseExtents,
     Hardlinks,
 }
@@ -311,7 +326,7 @@ impl SyncTargetProof {
             && self.matches_identity(entry)
     }
 
-    fn matches_identity(&self, entry: &Entry) -> bool {
+    pub(crate) fn matches_identity(&self, entry: &Entry) -> bool {
         self.is_dir == entry.is_dir
             && self.is_file == entry.is_file
             && self.is_symlink == entry.is_symlink
@@ -320,6 +335,20 @@ impl SyncTargetProof {
             && self.mode == entry.mode
             && self.device == entry.device
             && self.inode == entry.inode
+    }
+
+    /// Kindoperationen ändern Ordnerzeiten und -größen. Der Streamwriter bindet
+    /// deshalb die unveränderte typisierte Basis-ID innerhalb des gehaltenen Roots.
+    pub fn matches_directory_identity(&self, entry: &Entry) -> bool {
+        self.is_dir
+            && !self.is_file
+            && !self.is_symlink
+            && entry.is_dir
+            && !entry.is_file
+            && !entry.is_symlink
+            && self.inode.is_some()
+            && self.inode == entry.inode
+            && self.device == entry.device
     }
 
     fn matches_listed_at(&self, path: &Path, listed: &ProofListEntry) -> bool {
@@ -637,6 +666,13 @@ pub enum Action {
         target_mtime: Option<i64>,
         metadata: MetadataTransfer,
     },
+    /// Bestehende Datei objektweit ohne Inhaltskopie oder Namensänderung ändern.
+    SetFileDacl {
+        path: String,
+        source_hash: String,
+        source_metadata: MetadataManifest,
+        plan: crate::file_dacl::FileDaclPlan,
+    },
     /// Datei im Ziel löschen (nur im Mirror-Modus; existiert nicht in der Quelle).
     DeleteFile {
         path: String,
@@ -669,10 +705,22 @@ pub enum Action {
     SkipUnsupported { path: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MetadataObservation {
+    pub path: String,
+    pub source_digest: [u8; 32],
+    pub target_digest: Option<[u8; 32]>,
+}
+
 /// Ergebnis der Dry-Run-Berechnung: alle Aktionen plus eine Zusammenfassung fürs UI.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SyncPlan {
     pub actions: Vec<Action>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_dacl_selections: Vec<crate::file_dacl::FileDaclSelection>,
+    /// Manifestbindung beobachteter Windows-Sicherheit ohne eigene Schreibaktion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_observations: Vec<MetadataObservation>,
     #[serde(default)]
     pub local_parent_inheritance: Vec<crate::metadata::LocalParentInheritance>,
     /// Aus demselben Listing-Lauf wie `actions` abgeleitete Vergleichsansicht. Das
@@ -701,9 +749,18 @@ pub struct SyncPlan {
     pub metadata_report: MetadataReport,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncExecutionClass {
+    Assured,
+    BestEffort,
+}
+
 /// Bilanz eines ausgeführten Sync-Laufs.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct SyncStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_class: Option<SyncExecutionClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_execution: Option<crate::real_mode::LocalSyncExecution>,
     pub files_copied: u64,
@@ -723,6 +780,27 @@ pub struct SyncStats {
     /// Derselbe Bericht wie in der bestätigten Vorschau. Ein erfolgreicher Lauf hat
     /// jede als übertragen gezählte Klasse anschließend exakt rückgelesen.
     pub metadata_report: MetadataReport,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::directory_streams::DirectoryStreamReport::is_empty"
+    )]
+    pub directory_stream_report: crate::directory_streams::DirectoryStreamReport,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::directory_dacl::DirectoryDaclReport::is_empty"
+    )]
+    pub directory_dacl_report: crate::directory_dacl::DirectoryDaclReport,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::file_dacl::FileDaclReport::is_empty"
+    )]
+    pub file_dacl_report: crate::file_dacl::FileDaclReport,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::created_directory_dacl::CreatedDirectoryDaclReport::is_empty"
+    )]
+    pub created_directory_dacl_report:
+        Box<crate::created_directory_dacl::CreatedDirectoryDaclReport>,
 }
 
 #[cfg(test)]
@@ -747,6 +825,26 @@ mod metadata_report_tests {
     }
 
     #[test]
+    fn named_streams_transfer_legacy_default_und_neuer_roundtrip() {
+        let encoded = serde_json::json!({
+            "source": manifest(), "xattrs": false, "resource_fork": false
+        });
+        let legacy: MetadataTransfer = serde_json::from_value(encoded).unwrap();
+        assert!(!legacy.named_streams);
+        let encoded = serde_json::to_string(&legacy).unwrap();
+        assert!(!encoded.contains("named_streams"));
+        let mut active = legacy;
+        active.named_streams = true;
+        let decoded: MetadataTransfer =
+            serde_json::from_str(&serde_json::to_string(&active).unwrap()).unwrap();
+        assert_eq!(decoded, active);
+        assert_eq!(
+            serde_json::to_string(&MetadataClass::NamedStreams).unwrap(),
+            "\"NamedStreams\""
+        );
+    }
+
+    #[test]
     fn best_effort_bilanziert_uebertragung_und_auslassung_pfadgenau() {
         let actions = vec![Action::CopyFile {
             path: "programm".into(),
@@ -760,16 +858,19 @@ mod metadata_report_tests {
                 owner: true,
                 acl: false,
                 incompatible_acl_model: false,
+                windows_dacl: None,
                 normal_mode: true,
                 special_mode_bits: true,
                 xattrs: false,
                 resource_fork: false,
+                named_streams: false,
+                directory_streams: None,
                 sparse_extents: false,
                 hardlinks: true,
             }),
         }];
 
-        let report = build_metadata_report(MetadataProfile::NativeBestEffort, &actions);
+        let report = build_metadata_report(MetadataProfile::NativeBestEffort, &actions, true);
 
         assert!(report.classes.iter().any(|item| {
             item.class == MetadataClass::Owner && item.transferred == 1 && item.omitted == 0
@@ -812,3 +913,9 @@ mod metadata_report_tests {
         assert_eq!(decoded, report);
     }
 }
+
+#[cfg(test)]
+mod webdav_security_tests;
+
+#[cfg(test)]
+pub(crate) use execute::{CreatedSourceFault, CREATED_SOURCE_CHECKS, CREATED_SOURCE_FAULT};

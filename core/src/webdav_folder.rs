@@ -51,8 +51,8 @@ impl WebDavVfs {
                 "WebDAV-Elternkette änderte sich vor der Ordneranlage",
             ));
         }
-        let children = read_children(binding, &remote_parent, deadline)?;
-        if children
+        let before_children = read_children(binding, &remote_parent, deadline)?;
+        if before_children
             .iter()
             .any(|entry| crate::remote_rename::names_may_collide(&entry.entry.name, &name))
         {
@@ -68,7 +68,7 @@ impl WebDavVfs {
         before_mutation()?;
         check_deadline(deadline)?;
         self.ensure_mutation_binding_current(binding)?;
-        // Der eine gewünschte MKCOL bindet nur die unmittelbare Elternversion. Es gibt
+        // Der eine gewünschte MKCOL verwendet frische Elternprüfungen. Es gibt
         // keine Gegenprobe und keinen zweiten mutierenden Versuch bei Antwortverlust.
         let response = with_parent_condition(
             authenticated(
@@ -81,6 +81,7 @@ impl WebDavVfs {
             &binding.session.identity.origin,
             parents,
             &remote,
+            WebDavRequestClass::OrdinaryCollection,
         )?
         .header(IF_NONE_MATCH, "*")
         .timeout(TLS_IO_TIMEOUT)
@@ -165,11 +166,28 @@ impl WebDavVfs {
                     "WebDAV-Elternreadback bestätigt den neuen Namen und Typ nicht eindeutig",
                 ));
             }
-            if directory_chain(binding, &components, deadline)? != parents {
+            let unchanged = children
+                .into_iter()
+                .filter(|child| child.entry.name != name)
+                .collect::<Vec<_>>();
+            if namespace_facts(&unchanged)? != namespace_facts(&before_children)? {
                 return Err(drift(
-                    "WebDAV-Elternkette änderte sich nach der Ordneranlage",
+                    "WebDAV-Elternreadback enthält mehr als den eigenen neuen Ordner",
                 ));
             }
+            let observed_parents = directory_chain(binding, &components, deadline)?;
+            if observed_parents.len() != parents.len()
+                || observed_parents.is_empty()
+                || observed_parents[..observed_parents.len() - 1] != parents[..parents.len() - 1]
+                || observed_parents.last().unwrap().remote != parents.last().unwrap().remote
+            {
+                return Err(drift(
+                    "WebDAV-Vorfahren änderten sich nach der Ordneranlage",
+                ));
+            }
+            // Die eigene Kindanlage darf die Inhaltsversion des unmittelbaren
+            // Elternordners ändern. Erst der exakte übrige Bestand erlaubt diesen
+            // neuen Token; Vorfahren und die anschließende Prüfung bleiben gebunden.
             let fresh = stat_proof_in_session(&binding.session, &remote)?;
             if !fresh.entry.is_dir
                 || fresh.entry.is_symlink
@@ -177,6 +195,11 @@ impl WebDavVfs {
             {
                 return Err(drift(
                     "WebDAV-Collection änderte sich im abschließenden Readback",
+                ));
+            }
+            if directory_chain(binding, &components, deadline)? != observed_parents {
+                return Err(drift(
+                    "WebDAV-Elternversion änderte sich während des Anlagereadbacks",
                 ));
             }
             let identity = proof
@@ -208,6 +231,23 @@ impl WebDavVfs {
             identity,
         ))
     }
+}
+
+fn namespace_facts(entries: &[ProofListEntry]) -> io::Result<Vec<Vec<u8>>> {
+    let mut facts = entries
+        .iter()
+        .map(|entry| {
+            serde_json::to_vec(&(
+                &entry.raw_name,
+                entry.safely_decoded,
+                &entry.entry,
+                &entry.provider_token,
+            ))
+            .map_err(io::Error::other)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    facts.sort();
+    Ok(facts)
 }
 
 fn unclear(path: &Path, error: impl std::fmt::Display) -> io::Error {

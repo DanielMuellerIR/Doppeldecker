@@ -1,5 +1,6 @@
 //! Wirkungsbezogener lokaler AddOnly-/Update-Start über die Fensterqueue.
 
+use crate::frontend_payload::FrontendQueueSnapshot;
 use std::path::PathBuf;
 
 use doppeldecker_core::{
@@ -97,7 +98,9 @@ pub(crate) async fn prepare_local_sync(
             .map_err(AppError::from)?;
             let sandbox = sandbox_root()?;
             crate::local_sync_commands::local_sync_vfs(sandbox.as_deref(), &source, &target)?;
-            let prepared = doppeldecker_core::prepare_local_sync_run_with_sandbox(
+            let queue = operation_queue(&app, &window_state, label)?;
+            let prepared = doppeldecker_core::prepare_local_sync_run_for_queue(
+                &queue,
                 &source,
                 &target,
                 options,
@@ -236,7 +239,7 @@ pub(crate) async fn approve_local_sync_queue_entry(
     operation_id: String,
     preparation_digest: [u8; 32],
     replacements_confirmed: bool,
-) -> Result<doppeldecker_core::QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let label = window.label();
@@ -262,7 +265,7 @@ pub(crate) async fn approve_local_sync_queue_entry(
         })?;
         emit_queue_snapshot(&app, label, &queue);
         start_queue_worker(app, label.to_owned());
-        Ok(queue.snapshot())
+        Ok(queue.snapshot().into())
     })
     .await
     .map_err(|_| AppError::new("app", "Lokaler Queue-Worker wurde unterbrochen"))?
@@ -341,18 +344,25 @@ mod tests {
 
     #[test]
     fn verworfene_lokale_vorbereitung_kann_keinen_neueren_slot_ersetzen() {
-        let temp = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
+        let queue = OperationQueue::open(root.join("operations-queue.json")).unwrap();
         let make = |name: &str| {
             let source = root.join(format!("quelle-{name}"));
             let target = root.join(format!("ziel-{name}"));
             std::fs::create_dir(&source).unwrap();
             std::fs::create_dir(&target).unwrap();
             LocalSyncPreparation {
-                prepared: doppeldecker_core::prepare_local_sync_run(
+                prepared: doppeldecker_core::prepare_local_sync_run_for_queue(
+                    &queue,
                     &source,
                     &target,
                     SyncOptions::default(),
+                    None,
                 )
                 .unwrap(),
                 sandbox: None,

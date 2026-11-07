@@ -1,0 +1,39 @@
+.modal.archive-read-modal { width: min(1080px, calc(100vw - 32px)); }
+.archive-read-modal .modal-title { overflow-wrap: anywhere; }
+.archive-read-summary { margin: 0 0 10px; color: var(--text); }
+.archive-read-partial { margin: 0 0 12px; padding: 10px 12px; background: var(--row-sel); border-left: 3px solid var(--accent); color: var(--text); overflow-wrap: anywhere; }
+.archive-read-breadcrumbs { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 12px; }
+.archive-read-breadcrumbs button { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
+.archive-read-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: stretch; }
+.archive-read-browser, .archive-read-preview { min-width: 0; }
+.archive-read-list { height: min(380px, 44vh); min-height: 180px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); outline-offset: -2px; }
+.archive-read-list:focus-visible { outline: 2px solid var(--accent); }
+.archive-read-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); cursor: default; color: var(--text); }
+.archive-read-row:last-child { border-bottom: 0; }
+.archive-read-row[aria-selected="true"] { background: var(--row-sel); box-shadow: inset 3px 0 var(--accent); }
+.archive-read-identity { display: flex; min-width: 0; flex-wrap: wrap; align-items: baseline; gap: 3px 8px; }
+.archive-read-kind { font-size: 11px; color: var(--text-dim); }
+.archive-read-name { flex: 1 1 100px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.archive-read-tag { font-size: 10px; color: var(--text-dim); }
+.archive-read-issue { color: var(--text); }
+.archive-read-size { font-size: 11px; color: var(--text-dim); text-align: right; white-space: nowrap; }
+.archive-read-empty { padding: 10px 12px; }
+.archive-read-pages { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 10px; }
+.archive-read-pages .btn { padding: 7px 10px; }
+.archive-read-page-label { text-align: center; font-size: 11px; }
+.archive-read-preview { padding: 14px; border: 1px solid var(--border); border-radius: 6px; overflow: auto; max-height: min(440px, 53vh); background: var(--bg); }
+.archive-read-preview-title { font-size: 13px; line-height: 1.5; margin: 0 0 8px; color: var(--text); overflow-wrap: anywhere; white-space: pre-wrap; }
+.archive-read-note, .archive-read-problems { margin: 0 0 10px; font-size: 12px; overflow-wrap: anywhere; }
+.archive-read-problems { padding-left: 18px; }
+.archive-read-status { font-size: 12px; margin: 12px 0 0; min-height: 18px; overflow-wrap: anywhere; }
+.archive-read-preview .file-preview-text { max-height: 320px; min-height: 140px; margin: 0; }
+.archive-read-preview .file-preview-image { min-height: 120px; padding: 0; }
+.archive-read-preview .file-preview-image img { max-height: 320px; }
+@media (max-width: 740px) {
+  .modal.archive-read-modal { padding: 16px; }
+  .archive-read-layout { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .archive-read-list { height: min(240px, 30vh); min-height: 140px; }
+  .archive-read-preview { max-height: 320px; }
+}
+
+.archive-read-extract-action { max-width: 100%; margin-bottom: 12px; white-space: normal; overflow-wrap: anywhere; }

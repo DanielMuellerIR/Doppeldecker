@@ -154,7 +154,9 @@ pub enum FtpTransportSecurity {
     ExplicitTls,
 }
 
-/// Vertrauensmodell für explizites FTPS. `WebPkiAndPin` verlangt zusätzlich zur
+/// Vertrauensmodell für explizites FTPS. `WebPki` prüft öffentliche Kette,
+/// Gültigkeitszeit und Servernamen, ohne reguläre Zertifikatserneuerungen zu sperren.
+/// `WebPkiAndPin` verlangt zusätzlich zur
 /// exakten Zertifikatsbindung eine gültige öffentliche Kette und den Hostnamen.
 /// `PinnedCertificate` ist für bewusst extern geprüfte private/self-signed Server.
 /// `UnverifiedCertificate` verschlüsselt und pinnt ebenfalls exakt, behauptet aber
@@ -163,6 +165,7 @@ pub enum FtpTransportSecurity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FtpsCertificatePolicy {
+    WebPki,
     WebPkiAndPin,
     PinnedCertificate,
     UnverifiedCertificate,
@@ -227,12 +230,20 @@ impl FtpsConnectionConfig {
                 }
             }
             FtpTransportSecurity::ExplicitTls => {
-                self.certificate
-                    .as_ref()
-                    .ok_or_else(|| invalid("FTPS-Zertifikat fehlt"))?
-                    .validate()?;
-                if self.certificate_policy.is_none() {
-                    return Err(invalid("FTPS-Zertifikatsrichtlinie fehlt"));
+                let policy = self
+                    .certificate_policy
+                    .ok_or_else(|| invalid("FTPS-Zertifikatsrichtlinie fehlt"))?;
+                if policy == FtpsCertificatePolicy::WebPki {
+                    if self.certificate.is_some() {
+                        return Err(invalid(
+                            "Öffentliche FTPS-Prüfung verwendet keinen dauerhaften Zertifikat-Pin",
+                        ));
+                    }
+                } else {
+                    self.certificate
+                        .as_ref()
+                        .ok_or_else(|| invalid("FTPS-Zertifikat fehlt"))?
+                        .validate()?;
                 }
             }
         }
@@ -250,9 +261,10 @@ impl FtpsConnectionConfig {
     pub fn security_status(&self) -> FtpSecurityStatus {
         match (self.transport_security, self.certificate_policy) {
             (FtpTransportSecurity::Plaintext, _) => FtpSecurityStatus::Plaintext,
-            (FtpTransportSecurity::ExplicitTls, Some(FtpsCertificatePolicy::WebPkiAndPin)) => {
-                FtpSecurityStatus::TlsIdentityVerified
-            }
+            (
+                FtpTransportSecurity::ExplicitTls,
+                Some(FtpsCertificatePolicy::WebPki | FtpsCertificatePolicy::WebPkiAndPin),
+            ) => FtpSecurityStatus::TlsIdentityVerified,
             (FtpTransportSecurity::ExplicitTls, Some(FtpsCertificatePolicy::PinnedCertificate)) => {
                 FtpSecurityStatus::TlsIdentityExternallyVerified
             }
@@ -374,6 +386,11 @@ impl WebDavConnectionConfig {
         if self.certificate_policy == FtpsCertificatePolicy::UnverifiedCertificate {
             return Err(invalid(
                 "WebDAV unterstützt keine ungeprüfte Zertifikatsidentität",
+            ));
+        }
+        if self.certificate_policy == FtpsCertificatePolicy::WebPki {
+            return Err(invalid(
+                "WebDAV benötigt weiterhin eine ausdrückliche Zertifikatsbindung",
             ));
         }
         if self.username.contains(':') {
@@ -1210,6 +1227,26 @@ mod tests {
         assert!(dav.validate().is_err());
         let mut dav = valid_webdav_config();
         dav.username = "name:zweiter-teil".into();
+        assert!(dav.validate().is_err());
+    }
+
+    #[test]
+    fn oeffentliche_ftps_pruefung_braucht_keinen_dauerhaften_pin() {
+        let mut config = valid_ftps_config();
+        config.certificate_policy = Some(FtpsCertificatePolicy::WebPki);
+        config.certificate = None;
+        config.validate().unwrap();
+        assert_eq!(
+            config.security_status(),
+            FtpSecurityStatus::TlsIdentityVerified
+        );
+        let payload = serde_json::to_string(&config).unwrap();
+        let loaded: FtpsConnectionConfig = serde_json::from_str(&payload).unwrap();
+        assert_eq!(loaded, config);
+        config.certificate = Some(FtpsCertificatePin { sha256: digest(3) });
+        assert!(config.validate().is_err());
+        let mut dav = valid_webdav_config();
+        dav.certificate_policy = FtpsCertificatePolicy::WebPki;
         assert!(dav.validate().is_err());
     }
 

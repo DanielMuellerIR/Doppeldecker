@@ -33,16 +33,16 @@ pub fn directory_create_contract(provider: ProviderKind) -> DirectoryCreateContr
         ProviderKind::WebDav => DirectoryCreateContract {
             execution_class: Some(DirectoryCreateExecutionClass::BestEffort),
             limitations: vec![
-                "Best Effort: Der Server erhält genau eine bedingte Ordneranlage. Seine Zusagen werden ohne künstliche Schreib- oder Löschprobe verwendet; vorhandene Namen werden vorher geprüft und das Ergebnis danach zurückgelesen.".into(),
+                "Best Effort: Der Server erhält genau eine Ordneranlage. Eltern und vorhandene Namen werden vorher frisch geprüft und das Ergebnis danach zurückgelesen; eine atomare Collection-Elternbedingung besteht nicht. Es gibt keine künstliche Schreib- oder Löschprobe.".into(),
                 "Anlegeantwort und Rücklesen beweisen nicht in jedem Fall denselben neuen Ordner oder eine dauerhafte Speicherung. Bei unklarem Ausgang bleibt der mögliche neue Ordner zur Prüfung stehen; kein automatisches Wiederholen oder Entfernen.".into(),
                 crate::webdav::NAMESPACE_BINDING_LIMITATION.into(),
             ],
             blockers: Vec::new(),
         },
-        ProviderKind::Sftp => DirectoryCreateContract {
-            execution_class: None,
-            limitations: Vec::new(),
-            blockers: vec!["SFTP v3 bietet kein an den Elternordner gebundenes MKDIR. Ein Pfadtausch könnte außerhalb des gewählten Bereichs anlegen; diese Wirkung bleibt gesperrt.".into()],
+        ProviderKind::Sftp | ProviderKind::Ftps => DirectoryCreateContract {
+            execution_class: Some(DirectoryCreateExecutionClass::BestEffort),
+            limitations: vec![if provider == ProviderKind::Sftp { crate::sftp::SFTP_WRITE_LIMITATION } else { crate::remote_real_mode::ordinary_remote_limitation(provider) }.into()],
+            blockers: Vec::new(),
         },
         _ => DirectoryCreateContract {
             execution_class: Some(DirectoryCreateExecutionClass::Assured),
@@ -140,7 +140,7 @@ mod tests {
             ProviderKind::Sftp,
             DirectoryCreateExecutionClass::BestEffort
         )
-        .is_err());
+        .is_ok());
         assert_eq!(
             crate::error_code(
                 &validate_directory_create_class(

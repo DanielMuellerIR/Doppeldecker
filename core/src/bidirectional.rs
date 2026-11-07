@@ -21,6 +21,8 @@ use crate::vfs::{
     CompleteDirectoryListing, Entry, LocalRootIdentity, ProofListEntry, SparseRead, Vfs,
 };
 
+pub mod forward;
+
 const LEGACY_BASELINE_VERSION: u32 = 1;
 const BASELINE_VERSION: u32 = 2;
 const MAX_BASELINE_BYTES: u64 = 64 * 1024 * 1024;
@@ -403,6 +405,11 @@ impl Vfs for LocalProjectedVfs {
     fn open_fork_read(&self, path: &Path, kind: ForkKind) -> io::Result<Box<dyn Read + Send>> {
         let (vfs, mapped) = self.read_vfs_and_path(path)?;
         vfs.open_fork_read(&mapped, kind)
+    }
+
+    fn open_named_stream_read(&self, path: &Path, name: &[u8]) -> io::Result<Box<dyn Read + Send>> {
+        let (vfs, mapped) = self.read_vfs_and_path(path)?;
+        vfs.open_named_stream_read(&mapped, name)
     }
 
     fn remove_file(&self, _path: &Path) -> io::Result<()> {
@@ -2674,6 +2681,7 @@ pub struct LocalBidirectionalPreview {
     pub conflict_details: Vec<BidirectionalConflictView>,
     pub plan: BidirectionalPlan,
     pub confirmation_phrase: String,
+    pub scope_warnings: Vec<String>,
     pub expires_at_unix_ms: u128,
     pub backup_confirmation_required: bool,
     pub stage_blocker: Option<String>,
@@ -2783,9 +2791,8 @@ fn bidirectional_conflict_views(
             (ConflictDecision::Skip, "Beide Fassungen unverändert lassen. Eine bestehende Baseline bleibt für diesen Unterbaum erhalten."),
         ] {
             if matches!(decision, ConflictDecision::Skip) && skip_blocker.is_some() { continue; }
-            if let Ok(resolved) = resolve_conflicts(plan, left, right, &[ConflictResolution { path: path.clone(), decision: decision.clone() }]) {
-                let blocker = conflict_choice_stage_blocker(&resolved, left, right);
-                choices.push(BidirectionalConflictChoice { decision, explanation: explanation.into(), generated_name: None, blocker });
+            if resolve_conflicts(plan, left, right, &[ConflictResolution { path: path.clone(), decision: decision.clone() }]).is_ok() {
+                choices.push(BidirectionalConflictChoice { decision, explanation: explanation.into(), generated_name: None, blocker: None });
             }
         }
         if left_entry.is_some() && right_entry.is_some() {
@@ -2808,7 +2815,7 @@ fn bidirectional_conflict_views(
                         primary,
                         conflict_path: candidate.clone(),
                     };
-                    if let Ok(resolved) = resolve_conflicts(
+                    if resolve_conflicts(
                         plan,
                         left,
                         right,
@@ -2816,11 +2823,13 @@ fn bidirectional_conflict_views(
                             path: path.clone(),
                             decision: decision.clone(),
                         }],
-                    ) {
+                    )
+                    .is_ok()
+                    {
                         choices.push(BidirectionalConflictChoice {
                             decision, explanation: "Beide vollständigen Fassungen in beiden Bäumen erhalten. Die zweite Fassung bekommt den angezeigten neuen Namen.".into(),
                             generated_name: Some(crate::conflict_view::display_relative_name(&candidate.0)),
-                            blocker: conflict_choice_stage_blocker(&resolved, left, right),
+                            blocker: None,
                         });
                     }
                     break;
@@ -2837,60 +2846,6 @@ fn bidirectional_conflict_views(
         });
     }
     Ok(views)
-}
-
-/// Verwendet dieselben Mengengrenzen wie die spätere lokale Vorbereitung.
-/// Typwechsel zählen gemeinsam; bei Entfernungen bilden die unveränderten
-/// Zielpfade die virtuelle Mirror-Quelle. So ist die Absage vor der Auswahl sichtbar.
-fn conflict_choice_stage_blocker(
-    plan: &BidirectionalPlan,
-    left: &TreeSnapshot,
-    right: &TreeSnapshot,
-) -> Option<String> {
-    if matches!(
-        (&left.root_identity, &right.root_identity),
-        (RootIdentity::Local(_), RootIdentity::Local(_))
-    ) {
-        if let Some(reason) = local_type_swap_stage_blocker(plan) {
-            return Some(reason);
-        }
-    }
-    for direction in [SyncDirection::LeftToRight, SyncDirection::RightToLeft] {
-        let deletions = deleted_binary_paths(plan, direction);
-        if deletions.is_empty() {
-            continue;
-        }
-        let target = if direction == SyncDirection::LeftToRight {
-            right
-        } else {
-            left
-        };
-        let target_count = target.entries.len() as u64;
-        let delete_count = target
-            .entries
-            .iter()
-            .filter(|record| {
-                deletions
-                    .iter()
-                    .any(|path| *path == record.path || binary_path_contains(path, &record.path))
-            })
-            .count() as u64;
-        let summary = crate::SyncPlan {
-            source_count: target_count.saturating_sub(delete_count),
-            target_count,
-            delete_count,
-            ..Default::default()
-        };
-        let options = crate::SyncOptions {
-            mode: crate::SyncMode::Mirror,
-            compare: crate::Compare::ContentHash,
-            ..Default::default()
-        };
-        if let Err(error) = crate::real_mode::validate_real_plan(&summary, &options) {
-            return Some(error.to_string());
-        }
-    }
-    None
 }
 
 fn sibling_paths_may_collide(first: &BinaryRelativePath, second: &BinaryRelativePath) -> bool {
@@ -2948,6 +2903,7 @@ pub struct ProviderBidirectionalPlanPreview {
 /// Backend-gehaltene Vorbereitung. VFS-Handles, Einweg-Permits und Baseline-Lock
 /// sind absichtlich weder serialisierbar noch klonbar.
 pub struct PreparedLocalBidirectionalRun {
+    staging: crate::real_mode::RunStagingBinding,
     pair_id: PairId,
     left_root: PathBuf,
     right_root: PathBuf,
@@ -2971,6 +2927,7 @@ pub struct PreparedLocalBidirectionalRun {
 }
 
 pub struct LocalBidirectionalRun {
+    staging: crate::real_mode::RunStagingBinding,
     pair_id: PairId,
     left_root: PathBuf,
     right_root: PathBuf,
@@ -2989,6 +2946,7 @@ pub struct LocalBidirectionalRun {
     commit_required: bool,
     journal_required: bool,
     backup_confirmed: bool,
+    expires_at: std::time::SystemTime,
 }
 
 pub type PreparedProviderBidirectionalRun = PreparedLocalBidirectionalRun;
@@ -3056,6 +3014,8 @@ pub fn bind_bidirectional_endpoint_compatibility(
 
 #[derive(Clone, Debug, Serialize)]
 pub struct LocalBidirectionalStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_class: Option<crate::sync::SyncExecutionClass>,
     pub runs: Vec<crate::SyncStats>,
     pub baseline_generation: u64,
     pub baseline_committed: bool,
@@ -3070,6 +3030,7 @@ pub struct LocalBidirectionalRollbackPreview {
 }
 
 pub struct PreparedLocalBidirectionalRollback {
+    staging: crate::real_mode::RunStagingBinding,
     left_root: PathBuf,
     right_root: PathBuf,
     left_vfs: Arc<dyn Vfs>,
@@ -3083,6 +3044,7 @@ pub struct PreparedLocalBidirectionalRollback {
 }
 
 pub struct LocalBidirectionalRollback {
+    staging: crate::real_mode::RunStagingBinding,
     left_root: PathBuf,
     right_root: PathBuf,
     left_vfs: Arc<dyn Vfs>,
@@ -3124,14 +3086,36 @@ pub fn plan_provider_bidirectional(
     baseline_path: &Path,
     resolutions: &[ConflictResolution],
 ) -> io::Result<ProviderBidirectionalPlanPreview> {
+    let _ = (pair_id, left, right, baseline_path, resolutions);
+    Err(strict_queue_context_required())
+}
+
+pub fn plan_provider_bidirectional_for_queue(
+    queue: &crate::OperationQueue,
+    pair_id: PairId,
+    left: &crate::ProviderEndpoint,
+    right: &crate::ProviderEndpoint,
+    baseline_path: &Path,
+    resolutions: &[ConflictResolution],
+) -> io::Result<ProviderBidirectionalPlanPreview> {
     pair_id.validate()?;
     let (left_vfs, left_root, left_binding) = left.bidirectional_snapshot_context()?;
     let (right_vfs, right_root, right_binding) = right.bidirectional_snapshot_context()?;
-    let (left_snapshot, right_snapshot) = final_local_snapshots(
+    let staging = strict_staging_binding(
+        queue,
+        None,
+        left_vfs.clone(),
+        &left_root,
+        right_vfs.clone(),
+        &right_root,
+        Some((&left_binding, &right_binding)),
+    )?;
+    let (left_snapshot, right_snapshot) = guarded_local_snapshots(
         left_vfs.as_ref(),
         &left_root,
         right_vfs.as_ref(),
         &right_root,
+        &staging,
     )?;
     crate::remote_real_mode::reject_overlapping_roots(
         &left_snapshot.root_identity,
@@ -3216,15 +3200,99 @@ pub fn prepare_provider_bidirectional_with_decisions_bound(
     resolutions: &[ConflictResolution],
     expected_unresolved_digest: Option<[u8; 32]>,
 ) -> io::Result<PreparedProviderBidirectionalRun> {
+    let _ = (
+        pair_id,
+        pair_name,
+        left,
+        right,
+        baseline_path,
+        resolutions,
+        expected_unresolved_digest,
+    );
+    Err(strict_queue_context_required())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_provider_bidirectional_with_decisions_bound_for_queue(
+    queue: &crate::OperationQueue,
+    pair_id: PairId,
+    pair_name: &str,
+    left: crate::ProviderEndpoint,
+    right: crate::ProviderEndpoint,
+    baseline_path: &Path,
+    resolutions: &[ConflictResolution],
+    expected_unresolved_digest: Option<[u8; 32]>,
+) -> io::Result<PreparedProviderBidirectionalRun> {
+    prepare_provider_bidirectional_with_decisions_bound_for_queue_owned(
+        queue,
+        None,
+        pair_id,
+        pair_name,
+        left,
+        right,
+        baseline_path,
+        resolutions,
+        expected_unresolved_digest,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_provider_bidirectional_with_decisions_bound_for_queue_operation(
+    queue: &crate::OperationQueue,
+    operation_id: &str,
+    pair_id: PairId,
+    pair_name: &str,
+    left: crate::ProviderEndpoint,
+    right: crate::ProviderEndpoint,
+    baseline_path: &Path,
+    resolutions: &[ConflictResolution],
+    expected_unresolved_digest: Option<[u8; 32]>,
+) -> io::Result<PreparedProviderBidirectionalRun> {
+    prepare_provider_bidirectional_with_decisions_bound_for_queue_owned(
+        queue,
+        Some(operation_id),
+        pair_id,
+        pair_name,
+        left,
+        right,
+        baseline_path,
+        resolutions,
+        expected_unresolved_digest,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_provider_bidirectional_with_decisions_bound_for_queue_owned(
+    queue: &crate::OperationQueue,
+    operation_id: Option<&str>,
+    pair_id: PairId,
+    pair_name: &str,
+    left: crate::ProviderEndpoint,
+    right: crate::ProviderEndpoint,
+    baseline_path: &Path,
+    resolutions: &[ConflictResolution],
+    expected_unresolved_digest: Option<[u8; 32]>,
+) -> io::Result<PreparedProviderBidirectionalRun> {
+    validate_strict_queue_operation(queue, operation_id, baseline_path)?;
     validate_pair_name(pair_name)?;
     validate_remote_pair(&left, &right)?;
     let (left_vfs, left_root, left_binding) = left.bidirectional_snapshot_context()?;
     let (right_vfs, right_root, right_binding) = right.bidirectional_snapshot_context()?;
-    let (left_snapshot, right_snapshot) = final_local_snapshots(
+    let staging = strict_staging_binding(
+        queue,
+        operation_id,
+        left_vfs.clone(),
+        &left_root,
+        right_vfs.clone(),
+        &right_root,
+        Some((&left_binding, &right_binding)),
+    )?;
+    let (left_snapshot, right_snapshot) = guarded_local_snapshots(
         left_vfs.as_ref(),
         &left_root,
         right_vfs.as_ref(),
         &right_root,
+        &staging,
     )?;
     crate::remote_real_mode::reject_overlapping_roots(
         &left_snapshot.root_identity,
@@ -3254,7 +3322,7 @@ pub fn prepare_provider_bidirectional_with_decisions_bound(
             "Beide Bäume oder die Baseline haben sich seit dem Konfliktdialog geändert; bitte neu planen"));
     }
     let plan = resolve_conflicts(&unresolved, &left_snapshot, &right_snapshot, resolutions)?;
-    // Konflikte und feste Mengengrenzen benötigen keine Schreibprobe. Besonders
+    // Konflikte benötigen keine Schreibprobe. Besonders
     // FTPS/WebDAV-Capability-Proben können kurzlebige Objekte anlegen; ein bereits
     // gesperrter Plan darf sie daher gar nicht erst starten.
     let stage_blocker = match provider_plan_stage_blocker(&plan) {
@@ -3271,8 +3339,10 @@ pub fn prepare_provider_bidirectional_with_decisions_bound(
             )
         }
     };
+    staging.check(false, false)?;
     let journal_required = stage_blocker.is_none()
-        && (baseline.is_none()
+        && (operation_id.is_some()
+            || baseline.is_none()
             || plan
                 .actions
                 .iter()
@@ -3294,6 +3364,7 @@ pub fn prepare_provider_bidirectional_with_decisions_bound(
             right.clone(),
             left_root.clone(),
             right_root.clone(),
+            staging.clone(),
         )?;
         match prepare_projection_runs(&plan, &context, None, true) {
             Ok(value) => value,
@@ -3311,6 +3382,13 @@ pub fn prepare_provider_bidirectional_with_decisions_bound(
     let expires_at = now + crate::REAL_PERMIT_LIFETIME;
     let preview = LocalBidirectionalPreview {
         conflict_details: bidirectional_conflict_views(&plan, &left_snapshot, &right_snapshot)?,
+        scope_warnings: bidirectional_scope_warnings(
+            &plan,
+            &left_snapshot,
+            &left_root,
+            &right_snapshot,
+            &right_root,
+        )?,
         plan,
         confirmation_phrase: bidirectional_phrase(pair_name)?,
         expires_at_unix_ms: expires_at
@@ -3322,7 +3400,9 @@ pub fn prepare_provider_bidirectional_with_decisions_bound(
         backup_confirmation_required: true,
         stage_blocker,
     };
+    staging.check(false, false)?;
     Ok(PreparedLocalBidirectionalRun {
+        staging,
         pair_id,
         left_root,
         right_root,
@@ -3376,6 +3456,80 @@ pub fn prepare_local_bidirectional_with_decisions_bound(
     resolutions: &[ConflictResolution],
     expected_unresolved_digest: Option<[u8; 32]>,
 ) -> io::Result<PreparedLocalBidirectionalRun> {
+    let _ = (
+        pair_id,
+        pair_name,
+        left,
+        right,
+        baseline_path,
+        resolutions,
+        expected_unresolved_digest,
+    );
+    Err(strict_queue_context_required())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_local_bidirectional_with_decisions_bound_for_queue(
+    queue: &crate::OperationQueue,
+    pair_id: PairId,
+    pair_name: &str,
+    left: &Path,
+    right: &Path,
+    baseline_path: &Path,
+    resolutions: &[ConflictResolution],
+    expected_unresolved_digest: Option<[u8; 32]>,
+) -> io::Result<PreparedLocalBidirectionalRun> {
+    prepare_local_bidirectional_with_decisions_bound_for_queue_owned(
+        queue,
+        None,
+        pair_id,
+        pair_name,
+        left,
+        right,
+        baseline_path,
+        resolutions,
+        expected_unresolved_digest,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_local_bidirectional_with_decisions_bound_for_queue_operation(
+    queue: &crate::OperationQueue,
+    operation_id: &str,
+    pair_id: PairId,
+    pair_name: &str,
+    left: &Path,
+    right: &Path,
+    baseline_path: &Path,
+    resolutions: &[ConflictResolution],
+    expected_unresolved_digest: Option<[u8; 32]>,
+) -> io::Result<PreparedLocalBidirectionalRun> {
+    prepare_local_bidirectional_with_decisions_bound_for_queue_owned(
+        queue,
+        Some(operation_id),
+        pair_id,
+        pair_name,
+        left,
+        right,
+        baseline_path,
+        resolutions,
+        expected_unresolved_digest,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_local_bidirectional_with_decisions_bound_for_queue_owned(
+    queue: &crate::OperationQueue,
+    operation_id: Option<&str>,
+    pair_id: PairId,
+    pair_name: &str,
+    left: &Path,
+    right: &Path,
+    baseline_path: &Path,
+    resolutions: &[ConflictResolution],
+    expected_unresolved_digest: Option<[u8; 32]>,
+) -> io::Result<PreparedLocalBidirectionalRun> {
+    validate_strict_queue_operation(queue, operation_id, baseline_path)?;
     validate_pair_name(pair_name)?;
     let (left_root, right_root) = crate::sync::validate_local_sync_roots(left, right)?;
     crate::real_mode::validate_real_target(&left_root)?;
@@ -3390,19 +3544,25 @@ pub fn prepare_local_bidirectional_with_decisions_bound(
             .parent()
             .ok_or_else(|| invalid_input("Rechter Root besitzt keinen Elternordner"))?,
     )?;
-    let left_vfs = Arc::new(crate::LocalVfs::rooted(&left_parent)?);
-    let right_vfs = Arc::new(crate::LocalVfs::rooted(&right_parent)?);
-    let left_snapshot = build_tree_snapshot(
+    let protect_quarantine =
+        crate::real_mode::is_home_root(&left_root)? || crate::real_mode::is_home_root(&right_root)?;
+    let left_vfs = local_sync_vfs(&left_parent, &left_root, protect_quarantine)?;
+    let right_vfs = local_sync_vfs(&right_parent, &right_root, protect_quarantine)?;
+    let staging = strict_staging_binding(
+        queue,
+        operation_id,
+        left_vfs.clone(),
+        &left_root,
+        right_vfs.clone(),
+        &right_root,
+        None,
+    )?;
+    let (left_snapshot, right_snapshot) = guarded_local_snapshots(
         left_vfs.as_ref(),
         &left_root,
-        MetadataProfile::Portable,
-        SnapshotLimits::default(),
-    )?;
-    let right_snapshot = build_tree_snapshot(
         right_vfs.as_ref(),
         &right_root,
-        MetadataProfile::Portable,
-        SnapshotLimits::default(),
+        &staging,
     )?;
     let left_binding = EndpointBinding::local(&left_snapshot.root_identity)?;
     let right_binding = EndpointBinding::local(&right_snapshot.root_identity)?;
@@ -3446,8 +3606,10 @@ pub fn prepare_local_bidirectional_with_decisions_bound(
                 | BidirectionalAction::Tombstone { .. }
         )
     });
+    staging.check(false, false)?;
     let journal_required = stage_blocker.is_none()
-        && (baseline.is_none()
+        && (operation_id.is_some()
+            || baseline.is_none()
             || plan
                 .actions
                 .iter()
@@ -3470,6 +3632,7 @@ pub fn prepare_local_bidirectional_with_decisions_bound(
                 right_vfs.clone(),
                 left_root.clone(),
                 right_root.clone(),
+                staging.clone(),
             )?,
             None,
             true,
@@ -3482,6 +3645,13 @@ pub fn prepare_local_bidirectional_with_decisions_bound(
     let expires_at = now + crate::REAL_PERMIT_LIFETIME;
     let preview = LocalBidirectionalPreview {
         conflict_details: bidirectional_conflict_views(&plan, &left_snapshot, &right_snapshot)?,
+        scope_warnings: bidirectional_scope_warnings(
+            &plan,
+            &left_snapshot,
+            &left_root,
+            &right_snapshot,
+            &right_root,
+        )?,
         plan,
         confirmation_phrase: bidirectional_phrase(pair_name)?,
         expires_at_unix_ms: expires_at
@@ -3493,7 +3663,9 @@ pub fn prepare_local_bidirectional_with_decisions_bound(
     };
     let left_endpoint = crate::ProviderEndpoint::local(&left_root)?;
     let right_endpoint = crate::ProviderEndpoint::local(&right_root)?;
+    staging.check(false, false)?;
     Ok(PreparedLocalBidirectionalRun {
+        staging,
         pair_id,
         left_root,
         right_root,
@@ -3579,6 +3751,56 @@ pub fn prepare_resume_local_bidirectional(
     right: &Path,
     baseline_path: &Path,
 ) -> io::Result<PreparedLocalBidirectionalRun> {
+    let _ = (pair_name, left, right, baseline_path);
+    Err(strict_queue_context_required())
+}
+
+pub fn prepare_resume_local_bidirectional_for_queue(
+    queue: &crate::OperationQueue,
+    pair_name: &str,
+    left: &Path,
+    right: &Path,
+    baseline_path: &Path,
+) -> io::Result<PreparedLocalBidirectionalRun> {
+    prepare_resume_local_bidirectional_for_queue_owned(
+        queue,
+        None,
+        pair_name,
+        left,
+        right,
+        baseline_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_resume_local_bidirectional_for_queue_operation(
+    queue: &crate::OperationQueue,
+    operation_id: &str,
+    pair_name: &str,
+    left: &Path,
+    right: &Path,
+    baseline_path: &Path,
+) -> io::Result<PreparedLocalBidirectionalRun> {
+    prepare_resume_local_bidirectional_for_queue_owned(
+        queue,
+        Some(operation_id),
+        pair_name,
+        left,
+        right,
+        baseline_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_resume_local_bidirectional_for_queue_owned(
+    queue: &crate::OperationQueue,
+    operation_id: Option<&str>,
+    pair_name: &str,
+    left: &Path,
+    right: &Path,
+    baseline_path: &Path,
+) -> io::Result<PreparedLocalBidirectionalRun> {
+    validate_strict_queue_operation(queue, operation_id, baseline_path)?;
     validate_pair_name(pair_name)?;
     // Ein terminales Journal bindet bereits die vollständige Datenwirkung. Dieser
     // lokale Check kommt vor Root-Scans, damit Resume keinen alten Plan mehr öffnet.
@@ -3605,13 +3827,25 @@ pub fn prepare_resume_local_bidirectional(
             .parent()
             .ok_or_else(|| invalid_input("Rechter Root besitzt keinen Elternordner"))?,
     )?;
-    let left_vfs = Arc::new(crate::LocalVfs::rooted(&left_parent)?);
-    let right_vfs = Arc::new(crate::LocalVfs::rooted(&right_parent)?);
-    let (mut left_snapshot, mut right_snapshot) = final_local_snapshots(
+    let protect_quarantine =
+        crate::real_mode::is_home_root(&left_root)? || crate::real_mode::is_home_root(&right_root)?;
+    let left_vfs = local_sync_vfs(&left_parent, &left_root, protect_quarantine)?;
+    let right_vfs = local_sync_vfs(&right_parent, &right_root, protect_quarantine)?;
+    let staging = strict_staging_binding(
+        queue,
+        operation_id,
+        left_vfs.clone(),
+        &left_root,
+        right_vfs.clone(),
+        &right_root,
+        None,
+    )?;
+    let (mut left_snapshot, mut right_snapshot) = guarded_local_snapshots(
         left_vfs.as_ref(),
         &left_root,
         right_vfs.as_ref(),
         &right_root,
+        &staging,
     )?;
     let baseline = store.load()?;
     if baseline.as_ref().map(|value| value.body_digest) != journal.baseline_digest
@@ -3630,6 +3864,7 @@ pub fn prepare_resume_local_bidirectional(
             &left_snapshot,
             &right_snapshot,
             LocalEndpointPair {
+                staging_guard: &staging,
                 left_vfs: left_vfs.as_ref(),
                 left_root: &left_root,
                 right_vfs: right_vfs.as_ref(),
@@ -3637,11 +3872,12 @@ pub fn prepare_resume_local_bidirectional(
             },
         )?
     {
-        (left_snapshot, right_snapshot) = final_local_snapshots(
+        (left_snapshot, right_snapshot) = guarded_local_snapshots(
             left_vfs.as_ref(),
             &left_root,
             right_vfs.as_ref(),
             &right_root,
+            &staging,
         )?;
     }
     let prefix = recovery_prefix(&journal, &left_snapshot, &right_snapshot)?;
@@ -3658,6 +3894,7 @@ pub fn prepare_resume_local_bidirectional(
                     right_vfs.clone(),
                     left_root.clone(),
                     right_root.clone(),
+                    staging.clone(),
                 )
             },
             "Resume-Vorbereitung verlor eine offene Journalprojektion",
@@ -3688,6 +3925,13 @@ pub fn prepare_resume_local_bidirectional(
         )?,
         plan: journal.plan.clone(),
         confirmation_phrase: bidirectional_phrase(pair_name)?,
+        scope_warnings: bidirectional_scope_warnings(
+            &journal.plan,
+            &journal.left_snapshot,
+            &left_root,
+            &journal.right_snapshot,
+            &right_root,
+        )?,
         expires_at_unix_ms: expires_at
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(io::Error::other)?
@@ -3697,7 +3941,9 @@ pub fn prepare_resume_local_bidirectional(
     };
     let left_endpoint = crate::ProviderEndpoint::local(&left_root)?;
     let right_endpoint = crate::ProviderEndpoint::local(&right_root)?;
+    staging.check(false, false)?;
     Ok(PreparedLocalBidirectionalRun {
+        staging,
         pair_id: journal.pair_id,
         left_root,
         right_root,
@@ -3729,6 +3975,56 @@ pub fn prepare_local_bidirectional_rollback(
     right: &Path,
     baseline_path: &Path,
 ) -> io::Result<PreparedLocalBidirectionalRollback> {
+    let _ = (pair_name, left, right, baseline_path);
+    Err(strict_queue_context_required())
+}
+
+pub fn prepare_local_bidirectional_rollback_for_queue(
+    queue: &crate::OperationQueue,
+    pair_name: &str,
+    left: &Path,
+    right: &Path,
+    baseline_path: &Path,
+) -> io::Result<PreparedLocalBidirectionalRollback> {
+    prepare_local_bidirectional_rollback_for_queue_owned(
+        queue,
+        None,
+        pair_name,
+        left,
+        right,
+        baseline_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_local_bidirectional_rollback_for_queue_operation(
+    queue: &crate::OperationQueue,
+    operation_id: &str,
+    pair_name: &str,
+    left: &Path,
+    right: &Path,
+    baseline_path: &Path,
+) -> io::Result<PreparedLocalBidirectionalRollback> {
+    prepare_local_bidirectional_rollback_for_queue_owned(
+        queue,
+        Some(operation_id),
+        pair_name,
+        left,
+        right,
+        baseline_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_local_bidirectional_rollback_for_queue_owned(
+    queue: &crate::OperationQueue,
+    operation_id: Option<&str>,
+    pair_name: &str,
+    left: &Path,
+    right: &Path,
+    baseline_path: &Path,
+) -> io::Result<PreparedLocalBidirectionalRollback> {
+    validate_strict_queue_operation(queue, operation_id, baseline_path)?;
     validate_pair_name(pair_name)?;
     // RollbackCommitted darf auch bei inzwischen gedrifteten Roots niemals als
     // zweiter Rollback interpretiert werden. Offen ist ausschließlich Cleanup.
@@ -3748,13 +4044,25 @@ pub fn prepare_local_bidirectional_rollback(
             .parent()
             .ok_or_else(|| invalid_input("Rechter Root besitzt keinen Elternordner"))?,
     )?;
-    let left_vfs = Arc::new(crate::LocalVfs::rooted(&left_parent)?);
-    let right_vfs = Arc::new(crate::LocalVfs::rooted(&right_parent)?);
-    let (left_snapshot, right_snapshot) = final_local_snapshots(
+    let protect_quarantine =
+        crate::real_mode::is_home_root(&left_root)? || crate::real_mode::is_home_root(&right_root)?;
+    let left_vfs = local_sync_vfs(&left_parent, &left_root, protect_quarantine)?;
+    let right_vfs = local_sync_vfs(&right_parent, &right_root, protect_quarantine)?;
+    let staging = strict_staging_binding(
+        queue,
+        operation_id,
+        left_vfs.clone(),
+        &left_root,
+        right_vfs.clone(),
+        &right_root,
+        None,
+    )?;
+    let (left_snapshot, right_snapshot) = guarded_local_snapshots(
         left_vfs.as_ref(),
         &left_root,
         right_vfs.as_ref(),
         &right_root,
+        &staging,
     )?;
     if store.load()?.map(|value| value.body_digest) != journal.baseline_digest
         || EndpointBinding::local(&left_snapshot.root_identity)? != journal.left_binding
@@ -3783,6 +4091,7 @@ pub fn prepare_local_bidirectional_rollback(
             &right_snapshot,
             maximum,
             LocalEndpointPair {
+                staging_guard: &staging,
                 left_vfs: left_vfs.as_ref(),
                 left_root: &left_root,
                 right_vfs: right_vfs.as_ref(),
@@ -3825,7 +4134,9 @@ pub fn prepare_local_bidirectional_rollback(
             .map_err(io::Error::other)?
             .as_millis(),
     };
+    staging.check(false, false)?;
     Ok(PreparedLocalBidirectionalRollback {
+        staging,
         left_root,
         right_root,
         left_vfs,
@@ -3858,6 +4169,56 @@ pub fn prepare_resume_provider_bidirectional(
     right: crate::ProviderEndpoint,
     baseline_path: &Path,
 ) -> io::Result<PreparedProviderBidirectionalRun> {
+    let _ = (pair_name, left, right, baseline_path);
+    Err(strict_queue_context_required())
+}
+
+pub fn prepare_resume_provider_bidirectional_for_queue(
+    queue: &crate::OperationQueue,
+    pair_name: &str,
+    left: crate::ProviderEndpoint,
+    right: crate::ProviderEndpoint,
+    baseline_path: &Path,
+) -> io::Result<PreparedProviderBidirectionalRun> {
+    prepare_resume_provider_bidirectional_for_queue_owned(
+        queue,
+        None,
+        pair_name,
+        left,
+        right,
+        baseline_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_resume_provider_bidirectional_for_queue_operation(
+    queue: &crate::OperationQueue,
+    operation_id: &str,
+    pair_name: &str,
+    left: crate::ProviderEndpoint,
+    right: crate::ProviderEndpoint,
+    baseline_path: &Path,
+) -> io::Result<PreparedProviderBidirectionalRun> {
+    prepare_resume_provider_bidirectional_for_queue_owned(
+        queue,
+        Some(operation_id),
+        pair_name,
+        left,
+        right,
+        baseline_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_resume_provider_bidirectional_for_queue_owned(
+    queue: &crate::OperationQueue,
+    operation_id: Option<&str>,
+    pair_name: &str,
+    left: crate::ProviderEndpoint,
+    right: crate::ProviderEndpoint,
+    baseline_path: &Path,
+) -> io::Result<PreparedProviderBidirectionalRun> {
+    validate_strict_queue_operation(queue, operation_id, baseline_path)?;
     validate_pair_name(pair_name)?;
     validate_remote_pair(&left, &right)?;
     // Ein bereits abgeschlossener Lauf braucht nur noch lokalen Journalabbau.
@@ -3870,11 +4231,21 @@ pub fn prepare_resume_provider_bidirectional(
     reject_completed_run_recovery(&journal)?;
     let (left_vfs, left_root, left_binding) = left.bidirectional_snapshot_context()?;
     let (right_vfs, right_root, right_binding) = right.bidirectional_snapshot_context()?;
-    let (mut left_snapshot, mut right_snapshot) = final_local_snapshots(
+    let staging = strict_staging_binding(
+        queue,
+        operation_id,
+        left_vfs.clone(),
+        &left_root,
+        right_vfs.clone(),
+        &right_root,
+        Some((&left_binding, &right_binding)),
+    )?;
+    let (mut left_snapshot, mut right_snapshot) = guarded_local_snapshots(
         left_vfs.as_ref(),
         &left_root,
         right_vfs.as_ref(),
         &right_root,
+        &staging,
     )?;
     if provider_plan_stage_blocker(&journal.plan).is_some() {
         return Err(io::Error::new(
@@ -3914,17 +4285,19 @@ pub fn prepare_resume_provider_bidirectional(
         &left_snapshot,
         &right_snapshot,
         LocalEndpointPair {
+            staging_guard: &staging,
             left_vfs: left_vfs.as_ref(),
             left_root: &left_root,
             right_vfs: right_vfs.as_ref(),
             right_root: &right_root,
         },
     )? {
-        (left_snapshot, right_snapshot) = final_local_snapshots(
+        (left_snapshot, right_snapshot) = guarded_local_snapshots(
             left_vfs.as_ref(),
             &left_root,
             right_vfs.as_ref(),
             &right_root,
+            &staging,
         )?;
     }
     let prefix = recovery_prefix(&journal, &left_snapshot, &right_snapshot)?;
@@ -3940,6 +4313,7 @@ pub fn prepare_resume_provider_bidirectional(
                 right.clone(),
                 left_root.clone(),
                 right_root.clone(),
+                staging.clone(),
             )
         },
         "Remote-Resume verlor eine offene Journalprojektion",
@@ -3954,6 +4328,13 @@ pub fn prepare_resume_provider_bidirectional(
         )?,
         plan: journal.plan.clone(),
         confirmation_phrase: bidirectional_phrase(pair_name)?,
+        scope_warnings: bidirectional_scope_warnings(
+            &journal.plan,
+            &journal.left_snapshot,
+            &left_root,
+            &journal.right_snapshot,
+            &right_root,
+        )?,
         expires_at_unix_ms: expires_at
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(io::Error::other)?
@@ -3961,7 +4342,9 @@ pub fn prepare_resume_provider_bidirectional(
         backup_confirmation_required: true,
         stage_blocker: None,
     };
+    staging.check(false, false)?;
     Ok(PreparedLocalBidirectionalRun {
+        staging,
         pair_id: journal.pair_id,
         left_root,
         right_root,
@@ -4007,6 +4390,56 @@ pub fn prepare_provider_bidirectional_rollback(
     right: crate::ProviderEndpoint,
     baseline_path: &Path,
 ) -> io::Result<PreparedProviderBidirectionalRollback> {
+    let _ = (pair_name, left, right, baseline_path);
+    Err(strict_queue_context_required())
+}
+
+pub fn prepare_provider_bidirectional_rollback_for_queue(
+    queue: &crate::OperationQueue,
+    pair_name: &str,
+    left: crate::ProviderEndpoint,
+    right: crate::ProviderEndpoint,
+    baseline_path: &Path,
+) -> io::Result<PreparedProviderBidirectionalRollback> {
+    prepare_provider_bidirectional_rollback_for_queue_owned(
+        queue,
+        None,
+        pair_name,
+        left,
+        right,
+        baseline_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_provider_bidirectional_rollback_for_queue_operation(
+    queue: &crate::OperationQueue,
+    operation_id: &str,
+    pair_name: &str,
+    left: crate::ProviderEndpoint,
+    right: crate::ProviderEndpoint,
+    baseline_path: &Path,
+) -> io::Result<PreparedProviderBidirectionalRollback> {
+    prepare_provider_bidirectional_rollback_for_queue_owned(
+        queue,
+        Some(operation_id),
+        pair_name,
+        left,
+        right,
+        baseline_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_provider_bidirectional_rollback_for_queue_owned(
+    queue: &crate::OperationQueue,
+    operation_id: Option<&str>,
+    pair_name: &str,
+    left: crate::ProviderEndpoint,
+    right: crate::ProviderEndpoint,
+    baseline_path: &Path,
+) -> io::Result<PreparedProviderBidirectionalRollback> {
+    validate_strict_queue_operation(queue, operation_id, baseline_path)?;
     validate_pair_name(pair_name)?;
     validate_remote_pair(&left, &right)?;
     // RollbackCommitted ist bereits vollständig zurückgerollt. Auch hier muss die
@@ -4018,11 +4451,21 @@ pub fn prepare_provider_bidirectional_rollback(
     reject_completed_run_recovery(&journal)?;
     let (left_vfs, left_root, left_binding) = left.bidirectional_snapshot_context()?;
     let (right_vfs, right_root, right_binding) = right.bidirectional_snapshot_context()?;
-    let (left_snapshot, right_snapshot) = final_local_snapshots(
+    let staging = strict_staging_binding(
+        queue,
+        operation_id,
+        left_vfs.clone(),
+        &left_root,
+        right_vfs.clone(),
+        &right_root,
+        Some((&left_binding, &right_binding)),
+    )?;
+    let (left_snapshot, right_snapshot) = guarded_local_snapshots(
         left_vfs.as_ref(),
         &left_root,
         right_vfs.as_ref(),
         &right_root,
+        &staging,
     )?;
     if provider_plan_stage_blocker(&journal.plan).is_some() {
         return Err(io::Error::new(
@@ -4067,6 +4510,7 @@ pub fn prepare_provider_bidirectional_rollback(
             &right_snapshot,
             maximum,
             LocalEndpointPair {
+                staging_guard: &staging,
                 left_vfs: left_vfs.as_ref(),
                 left_root: &left_root,
                 right_vfs: right_vfs.as_ref(),
@@ -4108,7 +4552,9 @@ pub fn prepare_provider_bidirectional_rollback(
             .map_err(io::Error::other)?
             .as_millis(),
     };
+    staging.check(false, false)?;
     Ok(PreparedLocalBidirectionalRollback {
+        staging,
         left_root,
         right_root,
         left_vfs,
@@ -4125,6 +4571,19 @@ pub fn prepare_provider_bidirectional_rollback(
 impl PreparedLocalBidirectionalRollback {
     pub fn preview(&self) -> &LocalBidirectionalRollbackPreview {
         &self.preview
+    }
+
+    pub fn confirm_effects(
+        self,
+        effects_confirmed: bool,
+    ) -> io::Result<LocalBidirectionalRollback> {
+        if !effects_confirmed {
+            return Err(crate::real_mode::confirmation_mismatch(
+                "Die angezeigte Wiederherstellung wurde nicht bestätigt",
+            ));
+        }
+        let phrase = self.preview.confirmation_phrase.clone();
+        self.confirm(&phrase)
     }
 
     pub fn confirm(self, phrase: &str) -> io::Result<LocalBidirectionalRollback> {
@@ -4146,11 +4605,12 @@ impl PreparedLocalBidirectionalRollback {
                 "Rollback-Journal änderte sich seit der Vorschau",
             ));
         }
-        let (left, right) = final_local_snapshots(
+        let (left, right) = guarded_local_snapshots(
             self.left_vfs.as_ref(),
             &self.left_root,
             self.right_vfs.as_ref(),
             &self.right_root,
+            &self.staging,
         )?;
         if left != self.left_snapshot || right != self.right_snapshot {
             return Err(io::Error::new(
@@ -4159,6 +4619,7 @@ impl PreparedLocalBidirectionalRollback {
             ));
         }
         Ok(LocalBidirectionalRollback {
+            staging: self.staging,
             left_root: self.left_root,
             right_root: self.right_root,
             left_vfs: self.left_vfs,
@@ -4169,7 +4630,58 @@ impl PreparedLocalBidirectionalRollback {
     }
 }
 
+fn check_bidirectional_confirmation_deadline(expires_at: std::time::SystemTime) -> io::Result<()> {
+    if std::time::SystemTime::now() > expires_at {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Bidirektionale Vorbereitung ist älter als zehn Minuten",
+        ));
+    }
+    Ok(())
+}
+
 impl PreparedLocalBidirectionalRun {
+    pub(crate) fn confirmation_deadline(&self) -> io::Result<std::time::SystemTime> {
+        check_bidirectional_confirmation_deadline(self.expires_at)?;
+        Ok(self.expires_at)
+    }
+
+    pub(crate) fn limit_confirmation_deadline(
+        &mut self,
+        deadline: std::time::SystemTime,
+    ) -> io::Result<()> {
+        self.expires_at = self.expires_at.min(deadline);
+        for prepared in &mut self.prepared_runs {
+            prepared.limit_confirmation_deadline(self.expires_at)?;
+        }
+        self.preview.expires_at_unix_ms = self
+            .expires_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_millis();
+        Ok(())
+    }
+
+    pub(crate) fn baseline_path(&self) -> &Path {
+        &self.store.path
+    }
+
+    pub(crate) fn staging_queue(&self) -> &Path {
+        &self.staging.owner().queue
+    }
+
+    pub(crate) fn matches_queue_roots(&self, left: &Path, right: &Path) -> bool {
+        let matches = |path: &Path, root: &Path, endpoint: &crate::ProviderEndpoint| {
+            if endpoint.kind() == crate::ProviderKind::Local {
+                std::fs::canonicalize(path).is_ok_and(|canonical| canonical == root)
+            } else {
+                path == root
+            }
+        };
+        matches(left, &self.left_root, &self.left_endpoint)
+            && matches(right, &self.right_root, &self.right_endpoint)
+    }
+
     /// Berechnet nach jeder Einzelwahl die verbleibenden Optionen aus denselben
     /// gehaltenen Snapshots. Frühere Entscheidungen zählen bei Mengenlimits mit.
     pub fn conflict_choices_after_decisions(
@@ -4302,8 +4814,21 @@ impl PreparedLocalBidirectionalRun {
         }
     }
 
+    /// Der normale Sync bestätigt die konkrete Vorschau einmal. Die Phrase und
+    /// das externe Backup sind keine technischen Belege; Root-, Baseline-,
+    /// Snapshot-, Journal- und Ablaufprüfungen bleiben unverändert verpflichtend.
+    pub fn confirm_effects(self, effects_confirmed: bool) -> io::Result<LocalBidirectionalRun> {
+        if !effects_confirmed {
+            return self.reject_before_mutation(crate::real_mode::confirmation_mismatch(
+                "Die angezeigte bidirektionale Wirkung wurde nicht bestätigt",
+            ));
+        }
+        let phrase = self.preview.confirmation_phrase.clone();
+        self.confirm(&phrase, true)
+    }
+
     pub fn confirm(
-        self,
+        mut self,
         phrase: &str,
         backup_confirmed: bool,
     ) -> io::Result<LocalBidirectionalRun> {
@@ -4361,11 +4886,12 @@ impl PreparedLocalBidirectionalRun {
                 ));
             }
         }
-        let (fresh_left, fresh_right) = final_local_snapshots(
+        let (fresh_left, fresh_right) = guarded_local_snapshots(
             self.left_vfs.as_ref(),
             &self.left_root,
             self.right_vfs.as_ref(),
             &self.right_root,
+            &self.staging,
         )?;
         if fresh_left != self.left_snapshot || fresh_right != self.right_snapshot {
             return self.reject_before_mutation(io::Error::new(
@@ -4373,10 +4899,16 @@ impl PreparedLocalBidirectionalRun {
                 "Linker oder rechter Baum änderte sich seit der Vorschau",
             ));
         }
+        if let Err(error) = self.confirmation_deadline() {
+            return self.reject_before_mutation(error);
+        }
         let mut runs = Vec::with_capacity(self.prepared_runs.len());
-        for prepared in self.prepared_runs {
+        for prepared in std::mem::take(&mut self.prepared_runs) {
             let internal_phrase = prepared.preview().confirmation_phrase.clone();
             runs.push(prepared.confirm(&internal_phrase, backup_confirmed)?);
+        }
+        if let Err(error) = self.confirmation_deadline() {
+            return self.reject_before_mutation(error);
         }
         let commit_required = self.baseline.is_none()
             || self.baseline.as_ref().is_some_and(|baseline| {
@@ -4391,6 +4923,7 @@ impl PreparedLocalBidirectionalRun {
                 .iter()
                 .any(|action| !matches!(action, BidirectionalAction::SkippedConflict { .. }));
         Ok(LocalBidirectionalRun {
+            staging: self.staging,
             pair_id: self.pair_id,
             left_root: self.left_root,
             right_root: self.right_root,
@@ -4409,6 +4942,7 @@ impl PreparedLocalBidirectionalRun {
             commit_required,
             journal_required: self.journal_required,
             backup_confirmed,
+            expires_at: self.expires_at,
         })
     }
 }
@@ -4440,6 +4974,7 @@ impl LocalBidirectionalRun {
                 crate::error::with_recovery_paths(error, &paths)
             })?;
         Ok(LocalBidirectionalStats {
+            execution_class: None,
             runs: stats,
             baseline_generation,
             baseline_committed,
@@ -4453,6 +4988,7 @@ impl LocalBidirectionalRun {
         stats: &mut Vec<crate::SyncStats>,
     ) -> io::Result<(u64, bool)> {
         let LocalBidirectionalRun {
+            staging,
             pair_id,
             left_root,
             right_root,
@@ -4471,7 +5007,10 @@ impl LocalBidirectionalRun {
             commit_required,
             journal_required,
             backup_confirmed,
+            expires_at,
         } = self;
+        check_bidirectional_confirmation_deadline(expires_at)?;
+        staging.check(false, false)?;
         if store.load()? != baseline {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -4479,6 +5018,8 @@ impl LocalBidirectionalRun {
             ));
         }
         for (index, run) in run_ordinals.into_iter().zip(runs) {
+            check_bidirectional_confirmation_deadline(expires_at)?;
+            staging.check(false, false)?;
             if journal_required {
                 store.update_run_journal(|journal| {
                     let projection = journal
@@ -4529,8 +5070,10 @@ impl LocalBidirectionalRun {
                 right_endpoint.clone(),
                 left_root.clone(),
                 right_root.clone(),
+                staging.clone(),
             )?;
             for index in deferred_run_ordinals {
+                check_bidirectional_confirmation_deadline(expires_at)?;
                 if cancel.is_cancelled() {
                     return Err(io::Error::new(
                         io::ErrorKind::Interrupted,
@@ -4540,11 +5083,12 @@ impl LocalBidirectionalRun {
                 let journal = store
                     .load_run_journal()?
                     .ok_or_else(|| invalid_data("Aufgeschobene Projektion besitzt kein Journal"))?;
-                let (fresh_left, fresh_right) = final_local_snapshots(
+                let (fresh_left, fresh_right) = guarded_local_snapshots(
                     left_vfs.as_ref(),
                     &left_root,
                     right_vfs.as_ref(),
                     &right_root,
+                    &staging,
                 )?;
                 if !snapshots_match_projection_prefix(&journal, &fresh_left, &fresh_right, index)? {
                     let (expected_left, expected_right) =
@@ -4562,6 +5106,9 @@ impl LocalBidirectionalRun {
                         ),
                     ));
                 }
+                // Der vorgeschaltete Scan darf die ursprüngliche Freigabe nicht
+                // überleben und danach erstmals einen Wirkungsabschnitt starten.
+                check_bidirectional_confirmation_deadline(expires_at)?;
                 store.update_run_journal(|journal| {
                     let projection = journal
                         .projections
@@ -4584,7 +5131,9 @@ impl LocalBidirectionalRun {
                     execute_local_type_swap_projection(
                         &store,
                         index,
+                        expires_at,
                         LocalEndpointPair {
+                            staging_guard: &staging,
                             left_vfs: left_vfs.as_ref(),
                             left_root: &left_root,
                             right_vfs: right_vfs.as_ref(),
@@ -4601,10 +5150,13 @@ impl LocalBidirectionalRun {
                         "Aufgeschobene Einwegprojektion wurde nicht eindeutig vorbereitet",
                     ));
                 }
-                let prepared = prepared
+                let mut prepared = prepared
                     .into_iter()
                     .next()
                     .ok_or_else(|| invalid_data("Aufgeschobene Löschprojektion fehlt"))?;
+                // Frische Untervorbereitung ist kein neues Bestätigungsrecht.
+                prepared.limit_confirmation_deadline(expires_at)?;
+                check_bidirectional_confirmation_deadline(expires_at)?;
                 let phrase = prepared.preview().confirmation_phrase.clone();
                 let result_index = stats.len();
                 stats.push(
@@ -4636,17 +5188,19 @@ impl LocalBidirectionalRun {
             }
         }
 
-        let (first_left, first_right) = final_local_snapshots(
+        let (first_left, first_right) = guarded_local_snapshots(
             left_vfs.as_ref(),
             &left_root,
             right_vfs.as_ref(),
             &right_root,
+            &staging,
         )?;
-        let (second_left, second_right) = final_local_snapshots(
+        let (second_left, second_right) = guarded_local_snapshots(
             left_vfs.as_ref(),
             &left_root,
             right_vfs.as_ref(),
             &right_root,
+            &staging,
         )?;
         if first_left != second_left
             || first_right != second_right
@@ -4700,6 +5254,7 @@ impl LocalBidirectionalRun {
                     Ok(())
                 })?;
             }
+            staging.check(false, false)?;
             store.save(&next)?;
             if journal_required {
                 store.update_run_journal(|journal| {
@@ -4709,10 +5264,32 @@ impl LocalBidirectionalRun {
             }
             generation
         } else {
-            baseline
+            let unchanged = baseline
                 .as_ref()
-                .ok_or_else(|| invalid_data("No-op-Lauf besitzt keine Baseline"))?
-                .generation
+                .ok_or_else(|| invalid_data("No-op-Lauf besitzt keine Baseline"))?;
+            if journal_required {
+                staging.check(false, false)?;
+                if store.load()?.as_ref() != Some(unchanged) {
+                    return Err(crate::real_mode::plan_drift(
+                        "Baseline änderte sich vor dem mutationslosen Queueabschluss",
+                    ));
+                }
+                store.sync_baseline(unchanged).map_err(|error| {
+                    bidirectional_effect_error(error, &[&store.path, &store.run_journal_path()])
+                })?;
+                staging.check(false, false)?;
+                store.update_run_journal(|journal| {
+                    if journal.projections.iter().any(|projection| {
+                        projection.state != BidirectionalProjectionState::Committed
+                    }) {
+                        return Err(invalid_data("No-op-Abschluss besitzt offene Projektionen"));
+                    }
+                    journal.committed_baseline_digest = Some(unchanged.body_digest);
+                    journal.state = BidirectionalRunState::BaselineCommitted;
+                    Ok(())
+                })?;
+            }
+            unchanged.generation
         };
         Ok((generation, commit_required))
     }
@@ -4720,6 +5297,7 @@ impl LocalBidirectionalRun {
 
 #[derive(Clone, Copy)]
 struct LocalEndpointPair<'a> {
+    staging_guard: &'a crate::real_mode::RunStagingBinding,
     left_vfs: &'a dyn Vfs,
     left_root: &'a Path,
     right_vfs: &'a dyn Vfs,
@@ -4729,9 +5307,12 @@ struct LocalEndpointPair<'a> {
 fn execute_local_type_swap_projection(
     store: &BaselineStore,
     ordinal: usize,
+    expires_at: std::time::SystemTime,
     endpoints: LocalEndpointPair<'_>,
 ) -> io::Result<()> {
+    check_bidirectional_confirmation_deadline(expires_at)?;
     let LocalEndpointPair {
+        staging_guard,
         left_vfs,
         left_root,
         right_vfs,
@@ -4764,7 +5345,7 @@ fn execute_local_type_swap_projection(
         EndpointSide::Right => (right_vfs, right_root),
     };
     let (current_left, current_right) =
-        final_local_snapshots(left_vfs, left_root, right_vfs, right_root)?;
+        guarded_local_snapshots(left_vfs, left_root, right_vfs, right_root, staging_guard)?;
     if !snapshots_match_projection_prefix(&journal, &current_left, &current_right, ordinal)? {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -4790,8 +5371,17 @@ fn execute_local_type_swap_projection(
     let target_parent = root
         .parent()
         .ok_or_else(|| invalid_input("Typwechsel-Root besitzt keinen Elternordner"))?;
-    let base = target_parent.join(".doppeldecker-quarantine");
-    crate::real_mode::ensure_quarantine_root(vfs, target_parent, &base)?;
+    let quarantine_parent = if crate::real_mode::is_home_root(root)? {
+        root
+    } else {
+        target_parent
+    };
+    let base = quarantine_parent.join(".doppeldecker-quarantine");
+    check_bidirectional_confirmation_deadline(expires_at)?;
+    crate::real_mode::ensure_quarantine_root(vfs, quarantine_parent, &base)?;
+    if quarantine_parent == root {
+        crate::real_mode::protect_internal_quarantine(vfs, &base)?;
+    }
     let run_root = match projection.quarantine.as_deref() {
         Some(path) => PathBuf::from(path),
         None => crate::real_mode::reserve_quarantine_run_name(vfs, &base)?,
@@ -4821,6 +5411,10 @@ fn execute_local_type_swap_projection(
     })?;
     let _quarantine_lease = ensure_type_swap_quarantine_started(vfs, &run_root, root)?;
 
+    staging_guard.check(false, false)?;
+    // Bis zum ersten Datentausch bleibt die alte Frist maßgeblich. Danach wird
+    // derselbe bereits begonnene Typwechsel mit seinen Wiederanlaufbelegen abgeschlossen.
+    check_bidirectional_confirmation_deadline(expires_at)?;
     vfs.rename_exchange(&original, &staging)
         .map_err(|error| bidirectional_effect_error(error, &[&original, &staging]))?;
     sync_rollback_parents(vfs, &original, &staging)?;
@@ -4857,11 +5451,12 @@ fn execute_local_type_swap_projection(
         previous.kind == SnapshotEntryKind::Directory,
         crate::quarantine::QuarantineReason::Replaced,
     )?;
+    staging_guard.check(false, false)?;
     vfs.rename_noreplace(&staging, &backup)?;
     sync_rollback_parents(vfs, &staging, &backup)?;
 
     let (final_left, final_right) =
-        final_local_snapshots(left_vfs, left_root, right_vfs, right_root)?;
+        guarded_local_snapshots(left_vfs, left_root, right_vfs, right_root, staging_guard)?;
     let latest = store
         .load_run_journal()?
         .ok_or_else(|| invalid_data("Typwechseljournal verschwand"))?;
@@ -4925,6 +5520,7 @@ fn ensure_type_swap_quarantine_started(
 impl LocalBidirectionalRollback {
     pub fn execute(self, cancel: &crate::Cancel) -> io::Result<LocalBidirectionalRollbackStats> {
         let LocalBidirectionalRollback {
+            staging,
             left_root,
             right_root,
             left_vfs,
@@ -4932,6 +5528,7 @@ impl LocalBidirectionalRollback {
             store,
             mut journal,
         } = self;
+        staging.check(false, false)?;
         if store.load_run_journal()? != Some(journal.clone()) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -4996,6 +5593,7 @@ impl LocalBidirectionalRollback {
                 index,
                 &units,
                 LocalEndpointPair {
+                    staging_guard: &staging,
                     left_vfs: left_vfs.as_ref(),
                     left_root: &left_root,
                     right_vfs: right_vfs.as_ref(),
@@ -5006,17 +5604,19 @@ impl LocalBidirectionalRollback {
             rolled_back += 1;
         }
 
-        let (first_left, first_right) = final_local_snapshots(
+        let (first_left, first_right) = guarded_local_snapshots(
             left_vfs.as_ref(),
             &left_root,
             right_vfs.as_ref(),
             &right_root,
+            &staging,
         )?;
-        let (second_left, second_right) = final_local_snapshots(
+        let (second_left, second_right) = guarded_local_snapshots(
             left_vfs.as_ref(),
             &left_root,
             right_vfs.as_ref(),
             &right_root,
+            &staging,
         )?;
         if first_left != second_left
             || first_right != second_right
@@ -5045,6 +5645,7 @@ impl LocalBidirectionalRollback {
         // trotzdem noch nicht verschwinden: Erst sein eigener atomarer Commit
         // beweist einem neu gestarteten Prozess, dass ausschließlich der
         // mutationslose Queue-/Journalabschluss offen ist.
+        staging.check(false, false)?;
         store.update_run_journal(|persisted| {
             if *persisted != journal {
                 return Err(io::Error::new(
@@ -5223,11 +5824,13 @@ fn rollback_projection_units(
     quarantine_leases: &mut Vec<HeldRollbackQuarantine>,
 ) -> io::Result<()> {
     let LocalEndpointPair {
+        staging_guard,
         left_vfs,
         left_root,
         right_vfs,
         right_root,
     } = endpoints;
+    staging_guard.check(false, false)?;
     let side = units
         .first()
         .ok_or_else(|| invalid_data("Rollback-Projektion besitzt keine Einheiten"))?
@@ -5262,7 +5865,7 @@ fn rollback_projection_units(
             ));
         }
         let (current_left, current_right) =
-            final_local_snapshots(left_vfs, left_root, right_vfs, right_root)?;
+            guarded_local_snapshots(left_vfs, left_root, right_vfs, right_root, staging_guard)?;
         let matches_before = snapshots_match_rollback_units(
             journal,
             &current_left,
@@ -5325,6 +5928,7 @@ fn rollback_projection_units(
             ));
         }
 
+        staging_guard.check(false, false)?;
         if type_mismatch_delta(delta) {
             rollback_type_swap_unit(
                 store,
@@ -5334,6 +5938,7 @@ fn rollback_projection_units(
                 vfs,
                 root,
                 quarantine_leases,
+                staging_guard,
             )?;
         } else if metadata_only_delta(delta) {
             restore_portable_mode(vfs, &root.join(delta.path.to_path_buf()?), delta)?;
@@ -5376,6 +5981,7 @@ fn rollback_projection_units(
                 store.save_run_journal(journal)?;
             }
 
+            staging_guard.check(false, false)?;
             if let Some(before) = &delta.before {
                 ensure_previous_restored(
                     vfs,
@@ -5395,7 +6001,7 @@ fn rollback_projection_units(
         }
 
         let (after_left, after_right) =
-            final_local_snapshots(left_vfs, left_root, right_vfs, right_root)?;
+            guarded_local_snapshots(left_vfs, left_root, right_vfs, right_root, staging_guard)?;
         if !snapshots_match_rollback_units(
             journal,
             &after_left,
@@ -5424,6 +6030,7 @@ fn rollback_projection_units(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rollback_type_swap_unit(
     store: &BaselineStore,
     journal: &mut BidirectionalRunJournal,
@@ -5432,6 +6039,7 @@ fn rollback_type_swap_unit(
     vfs: &dyn Vfs,
     root: &Path,
     quarantine_leases: &[HeldRollbackQuarantine],
+    staging_guard: &crate::real_mode::RunStagingBinding,
 ) -> io::Result<()> {
     // Typwechsel bilden genau eine Rollbackeinheit. Projektion und Einheit gehören
     // deshalb als gemeinsame Position zusammen und werden unten getrennt geprüft.
@@ -5473,6 +6081,7 @@ fn rollback_type_swap_unit(
         .phase;
     if phase == BidirectionalRollbackPhase::RestoreTypePreviousToStaging {
         let (before_maps, _) = type_swap_before_after_maps(journal, ordinal, delta.side)?;
+        staging_guard.check(false, false)?;
         restore_type_previous_to_staging(
             vfs,
             root,
@@ -5496,6 +6105,7 @@ fn rollback_type_swap_unit(
         .as_ref()
         .is_some_and(|step| step.phase == BidirectionalRollbackPhase::ExchangeTypeNames)
     {
+        staging_guard.check(false, false)?;
         vfs.rename_exchange(&original, &staging)
             .map_err(|error| bidirectional_effect_error(error, &[&original, &staging]))?;
         sync_rollback_parents(vfs, &original, &staging)?;
@@ -5819,8 +6429,16 @@ fn ensure_rollback_quarantine(
         )?;
         return Ok(existing.run_root.clone());
     }
-    let base = target_parent.join(".doppeldecker-quarantine");
-    crate::real_mode::ensure_quarantine_root(vfs, target_parent, &base)?;
+    let quarantine_parent = if crate::real_mode::is_home_root(target_root)? {
+        target_root
+    } else {
+        target_parent
+    };
+    let base = quarantine_parent.join(".doppeldecker-quarantine");
+    crate::real_mode::ensure_quarantine_root(vfs, quarantine_parent, &base)?;
+    if quarantine_parent == target_root {
+        crate::real_mode::protect_internal_quarantine(vfs, &base)?;
+    }
     let run_root = crate::real_mode::reserve_quarantine_run_name(vfs, &base)?;
     journal
         .rollback_quarantines
@@ -6068,6 +6686,7 @@ fn sync_recovered_rollback_unit(
 }
 
 struct LocalProjectionContext {
+    staging: crate::real_mode::RunStagingBinding,
     left_vfs: Arc<dyn Vfs>,
     right_vfs: Arc<dyn Vfs>,
     left_endpoint: crate::ProviderEndpoint,
@@ -6103,6 +6722,7 @@ fn prepare_projection_runs(
     allowed_ordinals: Option<&BTreeSet<usize>>,
     allow_deferred_deletions: bool,
 ) -> io::Result<(Vec<crate::PreparedProviderRealRun>, Vec<usize>, Vec<usize>)> {
+    context.staging.check(false, false)?;
     let projections = planned_projections(plan)?;
     let first_type_swap = projections.iter().position(|entry| {
         matches!(
@@ -6181,7 +6801,7 @@ fn prepare_projection_runs(
                     aliases,
                 )?);
                 let mode = additive_projection_mode(&target_endpoint)?;
-                crate::remote_real_mode::prepare_projected_provider_transfer(
+                crate::remote_real_mode::prepare_projected_provider_transfer_guarded(
                     projection,
                     target_root.clone(),
                     target_endpoint,
@@ -6192,6 +6812,7 @@ fn prepare_projection_runs(
                         mtime_tolerance: 2,
                         exclude: Vec::new(),
                     },
+                    Some(context.staging.clone()),
                 )?
             }
             BidirectionalProjectionKind::Copy {
@@ -6227,7 +6848,7 @@ fn prepare_projection_runs(
                 } else {
                     additive_projection_mode(&target_endpoint)?
                 };
-                crate::remote_real_mode::prepare_projected_provider_transfer(
+                crate::remote_real_mode::prepare_projected_provider_transfer_guarded(
                     projection,
                     target_root.clone(),
                     target_endpoint,
@@ -6238,6 +6859,7 @@ fn prepare_projection_runs(
                         mtime_tolerance: 2,
                         exclude: Vec::new(),
                     },
+                    Some(context.staging.clone()),
                 )?
             }
             BidirectionalProjectionKind::Delete { direction, paths } => {
@@ -6264,7 +6886,7 @@ fn prepare_projection_runs(
                     BTreeSet::new(),
                     deleted,
                 )?);
-                crate::remote_real_mode::prepare_projected_provider_transfer(
+                crate::remote_real_mode::prepare_projected_provider_transfer_guarded(
                     projection,
                     target_root.clone(),
                     target_endpoint,
@@ -6275,6 +6897,7 @@ fn prepare_projection_runs(
                         mtime_tolerance: 2,
                         exclude: Vec::new(),
                     },
+                    Some(context.staging.clone()),
                 )?
             }
             BidirectionalProjectionKind::TypeSwap { .. } => {
@@ -6297,6 +6920,7 @@ impl LocalProjectionContext {
         right_endpoint: crate::ProviderEndpoint,
         left_root: PathBuf,
         right_root: PathBuf,
+        staging: crate::real_mode::RunStagingBinding,
     ) -> io::Result<Self> {
         if left_endpoint.root() != left_root || right_endpoint.root() != right_root {
             return Err(invalid_input(
@@ -6304,6 +6928,7 @@ impl LocalProjectionContext {
             ));
         }
         Ok(Self {
+            staging,
             left_vfs,
             right_vfs,
             left_endpoint,
@@ -6318,6 +6943,7 @@ impl LocalProjectionContext {
         right_vfs: Arc<dyn Vfs>,
         left_root: PathBuf,
         right_root: PathBuf,
+        staging: crate::real_mode::RunStagingBinding,
     ) -> io::Result<Self> {
         Self::new(
             left_vfs,
@@ -6326,6 +6952,7 @@ impl LocalProjectionContext {
             crate::ProviderEndpoint::local(&right_root)?,
             left_root,
             right_root,
+            staging,
         )
     }
 
@@ -6353,6 +6980,113 @@ impl LocalProjectionContext {
             ),
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn strict_test_queue(baseline: &Path) -> crate::OperationQueue {
+    use std::sync::{Mutex, OnceLock, Weak};
+    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<crate::OperationQueueProcessLock>>>> =
+        OnceLock::new();
+    let path = baseline
+        .parent()
+        .unwrap()
+        .join("strict-registry/queue.json");
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap();
+    if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
+        return crate::OperationQueue::open_with_process_lock(path, lock).unwrap();
+    }
+    let queue = crate::OperationQueue::open(&path).unwrap();
+    locks.insert(path, Arc::downgrade(&queue.ftps_owner(None).unwrap().1));
+    queue
+}
+
+fn strict_queue_context_required() -> io::Error {
+    crate::coded_error(io::ErrorKind::Unsupported, crate::ErrorCode::Unsupported,
+        "Strikter bidirektionaler Sync benötigt den privaten Registrykontext der Fensterqueue; den passenden *_for_queue-Einstieg verwenden")
+}
+
+fn validate_strict_queue_operation(
+    queue: &crate::OperationQueue,
+    operation_id: Option<&str>,
+    baseline_path: &Path,
+) -> io::Result<()> {
+    let Some(operation_id) = operation_id else {
+        return Ok(());
+    };
+    let snapshot = queue.snapshot();
+    let entry = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.operation_id == operation_id)
+        .ok_or_else(|| invalid_input("Bidirektionaler Stagingowner besitzt keinen Queueeintrag"))?;
+    if !matches!(&entry.operation, crate::QueueOperation::Bidirectional { baseline_path: expected, .. }
+        if Path::new(expected) == baseline_path)
+    {
+        return Err(crate::real_mode::plan_drift(
+            "Bidirektionaler Stagingowner gehört nicht zur gebundenen Baseline",
+        ));
+    }
+    queue.ftps_owner(Some(operation_id))?;
+    Ok(())
+}
+
+fn strict_staging_binding(
+    queue: &crate::OperationQueue,
+    operation_id: Option<&str>,
+    left_vfs: Arc<dyn Vfs>,
+    left_root: &Path,
+    right_vfs: Arc<dyn Vfs>,
+    right_root: &Path,
+    bindings: Option<(&EndpointBinding, &EndpointBinding)>,
+) -> io::Result<crate::real_mode::RunStagingBinding> {
+    let (owner, _, _) = queue.ftps_owner(operation_id)?;
+    let endpoints = [
+        (left_vfs, left_root, bindings.map(|b| b.0)),
+        (right_vfs, right_root, bindings.map(|b| b.1)),
+    ]
+    .map(|(vfs, root, binding)| {
+        let identity = vfs.root_identity(root)?;
+        let binding = if let Some(binding) = binding {
+            binding.clone()
+        } else {
+            match &identity {
+                RootIdentity::Local(_) => EndpointBinding::local(&identity)?,
+                _ => {
+                    // Den Accountdigest liefert ausschließlich der authentisierte Endpunkt.
+                    return Err(invalid_input(
+                        "Remote-Stagingbindung benötigt den authentisierten Account",
+                    ));
+                }
+            }
+        };
+        Ok(crate::staging_guard::StagingEndpoint {
+            vfs,
+            root: root.to_path_buf(),
+            binding,
+        })
+    });
+    let [left, right] = endpoints;
+    crate::real_mode::RunStagingBinding::new_bidirectional(
+        crate::staging_guard::KnownStagingRegistry::for_queue(queue)?,
+        [left?, right?],
+        owner,
+    )
+}
+
+fn guarded_local_snapshots(
+    left_vfs: &dyn Vfs,
+    left_root: &Path,
+    right_vfs: &dyn Vfs,
+    right_root: &Path,
+    staging: &crate::real_mode::RunStagingBinding,
+) -> io::Result<(TreeSnapshot, TreeSnapshot)> {
+    staging.check(false, false)?;
+    let snapshots = final_local_snapshots(left_vfs, left_root, right_vfs, right_root)?;
+    staging.check(false, false)?;
+    Ok(snapshots)
 }
 
 fn final_local_snapshots(
@@ -6593,21 +7327,110 @@ fn local_stage_blocker(plan: &BidirectionalPlan) -> Option<String> {
     if let Some(reason) = initial_one_sided_skip_blocker(plan) {
         return Some(reason);
     }
-    local_type_swap_stage_blocker(plan)
+    None
 }
 
-fn local_type_swap_stage_blocker(plan: &BidirectionalPlan) -> Option<String> {
-    let type_swaps = plan
-        .actions
-        .iter()
-        .filter(|action| matches!(action, BidirectionalAction::TypeSwap { .. }))
-        .count();
-    if type_swaps > 100 {
-        return Some(format!(
-            "{type_swaps} Typwechsel überschreiten die feste Grenze von 100 Ersetzungen"
-        ));
+fn local_sync_vfs(
+    parent: &Path,
+    root: &Path,
+    protect_quarantine: bool,
+) -> io::Result<Arc<crate::LocalVfs>> {
+    let vfs = crate::LocalVfs::rooted(parent)?;
+    Ok(Arc::new(if protect_quarantine {
+        vfs.with_sync_protected_entry(root)
+    } else {
+        vfs
+    }))
+}
+
+fn bidirectional_scope_warnings(
+    plan: &BidirectionalPlan,
+    left: &TreeSnapshot,
+    left_root: &Path,
+    right: &TreeSnapshot,
+    right_root: &Path,
+) -> io::Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    for (snapshot, root) in [(left, left_root), (right, right_root)] {
+        if matches!(snapshot.root_identity, RootIdentity::Local(_)) {
+            warnings.extend(crate::real_mode::target_scope_warnings(root)?);
+        }
     }
-    None
+    for (direction, target_side, source, target, label) in [
+        (
+            SyncDirection::LeftToRight,
+            EndpointSide::Right,
+            left,
+            right,
+            "Links → Rechts",
+        ),
+        (
+            SyncDirection::RightToLeft,
+            EndpointSide::Left,
+            right,
+            left,
+            "Rechts → Links",
+        ),
+    ] {
+        let (mut copies, mut replacements, mut conflict_copies) = (0, 0, 0);
+        let mut deleted = BTreeSet::new();
+        for action in &plan.actions {
+            match action {
+                BidirectionalAction::Copy {
+                    direction: action_direction,
+                    expected_target,
+                    ..
+                } if *action_direction == direction => {
+                    if expected_target.is_some() {
+                        replacements += 1;
+                    } else {
+                        copies += 1;
+                    }
+                }
+                BidirectionalAction::TypeSwap {
+                    direction: action_direction,
+                    ..
+                } if *action_direction == direction => replacements += 1,
+                BidirectionalAction::ConflictCopy {
+                    target_side: side, ..
+                } if *side == target_side => conflict_copies += 1,
+                BidirectionalAction::Delete {
+                    direction: action_direction,
+                    path,
+                    ..
+                } if *action_direction == direction => {
+                    deleted.insert(path.clone());
+                }
+                _ => {}
+            }
+        }
+        let (mut removed, mut bytes) = (0_u64, 0_u64);
+        if !deleted.is_empty() {
+            // Unterbäume zählen jeden Eintrag einmal, auch wenn der Plan einen
+            // absorbierten Ordner statt aller Kinder als einzelne Aktion führt.
+            for record in &target.entries {
+                if (1..=record.path.0.len()).any(|depth| {
+                    deleted.contains(&BinaryRelativePath(record.path.0[..depth].to_vec()))
+                }) {
+                    removed += 1;
+                    if record.entry.kind == SnapshotEntryKind::File {
+                        bytes = bytes.saturating_add(record.entry.size);
+                    }
+                }
+            }
+        }
+        warnings.push(format!("{label}: {copies} additive Pfade, {replacements} Ersetzungen/Typwechsel, {conflict_copies} Konfliktkopien; {removed} Einträge mit {bytes} Byte in Quarantäne entfernen ({} Löschpfade).", deleted.len()));
+        if removed > 0 {
+            if source.entries.is_empty() {
+                warnings.push(format!("{label}: Die Quelle ist leer; die bestätigten Löschungen werden trotzdem übernommen."));
+            }
+            let total = target.entries.len() as u64;
+            if removed > 50 || removed.saturating_mul(100) >= total.saturating_mul(5) {
+                warnings.push(format!("{label}: Umfangreiche Entfernung: {removed} von {total} Zieleinträgen ({:.1} %), {bytes} Byte. Wiederherstellung erfolgt über die Quarantäne.", removed as f64 * 100.0 / total.max(1) as f64));
+            }
+        }
+    }
+    Ok(warnings)
 }
 
 #[derive(Default)]
@@ -6799,24 +7622,6 @@ fn provider_plan_stage_blocker(plan: &BidirectionalPlan) -> Option<String> {
     }
     if let Some(reason) = initial_one_sided_skip_blocker(plan) {
         return Some(reason);
-    }
-    let replacements = plan
-        .actions
-        .iter()
-        .filter(|action| {
-            matches!(
-                action,
-                BidirectionalAction::Copy {
-                    expected_target: Some(_),
-                    ..
-                }
-            )
-        })
-        .count();
-    if replacements > 100 {
-        return Some(format!(
-            "{replacements} Dateiersetzungen überschreiten die feste Grenze von 100 Ersetzungen"
-        ));
     }
     None
 }
@@ -7255,6 +8060,13 @@ impl BaselineStore {
     }
 
     pub fn load_run_journal(&self) -> io::Result<Option<BidirectionalRunJournal>> {
+        if forward::has_active_forward_journal(self)? {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Offenes Best-Effort-Forwardjournal verlangt eine neue Wirkungsplanung gegen die gemeinsame Baseline"));
+        }
+        self.load_strict_run_journal()
+    }
+
+    fn load_strict_run_journal(&self) -> io::Result<Option<BidirectionalRunJournal>> {
         let path = self.run_journal_path();
         let Some((_, payload)) = read_store_payload(&path, MAX_RUN_JOURNAL_BYTES)? else {
             return Ok(None);
@@ -7766,11 +8578,13 @@ fn normalize_type_swap_step(
     endpoints: LocalEndpointPair<'_>,
 ) -> io::Result<bool> {
     let LocalEndpointPair {
+        staging_guard,
         left_vfs,
         left_root,
         right_vfs,
         right_root,
     } = endpoints;
+    staging_guard.check(false, false)?;
     let Some(step) = journal.type_swap_step.clone() else {
         return Ok(false);
     };
@@ -7909,11 +8723,12 @@ fn normalize_type_swap_step(
     // Vorzustand wieder her, ohne dass der Originalname jemals fehlt.
     let original = root.join(relative);
     let staging = root.join(staging_relative);
+    staging_guard.check(false, false)?;
     vfs.rename_exchange(&original, &staging)
         .map_err(|error| bidirectional_effect_error(error, &[&original, &staging]))?;
     sync_rollback_parents(vfs, &original, &staging)?;
     let (restored_left, restored_right) =
-        final_local_snapshots(left_vfs, left_root, right_vfs, right_root)?;
+        guarded_local_snapshots(left_vfs, left_root, right_vfs, right_root, staging_guard)?;
     if !snapshots_match_projection_prefix(journal, &restored_left, &restored_right, ordinal)? {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -7985,11 +8800,13 @@ fn normalize_rollback_step(
     endpoints: LocalEndpointPair<'_>,
 ) -> io::Result<usize> {
     let LocalEndpointPair {
+        staging_guard,
         left_vfs,
         left_root,
         right_vfs,
         right_root,
     } = endpoints;
+    staging_guard.check(false, false)?;
     let step = journal
         .rollback_step
         .clone()
@@ -8890,6 +9707,207 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_queue(baseline: &Path) -> crate::OperationQueue {
+        strict_test_queue(baseline)
+    }
+
+    fn prepare_local_bidirectional(
+        pair_id: PairId,
+        pair_name: &str,
+        left: &Path,
+        right: &Path,
+        baseline_path: &Path,
+    ) -> io::Result<PreparedLocalBidirectionalRun> {
+        super::prepare_local_bidirectional_with_decisions_bound_for_queue(
+            &fixture_queue(baseline_path),
+            pair_id,
+            pair_name,
+            left,
+            right,
+            baseline_path,
+            &[],
+            None,
+        )
+    }
+    fn prepare_local_bidirectional_with_decisions(
+        pair_id: PairId,
+        pair_name: &str,
+        left: &Path,
+        right: &Path,
+        baseline_path: &Path,
+        resolutions: &[ConflictResolution],
+    ) -> io::Result<PreparedLocalBidirectionalRun> {
+        super::prepare_local_bidirectional_with_decisions_bound_for_queue(
+            &fixture_queue(baseline_path),
+            pair_id,
+            pair_name,
+            left,
+            right,
+            baseline_path,
+            resolutions,
+            None,
+        )
+    }
+    fn prepare_local_bidirectional_with_decisions_bound(
+        pair_id: PairId,
+        pair_name: &str,
+        left: &Path,
+        right: &Path,
+        baseline_path: &Path,
+        resolutions: &[ConflictResolution],
+        expected_unresolved_digest: Option<[u8; 32]>,
+    ) -> io::Result<PreparedLocalBidirectionalRun> {
+        super::prepare_local_bidirectional_with_decisions_bound_for_queue(
+            &fixture_queue(baseline_path),
+            pair_id,
+            pair_name,
+            left,
+            right,
+            baseline_path,
+            resolutions,
+            expected_unresolved_digest,
+        )
+    }
+    fn prepare_provider_bidirectional_with_decisions(
+        pair_id: PairId,
+        pair_name: &str,
+        left: crate::ProviderEndpoint,
+        right: crate::ProviderEndpoint,
+        baseline_path: &Path,
+        resolutions: &[ConflictResolution],
+    ) -> io::Result<PreparedProviderBidirectionalRun> {
+        super::prepare_provider_bidirectional_with_decisions_bound_for_queue(
+            &fixture_queue(baseline_path),
+            pair_id,
+            pair_name,
+            left,
+            right,
+            baseline_path,
+            resolutions,
+            None,
+        )
+    }
+
+    fn plan_provider_bidirectional(
+        pair_id: PairId,
+        left: &crate::ProviderEndpoint,
+        right: &crate::ProviderEndpoint,
+        baseline_path: &Path,
+        resolutions: &[ConflictResolution],
+    ) -> io::Result<ProviderBidirectionalPlanPreview> {
+        super::plan_provider_bidirectional_for_queue(
+            &fixture_queue(baseline_path),
+            pair_id,
+            left,
+            right,
+            baseline_path,
+            resolutions,
+        )
+    }
+    fn prepare_resume_local_bidirectional(
+        pair_name: &str,
+        left: &Path,
+        right: &Path,
+        baseline_path: &Path,
+    ) -> io::Result<PreparedLocalBidirectionalRun> {
+        super::prepare_resume_local_bidirectional_for_queue(
+            &fixture_queue(baseline_path),
+            pair_name,
+            left,
+            right,
+            baseline_path,
+        )
+    }
+    fn prepare_resume_provider_bidirectional(
+        pair_name: &str,
+        left: crate::ProviderEndpoint,
+        right: crate::ProviderEndpoint,
+        baseline_path: &Path,
+    ) -> io::Result<PreparedProviderBidirectionalRun> {
+        super::prepare_resume_provider_bidirectional_for_queue(
+            &fixture_queue(baseline_path),
+            pair_name,
+            left,
+            right,
+            baseline_path,
+        )
+    }
+    fn prepare_local_bidirectional_rollback(
+        pair_name: &str,
+        left: &Path,
+        right: &Path,
+        baseline_path: &Path,
+    ) -> io::Result<PreparedLocalBidirectionalRollback> {
+        super::prepare_local_bidirectional_rollback_for_queue(
+            &fixture_queue(baseline_path),
+            pair_name,
+            left,
+            right,
+            baseline_path,
+        )
+    }
+    fn prepare_provider_bidirectional_rollback(
+        pair_name: &str,
+        left: crate::ProviderEndpoint,
+        right: crate::ProviderEndpoint,
+        baseline_path: &Path,
+    ) -> io::Result<PreparedProviderBidirectionalRollback> {
+        super::prepare_provider_bidirectional_rollback_for_queue(
+            &fixture_queue(baseline_path),
+            pair_name,
+            left,
+            right,
+            baseline_path,
+        )
+    }
+    fn prepare_sftp_bidirectional_with_decisions(
+        pair_id: PairId,
+        pair_name: &str,
+        left: crate::ProviderEndpoint,
+        right: crate::ProviderEndpoint,
+        baseline_path: &Path,
+        resolutions: &[ConflictResolution],
+    ) -> io::Result<PreparedProviderBidirectionalRun> {
+        super::prepare_provider_bidirectional_with_decisions_bound_for_queue(
+            &fixture_queue(baseline_path),
+            pair_id,
+            pair_name,
+            left,
+            right,
+            baseline_path,
+            resolutions,
+            None,
+        )
+    }
+    fn prepare_resume_sftp_bidirectional(
+        pair_name: &str,
+        left: crate::ProviderEndpoint,
+        right: crate::ProviderEndpoint,
+        baseline_path: &Path,
+    ) -> io::Result<PreparedProviderBidirectionalRun> {
+        super::prepare_resume_provider_bidirectional_for_queue(
+            &fixture_queue(baseline_path),
+            pair_name,
+            left,
+            right,
+            baseline_path,
+        )
+    }
+    fn prepare_sftp_bidirectional_rollback(
+        pair_name: &str,
+        left: crate::ProviderEndpoint,
+        right: crate::ProviderEndpoint,
+        baseline_path: &Path,
+    ) -> io::Result<PreparedProviderBidirectionalRollback> {
+        super::prepare_provider_bidirectional_rollback_for_queue(
+            &fixture_queue(baseline_path),
+            pair_name,
+            left,
+            right,
+            baseline_path,
+        )
+    }
     use crate::remote::{SftpHostKeyPin, SftpRootIdentity, SftpServerIdentity};
     use crate::vfs::LocalVfs;
     use std::os::unix::fs::PermissionsExt;
@@ -8901,6 +9919,7 @@ mod tests {
         bytes_read: Arc<std::sync::atomic::AtomicUsize>,
         failed_sync: Option<PathBuf>,
         scan_failure: Option<&'static str>,
+        on_root: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     struct CountedReader {
@@ -8998,6 +10017,9 @@ mod tests {
             self.inner.rename_noreplace(from, to)
         }
         fn root_identity(&self, path: &Path) -> io::Result<RootIdentity> {
+            if let Some(hook) = &self.on_root {
+                hook();
+            }
             if self.scan_failure == Some("root") {
                 return Err(crate::error::with_recovery_paths(
                     crate::coded_error(
@@ -9025,6 +10047,7 @@ mod tests {
             prepare_sftp_bidirectional_rollback("Recovery-fsync", left, right, &baseline).unwrap();
         let phrase = prepared.preview().confirmation_phrase.clone();
         let LocalBidirectionalRollback {
+            staging: _staging,
             left_root,
             right_root,
             left_vfs,
@@ -9053,6 +10076,7 @@ mod tests {
             bytes_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             failed_sync: Some(right_root.clone()),
             scan_failure: None,
+            on_root: None,
         };
         assert!(quarantine_rollback_entry(
             &vfs,
@@ -9071,6 +10095,7 @@ mod tests {
             &current_right,
             1,
             LocalEndpointPair {
+                staging_guard: &_staging,
                 left_vfs: left_vfs.as_ref(),
                 left_root: &left_root,
                 right_vfs: &vfs,
@@ -9172,6 +10197,7 @@ mod tests {
                 bytes_read: count.clone(),
                 failed_sync: None,
                 scan_failure: None,
+                on_root: None,
             };
             let result = build_tree_snapshot(
                 &vfs,
@@ -9262,6 +10288,7 @@ mod tests {
             bytes_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             failed_sync: Some(fixture.left.clone()),
             scan_failure: None,
+            on_root: None,
         };
         let base = parent.join(".doppeldecker-quarantine");
         crate::real_mode::ensure_quarantine_root(&vfs, parent, &base).unwrap();
@@ -9292,6 +10319,7 @@ mod tests {
                 bytes_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 failed_sync: None,
                 scan_failure: Some(fault),
+                on_root: None,
             };
             let error = build_tree_snapshot(
                 &vfs,
@@ -9328,6 +10356,7 @@ mod tests {
                 bytes_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 failed_sync: Some(target.clone()),
                 scan_failure: None,
+                on_root: None,
             };
             let delta = ProjectionDelta {
                 side: EndpointSide::Left,
@@ -9486,7 +10515,7 @@ mod tests {
     }
 
     #[test]
-    fn ap02_spaetere_konfliktentscheidung_beruecksichtigt_fruehere_mengengrenzen() {
+    fn spaetere_konfliktentscheidung_bleibt_ueber_frueherer_anteilsgrenze_moeglich() {
         let fixture = Fixture::new();
         for index in 0..20 {
             let name = format!("gleich-{index}");
@@ -9521,10 +10550,7 @@ mod tests {
         assert!(after[0].choices.iter().any(|choice| matches!(
             choice.decision,
             ConflictDecision::KeepRight
-        ) && choice
-            .blocker
-            .as_ref()
-            .is_some_and(|reason| reason.contains("5 %"))));
+        ) && choice.blocker.as_ref().is_none()));
         assert!(prepared
             .conflict_choices_after_decisions(&[], [0; 32])
             .is_err());
@@ -9532,7 +10558,7 @@ mod tests {
     }
 
     #[test]
-    fn spaetere_konfliktwahl_zeigt_die_erreichte_typwechselgrenze() {
+    fn mehr_als_hundert_typwechsel_bleiben_mit_wirkungsbestaetigung_moeglich() {
         let fixture = Fixture::new();
         let mut resolutions = Vec::new();
         for index in 0..101 {
@@ -9569,7 +10595,7 @@ mod tests {
             &resolutions,
         )
         .unwrap();
-        assert!(over_limit.preview().stage_blocker.is_some());
+        assert!(over_limit.preview().stage_blocker.is_none());
         over_limit.discard().unwrap();
         drop(over_limit);
         assert_eq!(choices.len(), 1);
@@ -9581,22 +10607,10 @@ mod tests {
             .choices
             .iter()
             .any(|choice| matches!(choice.decision, ConflictDecision::KeepLeft)));
-        for choice in &choices[0].choices {
-            if matches!(choice.decision, ConflictDecision::Skip) {
-                assert!(choice.blocker.is_none());
-            } else {
-                assert!(
-                    choice.blocker.is_some(),
-                    "Nicht ausführbare Typwechselwahl bleibt angeboten: {:?}",
-                    choice.decision
-                );
-            }
-        }
-        assert!(BaselineStore::open(&baseline)
-            .unwrap()
-            .load_run_journal()
-            .unwrap()
-            .is_none());
+        assert!(choices[0]
+            .choices
+            .iter()
+            .all(|choice| choice.blocker.is_none()));
         for index in 0..101 {
             let name = format!("konflikt-{index:03}");
             assert_eq!(std::fs::read(fixture.left.join(&name)).unwrap(), b"links");
@@ -10118,11 +11132,13 @@ mod tests {
         let phrase = prepared.preview().confirmation_phrase.clone();
         let run = prepared.confirm(&phrase, true).unwrap();
         let LocalBidirectionalRun {
+            staging: _staging,
             left_root,
             right_root,
             left_vfs,
             right_vfs,
             store,
+            expires_at,
             runs,
             run_ordinals,
             deferred_run_ordinals,
@@ -10155,7 +11171,9 @@ mod tests {
         execute_local_type_swap_projection(
             &store,
             1,
+            expires_at,
             LocalEndpointPair {
+                staging_guard: &_staging,
                 left_vfs: left_vfs.as_ref(),
                 left_root: &left_root,
                 right_vfs: right_vfs.as_ref(),
@@ -11645,7 +12663,7 @@ mod tests {
             let phrase = prepared.preview().confirmation_phrase.clone();
             let run = prepared.confirm(&phrase, true).unwrap();
             let LocalBidirectionalRun {
-                store,
+            staging: _staging,                store,
                 runs,
                 run_ordinals,
                 ..
@@ -11759,7 +12777,7 @@ mod tests {
             let phrase = prepared.preview().confirmation_phrase.clone();
             let run = prepared.confirm(&phrase, true).unwrap();
             let LocalBidirectionalRun {
-                store,
+            staging: _staging,                store,
                 runs,
                 run_ordinals,
                 ..
@@ -12634,7 +13652,7 @@ mod tests {
     }
 
     #[test]
-    fn konflikt_und_loeschung_bleiben_in_stufe_drei_ohne_mutation() {
+    fn konflikt_bleibt_offen_und_vollstaendige_loeschung_verlangt_wirkungsbestaetigung() {
         let fixture = Fixture::new();
         write(&fixture.left.join("a"), "alt");
         write(&fixture.right.join("a"), "alt");
@@ -12671,8 +13689,24 @@ mod tests {
             &deleted.right,
             &deleted_baseline,
         );
-        assert!(deletion.is_err());
+        let deletion = deletion.unwrap();
+        assert!(deletion.preview().stage_blocker.is_none());
+        assert!(deletion.confirm_effects(false).is_err());
         assert_eq!(std::fs::read(deleted.right.join("a")).unwrap(), b"alt");
+        let stats = prepare_local_bidirectional(
+            deleted_pair,
+            "Löschtest",
+            &deleted.left,
+            &deleted.right,
+            &deleted_baseline,
+        )
+        .unwrap()
+        .confirm_effects(true)
+        .unwrap()
+        .execute(&crate::Cancel::new(), &mut ignore_progress)
+        .unwrap();
+        assert!(!deleted.right.join("a").exists());
+        assert_eq!(stats.runs[0].files_deleted, 1);
     }
 
     #[test]
@@ -13033,6 +14067,7 @@ mod tests {
         let phrase = prepared.preview().confirmation_phrase.clone();
         let run = prepared.confirm(&phrase, true).unwrap();
         let LocalBidirectionalRun {
+            staging: _staging,
             left_root,
             right_root,
             right_vfs,
@@ -13150,6 +14185,7 @@ mod tests {
         let phrase = prepared.preview().confirmation_phrase.clone();
         let run = prepared.confirm(&phrase, true).unwrap();
         let LocalBidirectionalRun {
+            staging: _staging,
             left_root,
             right_root,
             left_vfs: _,
@@ -13273,11 +14309,13 @@ mod tests {
         let phrase = prepared.preview().confirmation_phrase.clone();
         let run = prepared.confirm(&phrase, true).unwrap();
         let LocalBidirectionalRun {
+            staging: _staging,
             left_root,
             right_root,
             left_vfs,
             right_vfs,
             store,
+            expires_at,
             runs,
             run_ordinals,
             deferred_run_ordinals,
@@ -13309,7 +14347,9 @@ mod tests {
         execute_local_type_swap_projection(
             &store,
             1,
+            expires_at,
             LocalEndpointPair {
+                staging_guard: &_staging,
                 left_vfs: left_vfs.as_ref(),
                 left_root: &left_root,
                 right_vfs: right_vfs.as_ref(),
@@ -13329,6 +14369,7 @@ mod tests {
         let phrase = prepared.preview().confirmation_phrase.clone();
         let rollback = prepared.confirm(&phrase).unwrap();
         let LocalBidirectionalRollback {
+            staging: _staging,
             right_root,
             right_vfs,
             store,
@@ -14704,6 +15745,7 @@ mod tests {
         let phrase = prepared.preview().confirmation_phrase.clone();
         let run = prepared.confirm(&phrase, true).unwrap();
         let LocalBidirectionalRun {
+            staging: _staging,
             store,
             runs,
             run_ordinals,
@@ -14794,6 +15836,7 @@ mod tests {
         let phrase = prepared.preview().confirmation_phrase.clone();
         let rollback = prepared.confirm(&phrase).unwrap();
         let LocalBidirectionalRollback {
+            staging: _staging,
             left_root,
             left_vfs,
             store,
@@ -14878,6 +15921,7 @@ mod tests {
         let phrase = prepared.preview().confirmation_phrase.clone();
         let run = prepared.confirm(&phrase, true).unwrap();
         let LocalBidirectionalRun {
+            staging: _staging,
             store,
             runs,
             run_ordinals,
@@ -14990,6 +16034,7 @@ mod tests {
         let phrase = prepared.preview().confirmation_phrase.clone();
         let run = prepared.confirm(&phrase, true).unwrap();
         let LocalBidirectionalRun {
+            staging: _staging,
             store,
             runs,
             run_ordinals,
@@ -15028,6 +16073,7 @@ mod tests {
         let phrase = prepared.preview().confirmation_phrase.clone();
         let rollback = prepared.confirm(&phrase).unwrap();
         let LocalBidirectionalRollback {
+            staging: _staging,
             right_root,
             right_vfs,
             store,
@@ -15122,6 +16168,7 @@ mod tests {
         let phrase = prepared.preview().confirmation_phrase.clone();
         let run = prepared.confirm(&phrase, true).unwrap();
         let LocalBidirectionalRun {
+            staging: _staging,
             store,
             runs,
             run_ordinals,
@@ -15296,5 +16343,893 @@ mod tests {
             .to_string()
             .contains("weder fortsetzen noch neu planen"));
         assert!(path.exists());
+    }
+    fn registry_neighbor(
+        queue: &crate::OperationQueue,
+        root: &Path,
+    ) -> crate::local_staging::NeighborStaging {
+        let (mut owner, _, _) = queue.ftps_owner(None).unwrap();
+        owner
+            .queue
+            .set_file_name("operations-queue-other-window.json");
+        let target = root.join("transferziel");
+        let intent = crate::local_staging::NeighborStaging::create(&owner, &target, None)
+            .unwrap()
+            .unwrap();
+        intent.candidate(&root.join("angefangener-inhalt")).unwrap();
+        intent
+    }
+
+    fn registry_prepare(
+        queue: &crate::OperationQueue,
+        fixture: &Fixture,
+        baseline: &Path,
+    ) -> PreparedLocalBidirectionalRun {
+        super::prepare_local_bidirectional_with_decisions_bound_for_queue(
+            queue,
+            PairId([202; 16]),
+            "Registrytest",
+            &fixture.left,
+            &fixture.right,
+            baseline,
+            &[],
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn strict_registry_privater_stage_aller_fenster_stoppt_planung_ohne_namensfilter() {
+        for on_left in [true, false] {
+            for crashed in [true, false] {
+                let fixture = Fixture::new();
+                let baseline = fixture._temp.path().join("state/pair.json");
+                let queue = fixture_queue(&baseline);
+                let root = if on_left {
+                    &fixture.left
+                } else {
+                    &fixture.right
+                };
+                std::fs::set_permissions(
+                    root,
+                    <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+                )
+                .unwrap();
+                let (mut owner, _, _) = queue.ftps_owner(None).unwrap();
+                owner
+                    .queue
+                    .set_file_name("operations-queue-other-window.json");
+                let held_root = crate::local_fs::RootHandle::open_nofollow(root).unwrap();
+                let stage = crate::local_staging::LocalStaging::create(
+                    Some(&held_root),
+                    None,
+                    &root.join("datei"),
+                    None,
+                    Some(&owner),
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+                let payload = stage.candidate(&root.join("datei"), "copy").unwrap();
+                write(&payload, "angefangene Nutzdaten");
+                let stage = if crashed {
+                    drop(stage);
+                    None
+                } else {
+                    Some(stage)
+                };
+                let error = super::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                    &queue,
+                    PairId([202; 16]),
+                    "Registrytest",
+                    &fixture.left,
+                    &fixture.right,
+                    &baseline,
+                    &[],
+                    None,
+                )
+                .err()
+                .expect("Bekannter privater Arbeitsbaum darf nicht in den Plan gelangen");
+                assert_eq!(crate::error_code(&error), crate::ErrorCode::OutcomeUnclear);
+                assert!(!crate::error::recovery_paths(&error).is_empty());
+                assert_eq!(std::fs::read(&payload).unwrap(), b"angefangene Nutzdaten");
+                assert!(!baseline.exists());
+                assert!(!baseline.with_extension("run.json").exists());
+                assert_eq!(
+                    std::fs::read_dir(if on_left {
+                        &fixture.right
+                    } else {
+                        &fixture.left
+                    })
+                    .unwrap()
+                    .count(),
+                    0
+                );
+                drop(stage);
+            }
+        }
+        let fixture = Fixture::new();
+        let baseline = fixture._temp.path().join("state/lookalike.json");
+        prepare_and_run(&fixture, PairId([202; 16]), &baseline, false);
+        write(
+            &fixture.left.join(".doppeldecker-stage-benutzerdaten"),
+            "normaler Inhalt",
+        );
+        prepare_and_run(&fixture, PairId([202; 16]), &baseline, false);
+        assert_eq!(
+            std::fs::read(fixture.right.join(".doppeldecker-stage-benutzerdaten")).unwrap(),
+            b"normaler Inhalt"
+        );
+    }
+
+    #[test]
+    fn strict_registry_aktiver_transfer_sperrt_auch_vor_sichtbarer_datei() {
+        for on_left in [true, false] {
+            let fixture = Fixture::new();
+            let baseline = fixture._temp.path().join("state/pair.json");
+            let queue = fixture_queue(&baseline);
+            let root = if on_left {
+                &fixture.left
+            } else {
+                &fixture.right
+            };
+            let intent = registry_neighbor(&queue, root);
+            assert!(!root.join("angefangener-inhalt").exists());
+            let error = super::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &queue,
+                PairId([202; 16]),
+                "Registrytest",
+                &fixture.left,
+                &fixture.right,
+                &baseline,
+                &[],
+                None,
+            )
+            .err()
+            .expect("Die aktive Lease muss vor Journal und Probe sperren");
+            assert_eq!(crate::error_code(&error), crate::ErrorCode::OutcomeUnclear);
+            assert!(crate::error::recovery_paths(&error)
+                .iter()
+                .any(|path| Path::new(path) == root.join("angefangener-inhalt")));
+            intent.finish().unwrap();
+            registry_prepare(&queue, &fixture, &baseline)
+                .discard()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn strict_registry_drift_und_aba_nach_permit_stoppen_vor_erster_wirkung() {
+        for aba in [false, true] {
+            let fixture = Fixture::new();
+            let baseline = fixture._temp.path().join("state/pair.json");
+            prepare_and_run(&fixture, PairId([202; 16]), &baseline, false);
+            let old_baseline = std::fs::read(&baseline).unwrap();
+            write(&fixture.left.join("neu"), "links");
+            let queue = fixture_queue(&baseline);
+            let run = registry_prepare(&queue, &fixture, &baseline)
+                .confirm_effects(true)
+                .unwrap();
+            let intent = registry_neighbor(&queue, &fixture.left);
+            if aba {
+                intent.finish().unwrap();
+            }
+            let error = run
+                .execute(&crate::Cancel::new(), &mut ignore_progress)
+                .unwrap_err();
+            assert_eq!(
+                crate::error_code(&error),
+                if aba {
+                    crate::ErrorCode::PlanDrift
+                } else {
+                    crate::ErrorCode::OutcomeUnclear
+                }
+            );
+            assert!(!fixture.right.join("neu").exists());
+            assert_eq!(std::fs::read(&baseline).unwrap(), old_baseline);
+            assert!(load_bidirectional_run_journal(&baseline).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn strict_registry_spaeter_transfer_stoppt_folgeprojektion_und_baseline() {
+        for second_projection in [false, true] {
+            let fixture = Fixture::new();
+            let baseline = fixture._temp.path().join("state/pair.json");
+            prepare_and_run(&fixture, PairId([202; 16]), &baseline, false);
+            let old_baseline = std::fs::read(&baseline).unwrap();
+            write(&fixture.left.join("von-links"), "links");
+            if second_projection {
+                write(&fixture.right.join("von-rechts"), "rechts");
+            }
+            let queue = fixture_queue(&baseline);
+            let run = registry_prepare(&queue, &fixture, &baseline)
+                .confirm_effects(true)
+                .unwrap();
+            let mut intent = None;
+            let error = run
+                .execute(&crate::Cancel::new(), &mut |progress| {
+                    if progress.phase == "done" && intent.is_none() {
+                        intent = Some(registry_neighbor(&queue, &fixture.left));
+                    }
+                })
+                .unwrap_err();
+            assert!(
+                intent.is_some(),
+                "Die erste echte Projektion muss committed sein"
+            );
+            assert_eq!(crate::error_code(&error), crate::ErrorCode::OutcomeUnclear);
+            assert_eq!(
+                std::fs::read(fixture.right.join("von-links")).unwrap(),
+                b"links"
+            );
+            assert!(!fixture.left.join("von-rechts").exists());
+            assert_eq!(std::fs::read(&baseline).unwrap(), old_baseline);
+            assert!(load_bidirectional_run_journal(&baseline).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn strict_registry_alte_ownerreste_sperren_resume_und_rollback_ohne_journalaenderung() {
+        for rollback in [false, true] {
+            let fixture = Fixture::new();
+            let baseline = fixture._temp.path().join("state/pair.json");
+            prepare_and_run(&fixture, PairId([202; 16]), &baseline, false);
+            let old_baseline = std::fs::read(&baseline).unwrap();
+            write(&fixture.left.join("neu"), "links");
+            let queue = fixture_queue(&baseline);
+            let LocalBidirectionalRun {
+                staging,
+                store,
+                runs,
+                ..
+            } = registry_prepare(&queue, &fixture, &baseline)
+                .confirm_effects(true)
+                .unwrap();
+            store
+                .update_run_journal(|journal| {
+                    journal.state = BidirectionalRunState::Running;
+                    journal.projections[0].state = BidirectionalProjectionState::Running;
+                    Ok(())
+                })
+                .unwrap();
+            let result = runs
+                .into_iter()
+                .next()
+                .unwrap()
+                .execute(&crate::Cancel::new(), &mut ignore_progress)
+                .unwrap();
+            store
+                .update_run_journal(|journal| {
+                    journal.projections[0].state = BidirectionalProjectionState::Committed;
+                    journal.projections[0].quarantine = result.quarantine.clone();
+                    Ok(())
+                })
+                .unwrap();
+            let owner = staging.owner().clone();
+            let intent = crate::local_staging::NeighborStaging::create(
+                &owner,
+                &fixture.right.join("transferziel"),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            let candidate = fixture.right.join("alter-eigener-rest");
+            intent.candidate(&candidate).unwrap();
+            write(&candidate, "bewusst bewahren");
+            drop(intent);
+            drop(store);
+            drop(staging);
+            let old_journal = std::fs::read(baseline.with_extension("run.json")).unwrap();
+            let error = if rollback {
+                super::prepare_local_bidirectional_rollback_for_queue(
+                    &queue,
+                    "Registrytest",
+                    &fixture.left,
+                    &fixture.right,
+                    &baseline,
+                )
+                .err()
+                .unwrap()
+            } else {
+                super::prepare_resume_local_bidirectional_for_queue(
+                    &queue,
+                    "Registrytest",
+                    &fixture.left,
+                    &fixture.right,
+                    &baseline,
+                )
+                .err()
+                .unwrap()
+            };
+            assert_eq!(crate::error_code(&error), crate::ErrorCode::OutcomeUnclear);
+            assert_eq!(std::fs::read(&baseline).unwrap(), old_baseline);
+            assert_eq!(
+                std::fs::read(baseline.with_extension("run.json")).unwrap(),
+                old_journal
+            );
+            assert_eq!(std::fs::read(&candidate).unwrap(), b"bewusst bewahren");
+            assert_eq!(std::fs::read(fixture.right.join("neu")).unwrap(), b"links");
+        }
+    }
+    #[test]
+    fn strict_registry_abschlussscan_erkennt_aba_vor_erstbaseline() {
+        let fixture = Fixture::new();
+        write(&fixture.left.join("gleich"), "gleich");
+        write(&fixture.right.join("gleich"), "gleich");
+        let baseline = fixture._temp.path().join("state/pair.json");
+        let queue = Arc::new(fixture_queue(&baseline));
+        let mut run = registry_prepare(&queue, &fixture, &baseline)
+            .confirm_effects(true)
+            .unwrap();
+        assert!(run.runs.is_empty());
+        let triggered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = triggered.clone();
+        let root = fixture.left.clone();
+        run.left_vfs = Arc::new(SnapshotFaultVfs {
+            inner: LocalVfs::rooted(fixture.left.parent().unwrap()).unwrap(),
+            payload: None,
+            bytes_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            failed_sync: None,
+            scan_failure: None,
+            on_root: Some(Arc::new(move || {
+                if !observed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // Der Baum bleibt unverändert, die relevante Registry durchläuft
+                    // innerhalb des Scans dennoch einen vollständigen Start/End-Zyklus.
+                    registry_neighbor(&queue, &root).finish().unwrap();
+                }
+            })),
+        });
+        let error = run
+            .execute(&crate::Cancel::new(), &mut ignore_progress)
+            .unwrap_err();
+        assert!(triggered.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(crate::error_code(&error), crate::ErrorCode::PlanDrift);
+        assert!(!baseline.exists());
+        let journal = load_bidirectional_run_journal(&baseline).unwrap().unwrap();
+        assert_ne!(journal.state, BidirectionalRunState::BaselineCommitted);
+        assert!(journal.committed_baseline_digest.is_none());
+    }
+    struct DirectLocalSecrets;
+    impl crate::SecretResolver for DirectLocalSecrets {
+        fn resolve(&self, _: &crate::KeychainSecretReference) -> io::Result<crate::SecretString> {
+            panic!("Lokaler Directtest darf keine Secrets auflösen");
+        }
+    }
+
+    fn direct_test_operation(
+        fixture: &Fixture,
+        baseline: &Path,
+        prepared: &PreparedLocalBidirectionalRun,
+    ) -> crate::QueueOperation {
+        crate::QueueOperation::Bidirectional {
+            pair_id: prepared.preview().plan.pair_id,
+            pair_name: "Direct-Frist".into(),
+            left: Box::new(crate::BidirectionalQueueEndpoint::Local {
+                root: fixture.left.to_string_lossy().into_owned(),
+            }),
+            right: Box::new(crate::BidirectionalQueueEndpoint::Local {
+                root: fixture.right.to_string_lossy().into_owned(),
+            }),
+            baseline_path: baseline.to_string_lossy().into_owned(),
+            resolutions: Vec::new(),
+            expected_baseline_digest: prepared.preview().plan.baseline_digest,
+            expected_plan_digest: prepared.preview().plan.plan_digest,
+        }
+    }
+
+    #[test]
+    fn strict_direct_reprepare_lehnt_abgelaufene_bestaetigung_vor_uebergang_ab() {
+        let fixture = Fixture::new();
+        let baseline = fixture._temp.path().join("state/pair.json");
+        prepare_and_run(&fixture, PairId([202; 16]), &baseline, false);
+        let b1 = std::fs::read(&baseline).unwrap();
+        write(&fixture.left.join("neu"), "links");
+        let queue = fixture_queue(&baseline);
+        let mut prepared = registry_prepare(&queue, &fixture, &baseline);
+        prepared.expires_at = std::time::UNIX_EPOCH;
+        prepared.preview.expires_at_unix_ms = 0;
+        let entry = queue
+            .enqueue_claimed(direct_test_operation(&fixture, &baseline, &prepared))
+            .unwrap();
+        let old_journal = std::fs::read(baseline.with_extension("run.json")).unwrap();
+        let error = crate::reprepare_direct_bidirectional_queue_run(
+            &queue,
+            &entry.operation_id,
+            Arc::new(DirectLocalSecrets),
+            prepared,
+        )
+        .err()
+        .expect("Abgelaufene Zustimmung darf keine frische Vorbereitung autorisieren");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(std::fs::read(&baseline).unwrap(), b1);
+        assert_eq!(
+            std::fs::read(baseline.with_extension("run.json")).unwrap(),
+            old_journal,
+            "Die Fristprüfung muss vor dem Übergang und neuen Proben greifen"
+        );
+        assert!(!fixture.right.join("neu").exists());
+        assert_eq!(
+            queue.snapshot().entries[0].state,
+            crate::QueueState::Validating
+        );
+    }
+
+    #[test]
+    fn strict_direct_reprepare_behaelt_die_urspruengliche_frist_auch_beim_noop() {
+        for copy in [false, true] {
+            let fixture = Fixture::new();
+            let baseline = fixture._temp.path().join("state/pair.json");
+            prepare_and_run(&fixture, PairId([202; 16]), &baseline, false);
+            let b1 = std::fs::read(&baseline).unwrap();
+            if copy {
+                write(&fixture.left.join("neu"), "links");
+            }
+            let queue = fixture_queue(&baseline);
+            let mut prepared = registry_prepare(&queue, &fixture, &baseline);
+            let deadline = std::time::SystemTime::now() + std::time::Duration::from_secs(45);
+            prepared.expires_at = deadline;
+            prepared.preview.expires_at_unix_ms = deadline
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let old_preview_deadline = prepared.preview().expires_at_unix_ms;
+            let entry = queue
+                .enqueue_claimed(direct_test_operation(&fixture, &baseline, &prepared))
+                .unwrap();
+            let fresh = crate::reprepare_direct_bidirectional_queue_run(
+                &queue,
+                &entry.operation_id,
+                Arc::new(DirectLocalSecrets),
+                prepared,
+            )
+            .unwrap();
+            assert_eq!(fresh.preview().expires_at_unix_ms, old_preview_deadline);
+            assert_eq!(fresh.expires_at, deadline);
+            let run = fresh.confirm_effects(true).unwrap();
+            queue.mark_running(&entry.operation_id).unwrap();
+            let stats = run
+                .execute(&crate::Cancel::new(), &mut ignore_progress)
+                .unwrap();
+            if !copy {
+                assert!(!stats.baseline_committed);
+                assert!(stats.runs.is_empty());
+                assert_eq!(std::fs::read(&baseline).unwrap(), b1);
+                assert_eq!(
+                    classify_bidirectional_run_recovery(&baseline).unwrap(),
+                    BidirectionalRunRecovery::CompletionCleanup
+                );
+            }
+            queue
+                .finish_bidirectional_after_effect(
+                    &entry.operation_id,
+                    false,
+                    crate::Progress::default(),
+                )
+                .unwrap();
+            queue
+                .finish_bidirectional_completion_recovery(&entry.operation_id)
+                .unwrap();
+            assert_eq!(
+                queue.snapshot().entries[0].state,
+                crate::QueueState::Completed
+            );
+            assert!(!baseline.with_extension("run.json").exists());
+            if !copy {
+                assert_eq!(std::fs::read(&baseline).unwrap(), b1);
+            }
+        }
+    }
+
+    #[test]
+    fn strict_queueworker_noop_beendet_ohne_baseline_oder_dateiwirkung() {
+        let fixture = Fixture::new();
+        for name in ["eins", "zwei", "drei"] {
+            write(&fixture.left.join(name), name);
+            write(&fixture.right.join(name), name);
+        }
+        let baseline = fixture._temp.path().join("state/pair.json");
+        prepare_and_run(&fixture, PairId([202; 16]), &baseline, false);
+        let b1 = std::fs::read(&baseline).unwrap();
+        let queue = fixture_queue(&baseline);
+        let prepared = registry_prepare(&queue, &fixture, &baseline);
+        assert!(
+            !prepared.journal_required,
+            "Reine Vorschau ohne echten Queueentry bleibt journallos"
+        );
+        let entry = queue
+            .enqueue(direct_test_operation(&fixture, &baseline, &prepared))
+            .unwrap();
+        prepared.finish_enqueue_transition().unwrap();
+        drop(prepared);
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let crate::BidirectionalQueuePreparation::Ready(prepared) =
+            crate::prepare_bidirectional_queue_entry(&queue, claimed, Arc::new(DirectLocalSecrets))
+                .unwrap()
+        else {
+            panic!("Unveränderter Noopplan darf nicht driften");
+        };
+        let crate::QueueExecutionResult::Bidirectional(stats) =
+            crate::execute_prepared_bidirectional_queue_entry_effects(
+                &queue,
+                *prepared,
+                true,
+                &crate::Cancel::new(),
+                &mut ignore_progress,
+            )
+            .unwrap()
+        else {
+            panic!("Falsche Ausführungsklasse");
+        };
+        assert!(!stats.baseline_committed);
+        assert!(
+            stats.runs.is_empty(),
+            "Noop führt keine Datei- oder Byteprojektion aus"
+        );
+        assert_eq!(std::fs::read(&baseline).unwrap(), b1);
+        assert_eq!(queue.snapshot().entries[0].operation_id, entry.operation_id);
+        assert_eq!(
+            queue.snapshot().entries[0].state,
+            crate::QueueState::Completed
+        );
+        assert!(!baseline.with_extension("run.json").exists());
+        for root in [&fixture.left, &fixture.right] {
+            let names = std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                names,
+                ["eins", "zwei", "drei"]
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect()
+            );
+        }
+    }
+    #[test]
+    fn strict_deadline_confirm_stoppt_nach_fristablauf_im_abschlussscan() {
+        for copy in [false, true] {
+            let fixture = Fixture::new();
+            let baseline = fixture._temp.path().join("state/pair.json");
+            prepare_and_run(&fixture, PairId([202; 16]), &baseline, false);
+            let b1 = std::fs::read(&baseline).unwrap();
+            if copy {
+                write(&fixture.left.join("neu"), "links");
+            }
+            let queue = fixture_queue(&baseline);
+            let preview = registry_prepare(&queue, &fixture, &baseline);
+            let entry = queue
+                .enqueue_claimed(direct_test_operation(&fixture, &baseline, &preview))
+                .unwrap();
+            let mut prepared = crate::reprepare_direct_bidirectional_queue_run(
+                &queue,
+                &entry.operation_id,
+                Arc::new(DirectLocalSecrets),
+                preview,
+            )
+            .unwrap();
+            let deadline = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+            prepared.limit_confirmation_deadline(deadline).unwrap();
+            let scanned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = scanned.clone();
+            prepared.left_vfs = Arc::new(SnapshotFaultVfs {
+                inner: LocalVfs::rooted(fixture.left.parent().unwrap()).unwrap(),
+                payload: None,
+                bytes_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                failed_sync: None,
+                scan_failure: None,
+                on_root: Some(Arc::new(move || {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(remaining) = deadline.duration_since(std::time::SystemTime::now()) {
+                        std::thread::sleep(remaining + std::time::Duration::from_millis(5));
+                    }
+                })),
+            });
+            let error = prepared
+                .confirm_effects(true)
+                .err()
+                .expect("Ein rechtzeitig begonnener Scan darf nach Fristende keinen Lauf ausgeben");
+            assert!(scanned.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(std::fs::read(&baseline).unwrap(), b1);
+            assert!(!fixture.right.join("neu").exists());
+        }
+    }
+
+    #[test]
+    fn strict_deadline_innere_permits_sperren_verspaeteten_ersten_dateistart() {
+        let fixture = Fixture::new();
+        let baseline = fixture._temp.path().join("state/pair.json");
+        prepare_and_run(&fixture, PairId([202; 16]), &baseline, false);
+        let b1 = std::fs::read(&baseline).unwrap();
+        write(&fixture.left.join("neu"), "links");
+        let queue = fixture_queue(&baseline);
+        let preview = registry_prepare(&queue, &fixture, &baseline);
+        let entry = queue
+            .enqueue_claimed(direct_test_operation(&fixture, &baseline, &preview))
+            .unwrap();
+        let mut prepared = crate::reprepare_direct_bidirectional_queue_run(
+            &queue,
+            &entry.operation_id,
+            Arc::new(DirectLocalSecrets),
+            preview,
+        )
+        .unwrap();
+        assert!(!prepared.prepared_runs.is_empty());
+        let deadline = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+        prepared.limit_confirmation_deadline(deadline).unwrap();
+        let run = prepared.confirm_effects(true).unwrap();
+        if let Ok(remaining) = deadline.duration_since(std::time::SystemTime::now()) {
+            std::thread::sleep(remaining + std::time::Duration::from_millis(5));
+        }
+        let error = run
+            .execute(&crate::Cancel::new(), &mut ignore_progress)
+            .expect_err("Ein inneres Permit darf die alte Directfrist nicht verlängern");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(std::fs::read(&baseline).unwrap(), b1);
+        assert!(!fixture.right.join("neu").exists());
+    }
+
+    fn strict_deadline_wait_until_expired(deadline: std::time::SystemTime) {
+        if let Ok(remaining) = deadline.duration_since(std::time::SystemTime::now()) {
+            std::thread::sleep(remaining + std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn strict_deadline_type_swap_preparation(
+        fixture: &Fixture,
+        baseline: &Path,
+    ) -> PreparedLocalBidirectionalRun {
+        write(&fixture.left.join("knoten"), "gewinner");
+        std::fs::create_dir(fixture.right.join("knoten")).unwrap();
+        write(&fixture.right.join("knoten/kind"), "verlierer");
+        prepare_local_bidirectional_with_decisions(
+            PairId([211; 16]),
+            "Frist-Typwechsel",
+            &fixture.left,
+            &fixture.right,
+            baseline,
+            &[resolution("knoten", ConflictDecision::KeepLeft)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn strict_deadline_typwechsel_startet_nicht_nach_abgeschlossener_vorkopie() {
+        let fixture = Fixture::new();
+        let baseline = fixture._temp.path().join("state/pair.json");
+        let mut prepared = strict_deadline_type_swap_preparation(&fixture, &baseline);
+        let deadline = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+        prepared.limit_confirmation_deadline(deadline).unwrap();
+        let phrase = prepared.preview().confirmation_phrase.clone();
+        let mut run = prepared.confirm(&phrase, true).unwrap();
+        assert_eq!(run.expires_at, deadline);
+        assert_eq!(run.run_ordinals, vec![0]);
+        assert_eq!(run.deferred_run_ordinals, vec![1]);
+        let visited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_visited = visited.clone();
+        // Diese Sicht wird erst nach der bereits bestätigten Vorkopie verwendet.
+        // Der vorgeschaltete Kontext-/Scanweg verbraucht den Rest der Freigabe.
+        run.left_vfs = Arc::new(SnapshotFaultVfs {
+            inner: LocalVfs::rooted(fixture.left.parent().unwrap()).unwrap(),
+            payload: None,
+            bytes_read: Arc::default(),
+            failed_sync: None,
+            scan_failure: None,
+            on_root: Some(Arc::new(move || {
+                hook_visited.store(true, std::sync::atomic::Ordering::SeqCst);
+                strict_deadline_wait_until_expired(deadline);
+            })),
+        });
+        let error = run
+            .execute(&crate::Cancel::new(), &mut ignore_progress)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(visited.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(fixture.left.join("knoten")).unwrap(),
+            b"gewinner"
+        );
+        assert_eq!(
+            std::fs::read(fixture.right.join("knoten/kind")).unwrap(),
+            b"verlierer"
+        );
+        let journal = load_bidirectional_run_journal(&baseline).unwrap().unwrap();
+        assert_eq!(
+            journal.projections[0].state,
+            BidirectionalProjectionState::Committed
+        );
+        assert_eq!(
+            journal.projections[1].state,
+            BidirectionalProjectionState::Prepared
+        );
+        assert!(journal.type_swap_step.is_none());
+        let BidirectionalProjectionKind::TypeSwap { staging_path, .. } =
+            &journal.projections[1].projection
+        else {
+            panic!()
+        };
+        assert_eq!(
+            std::fs::read(fixture.right.join(staging_path.to_path_buf().unwrap())).unwrap(),
+            b"gewinner"
+        );
+        assert!(
+            !baseline.exists(),
+            "Keine neue Baseline trotz unvollständigem Lauf"
+        );
+    }
+
+    #[test]
+    fn strict_deadline_typwechsel_innenscan_darf_keinen_datentausch_nach_fristende_starten() {
+        let fixture = Fixture::new();
+        let baseline = fixture._temp.path().join("state/pair.json");
+        let mut prepared = strict_deadline_type_swap_preparation(&fixture, &baseline);
+        let deadline = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+        prepared.limit_confirmation_deadline(deadline).unwrap();
+        let phrase = prepared.preview().confirmation_phrase.clone();
+        let run = prepared.confirm(&phrase, true).unwrap();
+        let LocalBidirectionalRun {
+            staging,
+            left_root,
+            right_root,
+            left_vfs,
+            right_vfs,
+            store,
+            runs,
+            run_ordinals,
+            deferred_run_ordinals,
+            expires_at,
+            ..
+        } = run;
+        assert_eq!(expires_at, deadline);
+        assert_eq!(run_ordinals, vec![0]);
+        assert_eq!(deferred_run_ordinals, vec![1]);
+        store
+            .update_run_journal(|journal| {
+                journal.state = BidirectionalRunState::Running;
+                journal.projections[0].state = BidirectionalProjectionState::Running;
+                Ok(())
+            })
+            .unwrap();
+        let first = runs
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute(&crate::Cancel::new(), &mut ignore_progress)
+            .unwrap();
+        store
+            .update_run_journal(|journal| {
+                journal.projections[0].state = BidirectionalProjectionState::Committed;
+                journal.projections[0].quarantine = first.quarantine.clone();
+                journal.projections[1].state = BidirectionalProjectionState::Running;
+                Ok(())
+            })
+            .unwrap();
+        let before = store.load_run_journal().unwrap().unwrap();
+        let parent_names = || {
+            std::fs::read_dir(fixture.right.parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<BTreeSet<_>>()
+        };
+        let names = parent_names();
+        let visited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_visited = visited.clone();
+        let observed_left = SnapshotFaultVfs {
+            inner: LocalVfs::rooted(fixture.left.parent().unwrap()).unwrap(),
+            payload: None,
+            bytes_read: Arc::default(),
+            failed_sync: None,
+            scan_failure: None,
+            on_root: Some(Arc::new(move || {
+                hook_visited.store(true, std::sync::atomic::Ordering::SeqCst);
+                strict_deadline_wait_until_expired(deadline);
+            })),
+        };
+        let error = execute_local_type_swap_projection(
+            &store,
+            1,
+            deadline,
+            LocalEndpointPair {
+                staging_guard: &staging,
+                left_vfs: &observed_left,
+                left_root: &left_root,
+                right_vfs: right_vfs.as_ref(),
+                right_root: &right_root,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(visited.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(store.load_run_journal().unwrap().unwrap(), before);
+        assert_eq!(
+            parent_names(),
+            names,
+            "Kein neues Quarantänesetup nach dem Scan"
+        );
+        assert_eq!(
+            std::fs::read(right_root.join("knoten/kind")).unwrap(),
+            b"verlierer"
+        );
+        assert_eq!(
+            std::fs::read(left_root.join("knoten")).unwrap(),
+            b"gewinner"
+        );
+        assert!(!baseline.exists());
+        drop(left_vfs);
+    }
+
+    #[test]
+    fn strict_deadline_frische_loeschvorbereitung_bekommt_keine_neue_freigabe() {
+        let fixture = Fixture::new();
+        for root in [&fixture.left, &fixture.right] {
+            write(&root.join("alt"), "gebunden");
+        }
+        let baseline = fixture._temp.path().join("state/pair.json");
+        let pair = PairId([212; 16]);
+        prepare_and_run(&fixture, pair, &baseline, false);
+        let previous_baseline = std::fs::read(&baseline).unwrap();
+        write(&fixture.left.join("neu"), "kopiert");
+        std::fs::remove_file(fixture.left.join("alt")).unwrap();
+        let mut prepared = prepare_local_bidirectional(
+            pair,
+            "Frist-Löschung",
+            &fixture.left,
+            &fixture.right,
+            &baseline,
+        )
+        .unwrap();
+        assert_eq!(prepared.prepared_run_ordinals, vec![0]);
+        assert_eq!(prepared.deferred_run_ordinals, vec![1]);
+        let deadline = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+        prepared.limit_confirmation_deadline(deadline).unwrap();
+        let phrase = prepared.preview().confirmation_phrase.clone();
+        let mut run = prepared.confirm(&phrase, true).unwrap();
+        assert_eq!(run.expires_at, deadline);
+        let journal_path = run.store.run_journal_path();
+        let visited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_visited = visited.clone();
+        // Erst nach dem Running-Commit der deferred-Projektion verzögern. Damit
+        // liegt der Fristablauf innerhalb ihrer frischen Untervorbereitung.
+        run.right_vfs = Arc::new(SnapshotFaultVfs {
+            inner: LocalVfs::rooted(fixture.right.parent().unwrap()).unwrap(),
+            payload: None,
+            bytes_read: Arc::default(),
+            failed_sync: None,
+            scan_failure: None,
+            on_root: Some(Arc::new(move || {
+                let journal: BidirectionalRunJournal =
+                    serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+                if journal.projections[1].state == BidirectionalProjectionState::Running {
+                    hook_visited.store(true, std::sync::atomic::Ordering::SeqCst);
+                    strict_deadline_wait_until_expired(deadline);
+                }
+            })),
+        });
+        let error = run
+            .execute(&crate::Cancel::new(), &mut ignore_progress)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(visited.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(fixture.right.join("neu")).unwrap(),
+            b"kopiert"
+        );
+        assert_eq!(
+            std::fs::read(fixture.right.join("alt")).unwrap(),
+            b"gebunden"
+        );
+        assert_eq!(std::fs::read(&baseline).unwrap(), previous_baseline);
+        let journal = load_bidirectional_run_journal(&baseline).unwrap().unwrap();
+        assert_eq!(
+            journal.projections[0].state,
+            BidirectionalProjectionState::Committed
+        );
+        assert_eq!(
+            journal.projections[1].state,
+            BidirectionalProjectionState::Running
+        );
+        assert!(journal.projections[1].quarantine.is_none());
     }
 }

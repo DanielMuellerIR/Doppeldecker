@@ -1,30 +1,23 @@
 # Funktionsaudit: Datei- und Sync-Operationen
 
-Stand: Preview 0.1.124 vom 2026-10-19. Die Grundmatrix wurde am 2026-10-07 abgeglichen.
-Ergänzung 2026-10-18: normaler lokaler Sync einschließlich schwacher Zielklassen
-und begrenzte interaktive SFTP-Inhalte samt Anzeigebilanz sowie gewöhnliches
-WebDAV-mkdir, -Rename und additive Datei-/Baumuploads;
-übrige Providerfreigaben behalten ihren
-damaligen Prüfstand.
+Stand: 2026-11-07. Diese Matrix beschreibt das implementierte Verhalten;
+[Roadmap](roadmap.md) und [Backlog](../backlog.md) nennen die offene Arbeit.
+Frühere Prüfberichte gelten für ihren datierten Stand. Grundlage bleiben die
+[Produktprinzipien](product-principles.md) und das
+[Produktaudit](usability-audit-2026-10-20.md#umsetzungsstand).
 
 ## Zweck und Legende
 
-Diese Matrix beschreibt das heute angebotene Verhalten. Frühere erfolgreiche
-Providerproben sind kein Ersatz für den aktuellen Sicherheitsvertrag. Browsertests
-mit simulierten Providern geben keine echte Serverfähigkeit frei. Die
-[Produktprinzipien](product-principles.md) verlangen die stärkste begrenzbare
-Wirkung und konkrete Gründe für verbleibende Sperren.
+- **A:** mit den für die konkrete Wirkung erforderlichen Belegen abgesichert.
+- **BE:** Best Effort mit sichtbarer Grenze, frischer Prüfung, einem Mutationsversuch
+  und Readback. Kein blinder Retry.
+- **N:** benötigte Fähigkeit oder Bindung fehlt; derzeit gesperrt.
+- **—:** kein eigener Weg.
 
-- **A:** abgesichert durch die für die konkrete Wirkung erforderlichen Belege.
-- **BE:** Best Effort mit sichtbarer Einschränkung, frischer Prüfung, genau einer
-  Mutation und Readback; kein blinder Retry.
-- **N:** derzeit gesperrt; benötigte Bindung oder Fähigkeit fehlt.
-- **—:** kein eigener Weg für diese Funktion.
-
-Die Tabellen gelten nach erfolgreicher Verbindung und den erforderlichen frischen
-Proben. Ablehnung, unvollständiges Listing oder Identitätsdrift können einzelne
-Wirkungen zusätzlich sperren. „Umgesetzt“ umfasst auch belegte Sperren und bedeutet
-keine vollständige Protokollunterstützung.
+Die Tabellen setzen eine erfolgreiche Verbindung und frische Wirkungsprüfungen
+voraus. Gewöhnliche Aktionen benötigen keine künstlichen Fähigkeitsproben.
+Ablehnung, unvollständiges Listing oder Identitätsdrift können einzelne Wirkungen
+sperren. Simulierte Browserantworten geben keine Serverfähigkeit frei.
 
 ## 1. Navigation und Darstellung
 
@@ -33,134 +26,111 @@ keine vollständige Protokollunterstützung.
 | Listing, Refresh, Verlauf, Sortierung | A | BE | A | A | A |
 | Mehrere Tabs je Pane | A | A | A | A | A |
 | Reguläre Datei öffnen / geprüfter Nur-Lese-Snapshot | A | BE | A | A | A |
+| ZIP-Inhalt anzeigen / passive Inhaltsvorschau | A | BE | A | A | A |
 | Ordnerreferenz als Favorit speichern | A | A | A | A | A |
 
-Tabs und Favoriten speichern Navigationsreferenzen, keine Serverberechtigung.
-Das [Tab-Modell](pane-tabs.md) hält Verlauf, Auswahl, Sortierung und Scrollposition
-je Tab; die native macOS-Abnahme schließt einen echten App-Neustart ein.
+[Tabs](pane-tabs.md) halten Verlauf, Auswahl, Sortierung und Scrollposition.
+Favoriten speichern Navigationsreferenzen, keine Serverberechtigung.
+[ZIP-Ansicht](archive-read.md) und [Entpacken](archive-extract.md) verwenden bei
+entfernten Quellen eine geprüfte lokale Momentaufnahme. ZIP-Erzeugung und Entpacken
+zu entfernten Zielen übertragen denselben versiegelten Zwischenstand auch nach
+Konfliktpause oder Neustart. Nach dauerhaftem Erfolg werden belegte lokale
+Ergebnisdaten freigegeben; Abbruch und unklare Ausgänge behalten sie.
+[Archivupload](remote-pack.md).
 
-SFTP verwendet das getrennte `SftpPathBestEffort`-Listing sowie eine private
-Inhaltslesesicht für reguläre Dateien und begrenzte Verzeichnisbäume. Hostkey, Sitzung,
-beobachtbare Pfadattribute, READ-Handles, Größe und vollständiger BLAKE3-Readback sind gebunden.
-Das erste OPEN bleibt pfadbasiert; ein unbemerkter Austausch mit identischen
-Attributen ist kein ausgeschlossenes Risiko. Striktes VFS, Rootidentitäten, Sync,
-Quarantäne und Remote-Mutationen bleiben gesperrt. Vertrag und Gegenbelege:
-[SFTP-Inhalte](sftp-contents.md).
-
-SFTP-Ordnergrößen verwenden eine eigene begrenzte Metadatenbeobachtung ohne Datei-
-OPEN. Große Größen sind damit zählbar, ohne Inhaltsdownloadgrenzen zu lockern.
-`observed`, „≈“, Best Effort und sichtbare Teilbilanzen ersetzen keine strikte
-Listingfähigkeit. Vertrag: [SFTP-Ordnergrößen](sftp-directory-sizes.md).
-Das interaktive Listing lässt nicht bedienbare Namen und fehlende Dateitypen
-mit sichtbarer Bilanz aus; unabhängige Dateien bleiben nutzbar. Doppelte Namen
-und Protokollfehler bleiben Fehler. [Vertrag](sftp-listing.md).
+SFTP liest über die private Inhaltsklasse mit gehaltenem READ-Handle und Hash;
+das erste OPEN bleibt pfadbasiert. [Lesevertrag](sftp-contents.md).
+[Ordnergrößen](sftp-directory-sizes.md) sind gesonderte Metadatenbeobachtungen.
+Nicht bedienbare Namen oder fehlende Dateitypen werden sichtbar ausgelassen;
+doppelte Namen und Protokollfehler bleiben Fehler. [Listing](sftp-listing.md).
 
 ## 2. Interaktive Dateioperationen
 
 | Funktion | Lokal | SFTP | FTP/FTPS | WebDAV | SMB |
 | --- | --- | --- | --- | --- | --- |
-| Ordner anlegen | A | N | A | BE ⁶ | A |
-| Umbenennen im selben Ordner | A | N | A / BE ¹ | BE | A |
-| Neue Datei / rekursive Kopie / Upload | A | N | A / BE ¹ | BE ⁷ | A |
-| Reguläre Zieldatei bestätigt ersetzen | A / BE ² | N | BE | N | N |
-| Download in einen lokalen Ordner | A | BE ⁵ | A | A | A |
-| Vorhandene Ordner zusammenführen | A | N | A / BE ¹ | BE ⁷ | A |
-| In-Place-Schreiben in Remote-Datei | — | N | N | N | N |
+| Ordner anlegen | A | BE | BE | BE | BE |
+| Normale Unix-Rechte bearbeiten, auch rekursiv | A | BE | BE | — | — |
+| Eigentümer/Gruppe ändern; macOS/Linux auch mit Administratorfreigabe | A | — | — | — | — |
+| Finder-Tags/Farben, Kommentare und Dateiflags bearbeiten | A (macOS) | — | — | — | — |
+| Umbenennen im selben Ordner | A | BE | BE | BE | BE |
+| Neue Datei / rekursive Kopie / Upload | A | BE | A / BE | BE | A |
+| Reguläre Zieldatei bestätigt ersetzen | A / BE | BE | BE | BE | BE |
+| Download in einen lokalen Ordner | A | BE | BE | BE | BE |
+| Vorhandene Ordner zusammenführen | A | BE | A / BE | BE | A |
+| Extern bearbeiten und explizit zurückspeichern | — | BE | BE | BE | BE |
 
-Bei Schreibaktionen bezeichnet die Providerspalte das Ziel; die Downloadzeile
-bezeichnet die Quelle. SFTP-Downloads dürfen deshalb vorhandene lokale Ordner
-kontrolliert zusammenführen. Schreiben in eine SFTP-Collection bleibt gesperrt.
+Bei Schreibaktionen bezeichnet die Providerspalte das Ziel, bei Downloads die
+Quelle. Vorhandene Ordner werden ohne Entfernen unabhängiger Inhalte zusammengeführt.
 
-¹ FTP/FTPS ist nur nach bewiesener No-Replace-Semantik abgesichert. Bei
-überschreibendem RNTO steht interaktiven Aktionen ein eigener Best-Effort-Weg zur
-Verfügung: vollständiges Elternlisting frisch prüfen, genau eine Mutation senden,
-Ergebnis zurücklesen. Zwischen Listing und Rename kann ein neu entstandenes Ziel
-dennoch ersetzt werden; der begrenzte Schaden betrifft genau diesen Eintrag.
-Der unbeaufsichtigte Sync verwendet diese Lockerung nicht.
+- **Lokal:** Ersetzung verwendet den privaten C2-Arbeitsbereich, soweit dessen
+  Bindung belegt ist; ein gekennzeichneter Best-Effort-Weg kann ohne wiederherstellbare
+  Altversion auskommen. [Temp- und Sicherungsreste](decision-lokale-restbereinigung.md).
+- **SFTP:** Standard-Subsystem ohne Serverhelfer. Exklusive Temps, Streaming und
+  Readback; dauerhafte Ersetzung über POSIX-Rename oder bestätigtes Remove/Rename.
+  Ein gleichzeitiger Elternpfadtausch kann innerhalb desselben Serverkontos umleiten.
+  Nicht übertragbare Metadaten bleiben sichtbar. [Schreibvertrag](sftp-writes.md).
+- **FTP/FTPS:** Absicherung nur bei bewiesener No-Replace-Semantik; sonst kann RNTO
+  trotz frischem Listing ein zwischenzeitlich entstandenes Ziel ersetzen.
+  Downloads prüfen MLSD-Fakten, Länge und Transportabschluss; FSTAT und atomare
+  Pfadbindung fehlen. [Inhaltsvertrag](ftp-contents.md).
+- **WebDAV:** Bedingtes [MKCOL](webdav-folder.md) sowie
+  [PUT/MOVE](webdav-upload.md) mit vollständigen frischen Listings und Readback.
+  Die MKCOL-Antwort-ETag ist optional. Bestätigte reguläre Ersetzung hat keine
+  Quarantäne. Downloads nutzen GET/If-Match; Elternbindung und Symlinkerkennung
+  bleiben begrenzt. [Lesevertrag](webdav-contents.md).
+- **SMB-Download:** Datei-ID, ChangeTime und Dateifakten werden am geöffneten Handle
+  vor Inhaltsbeginn und nach EOF geprüft. Fehlende IDs lassen nur die ausgewiesene
+  schwächere Attributbindung zu; Rennen zwischen Requests bleiben möglich.
+  [Inhaltsvertrag](smb-contents.md).
 
-² Lokale Ersetzung nutzt den privaten C2-Arbeitsbereich, soweit dessen Bindung
-belegt ist. Erhaltene Verzeichnissicherungen werden getrennt bilanziert. Der
-generische Provider-Dateiweg kann eine ausdrücklich gekennzeichnete lokale
-Best-Effort-Ersetzung liefern, ohne eine wiederherstellbare Altversion zu
-versprechen. Vertrag: [lokale Temp- und Sicherungsreste](decision-lokale-restbereinigung.md).
+Additive lokale Uploads nach FTP/FTPS und SMB sowie lokale WebDAV-Uploads und
+Downloads aller angebotenen Remote-Provider lassen mehrdeutige Case-/Unicode-
+Namensgruppen pfadgenau aus. Das erweitert weder Move noch Ersetzen pauschal.
 
-⁵ Ausschließlich additive SFTP→lokal-Downloads von 1 bis 100 direkten Auswahlen
-des Pane-Roots: Dateien bis 8 GiB und begrenzte Bäume bis 1000 Einträge,
-16 Unterordnerebenen und 16 GiB. Keine Ersetzung oder Quellentfernung. Überspringen
-und abgesichertes „Beide behalten“ erhalten bestehende
-Ziele; lokale Commitgrenzen gelten zusätzlich zur schwachen SFTP-Leseklasse.
+Der [Informationsdialog](file-properties.md) ändert normale Rechte unter Erhalt
+von Sonderbits, lokal auch Eigentümer/Gruppe, macOS-Tags und
+Verstecktmarkierung, Dateisperre und Erweiterungsanzeige.
+Ein Eigentümerwechsel kann Sonderbits entfernen; die Bilanz nennt das Ergebnis.
+Links und Spezialdateien werden ausgelassen. Lokale macOS-Editoren einschließlich
+App-Neustart sind nativ geprüft; direkte SFTP-Rechteänderungen und Anzeigenamen
+ebenfalls. Weitere entfernte macOS-Abläufe folgen mit dem Kandidaten.
 
-⁶ Gewöhnliches WebDAV-mkdir benötigt keine künstliche Collection-/Löschprobe.
-Starke Eltern-ETags, vollständiges frisches Listing, genau ein bedingtes MKCOL und
-Readback bleiben erforderlich. Die Antwort-ETag ist optional; ein unklarer Ausgang
-erhält den möglichen neuen Ordner und seinen Prüfpfad. Vertrag:
-[WebDAV-Ordneranlage](webdav-folder.md).
-
-⁷ Lokale Dateiadditionen und begrenzte Verzeichnisbäume unter vorhandenen
-WebDAV-Pane-Ordnern verwenden bedingtes MKCOL/PUT/MOVE ohne künstliche Collection-/
-Löschprobe als eigene Best-Effort-Klasse. Exaktes Zusammenführen schützt vorhandene
-Blätter; Ordnerintents erhalten Teilwirkungen ohne rekursives Cleanup. Überschreibende
-und andere strikte Wege bleiben ohne gemeinsame Root-/Elternbindung passiv gesperrt. [WebDAV-Uploads](webdav-upload.md).
+Lokale macOS-Kopien erhalten Erstellungszeit, Tags, lesbare xattrs, Finder-
+Informationen, Resource Forks, Verstecktmarkierung und Dateisperre. Fehlende Klassen werden
+bilanziert; ein unvollständiger Resource Fork verhindert den Quellabbau beim
+kopierenden Move. [Kopiervertrag und Grenzen](copy-metadata.md).
 
 ### Kopieren und Verschieben getrennt bewerten
 
-Verschieben braucht zusätzlich zur Kopie eine eigene Quellentfernung.
-`ProviderEndpoint::probe_file_capabilities` in `core/src/remote_real_mode.rs`
-liefert getrennt `remove_source` und `remove_source_best_effort`. Die heutigen
-lokalen, FTPS- und SMB-Fallbacks entfernen vollständig kopierte Quellen
-als begrenztes Best Effort: frischer manifestgebundener Readback, Blatt für Blatt,
-Ordner ausschließlich leer. Zwischen Readback und Einzelwirkung bleibt ein
-sichtbares Austauschfenster. SFTP und WebDAV bieten keinen solchen Weg. Ein möglicher
-No-Replace-Rename im selben Namespace wird gesondert bewertet und belegt keine
-beliebigen Quelle→Ziel-Moves.
+Verschieben benötigt zusätzlich eine eigene Quellentfernung. Lokale, SFTP-,
+FTPS- und SMB-Fallbacks entfernen nach vollständigem Readback einzelne Blätter und
+zuletzt leere Ordner als Best Effort. Das Austauschfenster vor der Einzelwirkung
+bleibt sichtbar. WebDAV bietet keinen solchen Quellabbau. Innerhalb derselben
+gehaltenen SFTP-Sitzung kann F6 bei freiem Zielnamen einen einzelnen Server-Rename
+verwenden. Eine solche Rename-Fähigkeit erlaubt keine beliebigen Quelle→Ziel-Moves.
 
-Lokales WebDAV-Copy mit Ersetzung ist seit der
-[AP13-Tragfähigkeitsprüfung](webdav-replace-boundary.md) konkret gesperrt:
-Standard-MOVE bindet Temp, Altziel und sämtliche Eltern nicht gemeinsam atomar.
-Die privaten AP11/AP12-Additionen bleiben verfügbar. Die folgende historische
-Ersetzungsprobe erteilt dafür keine Ausnahme.
-
-Bestätigtes Ersetzen auf FTPS ist eine eigene verhaltensgeprüfte
-Best-Effort-Wirkung für reguläre Datei gegen reguläre Datei. Die Altversion wird
-ohne Quarantäne dauerhaft verworfen. GUI und CLI benennen diese Folge vor der
-Bestätigung. Danach werden Temp-Verschwinden, Endname, Typ, Größe und BLAKE3-Inhalt
-geprüft. Typkonflikte, Sync und Mirror nutzen diesen Weg nicht. SMB bietet derzeit
-kein identitätsgebundenes bedingtes Parken und deshalb kein solches Ersetzen.
-
-Beide behalten ist für Copy/Move über denselben Queue-/VFS-Weg umgesetzt, wenn
-der konkrete Zielprovider einen atomaren No-Replace-Commit liefert. Der Core vergibt
-und prüft den sichtbaren neuen Namen; ein ausgewählter kollidierender Ordner wird
-vollständig daneben erhalten. Ohne diese Garantie nennt der Dialog den Grund für
-die fehlende Variante; die normalen Best-Effort-Wege bleiben unverändert.
-Details: [Konfliktentscheidungen](conflict-decisions.md).
+„Beide behalten“ vergibt und prüft einen neuen Namen im Core und setzt einen
+atomaren No-Replace-Commit des konkreten Ziels voraus. Kollidierende Ordner bleiben
+vollständig daneben erhalten. [Konfliktentscheidungen](conflict-decisions.md).
 
 ### Umbenennen und Quellenbindung
 
-Die gewöhnliche WebDAV-Umbenennung benutzt einen eigenen bedingten Best-Effort-Weg
-ohne künstliche Löschprobe. Quelle, Sitzung und Elternkette werden bis zum
-Einzel-MOVE gebunden; der Readback muss Quellabwesenheit und exakte Zielversion
-belegen. Antwortverlust löst keinen automatischen Retry aus. Serverbedingungen
-und starke ETags bleiben ausdrücklich begrenzte Serverbelege. Details:
-[Gewöhnliche WebDAV-Umbenennung](webdav-rename.md).
+Gewöhnlicher Remote-Rename bindet die Quelle über ihren Pfad. Auch bei No-Replace
+kann ein zwischen Listing und Mutation ausgetauschter gleichnamiger Eintrag getroffen
+werden. Best Effort ergänzt das Zielkollisionsfenster; unklare Ausgänge erlauben
+keinen erneuten Schreibversuch. [WebDAV-Rename](webdav-rename.md) prüft zusätzlich
+Quellabwesenheit und die exakte Zielversion über bedingtes MOVE und Readback.
 
-`ProviderEndpoint::execute_interactive_rename` verwendet die Einstufung aus
-`core/src/remote_rename.rs`. Auch die abgesicherte Klasse beschreibt den Schutz des
-Ziels durch No-Replace. Die Quelle ist über ihren Pfad gebunden: Ein zwischen
-Listing und Mutation ausgetauschter gleichnamiger Eintrag kann umbenannt werden.
-`SOURCE_PATH_BINDING_LIMITATION` wird in Vorschau und Ergebnis mitgeführt.
-Best Effort hat zusätzlich das oben beschriebene Zielkollisionsfenster. Sichtbare
-Kollisionen stoppen mit `already_exists`; nach Antwortverlust darf nur eine
-identitätsgleiche Lesesitzung den Zustand klären. Bleibt er unklar, folgt
-`outcome_unclear`, ohne erneute Mutation.
+[Stapelumbenennung](batch-rename.md) unterstützt reine Case-/Unicode-Änderungen und
+entfernte Datei-/Ordnerzyklen mit dauerhaft bilanziertem Zwischennamen. Rohname und
+Providerbeleg werden frisch geprüft. Offene Zwischenordner bleiben auch für darin
+liegende Sync-Wurzeln gesperrt.
 
 ### Finder-Drop in eine FTPS-Pane
 
-Der integrierte native macOS-Lauf vom 2026-10-07 belegt echte Finder-Quelle,
-Pane-Root als Ziel trotz unterlegter Ordnerzeile, Best-Effort-Kopie, Überspringen,
-bestätigtes dauerhaftes Ersetzen, Fortschritt, Abbruch und konkreten Providerfehler.
-Quelldaten bleiben unverändert; unabhängige Zielprüfungen bestätigen Inhalte und
-fehlende Proben-/Tempreste. Die Korrektur erhält den konkreten Fehler zusammen mit
-der Bilanz bereits eingereihter Gruppen. Beleg: [Finder→FTPS](finder-ftps-gui.md).
+Der native Ablauf belegt Pane-Root als Ziel, Kopie, Überspringen, dauerhaftes
+Ersetzen, Fortschritt, Abbruch und Providerfehler bei unveränderter Quelle.
+Bereits eingereihte Gruppen bleiben in der Teilbilanz. [Prüfbericht](finder-ftps-gui.md).
 
 ## 3. Löschen und Wiederherstellen
 
@@ -168,120 +138,87 @@ der Bilanz bereits eingereihter Gruppen. Beleg: [Finder→FTPS](finder-ftps-gui.
 | --- | --- | --- | --- | --- | --- |
 | Systempapierkorb | A | — | — | — | — |
 | Neue Einträge in Provider-Quarantäne verschieben | — | N | N | N | N |
-| Dauerhaftes Remote-Löschen mit exakter Phrase | — | N | N | N | N |
+| Dauerhaftes Remote-Löschen mit Wirkungsbestätigung | — | BE | BE | BE | BE |
 | Vorhandene Remote-Quarantäneläufe anzeigen | — | N | N | N | A |
-| Quarantäne-Restore / endgültiges Leeren | A ³ | N | N | N | N |
+| Quarantäne-Restore / endgültiges Leeren | A | N | N | N | N |
 
-³ Lokale Sync-Quarantäne ist vom Systempapierkorb getrennt. Restore ersetzt nie;
-Leeren verlangt den exakten Lauftext. Die Aufbewahrungsdauer ist kein automatischer
-Löschauftrag.
+Der lokale [Papierkorb](trash-private-claim.md) verwendet private Claims und ein
+Crash-Journal. Lokale Sync-Quarantäne bleibt davon getrennt: Restore ersetzt nie,
+Leeren verlangt den exakten Lauftext, die Aufbewahrungsdauer ist kein Löschauftrag.
+Kein Remote-Provider liefert den vollständigen Restore-/Purge-Vertrag; SMB kann
+alte Läufe nur lesen.
 
-Der lokale [Papierkorb](trash-private-claim.md) verwendet auf macOS und Linux/XDG
-private Claims und Journal v2. Neue Operationen benutzen keinen v1-Schreibweg.
-Altjournal-Recovery bleibt konservativ und erfindet keine private Herkunft.
-
-Remote-Quarantäne benötigt den vollständigen Vertrag aus
-`Vfs::supports_bound_restore_probe`: identitätsgebundenes Create, Rename zwischen
-gebundenen Eltern, Manifest-CAS und Remove. Keiner der aktuellen Remote-Provider
-liefert ihn vollständig. Ein erfolgreicher gewöhnlicher Rename-/Delete-Test
-genügt nicht. SMB kann alte Läufe lesen; `quarantine_management_capabilities`
-gibt Restore und Purge ausdrücklich nicht frei.
-
-WebDAV-Dauerlöschen bleibt seit AP13R passiv gesperrt: Ein Datei-`If-Match`
-bindet nicht gemeinsam die vollständige Root-/Elternkette. Auch seine strikten
-Capability- und Quarantäneabfragen erzeugen keinen Probenbestand.
-[Mutationsvertrag](webdav-mutation-boundary.md). FTPS-DELE/RMD kann den bestätigten
-Token nicht an die Wirkung binden. Ein Stat-/Providerfehler belegt niemals Abwesenheit.
+Dauerhaftes Remote-Löschen bindet Auswahl und Rekursionsumfang, prüft jeden Eintrag
+frisch und liest seine Abwesenheit zurück. Es gibt weder Papierkorb noch stillen
+Retry. Mehr als 1000 Einträge oder 10 GiB benötigen zusätzlich eine exakte
+Löschphrase. Stat-/Providerfehler beweisen keine Abwesenheit.
+[Mutationsvertrag](webdav-mutation-boundary.md).
 
 ## 4. Synchronisation und Richtungen
 
-Der normale lokale GUI-Start führt AddOnly und Update auf abgesicherten lokalen
-Zielen über die Fensterqueue aus. Additionen brauchen keine Laufphrase; Update
-verlangt ContentHash, Wirkungsbestätigung und den vorhandenen Quarantäneweg.
-Nach Neustart wird frisch vorbereitet und erneut bestätigt. Simulation ist ein
-eigener Start ohne Schreibwirkung. Begrenzte schwächere lokale Zielklassen sind
-ebenfalls umgesetzt; Mirror behält seinen getrennten Assistenten.
-Konkrete Ziel- und Mengengrenzen: [Normaler lokaler Sync](local-sync.md).
-
-Diese Tabelle bezeichnet den **Zielprovider**. Die Quelle muss einen vollständigen,
-rootgebundenen Scan und die benötigten Dateiinhalte liefern; SFTP scheidet bereits
-als Quelle aus. FTPS, WebDAV und SMB können dagegen alle drei Einwegmodi in ein
-starkes lokales Ziel speisen.
+Die Tabelle bezeichnet den **Zielprovider**; alle angebotenen Provider können
+Quellen sein. Gewöhnlicher Remote-Inhaltssync verwendet vollständige Listings,
+frische Quellen-/Zielprüfungen, Streaminghash und einen Mutationsversuch als
+Best Effort. Remote↔Remote benötigt keinen lokalen Klartext-Spool.
 
 | Zielwirkung | Lokal | SFTP | FTP/FTPS | WebDAV | SMB |
 | --- | --- | --- | --- | --- | --- |
-| Einweg AddOnly | A | N | A ⁴ | N | A |
-| Einweg Update | A | N | N | N | N |
-| Einweg Mirror | A | N | N | N | N |
-| Bidirektionale Zielprojektion | A | N | N | N | N |
+| Einweg AddOnly | A / BE | BE | BE | BE | BE |
+| Einweg Update | A / BE | BE | BE | BE | BE |
+| Einweg Mirror | A / BE | BE | BE | BE | BE |
+| Bidirektionale Zielprojektion (GUI) | A / BE | BE | BE | BE | BE |
 
-⁴ Nur nach erfolgreicher STOU-/Readback-/No-Replace-Probe. Ein FTP-/FTPS-Server
-mit überschreibendem RNTO kann weiterhin interaktives Best-Effort-Kopieren bieten,
-aber keinen AddOnly-Sync. Seine Transportstufe allein ist kein Funktionsgate.
+[Lokaler AddOnly/Update-Sync](local-sync.md) läuft über die Fensterqueue. Additionen
+brauchen keine Laufphrase; Update braucht ContentHash und Wirkungsbestätigung.
+Starke lokale Ziele behalten Quarantäne. Fehlt sie, nennt die Vorschau dauerhafte
+Ersetzungen und Entfernungen. Mirror lässt bei Konflikten, Symlinks oder
+Auslassungen sämtliche Entfernungen aus. Neustart verlangt frische Vorbereitung.
+Verträge: [Inhaltssync](content-sync.md), [bidirektionaler Alltagssync](bidirectional-forward.md).
 
-`RemoteCapabilities` in `core/src/remote.rs` hält fünfzehn Fähigkeiten;
-Capability-Digest Version 8 bindet sie an Vorschau und Permit:
+Einseitiger nativer SMB-Inhaltssync erhält bei geeigneten Endpunkten benannte
+Dateiströme; Verzeichnisströme besitzen einen getrennten NativeBestEffort-Vertrag
+mit Einzel- und Teilbilanz. Der portable bidirektionale Vertrag bleibt unverändert.
+[Metadatenumfang](metadata-stage2-design.md#benannte-smb-datenströme-regulärer-dateien).
 
-- `permits_directory_create`: vollständiges Listing und exklusives Ordneranlegen.
-- `permits_add_only`: vollständiges Listing, exklusives Create und dauerhaftes
-  Datei-Flush oder verifizierter Datei-Commit.
-- `permits_update`: zusätzlich No-Replace, Replace, Datei-Flush,
-  Eintragsentfernung und geprüfte Quarantäne.
-- `permits_mirror`: zusätzlich Verzeichnis-Flush und Platzabfrage.
-
-Die stärkere Restore-Proofgrenze wird vor künstlichen Quarantäneobjekten geprüft.
-Deshalb gibt SMB trotz Create-/FLUSH-/Rename-Fähigkeiten heute kein zielseitiges
-Update/Mirror frei. Bidirektionale Zieladditionen brauchen ebenfalls den starken
-Rollbackvertrag; ein gewöhnlicher AddOnly-Upload reicht nicht. Frühere
-SFTP-/SMB-Freigaben aus der Implementierungschronik sind insoweit überholt.
-
-Remote↔Remote benutzt dieselben `ProviderEndpoint`- und `ProviderSync`-Verträge,
-keinen protokollspezifischen Ausweichweg und keinen lokalen Klartext-Spool.
-Quelle und Ziel werden frisch verbunden; Profile, Roots, Fähigkeiten, Listings und
-Plan sind gebunden. Die Zielmatrix gilt unverändert. Quellen und Prüfgrenzen:
-[Remote-Vertrag](remote-providers-design.md),
-[bidirektionaler Vertrag](bidirectional-sync-design.md).
+Der getrennte strikte ProviderSync bleibt an Listing-, Create-/Rename-, Flush-,
+Platz- und Quarantänefähigkeiten gebunden. Gewöhnliche Upload-/Renamefähigkeiten
+geben striktes Update/Mirror oder bidirektionales Rollback nicht frei.
+Verträge: [Remote-Provider](remote-providers-design.md),
+[strikter bidirektionaler Sync](bidirectional-sync-design.md).
 
 ## 5. Queue, Fehlercodes, Metadaten und Oberfläche
 
 Jedes Fenster besitzt eigene Queue, Schranke, Vorbereitungen und Permits;
-Verbindungen und externer Prozesslock sind gemeinsam. Journalversion 25 speichert
-keine Handles, Secretwerte oder Permits. `outcome_unclear` sperrt den normalen Retry
-auch nach Neustart. Verträge: [Queue](operations-queue-design.md),
-[mehrere Fenster](goal-mehrere-fenster.md), [Recoverybilanz](recovery-aggregation.md).
+Verbindungen und externer Prozesslock sind gemeinsam. Handles, Secrets und Permits
+werden nicht persistiert. `outcome_unclear` sperrt den normalen Retry auch nach
+Neustart. Ausgelassene Resource Forks bleiben als Teilstatus erhalten.
+Verträge: [Queue](operations-queue-design.md), [Fenster](goal-mehrere-fenster.md),
+[Recoverybilanz](recovery-aggregation.md).
 
-`unsupported`, `capability_probe_required` und `permission_denied` unterscheiden
-dauerhafte Grenze, fehlenden Sitzungsbeleg und echte Ablehnung. `connection_lost`
-bleibt vor einer Mutation erhalten; ein unklärbarer möglicher Mutationsausgang wird
-`outcome_unclear`. Core, Tauri und CLI reichen die Codes strukturiert durch.
+Core, Tauri und CLI reichen strukturierte Fehlercodes durch. Fehlende Fähigkeit,
+fehlender Sitzungsbeleg und verweigerte Rechte bleiben unterscheidbar. Ein
+Verbindungsfehler wird bei möglicher unklärbarer Schreibwirkung `outcome_unclear`.
 
-`Portable` bleibt Default. Native Profile verlangen ContentHash; NativeBestEffort
-bleibt für Mirror und bidirektionale Paare gesperrt. Die tatsächlich gehaltene
-Mount-/Providerfähigkeit bestimmt jede Metadatenklasse, nicht der Plattformname.
-Pane-Listen bleiben zugänglich und virtualisiert; Templates halten die strikte CSP.
+`Portable` ist Default. Native Profile brauchen ContentHash; NativeBestEffort
+bleibt im strikten Vertrag für Mirror und bidirektionale Paare gesperrt.
+Technische Metadatenauslassungen werden getrennt bilanziert; ausgelassene
+Dateieinträge sperren weiterhin Mirror-Entfernungen. Tatsächliche Mount-/Provider-
+Fähigkeiten entscheiden, nicht der Plattformname. Listen sind zugänglich und
+virtualisiert; Templates halten die strikte CSP.
 
 ## 6. CLI und Prüfbelege
 
-Die [CLI](headless-cli.md) bietet `plan`, `real`, `mkdir`, `list`, `sync`, `copy`,
-`move`, `rename`, `trash`, `delete`, `capabilities`, `quarantine`, `bidirectional`
-und `connections import`. Es gibt keinen eigenen `download`-/`open`-Befehl und
-keine CLI-Favoritenverwaltung. Ein Download ist eine passende `copy`-Richtung.
-Die Providergrenzen dieses Dokuments gelten auch für alle CLI-Einstiege.
+Die [CLI](headless-cli.md) nutzt dieselben Core-Verträge. Downloads sind eine
+`copy`-Richtung; eigene `download`-/`open`-Befehle und CLI-Favoritenverwaltung gibt
+es nicht. Bidirektionale CLI-Läufe sind auf lokale Paare begrenzt.
 
-Vorliegende Belege umfassen Core-/CLI-/App-Regressionen auf macOS/Linux,
-künstliche FTPS-/WebDAV-/verschlüsselte Samba-E2Es, SFTP-Schutztests und Browserfälle.
-Der vollständige UI-Lauf vom 2026-10-07 besteht aus sechs Modelltests, 234
-Browserfällen und CSP-Prüfung. Native macOS-Belege decken Finder→FTPS,
-Papierkorb v2 und Tabs einschließlich Neustart ab. Historische Testzahlen bleiben
-an ihren jeweiligen Stand gebunden; daraus folgt kein erneut ausgeführter Test.
-Die interaktive Linux-GUI-/Installationsabnahme muss für den Releasekandidaten
-wiederholt werden. Aktuelle Restarbeit: [Backlog](../backlog.md).
+Headless-, Browser- und native Prüfberichte behalten ihre jeweiligen Grenzen.
+Lokale macOS-Informationseditoren und F5-Kopiermetadaten sind nativ geprüft;
+Paket-, Upgrade-, Recovery- und weitere Plattform-/Providerabnahme folgen mit dem
+Releasekandidaten. Aktueller Restumfang: [Backlog](../backlog.md).
 
 ## Pflege
 
-Bei Änderungen an Verhalten, Capabilities oder Gates wird diese Matrix im selben
-Commit aktualisiert. Quellen möglichst über Datei und Symbol angeben; verschobene
-Zeilennummern sind kein stabiler Vertrag. Neue Freigaben brauchen einen konkreten
-Gegenbeleg, passende Tests und den Abgleich von GUI, CLI, Queue und Recovery.
-Eine simulierte UI-Antwort oder ein historischer Erfolg hebt keine aktuelle
-Sicherheitsgrenze auf.
+Verhaltensänderungen aktualisieren die betroffene Tabellenzeile und ihren Vertrag
+im selben Commit. Technische Details und Prüfchronik stehen einmal im verlinkten
+Vertrags-/Prüfdokument. Historische Erfolge ersetzen keine aktuelle Freigabe.

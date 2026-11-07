@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Doppeldecker verwendet Finder, um Dateikommentare mit dem Finder-Infofenster abzugleichen und zu speichern.</string>
   <!-- Doppeldecker sendet auf ausdrücklich abschaltbare Weise drei feste
        Bonjour-Abfragen, um SMB-, SFTP- und WebDAV-Ziele in der Seitenleiste zu
        zeigen. Die Verbindung selbst bleibt danach eine getrennte Nutzeraktion. -->

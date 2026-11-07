@@ -120,6 +120,10 @@ struct CodedError {
     code: ErrorCode,
     message: String,
     recovery_paths: Vec<String>,
+    directory_stream_report: crate::directory_streams::DirectoryStreamReport,
+    directory_dacl_report: crate::directory_dacl::DirectoryDaclReport,
+    file_dacl_report: crate::file_dacl::FileDaclReport,
+    created_directory_dacl_report: crate::created_directory_dacl::CreatedDirectoryDaclReport,
 }
 
 impl fmt::Display for CodedError {
@@ -140,6 +144,10 @@ pub fn coded_error(kind: io::ErrorKind, code: ErrorCode, message: impl Into<Stri
             code,
             message: message.into(),
             recovery_paths: Vec::new(),
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
         },
     )
 }
@@ -153,6 +161,10 @@ pub(crate) fn with_context(error: io::Error, context: impl fmt::Display) -> io::
             code: error_code(&error),
             message: format!("{context}: {error}"),
             recovery_paths: recovery_paths(&error),
+            directory_stream_report: directory_stream_report(&error),
+            directory_dacl_report: directory_dacl_report(&error),
+            file_dacl_report: file_dacl_report(&error),
+            created_directory_dacl_report: created_directory_dacl_report(&error),
         },
     )
 }
@@ -164,6 +176,12 @@ pub(crate) fn with_recovery_path(
     path: &std::path::Path,
     cleanup: &io::Error,
 ) -> io::Error {
+    let mut report = directory_stream_report(&error);
+    report.merge(&directory_stream_report(cleanup));
+    let mut dacl_report = directory_dacl_report(&error);
+    dacl_report.merge(&directory_dacl_report(cleanup));
+    let mut file_report = file_dacl_report(&error);
+    file_report.merge(&file_dacl_report(cleanup));
     let mut paths = recovery_paths(&error);
     for path in recovery_paths(cleanup) {
         if !paths.contains(&path) {
@@ -182,6 +200,14 @@ pub(crate) fn with_recovery_path(
                 "{error}; Bereinigung fehlgeschlagen ({cleanup}); Recoverypfad: {path}"
             ),
             recovery_paths: paths,
+            directory_stream_report: report,
+            directory_dacl_report: dacl_report,
+            file_dacl_report: file_report,
+            created_directory_dacl_report: {
+                let mut report = created_directory_dacl_report(&error);
+                report.merge(&created_directory_dacl_report(cleanup));
+                report
+            },
         },
     )
 }
@@ -204,6 +230,10 @@ pub fn with_recovery_paths(error: io::Error, additional: &[String]) -> io::Error
             code: error_code(&error),
             message: format!("{error}; Recoverypfade: {}", paths.join("; ")),
             recovery_paths: paths,
+            directory_stream_report: directory_stream_report(&error),
+            directory_dacl_report: directory_dacl_report(&error),
+            file_dacl_report: file_dacl_report(&error),
+            created_directory_dacl_report: created_directory_dacl_report(&error),
         },
     )
 }
@@ -221,7 +251,151 @@ pub(crate) fn with_recovery_context(
         .flat_map(|cause| recovery_paths(cause))
         .collect::<Vec<_>>();
     recovery.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
-    with_recovery_paths(error, &recovery)
+    let mut report = directory_stream_report(&error);
+    let mut dacl_report = directory_dacl_report(&error);
+    let mut file_report = file_dacl_report(&error);
+    for cause in causes {
+        file_report.merge(&file_dacl_report(cause));
+        report.merge(&directory_stream_report(cause));
+        dacl_report.merge(&directory_dacl_report(cause));
+    }
+    let mut created_report = created_directory_dacl_report(&error);
+    for cause in causes {
+        created_report.merge(&created_directory_dacl_report(cause));
+    }
+    with_created_directory_dacl_report(
+        with_file_dacl_report(
+            with_directory_dacl_report(
+                with_directory_stream_report(with_recovery_paths(error, &recovery), &report),
+                &dacl_report,
+            ),
+            &file_report,
+        ),
+        &created_report,
+    )
+}
+
+/// Erhält bestätigte und unklare dauerhafte Einzelwirkungen auch beim Ersetzen
+/// einer Fehlerhülle. Derselbe Beleg wird nur einmal geführt.
+pub fn with_directory_stream_report(
+    error: io::Error,
+    additional: &crate::directory_streams::DirectoryStreamReport,
+) -> io::Error {
+    let mut report = directory_stream_report(&error);
+    report.merge(additional);
+    if report.is_empty() || report == directory_stream_report(&error) {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        CodedError {
+            code: error_code(&error),
+            message: format!("{error}; {}", directory_stream_report_text(&report)),
+            recovery_paths: recovery_paths(&error),
+            directory_stream_report: report,
+            directory_dacl_report: directory_dacl_report(&error),
+            file_dacl_report: file_dacl_report(&error),
+            created_directory_dacl_report: created_directory_dacl_report(&error),
+        },
+    )
+}
+
+/// Maschinenlesbare Einzelwirkungen; ein leerer Report behauptet keine Wirkung.
+pub fn directory_stream_report(
+    error: &io::Error,
+) -> crate::directory_streams::DirectoryStreamReport {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<CodedError>())
+        .map(|coded| coded.directory_stream_report.clone())
+        .unwrap_or_default()
+}
+
+/// Sichtbarer Beleg ohne Wiederherstellungsbehauptung. Die vollständigen Hashes
+/// und Größen bleiben zusätzlich im strukturierten Report erhalten.
+pub fn directory_stream_report_text(
+    report: &crate::directory_streams::DirectoryStreamReport,
+) -> String {
+    use crate::directory_streams::DirectoryStreamEffect;
+    let describe = |outcome: &crate::directory_streams::DirectoryStreamOutcome| {
+        let action = match &outcome.effect {
+            DirectoryStreamEffect::Add { after } => {
+                format!("angelegt ({} Bytes)", after.value.size)
+            }
+            DirectoryStreamEffect::Replace { before, after } => format!(
+                "dauerhaft ersetzt ({} → {} Bytes)",
+                before.value.size, after.value.size
+            ),
+            DirectoryStreamEffect::Remove { before } => {
+                format!("dauerhaft entfernt ({} Bytes)", before.value.size)
+            }
+        };
+        format!(
+            "{}: Stream {:?} {action}",
+            outcome.directory,
+            String::from_utf8_lossy(outcome.effect.name())
+        )
+    };
+    let mut parts = Vec::new();
+    for outcome in &report.completed {
+        parts.push(format!("Bestätigt: {}", describe(outcome)));
+    }
+    for outcome in &report.uncertain {
+        parts.push(format!("Ausgang unklar: {}", describe(outcome)));
+    }
+    parts.join("; ")
+}
+
+/// Bewahrt bestätigte und unklare DACL-Einzelwirkungen beim Weiterreichen.
+pub fn with_directory_dacl_report(
+    error: io::Error,
+    additional: &crate::directory_dacl::DirectoryDaclReport,
+) -> io::Error {
+    let mut report = directory_dacl_report(&error);
+    report.merge(additional);
+    if report.is_empty() || report == directory_dacl_report(&error) {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        CodedError {
+            code: error_code(&error),
+            message: format!("{error}; {}", directory_dacl_report_text(&report)),
+            recovery_paths: recovery_paths(&error),
+            directory_stream_report: directory_stream_report(&error),
+            directory_dacl_report: report,
+            file_dacl_report: file_dacl_report(&error),
+            created_directory_dacl_report: created_directory_dacl_report(&error),
+        },
+    )
+}
+
+pub fn directory_dacl_report(error: &io::Error) -> crate::directory_dacl::DirectoryDaclReport {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<CodedError>())
+        .map(|coded| coded.directory_dacl_report.clone())
+        .unwrap_or_default()
+}
+
+pub fn directory_dacl_report_text(report: &crate::directory_dacl::DirectoryDaclReport) -> String {
+    report
+        .completed
+        .iter()
+        .map(|outcome| {
+            format!(
+                "Bestätigt: {}: Verzeichnis-DACL dauerhaft gesetzt",
+                outcome.directory
+            )
+        })
+        .chain(report.uncertain.iter().map(|outcome| {
+            format!(
+                "Ausgang unklar: {}: Verzeichnis-DACL; vor weiteren Änderungen prüfen",
+                outcome.directory
+            )
+        }))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Strukturierte Prüfhinweise für Queue, GUI und CLI. Sie erteilen kein Recht,
@@ -260,9 +434,183 @@ pub fn error_code(error: &io::Error) -> ErrorCode {
         })
 }
 
+pub fn with_file_dacl_report(
+    error: io::Error,
+    additional: &crate::file_dacl::FileDaclReport,
+) -> io::Error {
+    let mut report = file_dacl_report(&error);
+    report.merge(additional);
+    if report.is_empty() || report == file_dacl_report(&error) {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        CodedError {
+            code: error_code(&error),
+            message: format!("{error}; {}", file_dacl_report_text(&report)),
+            recovery_paths: recovery_paths(&error),
+            directory_stream_report: directory_stream_report(&error),
+            directory_dacl_report: directory_dacl_report(&error),
+            file_dacl_report: report,
+            created_directory_dacl_report: created_directory_dacl_report(&error),
+        },
+    )
+}
+pub fn file_dacl_report(error: &io::Error) -> crate::file_dacl::FileDaclReport {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<CodedError>())
+        .map(|coded| coded.file_dacl_report.clone())
+        .unwrap_or_default()
+}
+pub fn file_dacl_report_text(report: &crate::file_dacl::FileDaclReport) -> String {
+    let describe = |outcome: &crate::file_dacl::FileDaclOutcome| {
+        format!("{}: objektweite Datei-DACL ({} ausgewählte Namen; bekannte Namensliste unvollständig, alle bestehenden und neuen Namen auch außerhalb des Scanroots betroffen)",outcome.file,outcome.alias_scope.selected_paths.len())
+    };
+    report
+        .completed
+        .iter()
+        .map(|outcome| format!("Bestätigt: {}", describe(outcome)))
+        .chain(
+            report
+                .uncertain
+                .iter()
+                .map(|outcome| format!("Ausgang unklar: {}", describe(outcome))),
+        )
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+pub fn with_created_directory_dacl_report(
+    error: io::Error,
+    additional: &crate::created_directory_dacl::CreatedDirectoryDaclReport,
+) -> io::Error {
+    let mut report = created_directory_dacl_report(&error);
+    report.merge(additional);
+    if report.is_empty() || report == created_directory_dacl_report(&error) {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        CodedError {
+            code: error_code(&error),
+            message: format!("{error}; {}", created_directory_dacl_report_text(&report)),
+            recovery_paths: recovery_paths(&error),
+            directory_stream_report: directory_stream_report(&error),
+            directory_dacl_report: directory_dacl_report(&error),
+            file_dacl_report: file_dacl_report(&error),
+            created_directory_dacl_report: report,
+        },
+    )
+}
+pub fn created_directory_dacl_report(
+    error: &io::Error,
+) -> crate::created_directory_dacl::CreatedDirectoryDaclReport {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<CodedError>())
+        .map(|coded| coded.created_directory_dacl_report.clone())
+        .unwrap_or_default()
+}
+pub fn created_directory_dacl_report_text(
+    report: &crate::created_directory_dacl::CreatedDirectoryDaclReport,
+) -> String {
+    let describe = |outcome: &crate::created_directory_dacl::CreatedDirectoryDaclOutcome| {
+        format!(
+            "{}: {} (Objekt {})",
+            outcome.directory,
+            if outcome.origin == crate::created_directory_dacl::CreatedDirectoryOrigin::ExclusiveMinimalCreateBeforeChildren {
+                "Rechte vor der Kinderarbeit am selbst neu erzeugten Ordner"
+            } else { "Rechte des selbst neu erzeugten leeren Ordners" },
+            outcome.file_id
+        )
+    };
+    report
+        .created
+        .iter()
+        .map(|observation| {
+            format!(
+                "{}: {} (Objekt {}; gewöhnliche Metadaten {})",
+                if observation.effect_key.origin == crate::created_directory_dacl::CreatedDirectoryOrigin::ExclusiveMinimalCreateBeforeChildren { "Vor Kinderarbeit angelegt" } else { "Angelegt" },
+                observation.effect_key.directory,
+                observation.effect_key.file_id,
+                if observation.ordinary_metadata_applied {
+                    "bestätigt"
+                } else {
+                    "noch nicht bestätigt"
+                }
+            )
+        })
+        .chain(
+            report
+                .completed
+                .iter()
+                .map(|outcome| format!("Bestätigt: {}", describe(outcome))),
+        )
+        .chain(
+            report
+                .uncertain
+                .iter()
+                .map(|outcome| format!("Ausgang unklar: {}", describe(outcome))),
+        )
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stream_report(uncertain: bool) -> crate::directory_streams::DirectoryStreamReport {
+        use crate::directory_streams::{
+            DirectoryStreamEffect, DirectoryStreamOutcome, DirectoryStreamReport,
+        };
+        let outcome = DirectoryStreamOutcome {
+            directory: "ordner".into(),
+            effect: DirectoryStreamEffect::Remove {
+                before: crate::metadata::NamedBlobSummary {
+                    name: b"Altstream".to_vec(),
+                    value: crate::metadata::BlobSummary::from_bytes(b"alt"),
+                },
+            },
+        };
+        DirectoryStreamReport {
+            completed: if uncertain {
+                vec![]
+            } else {
+                vec![outcome.clone()]
+            },
+            uncertain: if uncertain { vec![outcome] } else { vec![] },
+        }
+    }
+
+    #[test]
+    fn verzeichnisstream_bilanz_ueberlebt_kontext_codeersatz_und_cleanup() {
+        let report = stream_report(false);
+        let error = with_directory_stream_report(io::Error::other("nach Teilwirkung"), &report);
+        let error = with_context(error, "Kontext");
+        let error = with_recovery_paths(error, &["rest".into()]);
+        let cleanup =
+            with_directory_stream_report(io::Error::other("cleanup"), &stream_report(true));
+        let error = with_recovery_path(error, std::path::Path::new("temp"), &cleanup);
+        let error = with_recovery_context(
+            coded_error(
+                io::ErrorKind::Other,
+                ErrorCode::OutcomeUnclear,
+                "neue Hülle",
+            ),
+            &[&error, &cleanup],
+            &[],
+        );
+        assert_eq!(directory_stream_report(&error), report);
+        assert_eq!(error_code(&error), ErrorCode::OutcomeUnclear);
+        assert_eq!(recovery_paths(&error), vec!["rest", "temp"]);
+        assert!(error.to_string().contains("Altstream"));
+        assert!(error.to_string().contains("dauerhaft entfernt"));
+        let before = error.to_string();
+        let error = with_directory_stream_report(error, &report);
+        assert_eq!(error.to_string(), before);
+    }
 
     #[test]
     fn code_und_text_ueberleben_den_io_error() {

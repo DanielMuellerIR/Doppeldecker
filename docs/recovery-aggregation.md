@@ -42,4 +42,4 @@ Fehler bestehen auf macOS. Die Linux-Testkopie verwendet Rust 1.96.1; macOS
 prüft denselben Quellstand. Keine Frontendänderung oder Produktinstallation.
 
 Die bisherigen Einweg-/Provider-/SFTP-Korrekturen und deren Belege stehen in
-[Review-Korrekturen 2026-10-03](release-validation.md).
+[Review-Korrekturen 2026-10-03](code-review-2026-10-03.md).

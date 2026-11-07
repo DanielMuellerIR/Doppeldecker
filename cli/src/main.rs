@@ -1,8 +1,9 @@
 //! Headless-Kommandozeile für denselben Sicherheitsvertrag wie die Desktop-App.
 //!
 //! Es existiert bewusst kein `--force` und kein serialisierbares Permit. Ein realer
-//! Lauf bleibt im selben Prozess, hält seine Deskriptoren offen und liest die zufällige
-//! Phrase sowie bei Update/Mirror die Backup-Bestätigung über stdin.
+//! Lauf bleibt im selben Prozess und hält seine Backendvorbereitung offen. Die
+//! konkrete Wirkung wird über stdin bestätigt; große dauerhafte Entfernungen
+//! verlangen zusätzlich den dafür gebundenen Bestätigungstext.
 
 mod connection_import;
 
@@ -27,8 +28,6 @@ use doppeldecker_core::{
     SftpVfs, SyncMode, SyncOptions, SyncStats, Vfs,
 };
 use zeroize::Zeroizing;
-
-const BACKUP_CONFIRMATION: &str = "BACKUP UND RESTORE BESTÄTIGT";
 
 /// Umgebungsvariable, die jeden stillen Rückfall auf die echten Nutzerpfade verbietet.
 ///
@@ -100,6 +99,21 @@ enum Command {
     Bidirectional(BidirectionalArgs),
     /// Gespeicherte Verbindungen ohne GUI verwalten.
     Connections(ConnectionsArgs),
+    /// Offene Verzeichnis-DACL ohne erneutes Setzen frisch prüfen und abschließen.
+    AcknowledgeDirectoryDacl(AcknowledgeDirectoryDaclArgs),
+    /// Objektweite Datei-DACL ohne erneutes Setzen frisch prüfen und abschließen.
+    AcknowledgeFileDacl(AcknowledgeDirectoryDaclArgs),
+    /// Rechte selbst neu angelegter Ordner ausschließlich lesend abschließen.
+    AcknowledgeCreatedDirectoryDacl(AcknowledgeDirectoryDaclArgs),
+}
+
+#[derive(Args)]
+struct AcknowledgeDirectoryDaclArgs {
+    /// Operations-ID des gespeicherten Inhaltssyncs.
+    operation_id: String,
+    /// Bestätigt die bewusste Prüfung des möglichen Rechtezustands.
+    #[arg(long)]
+    reviewed: bool,
 }
 
 #[derive(Args)]
@@ -270,7 +284,7 @@ enum BidirectionalCommand {
     Plan(BidirectionalPlanArgs),
     /// Im selben Prozess planen, bestätigen und ausführen.
     Run(BidirectionalPlanArgs),
-    /// Einen offenen Lauf mit frischen Handles und neuer Phrase fortsetzen.
+    /// Einen offenen Lauf mit frischen Handles und bestätigter Wirkung fortsetzen.
     Resume(BidirectionalRecoveryArgs),
     /// Einen offenen Teilcommit rückwärts wiederherstellen.
     Rollback(BidirectionalRecoveryArgs),
@@ -509,12 +523,33 @@ impl Output {
 }
 
 fn cli_error_event(error: &io::Error) -> serde_json::Value {
-    serde_json::json!({
+    let mut event = serde_json::json!({
         "event": "error",
         "code": doppeldecker_core::error_code(error).as_str(),
         "message": error.to_string(),
         "recovery_paths": doppeldecker_core::error::recovery_paths(error),
-    })
+    });
+    let report = doppeldecker_core::error::directory_stream_report(error);
+    if !report.is_empty() {
+        event["directory_stream_report"] =
+            serde_json::to_value(report).expect("serialisierbare Streambilanz");
+    }
+    let report = doppeldecker_core::error::directory_dacl_report(error);
+    if !report.is_empty() {
+        event["directory_dacl_report"] =
+            serde_json::to_value(report).expect("serialisierbare Verzeichnis-DACL-Bilanz");
+    }
+    let report = doppeldecker_core::error::file_dacl_report(error);
+    if !report.is_empty() {
+        event["file_dacl_report"] =
+            serde_json::to_value(report).expect("serialisierbare Datei-DACL-Bilanz");
+    }
+    let report = doppeldecker_core::error::created_directory_dacl_report(error);
+    if !report.is_empty() {
+        event["created_directory_dacl_report"] =
+            serde_json::to_value(report).expect("serialisierbare Neuordner-DACL-Bilanz");
+    }
+    event
 }
 
 fn provider_file_error_event(
@@ -525,7 +560,7 @@ fn provider_file_error_event(
     journal_errors: &[io::Error],
 ) -> serde_json::Value {
     let primary = journal_errors.last().unwrap_or(execution_error);
-    serde_json::json!({
+    let mut event = serde_json::json!({
         "event": "error",
         "code": doppeldecker_core::error_code(primary).as_str(),
         "message": primary.to_string(),
@@ -556,7 +591,41 @@ fn provider_file_error_event(
             "retained_backup_paths": actuals.retained_backup_paths,
         },
         "recovery": recovery,
-    })
+    });
+    let mut report = progress.directory_dacl_report.clone();
+    report.merge(&doppeldecker_core::error::directory_dacl_report(
+        execution_error,
+    ));
+    for error in journal_errors {
+        report.merge(&doppeldecker_core::error::directory_dacl_report(error));
+    }
+    if !report.is_empty() {
+        event["directory_dacl_report"] =
+            serde_json::to_value(report).expect("serialisierbare Verzeichnis-DACL-Bilanz");
+    }
+    let mut file_report = progress.file_dacl_report.clone();
+    file_report.merge(&doppeldecker_core::error::file_dacl_report(execution_error));
+    for error in journal_errors {
+        file_report.merge(&doppeldecker_core::error::file_dacl_report(error));
+    }
+    if !file_report.is_empty() {
+        event["file_dacl_report"] =
+            serde_json::to_value(file_report).expect("serialisierbare Datei-DACL-Bilanz");
+    }
+    let mut created_report = progress.created_directory_dacl_report.clone();
+    created_report.merge(&doppeldecker_core::error::created_directory_dacl_report(
+        execution_error,
+    ));
+    for error in journal_errors {
+        created_report.merge(&doppeldecker_core::error::created_directory_dacl_report(
+            error,
+        ));
+    }
+    if !created_report.is_empty() {
+        event["created_directory_dacl_report"] =
+            serde_json::to_value(created_report).expect("serialisierbare Datei-DACL-Bilanz");
+    }
+    event
 }
 
 fn main() {
@@ -587,6 +656,15 @@ fn main() {
             Command::Quarantine(args) => quarantine_command(args, &config_dir, &mut output),
             Command::Bidirectional(args) => bidirectional_command(args, &config_dir, &mut output),
             Command::Connections(args) => connections_command(args, &config_dir, &mut output),
+            Command::AcknowledgeCreatedDirectoryDacl(args) => {
+                acknowledge_created_directory_dacl_command(args, &config_dir, &mut output)
+            }
+            Command::AcknowledgeFileDacl(args) => {
+                acknowledge_file_dacl_command(args, &config_dir, &mut output)
+            }
+            Command::AcknowledgeDirectoryDacl(args) => {
+                acknowledge_directory_dacl_command(args, &config_dir, &mut output)
+            }
         },
     };
     let code = match result {
@@ -601,13 +679,288 @@ fn main() {
     }
 }
 
+fn acknowledge_directory_dacl_command(
+    args: AcknowledgeDirectoryDaclArgs,
+    config_dir: &Path,
+    output: &mut Output,
+) -> io::Result<i32> {
+    if !args.reviewed {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::PermissionDenied,
+            ErrorCode::ConfirmationMismatch,
+            "Der mögliche Rechtezustand muss mit --reviewed bewusst bestätigt werden",
+        ));
+    }
+    let queue = open_cli_queue(config_dir)?;
+    let entry = queue
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.operation_id == args.operation_id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Queueeintrag fehlt"))?;
+    if !matches!(
+        entry.state,
+        doppeldecker_core::QueueState::Failed | doppeldecker_core::QueueState::Interrupted
+    ) || !entry.directory_dacl_recovery
+    {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::InvalidInput,
+            ErrorCode::ReplanRequired,
+            "Der Queueeintrag besitzt keine offene Verzeichnis-DACL-Recovery",
+        ));
+    }
+    let QueueOperation::ContentSync { target, .. } = &entry.operation else {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::InvalidInput,
+            ErrorCode::ReplanRequired,
+            "Verzeichnis-DACL-Recovery benötigt den ursprünglichen Inhaltssync",
+        ));
+    };
+    let BidirectionalQueueEndpoint::Smb { connection, .. } = target.as_ref() else {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::InvalidInput,
+            ErrorCode::PlanDrift,
+            "Das gespeicherte Rechteziel ist kein SMB-Endpunkt",
+        ));
+    };
+    // GUI-erzeugte Queueeinträge behalten auch beim Headless-Abschluss ihre
+    // gespeicherte Profilrevision. Ältere CLI-Einträge binden direkt ihre vollständige
+    // gespeicherte Verbindung; weder ein neues Profil noch ein anderer Pin wird gewählt.
+    if !entry.profile_bindings.is_empty() {
+        let profiles =
+            doppeldecker_core::load_smb_profiles_versioned(&config_dir.join("smb-profiles.json"))?;
+        let matching = profiles.iter().any(|profile| {
+            profile.profile.connection == **connection
+                && entry.profile_bindings.iter().any(|binding| {
+                    binding.protocol == doppeldecker_core::RemoteProfileProtocol::Smb
+                        && binding.profile_id == profile.profile.id
+                        && binding.revision == profile.revision
+                })
+        });
+        if !matching {
+            return Err(doppeldecker_core::coded_error(
+                io::ErrorKind::InvalidInput,
+                ErrorCode::PlanDrift,
+                "Das gespeicherte SMB-Zielprofil oder seine Revision änderte sich",
+            ));
+        }
+    }
+    let endpoint = target.connect(Arc::new(KeyringResolver))?;
+    doppeldecker_core::directory_dacl_queue::acknowledge_directory_dacl_outcome(
+        &queue,
+        &args.operation_id,
+        &endpoint,
+        args.reviewed,
+    )?;
+    let entry = queue
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.operation_id == args.operation_id)
+        .expect("zuvor geprüft");
+    output.event(serde_json::json!({"event":"directory_dacl_acknowledged", "operation_id":args.operation_id, "directory_dacl_report":entry.directory_dacl_report}))?;
+    if !entry.directory_dacl_report.is_empty() {
+        output.text(doppeldecker_core::error::directory_dacl_report_text(
+            &entry.directory_dacl_report,
+        ));
+    }
+    output.text(
+        "Aktueller Rechtezustand geprüft und Queueeintrag ohne erneutes Setzen abgeschlossen.",
+    );
+    Ok(0)
+}
+
+fn acknowledge_file_dacl_command(
+    args: AcknowledgeDirectoryDaclArgs,
+    config_dir: &Path,
+    output: &mut Output,
+) -> io::Result<i32> {
+    if !args.reviewed {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::PermissionDenied,
+            ErrorCode::ConfirmationMismatch,
+            "Der mögliche Rechtezustand muss mit --reviewed bewusst bestätigt werden",
+        ));
+    }
+    let queue = open_cli_queue(config_dir)?;
+    let entry = queue
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.operation_id == args.operation_id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Queueeintrag fehlt"))?;
+    if !matches!(
+        entry.state,
+        doppeldecker_core::QueueState::Failed | doppeldecker_core::QueueState::Interrupted
+    ) || !entry.file_dacl_recovery
+    {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::InvalidInput,
+            ErrorCode::ReplanRequired,
+            "Der Queueeintrag besitzt keine offene Datei-DACL-Recovery",
+        ));
+    }
+    let QueueOperation::ContentSync { target, .. } = &entry.operation else {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::InvalidInput,
+            ErrorCode::ReplanRequired,
+            "Datei-DACL-Recovery benötigt den ursprünglichen Inhaltssync",
+        ));
+    };
+    let BidirectionalQueueEndpoint::Smb { connection, .. } = target.as_ref() else {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::InvalidInput,
+            ErrorCode::PlanDrift,
+            "Das gespeicherte Rechteziel ist kein SMB-Endpunkt",
+        ));
+    };
+    // GUI-erzeugte Queueeinträge behalten auch beim Headless-Abschluss ihre
+    // gespeicherte Profilrevision. Ältere CLI-Einträge binden direkt ihre vollständige
+    // gespeicherte Verbindung; weder ein neues Profil noch ein anderer Pin wird gewählt.
+    if !entry.profile_bindings.is_empty() {
+        let profiles =
+            doppeldecker_core::load_smb_profiles_versioned(&config_dir.join("smb-profiles.json"))?;
+        let matching = profiles.iter().any(|profile| {
+            profile.profile.connection == **connection
+                && entry.profile_bindings.iter().any(|binding| {
+                    binding.protocol == doppeldecker_core::RemoteProfileProtocol::Smb
+                        && binding.profile_id == profile.profile.id
+                        && binding.revision == profile.revision
+                })
+        });
+        if !matching {
+            return Err(doppeldecker_core::coded_error(
+                io::ErrorKind::InvalidInput,
+                ErrorCode::PlanDrift,
+                "Das gespeicherte SMB-Zielprofil oder seine Revision änderte sich",
+            ));
+        }
+    }
+    let endpoint = target.connect(Arc::new(KeyringResolver))?;
+    doppeldecker_core::file_dacl_queue::acknowledge_file_dacl_outcome(
+        &queue,
+        &args.operation_id,
+        &endpoint,
+        args.reviewed,
+    )?;
+    let entry = queue
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.operation_id == args.operation_id)
+        .expect("zuvor geprüft");
+    output.event(serde_json::json!({"event":"file_dacl_acknowledged", "operation_id":args.operation_id, "file_dacl_report":entry.file_dacl_report}))?;
+    if !entry.file_dacl_report.is_empty() {
+        output.text(doppeldecker_core::error::file_dacl_report_text(
+            &entry.file_dacl_report,
+        ));
+    }
+    output.text(
+        "Aktueller Rechtezustand geprüft und Queueeintrag ohne erneutes Setzen abgeschlossen.",
+    );
+    Ok(0)
+}
+
+fn acknowledge_created_directory_dacl_command(
+    args: AcknowledgeDirectoryDaclArgs,
+    config_dir: &Path,
+    output: &mut Output,
+) -> io::Result<i32> {
+    if !args.reviewed {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::PermissionDenied,
+            ErrorCode::ConfirmationMismatch,
+            "Der mögliche Rechtezustand muss mit --reviewed bewusst bestätigt werden",
+        ));
+    }
+    let queue = open_cli_queue(config_dir)?;
+    let entry = queue
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.operation_id == args.operation_id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Queueeintrag fehlt"))?;
+    if !matches!(
+        entry.state,
+        doppeldecker_core::QueueState::Failed | doppeldecker_core::QueueState::Interrupted
+    ) || !entry.created_directory_dacl_recovery
+    {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::InvalidInput,
+            ErrorCode::ReplanRequired,
+            "Der Queueeintrag besitzt keine offene Neuordner-DACL-Recovery",
+        ));
+    }
+    let QueueOperation::ContentSync { target, .. } = &entry.operation else {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::InvalidInput,
+            ErrorCode::ReplanRequired,
+            "Neuordner-DACL-Recovery benötigt den ursprünglichen Inhaltssync",
+        ));
+    };
+    let BidirectionalQueueEndpoint::Smb { connection, .. } = target.as_ref() else {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::InvalidInput,
+            ErrorCode::PlanDrift,
+            "Das gespeicherte Rechteziel ist kein SMB-Endpunkt",
+        ));
+    };
+    // GUI-erzeugte Queueeinträge behalten auch beim Headless-Abschluss ihre
+    // gespeicherte Profilrevision. Ältere CLI-Einträge binden direkt ihre vollständige
+    // gespeicherte Verbindung; weder ein neues Profil noch ein anderer Pin wird gewählt.
+    if !entry.profile_bindings.is_empty() {
+        let profiles =
+            doppeldecker_core::load_smb_profiles_versioned(&config_dir.join("smb-profiles.json"))?;
+        let matching = profiles.iter().any(|profile| {
+            profile.profile.connection == **connection
+                && entry.profile_bindings.iter().any(|binding| {
+                    binding.protocol == doppeldecker_core::RemoteProfileProtocol::Smb
+                        && binding.profile_id == profile.profile.id
+                        && binding.revision == profile.revision
+                })
+        });
+        if !matching {
+            return Err(doppeldecker_core::coded_error(
+                io::ErrorKind::InvalidInput,
+                ErrorCode::PlanDrift,
+                "Das gespeicherte SMB-Zielprofil oder seine Revision änderte sich",
+            ));
+        }
+    }
+    let endpoint = target.connect(Arc::new(KeyringResolver))?;
+    doppeldecker_core::acknowledge_created_directory_dacl_outcome(
+        &queue,
+        &args.operation_id,
+        &endpoint,
+        args.reviewed,
+    )?;
+    let entry = queue
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.operation_id == args.operation_id)
+        .expect("zuvor geprüft");
+    output.event(serde_json::json!({"event":"created_directory_dacl_acknowledged", "operation_id":args.operation_id, "created_directory_dacl_report":entry.created_directory_dacl_report}))?;
+    if !entry.created_directory_dacl_report.is_empty() {
+        output.text(
+            doppeldecker_core::error::created_directory_dacl_report_text(
+                &entry.created_directory_dacl_report,
+            ),
+        );
+    }
+    output.text(
+        "Aktueller Rechtezustand geprüft und Queueeintrag ohne erneutes Setzen abgeschlossen.",
+    );
+    Ok(0)
+}
+
 fn plan_command(args: SyncArgs, output: &mut Output) -> io::Result<i32> {
     let options = args.options();
     options.validate()?;
     let source = expand_and_canonicalize(&args.source)?;
     let target = expand_and_canonicalize(&args.target)?;
     let (source, target) = doppeldecker_core::validate_local_sync_roots(&source, &target)?;
-    let vfs = LocalVfs::new();
+    let vfs = LocalVfs::new().with_sync_scope(&source, &target)?;
     let plan = doppeldecker_core::plan(&vfs, &source, &vfs, &target, &options)?;
     output.event(serde_json::json!({
         "event": "plan",
@@ -656,8 +1009,9 @@ fn mkdir_command(args: MkdirArgs, config_dir: &Path, output: &mut Output) -> io:
     })?;
     // Prozessbesitz bleibt vor Verbindung und jeder Providerwirkung. Nur die
     // bisherigen übrigen Provider verwenden weiterhin ihre getrennte mkdir-Probe.
+    let queue_endpoint = resolve_queue_endpoint(&spec, config_dir)?;
     let _queue_lock = open_cli_queue(config_dir)?;
-    let mut resolved = resolve_endpoint(&spec, config_dir)?;
+    let mut resolved = connect_resolved_endpoint(&spec, queue_endpoint)?;
     resolved.endpoint = _queue_lock.bind_provider_preparation(&resolved.endpoint)?;
     for note in &contract.limitations {
         eprintln!("{note}");
@@ -771,6 +1125,9 @@ fn provider_sync_command(
     // Queue-Mutation zur Folge.
     let options = args.options();
     options.validate()?;
+    if args.source_provider != ProviderArg::Local || args.target_provider != ProviderArg::Local {
+        doppeldecker_core::validate_content_sync_options(&options)?;
+    }
     let source_root = validate_provider_sync_root(args.source_provider, &args.source_root)?;
     let target_root = validate_provider_sync_root(args.target_provider, &args.target_root)?;
     let source_spec = EndpointSpec {
@@ -821,11 +1178,15 @@ fn provider_sync_command(
             "Provider-Sync-Roots stimmen nicht mit den frisch gebundenen Endpunkten überein",
         ));
     }
+    if args.source_provider != ProviderArg::Local || args.target_provider != ProviderArg::Local {
+        return content_sync_command(source, target, options, &queue_lock, &audit, output);
+    }
     output.event(serde_json::json!({ "event": "provider_sync_preparing" }))?;
     if !output.json {
         eprintln!("Provider-Sync-Vorprüfung: Identitäten, Listings, Fähigkeiten, Plan und Platz …");
     }
-    let prepared = doppeldecker_core::prepare_provider_transfer(
+    let prepared = doppeldecker_core::prepare_provider_transfer_for_queue(
+        &queue_lock,
         queue_lock.bind_provider_preparation(&source.endpoint)?,
         queue_lock.bind_provider_preparation(&target.endpoint)?,
         options,
@@ -840,14 +1201,246 @@ fn provider_sync_command(
         preview.impact.required_available_bytes
     ));
 
-    let (confirmation, backup_confirmed) = read_run_confirmation(preview)?;
-    let run = prepared.confirm(&confirmation, backup_confirmed)?;
+    let effects_confirmed = read_run_confirmation(preview)?;
+    let run = prepared.confirm_effects(effects_confirmed)?;
     let cancel = install_cancel_handler()?;
     let mut last = Instant::now() - Duration::from_secs(1);
     let stats = run.execute_with_audit(&audit, &cancel, &mut |progress| {
         emit_throttled_progress(output, &mut last, progress);
     })?;
     emit_sync_result(output, "provider_sync_result", &stats, &audit)
+}
+
+fn content_sync_command(
+    source: ResolvedEndpoint,
+    target: ResolvedEndpoint,
+    options: SyncOptions,
+    queue: &OperationQueue,
+    audit: &Path,
+    output: &mut Output,
+) -> io::Result<i32> {
+    let cancel = install_cancel_handler()?;
+    output.event(
+        serde_json::json!({ "event": "provider_sync_preparing", "execution_class": "best_effort" }),
+    )?;
+    let prepared = doppeldecker_core::prepare_content_sync_for_queue(
+        queue,
+        queue.bind_provider_preparation_with_cancel(&source.endpoint, &cancel)?,
+        queue.bind_provider_preparation_with_cancel(&target.endpoint, &cancel)?,
+        options.clone(),
+        &cancel,
+    )?;
+    let preview = prepared.preview();
+    output.event(serde_json::json!({ "event": "provider_sync_preview", "execution_class": "best_effort", "preview": preview }))?;
+    output.text(format!(
+        "Dateisync: {} neu, {} aktualisieren, {} entfernen; davon {} Ersetzungen und {} Entfernungen dauerhaft; {} Bytes übertragen",
+        preview.plan.copy_count,
+        preview.plan.update_count,
+        preview.plan.delete_count,
+        preview.irreversible_replacements,
+        preview.irreversible_removals,
+        preview.plan.bytes_to_transfer,
+    ));
+    let planned_skips = preview.plan.skip_count;
+    let (confirmed, removal_phrase) = read_content_sync_confirmation(preview)?;
+    if !confirmed {
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::PermissionDenied,
+            ErrorCode::ConfirmationMismatch,
+            "Die angezeigte Dateisync-Wirkung wurde nicht bestätigt",
+        ));
+    }
+    let operation = QueueOperation::ContentSync {
+        source: Box::new(source.queue_endpoint),
+        target: Box::new(target.queue_endpoint),
+        options,
+        expected_plan: Box::new(preview.plan.clone()),
+        binding_digest: preview.digest,
+    };
+    let entry = queue.enqueue_claimed(operation)?;
+    let mut last = Instant::now() - Duration::from_secs(1);
+    let mut latest_progress = Progress::default();
+    let result =
+        doppeldecker_core::queue::execute_prepared_content_sync_queue_entry_with_removal_phrase(
+            queue,
+            &entry,
+            prepared,
+            confirmed,
+            removal_phrase.as_deref(),
+            audit,
+            &cancel,
+            &mut |progress| {
+                latest_progress = progress.clone();
+                emit_throttled_progress(output, &mut last, progress);
+            },
+        );
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let current = queue
+                .snapshot()
+                .entries
+                .into_iter()
+                .find(|current| current.operation_id == entry.operation_id);
+            if current.is_some_and(|current| {
+                matches!(
+                    current.state,
+                    doppeldecker_core::QueueState::Validating
+                        | doppeldecker_core::QueueState::Running
+                )
+            }) {
+                if let Err(journal_error) =
+                    queue.fail_coded(&entry.operation_id, latest_progress, &error)
+                {
+                    return Err(queue_commit_error(&error, &journal_error, "Queueabschluss"));
+                }
+            }
+            return Err(error);
+        }
+    };
+    let QueueExecutionResult::Sync(stats) = result else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Dateisync lieferte einen fremden Queue-Ergebnistyp",
+        ));
+    };
+    output.event(serde_json::json!({ "event": "provider_sync_result", "execution_class": "best_effort", "operation_id": entry.operation_id, "stats": stats, "planned_skips": planned_skips, "audit": audit }))?;
+    if !stats.directory_stream_report.is_empty() {
+        output.text(doppeldecker_core::error::directory_stream_report_text(
+            &stats.directory_stream_report,
+        ));
+    }
+    if !stats.file_dacl_report.is_empty() {
+        output.text(doppeldecker_core::error::file_dacl_report_text(
+            &stats.file_dacl_report,
+        ));
+    }
+    if !stats.created_directory_dacl_report.is_empty() {
+        output.text(
+            doppeldecker_core::error::created_directory_dacl_report_text(
+                &stats.created_directory_dacl_report,
+            ),
+        );
+    }
+    if !stats.directory_dacl_report.is_empty() {
+        output.text(doppeldecker_core::error::directory_dacl_report_text(
+            &stats.directory_dacl_report,
+        ));
+    }
+    output.text(format!("{}: {} Dateien übertragen, {} Metadatenänderungen, {} dauerhaft ersetzt, {} Zieleinträge entfernt, {} Bytes",
+        if stats.cancelled { "Abgebrochen" } else { "Fertig" }, stats.files_copied,
+        stats.metadata_updated, stats.irreversible_replacements, stats.files_deleted, stats.bytes_copied));
+    output.text(format!(
+        "{planned_skips} Einträge laut bestätigtem Plan ausgelassen."
+    ));
+    for path in &stats.temp_recovery_paths {
+        output.text(format!(
+            "Möglicher Temp-Recoverypfad (nicht automatisch löschen): {path}"
+        ));
+    }
+    Ok(if stats.cancelled { 130 } else { 0 })
+}
+
+fn content_sync_omission_text(plan: &doppeldecker_core::SyncPlan) -> Vec<String> {
+    use doppeldecker_core::Action;
+    plan.actions
+        .iter()
+        .filter_map(|action| {
+            let (path, reason) = match action {
+                Action::SkipSymlink { path } => (path, "Symlink wird nicht verfolgt"),
+                Action::SkipConflict { path } => {
+                    (path, "Typ oder Änderungsvorrang nicht eindeutig")
+                }
+                Action::SkipUnsupported { path } => {
+                    (path, "kein unterstützter regulärer Datei- oder Ordnertyp")
+                }
+                _ => return None,
+            };
+            Some(format!("Ausgelassen: {path} · {reason}"))
+        })
+        .collect()
+}
+
+fn read_content_sync_confirmation(
+    preview: &doppeldecker_core::ContentSyncPreview,
+) -> io::Result<(bool, Option<String>)> {
+    eprintln!(
+        "Quelle: {} → Ziel: {}",
+        sync_root_label(&preview.source_identity),
+        sync_root_label(&preview.target_identity)
+    );
+    for limitation in &preview.limitations {
+        eprintln!("Hinweis: {limitation}");
+    }
+    for issue in &preview.plan.metadata_report.issues {
+        eprintln!(
+            "Metadaten ausgelassen: {} · {:?} · {}",
+            issue.path, issue.class, issue.reason
+        );
+    }
+    for line in content_sync_omission_text(&preview.plan) {
+        eprintln!("{line}");
+    }
+    eprintln!(
+        "{} Einträge werden laut Plan ausgelassen.",
+        preview.plan.skip_count
+    );
+    if preview.blocked_removals > 0 {
+        eprintln!(
+            "{} geplante Entfernungen bleiben wegen ausgelassener Einträge gesperrt.",
+            preview.blocked_removals
+        );
+    }
+    eprintln!("{} neue Dateien, {} Aktualisierungen und {} Entfernungen; davon {} Ersetzungen und {} Entfernungen dauerhaft. Angezeigte Wirkung ausführen? [ja/Nein]",
+        preview.plan.copy_count, preview.plan.update_count, preview.plan.delete_count,
+        preview.irreversible_replacements, preview.irreversible_removals);
+    if !read_stdin_line()?.eq_ignore_ascii_case("ja") {
+        return Ok((false, None));
+    }
+    if !preview.created_directory_before_children_effects.is_empty() {
+        eprintln!("Dauerhafte Quellrechte VOR den Kindern auf {} tatsächlich neue nichtleere Ordner übernehmen? Bestätigte Rechte bleiben bei späteren Kind- oder Metadatenfehlern bestehen. Keine automatische Wiederherstellung. [ja/Nein]", preview.created_directory_before_children_effects.len());
+        for effect in &preview.created_directory_before_children_effects {
+            eprintln!("  {}", effect.directory);
+        }
+        if !read_stdin_line()?.eq_ignore_ascii_case("ja") {
+            return Ok((false, None));
+        }
+    }
+    if !preview.created_directory_dacl_effects.is_empty() {
+        eprintln!("Dauerhafte Quellrechte auf {} tatsächlich neu angelegte leere Ordner übernehmen? Keine automatische Wiederherstellung. Fehlende Zusatzrechte lassen die normale Anlage weiterlaufen. [ja/Nein]",preview.created_directory_dacl_effects.len());
+        for effect in &preview.created_directory_dacl_effects {
+            eprintln!("  {}", effect.directory);
+        }
+        if !read_stdin_line()?.eq_ignore_ascii_case("ja") {
+            return Ok((false, None));
+        }
+    }
+    if !preview.file_dacl_effects.is_empty() {
+        let aliases: usize = preview
+            .file_dacl_effects
+            .iter()
+            .map(|effect| effect.alias_scope.selected_paths.len())
+            .sum();
+        eprintln!("{} Dateiobjekt(e), {} ausgewählte Namen: dauerhafte objektweite DACL für ALLE bestehenden und neuen Namen einschließlich außerhalb des gescannten Roots bestätigen? Bekannte Namensliste unvollständig; Linkzahl begrenzt die Wirkung nicht. [ja/Nein]",preview.file_dacl_effects.len(),aliases);
+        for effect in &preview.file_dacl_effects {
+            eprintln!(
+                "Dateiobjekt {} · bekannte ausgewählte Namen: {:?} · beobachtete Linkzahl: {:?}",
+                effect.file,
+                effect.alias_scope.selected_paths,
+                effect.alias_scope.observed_link_count
+            );
+        }
+        if !read_stdin_line()?.eq_ignore_ascii_case("ja") {
+            return Ok((false, None));
+        }
+    }
+    let phrase = if let Some(required) = &preview.removal_confirmation {
+        eprintln!("Große dauerhafte Entfernung. Zum Bestätigen exakt eingeben: {required}");
+        Some(read_stdin_line()?)
+    } else {
+        None
+    };
+    Ok((true, phrase))
 }
 
 /// Prüft einen CLI-Root vollständig, bevor Profile, Secrets oder Netzwerk überhaupt
@@ -1212,8 +1805,8 @@ fn probe_ftps_import(resolved: &ResolvedConnection) -> Result<ImportProfile, Pro
             username: resolved.username.clone(),
             requested_root: resolved.requested_root.clone(),
             transport_security: FtpTransportSecurity::ExplicitTls,
-            certificate: Some(certificate),
-            certificate_policy: Some(FtpsCertificatePolicy::WebPkiAndPin),
+            certificate: None,
+            certificate_policy: Some(FtpsCertificatePolicy::WebPki),
             password_reference: reference.clone(),
         },
     };
@@ -1230,6 +1823,7 @@ fn probe_ftps_import(resolved: &ResolvedConnection) -> Result<ImportProfile, Pro
             // sichtbar auf „ungeprüft“ zurückgestuft.
             profile.connection.certificate_policy =
                 Some(FtpsCertificatePolicy::UnverifiedCertificate);
+            profile.connection.certificate = Some(certificate);
             FtpsVfs::connect(profile.connection.clone(), resolver)
                 .map_err(|error| ProbeFailure::Unavailable(ftps_connection_stage(&error)))?
         }
@@ -1536,14 +2130,7 @@ fn provider_file_command(
         args.replace,
     )?;
     if source_spec.provider == ProviderArg::Sftp {
-        if target_spec.provider != ProviderArg::Local || kind != FileQueueKind::Copy || args.replace
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "SFTP-Inhalte erlauben ausschließlich additive lokale Downloads",
-            ));
-        }
-        doppeldecker_core::sftp::validate_interactive_content_selection(&source_root, &item_paths)?;
+        doppeldecker_core::sftp::validate_interactive_write_selection(&source_root, &item_paths)?;
     }
     // Erst beide Profile prüfen, dann Prozessbesitz und Verbindungen erwerben.
     // Der additive WebDAV-Upload behält seine Bindung an die Profilrevision.
@@ -1684,13 +2271,7 @@ fn provider_file_command(
     let skip_only = prepared_target.skip_only;
     let source_removal_required = prepared_target.source_removal_required;
     let same_namespace_move = prepared_target.rename_only;
-    let mut target_capabilities = prepared_target.capabilities;
-    if source.endpoint.kind() == doppeldecker_core::ProviderKind::Sftp {
-        if let Some(capabilities) = &mut target_capabilities {
-            capabilities.replace = false;
-            capabilities.replace_best_effort = false;
-        }
-    }
+    let target_capabilities = prepared_target.capabilities;
     if !skip_only
         && target_capabilities.as_ref().is_some_and(|capabilities| {
             !capabilities.copy_new && !capabilities.copy_new_best_effort
@@ -1763,49 +2344,26 @@ fn provider_file_command(
             "Zielkonflikte vorhanden; mit --skip-conflicts ausschließlich neue Namen kopieren",
         ));
     }
-    // Die verlangten Bestätigungsphrasen entstehen vor der Vorschau und fahren in
-    // ihr mit. Sonst müsste ein `--json`-Controller sie aus dem deutschen
-    // stderr-Text lesen oder aus den eigenen Argumenten rekonstruieren; das
-    // `file_preview`-Ereignis nannte bisher nicht einmal die Profil-IDs, aus denen
-    // die Phrase gebildet wird.
-    let best_effort_replace = target_capabilities
-        .as_ref()
-        .is_some_and(|value| !value.replace && value.replace_best_effort);
-    let replace_confirmation = (args.replace && !conflicts.is_empty()).then(|| {
-        format!(
-            "{} {} {} {}",
-            if best_effort_replace {
-                "DAUERHAFT ERSETZEN"
-            } else {
-                "ERSETZEN"
-            },
-            target.provider_label,
-            target.profile_id.as_deref().unwrap_or("-"),
-            conflicts.len()
-        )
-    });
-    let move_confirmation = (kind == FileQueueKind::Move && source_removal_required && !skip_only)
-        .then(|| {
-            format!(
-                "VERSCHIEBEN {} {} {}",
-                source.provider_label,
-                source.profile_id.as_deref().unwrap_or("-"),
-                item_paths.len()
-            )
-        });
-    let local_copy_confirmation = if target.endpoint.kind()
-        == doppeldecker_core::ProviderKind::Local
+    // Der konkrete CLI-Aufruf mit --replace beziehungsweise move ist bereits
+    // die Wirkungsentscheidung. Die frisch gebundenen Erwartungen fahren im
+    // Queueauftrag mit; zusätzliche Routinephrasen prüfen keine Servergarantie.
+    let best_effort_replace = args.replace
+        && !conflicts.is_empty()
+        && target_capabilities
+            .as_ref()
+            .is_some_and(|value| !value.replace && value.replace_best_effort);
+    let local_copy_identity = if target.endpoint.kind() == doppeldecker_core::ProviderKind::Local
         && target_capabilities
             .as_ref()
             .is_some_and(|value| !value.copy_new && value.copy_new_best_effort)
     {
-        Some((
-            target_vfs.local_root_identity(&target_root)?,
-            format!("BEST EFFORT LOKAL {}", target_root.display()),
-        ))
+        Some(target_vfs.local_root_identity(&target_root)?)
     } else {
         None
     };
+    if best_effort_replace && !output.json {
+        eprintln!("Best Effort: Die {} bestätigte(n) Altdatei(en) werden ohne Quarantäne dauerhaft ersetzt; unklare Wirkungen werden nicht wiederholt.", conflicts.len());
+    }
     output.event(serde_json::json!({
         "event": "file_preview",
         "skip_only": skip_only,
@@ -1820,25 +2378,10 @@ fn provider_file_command(
         "target_capabilities": target_capabilities,
         "source_capabilities": source_capabilities,
         "source_tree": source_tree,
-        "replace_confirmation": replace_confirmation,
-        "move_confirmation": move_confirmation,
-        "local_copy_new_confirmation": local_copy_confirmation.as_ref().map(|(_, phrase)| phrase),
+        "replace_confirmation": null,
+        "move_confirmation": null,
+        "local_copy_new_confirmation": null,
     }))?;
-    if let Some((_, phrase)) = &local_copy_confirmation {
-        require_stdin_confirmation(phrase)?;
-    }
-    if let Some(phrase) = &replace_confirmation {
-        if best_effort_replace && !output.json {
-            eprintln!(
-                "Best Effort: Die {} bestätigte(n) Altdatei(en) werden ohne Quarantäne dauerhaft ersetzt; ein unklarer Ausgang wird nicht wiederholt.",
-                conflicts.len()
-            );
-        }
-        require_stdin_confirmation(phrase)?;
-    }
-    if let Some(phrase) = &move_confirmation {
-        require_stdin_confirmation(phrase)?;
-    }
     let operation = QueueOperation::ProviderFile {
         kind,
         source: Box::new(source.queue_endpoint),
@@ -1854,8 +2397,7 @@ fn provider_file_command(
         keep_both_targets: Vec::new(),
         expected_conflict_proofs: conflict_proofs,
         best_effort_commit_expected: None,
-        local_copy_new_best_effort_expected: local_copy_confirmation
-            .map(|(identity, _)| Box::new(identity)),
+        local_copy_new_best_effort_expected: local_copy_identity.map(Box::new),
         copy_new_best_effort_expected: target_capabilities
             .as_ref()
             .map(|capabilities| !capabilities.copy_new && capabilities.copy_new_best_effort),
@@ -2040,8 +2582,9 @@ fn rename_command(args: RenameArgs, config_dir: &Path, output: &mut Output) -> i
     };
     validate_endpoint_spec(&spec)?;
     // Prozessbesitz vor Verbindung, Probe und Mutation (siehe mkdir_command).
+    let queue_endpoint = resolve_queue_endpoint(&spec, config_dir)?;
     let _queue_lock = open_cli_queue(config_dir)?;
-    let mut resolved = resolve_endpoint(&spec, config_dir)?;
+    let mut resolved = connect_resolved_endpoint(&spec, queue_endpoint)?;
     resolved.endpoint = _queue_lock.bind_provider_preparation(&resolved.endpoint)?;
     let path = bound_path;
     if !path.starts_with(resolved.endpoint.root()) || path == resolved.endpoint.root() {
@@ -2147,9 +2690,10 @@ fn delete_command(args: DeleteArgs, config_dir: &Path, output: &mut Output) -> i
     }
     // Prozessbesitz vor Verbindung und mutierender Löschprobe (siehe
     // mkdir_command); dieselbe Queue-Instanz trägt anschließend Enqueue und Claim.
+    let queue_endpoint = resolve_queue_endpoint(&spec, config_dir)?;
     let queue = open_cli_queue(config_dir)?;
-    let resolved = resolve_endpoint(&spec, config_dir)?;
-    let (vfs, root) = resolved.endpoint.file_context()?;
+    let resolved = connect_resolved_endpoint(&spec, queue_endpoint)?;
+    let (vfs, root) = resolved.endpoint.ordinary_file_context()?;
     let (bound_root, bound_items) =
         doppeldecker_core::fileops::validate_file_operation_scope(&root, &item_paths)?;
     if bound_root != root_input || bound_items != item_paths {
@@ -2164,6 +2708,9 @@ fn delete_command(args: DeleteArgs, config_dir: &Path, output: &mut Output) -> i
         bind_delete_preview_around_probe(vfs.as_ref(), &root, &item_paths, || {
             resolved.endpoint.probe_delete_capabilities()
         })?;
+    for limitation in &capabilities.limitations {
+        eprintln!("Best Effort: {limitation}");
+    }
     let mode = match args.mode {
         DeleteModeArg::Quarantine if capabilities.quarantine => RemoteDeleteMode::Quarantine,
         DeleteModeArg::Permanent if capabilities.permanent => RemoteDeleteMode::Permanent,
@@ -2188,14 +2735,17 @@ fn delete_command(args: DeleteArgs, config_dir: &Path, output: &mut Output) -> i
     } else {
         "DAUERHAFT LÖSCHEN"
     };
-    let phrase = format!(
-        "{effect} {} {} {} {} {}",
-        resolved.provider_label.to_uppercase(),
-        resolved.profile_id.as_deref().unwrap_or("-"),
-        plan.root,
-        plan.items.len(),
-        plan.entries
-    );
+    let phrase =
+        needs_large_permanent_delete_confirmation(mode, plan.entries, plan.bytes).then(|| {
+            format!(
+                "{effect} {} {} {} {} {}",
+                resolved.provider_label.to_uppercase(),
+                resolved.profile_id.as_deref().unwrap_or("-"),
+                plan.root,
+                plan.items.len(),
+                plan.entries
+            )
+        });
     output.event(serde_json::json!({
         "event": "delete_preview",
         "mode": mode,
@@ -2205,7 +2755,9 @@ fn delete_command(args: DeleteArgs, config_dir: &Path, output: &mut Output) -> i
         "capabilities": capabilities,
         "confirmation": phrase,
     }))?;
-    require_stdin_confirmation(&phrase)?;
+    if let Some(phrase) = &phrase {
+        require_stdin_confirmation(phrase)?;
+    }
     let operation = QueueOperation::ProviderDelete {
         endpoint: Box::new(resolved.queue_endpoint),
         mode,
@@ -2223,6 +2775,14 @@ fn delete_command(args: DeleteArgs, config_dir: &Path, output: &mut Output) -> i
     );
     let result = finalize_executor_result(&queue, &operation_id, result)?;
     emit_queue_result(output, &operation_id, result)
+}
+
+fn needs_large_permanent_delete_confirmation(
+    mode: RemoteDeleteMode,
+    entries: u64,
+    bytes: u64,
+) -> bool {
+    mode == RemoteDeleteMode::Permanent && (entries > 1_000 || bytes > 10 * 1024 * 1024 * 1024)
 }
 
 fn trash_command(args: TrashArgs, config_dir: &Path, output: &mut Output) -> io::Result<i32> {
@@ -2486,6 +3046,8 @@ fn file_result_text(stats: &doppeldecker_core::OpStats) -> Vec<String> {
         "{}: {} Dateien, {} Bytes{}{}",
         if stats.cancelled {
             "Abgebrochen"
+        } else if stats.incomplete_resource_forks > 0 || !stats.retained_source_paths.is_empty() {
+            "Mit Auslassungen"
         } else {
             "Fertig"
         },
@@ -2494,6 +3056,12 @@ fn file_result_text(stats: &doppeldecker_core::OpStats) -> Vec<String> {
         skipped,
         assurance,
     )];
+    lines.extend(
+        stats
+            .retained_source_paths
+            .iter()
+            .map(|path| format!("Verschieben unvollständig; Quelle erhalten: {path}")),
+    );
     lines.extend(stats.source_read_limitations.iter().cloned());
     lines.extend(stats.target_write_limitations.iter().cloned());
     lines.extend(stats.temp_recovery_paths.iter().map(|path| {
@@ -2521,7 +3089,14 @@ fn emit_queue_result(
             for line in file_result_text(&stats) {
                 output.text(line);
             }
-            Ok(if stats.cancelled { 130 } else { 0 })
+            Ok(if stats.cancelled {
+                130
+            } else if stats.incomplete_resource_forks > 0 || !stats.retained_source_paths.is_empty()
+            {
+                1
+            } else {
+                0
+            })
         }
         QueueExecutionResult::AwaitingConfirmation { reason, .. } => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -2555,7 +3130,9 @@ fn real_command(args: RealArgs, config_dir: &Path, output: &mut Output) -> io::R
     if !output.json {
         eprintln!("Realmodus-Vorprüfung: Mounts, Listings, Plan, Platz und Restore-Probe …");
     }
-    let prepared = doppeldecker_core::prepare_local_real_run(&source, &target, options)?;
+    let prepared = doppeldecker_core::prepare_local_real_run_for_queue(
+        &queue, &source, &target, options, None,
+    )?;
     let preview = prepared.preview();
     output.event(serde_json::json!({ "event": "real_preview", "preview": preview }))?;
     output.text(format!(
@@ -2567,37 +3144,56 @@ fn real_command(args: RealArgs, config_dir: &Path, output: &mut Output) -> io::R
         preview.impact.available_bytes
     ));
 
-    let (confirmation, backup_confirmed) = read_run_confirmation(preview)?;
+    let effects_confirmed = read_run_confirmation(preview)?;
     let cancel = install_cancel_handler()?;
 
     let mut last = Instant::now() - Duration::from_secs(1);
-    let stats = prepared.confirm_and_execute_with_audit(
-        &confirmation,
-        backup_confirmed,
-        &audit,
-        &cancel,
-        &mut |progress| {
+    let stats = prepared
+        .confirm_effects(effects_confirmed)?
+        .execute_with_audit(&audit, &cancel, &mut |progress| {
             emit_throttled_progress(output, &mut last, progress);
-        },
-    )?;
+        })?;
     emit_sync_result(output, "result", &stats, &audit)
 }
 
-fn read_run_confirmation(preview: &RealRunPreview) -> io::Result<(String, bool)> {
-    // Die CLI liest nur die beiden Zeilen. Der Core prüft sie anschließend nochmals
-    // gegen die gebundene Vorschau und erzeugt erst danach das einmalige Permit.
+fn sync_root_label(identity: &doppeldecker_core::RootIdentity) -> String {
+    use doppeldecker_core::RootIdentity;
+    match identity {
+        RootIdentity::Local(root) => root.display_path.display().to_string(),
+        RootIdentity::Sftp(root) => format!(
+            "sftp://{}:{}{}",
+            root.server.host, root.server.port, root.virtual_root
+        ),
+        RootIdentity::Ftps(root) => format!(
+            "FTP/FTPS {}:{}{}",
+            root.server.host, root.server.port, root.virtual_root
+        ),
+        RootIdentity::WebDav(root) => format!("{}{}", root.server.origin, root.virtual_root),
+        RootIdentity::Smb(root) => format!(
+            "smb://{}/{}{}",
+            root.server.host, root.server.share, root.virtual_root
+        ),
+    }
+}
+
+fn read_run_confirmation(preview: &RealRunPreview) -> io::Result<bool> {
     eprintln!(
-        "Exakt über stdin bestätigen: {}",
-        preview.confirmation_phrase
+        "Quelle: {} → Ziel: {}",
+        sync_root_label(&preview.source_identity),
+        sync_root_label(&preview.target_identity)
     );
-    let confirmation = read_stdin_line()?;
-    let backup_confirmed = if preview.backup_confirmation_required {
-        eprintln!("Zusätzlich exakt über stdin bestätigen: {BACKUP_CONFIRMATION}");
-        read_stdin_line()? == BACKUP_CONFIRMATION
-    } else {
-        false
-    };
-    Ok((confirmation, backup_confirmed))
+    for warning in &preview.scope_warnings {
+        eprintln!("Hinweis: {warning}");
+    }
+    eprintln!(
+        "{} neue Dateien, {} Ersetzungen, {} Metadatenänderungen und {} Quarantäne-Einträge.",
+        preview.impact.new_files,
+        preview.impact.replacements,
+        preview.impact.metadata_changes,
+        preview.impact.quarantine_entries
+    );
+    eprintln!("Angezeigte Sync-Wirkung ausführen? [ja/Nein]");
+    Ok(read_stdin_line()?.eq_ignore_ascii_case("ja"))
 }
 
 fn emit_throttled_progress(output: &mut Output, last: &mut Instant, progress: &Progress) {
@@ -2627,6 +3223,28 @@ fn emit_sync_result(
         stats.files_deleted,
         stats.bytes_copied
     ));
+    if !stats.directory_stream_report.is_empty() {
+        output.text(doppeldecker_core::error::directory_stream_report_text(
+            &stats.directory_stream_report,
+        ));
+    }
+    if !stats.file_dacl_report.is_empty() {
+        output.text(doppeldecker_core::error::file_dacl_report_text(
+            &stats.file_dacl_report,
+        ));
+    }
+    if !stats.created_directory_dacl_report.is_empty() {
+        output.text(
+            doppeldecker_core::error::created_directory_dacl_report_text(
+                &stats.created_directory_dacl_report,
+            ),
+        );
+    }
+    if !stats.directory_dacl_report.is_empty() {
+        output.text(doppeldecker_core::error::directory_dacl_report_text(
+            &stats.directory_dacl_report,
+        ));
+    }
     for path in &stats.temp_recovery_paths {
         output.text(format!(
             "Möglicher Temp-Recoverypfad (nicht automatisch löschen): {path}"
@@ -2655,26 +3273,65 @@ fn emit_progress(output: &mut Output, progress: &Progress) {
     }
 }
 
+fn queue_commit_error(
+    execution_error: &io::Error,
+    journal_error: &io::Error,
+    context: &str,
+) -> io::Error {
+    use doppeldecker_core::error;
+    let mut paths = error::recovery_paths(execution_error);
+    paths.extend(error::recovery_paths(journal_error));
+    let mut streams = error::directory_stream_report(execution_error);
+    streams.merge(&error::directory_stream_report(journal_error));
+    let mut directories = error::directory_dacl_report(execution_error);
+    directories.merge(&error::directory_dacl_report(journal_error));
+    let mut files = error::file_dacl_report(execution_error);
+    files.merge(&error::file_dacl_report(journal_error));
+    let mut created = error::created_directory_dacl_report(execution_error);
+    created.merge(&error::created_directory_dacl_report(journal_error));
+    let combined = error::with_recovery_paths(
+        doppeldecker_core::coded_error(
+            io::ErrorKind::Other,
+            ErrorCode::OutcomeUnclear,
+            format!("{execution_error}; auch der {context} scheiterte: {journal_error}"),
+        ),
+        &paths,
+    );
+    let combined = error::with_directory_stream_report(combined, &streams);
+    let combined = error::with_directory_dacl_report(combined, &directories);
+    let combined = error::with_file_dacl_report(combined, &files);
+    error::with_created_directory_dacl_report(combined, &created)
+}
+
+fn preserve_bidirectional_interruption_error(
+    execution_error: &io::Error,
+    interrupted_commit: io::Result<()>,
+) -> io::Result<()> {
+    interrupted_commit.map_err(|journal_error| {
+        queue_commit_error(execution_error, &journal_error, "Queue-Fehlercommit")
+    })
+}
+
 fn bidirectional_command(
     args: BidirectionalArgs,
     config_dir: &Path,
     output: &mut Output,
 ) -> io::Result<i32> {
-    // Auch „Plan“ schreibt ein kurzlebiges Laufjournal und führt Realmodus-Proben aus.
-    // Deshalb umfasst der Prozessbesitz absichtlich alle vier Unterbefehle und bleibt
-    // über Bestätigung, Run/Resume beziehungsweise Rollback erhalten.
-    let _queue_lock = open_cli_queue(config_dir)?;
     match args.command {
         BidirectionalCommand::Plan(args) => {
             let (pair_id, left, right, baseline, resolutions) =
                 prepare_bidirectional_arguments(&args)?;
-            let prepared = doppeldecker_core::prepare_local_bidirectional_with_decisions(
+            // Prozessbesitz vor Realmodus-Proben und Laufjournal halten.
+            let queue = open_cli_queue(config_dir)?;
+            let prepared = doppeldecker_core::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &queue,
                 pair_id,
                 &args.pair_name,
                 &left,
                 &right,
                 &baseline,
                 &resolutions,
+                None,
             )?;
             output.event(serde_json::json!({
                 "event": "bidirectional_preview",
@@ -2686,59 +3343,175 @@ fn bidirectional_command(
                 prepared.preview().plan.actions.len(),
                 prepared.preview().plan.conflicts
             ));
+            print_bidirectional_effects(prepared.preview());
             prepared.discard()?;
             Ok(0)
         }
         BidirectionalCommand::Run(args) => {
             let (pair_id, left, right, baseline, resolutions) =
                 prepare_bidirectional_arguments(&args)?;
-            let prepared = doppeldecker_core::prepare_local_bidirectional_with_decisions(
+            // Prozessbesitz vor Realmodus-Proben und Laufjournal halten.
+            let queue = open_cli_queue(config_dir)?;
+            require_cli_queue_idle(&queue, "Bidirektionaler Lauf")?;
+            let prepared = doppeldecker_core::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &queue,
                 pair_id,
                 &args.pair_name,
                 &left,
                 &right,
                 &baseline,
                 &resolutions,
+                None,
             )?;
-            execute_bidirectional_prepared(prepared, &baseline, true, output)
+            let operation = QueueOperation::Bidirectional {
+                pair_id,
+                pair_name: args.pair_name,
+                left: Box::new(BidirectionalQueueEndpoint::Local {
+                    root: doppeldecker_core::fileops::path_to_utf8(&left)?,
+                }),
+                right: Box::new(BidirectionalQueueEndpoint::Local {
+                    root: doppeldecker_core::fileops::path_to_utf8(&right)?,
+                }),
+                baseline_path: doppeldecker_core::fileops::path_to_utf8(&baseline)?,
+                resolutions,
+                expected_baseline_digest: prepared.preview().plan.baseline_digest,
+                expected_plan_digest: prepared.preview().plan.plan_digest,
+            };
+            execute_bidirectional_prepared(
+                prepared,
+                &baseline,
+                Some((&queue, operation)),
+                None,
+                output,
+            )
         }
         BidirectionalCommand::Resume(args) => {
             let (left, right, baseline) = prepare_recovery_arguments(&args)?;
-            let prepared = doppeldecker_core::prepare_resume_local_bidirectional(
-                &args.pair_name,
-                &left,
-                &right,
+            let queue = open_cli_queue(config_dir)?;
+            let (operation_id, baseline) =
+                match bidirectional_recovery_operation(&queue, &left, &right, &baseline)? {
+                    Some((operation_id, persisted_baseline)) => {
+                        (Some(operation_id), persisted_baseline)
+                    }
+                    None => (None, baseline),
+                };
+            if let Some(operation_id) = &operation_id {
+                if finish_bidirectional_cli_completion(&queue, operation_id, output)? {
+                    return Ok(0);
+                }
+            }
+            let prepared = if let Some(operation_id) = &operation_id {
+                doppeldecker_core::bidirectional::prepare_resume_local_bidirectional_for_queue_operation(
+                    &queue, operation_id, &args.pair_name, &left, &right, &baseline,
+                )?
+            } else {
+                require_cli_queue_idle(&queue, "Bidirektionales Resume")?;
+                doppeldecker_core::prepare_resume_local_bidirectional_for_queue(
+                    &queue,
+                    &args.pair_name,
+                    &left,
+                    &right,
+                    &baseline,
+                )?
+            };
+            execute_bidirectional_prepared(
+                prepared,
                 &baseline,
-            )?;
-            execute_bidirectional_prepared(prepared, &baseline, false, output)
+                None,
+                operation_id
+                    .as_deref()
+                    .map(|operation_id| (&queue, operation_id)),
+                output,
+            )
         }
         BidirectionalCommand::Rollback(args) => {
             let (left, right, baseline) = prepare_recovery_arguments(&args)?;
-            let prepared = doppeldecker_core::prepare_local_bidirectional_rollback(
-                &args.pair_name,
-                &left,
-                &right,
-                &baseline,
-            )?;
+            let queue = open_cli_queue(config_dir)?;
+            let (operation_id, baseline) =
+                match bidirectional_recovery_operation(&queue, &left, &right, &baseline)? {
+                    Some((operation_id, persisted_baseline)) => {
+                        (Some(operation_id), persisted_baseline)
+                    }
+                    None => (None, baseline),
+                };
+            if let Some(operation_id) = &operation_id {
+                if finish_bidirectional_cli_completion(&queue, operation_id, output)? {
+                    return Ok(0);
+                }
+            }
+            let prepared = if let Some(operation_id) = &operation_id {
+                doppeldecker_core::bidirectional::prepare_local_bidirectional_rollback_for_queue_operation(
+                    &queue, operation_id, &args.pair_name, &left, &right, &baseline,
+                )?
+            } else {
+                require_cli_queue_idle(&queue, "Bidirektionales Rollback")?;
+                doppeldecker_core::prepare_local_bidirectional_rollback_for_queue(
+                    &queue,
+                    &args.pair_name,
+                    &left,
+                    &right,
+                    &baseline,
+                )?
+            };
             output.event(serde_json::json!({
                 "event": "bidirectional_rollback_preview",
                 "preview": prepared.preview(),
             }))?;
             eprintln!(
-                "Exakt über stdin bestätigen: {}",
-                prepared.preview().confirmation_phrase
+                "{} Teilprojektion(en) rückwärts wiederherstellen? [ja/Nein]",
+                prepared.preview().committed_projections
             );
-            let confirmation = read_stdin_line()?;
-            let run = prepared.confirm(&confirmation)?;
+            let run = prepared.confirm_effects(read_stdin_line()?.eq_ignore_ascii_case("ja"))?;
             let cancel = install_cancel_handler()?;
-            let stats = run.execute(&cancel)?;
+            let stats = match run.execute(&cancel) {
+                Ok(stats) => stats,
+                Err(error) => {
+                    if let Some(operation_id) = &operation_id {
+                        preserve_bidirectional_interruption_error(
+                            &error,
+                            queue.interrupt_bidirectional_coded(
+                                operation_id,
+                                Progress::default(),
+                                &error,
+                            ),
+                        )?;
+                    }
+                    return Err(error);
+                }
+            };
             // Die Daten sind bereits zurückgerollt. Erst der mutationslose,
             // rücklesend gebundene Journalabschluss erlaubt eine Erfolgsausgabe.
             // So kann ein Absturz zwischen Wirkung und Ausgabe den alten Plan
             // niemals als erneut ausführbaren Retry erscheinen lassen.
-            doppeldecker_core::bidirectional::finish_bidirectional_rollback_completion(&baseline)?;
+            if let Some(operation_id) = &operation_id {
+                queue
+                    .finish_bidirectional_after_effect_with_paths(
+                        operation_id,
+                        true,
+                        Progress::default(),
+                        &stats.rollback_quarantines,
+                    )
+                    .and_then(|()| queue.finish_bidirectional_completion_recovery(operation_id))
+                    .map_err(|error| {
+                        doppeldecker_core::error::with_recovery_paths(
+                            error,
+                            &stats.rollback_quarantines,
+                        )
+                    })?;
+            } else {
+                doppeldecker_core::bidirectional::finish_bidirectional_rollback_completion(
+                    &baseline,
+                )?;
+            }
+            let recovery_paths = operation_id
+                .as_deref()
+                .map(|id| bidirectional_queue_recovery_paths(&queue, id))
+                .unwrap_or_else(|| stats.rollback_quarantines.clone());
+            print_bidirectional_recovery_paths(&recovery_paths);
             output.event(serde_json::json!({
                 "event": "bidirectional_rollback_result",
+                "operation_id": operation_id,
+                "recovery_paths": recovery_paths,
                 "stats": stats,
             }))?;
             output.text(format!(
@@ -2753,7 +3526,8 @@ fn bidirectional_command(
 fn execute_bidirectional_prepared(
     prepared: doppeldecker_core::PreparedLocalBidirectionalRun,
     baseline_path: &Path,
-    discard_on_blocker: bool,
+    new_operation: Option<(&OperationQueue, QueueOperation)>,
+    recovery_owner: Option<(&OperationQueue, &str)>,
     output: &mut Output,
 ) -> io::Result<i32> {
     output.event(serde_json::json!({
@@ -2762,37 +3536,146 @@ fn execute_bidirectional_prepared(
     }))?;
     if let Some(blocker) = &prepared.preview().stage_blocker {
         let blocker = blocker.clone();
-        if discard_on_blocker {
+        if new_operation.is_some() {
             prepared.discard()?;
         }
         return Err(io::Error::new(io::ErrorKind::InvalidInput, blocker));
     }
-    eprintln!(
-        "Exakt über stdin bestätigen: {}",
-        prepared.preview().confirmation_phrase
-    );
-    let confirmation = read_stdin_line()?;
-    let backup_confirmed = if prepared.preview().backup_confirmation_required {
-        eprintln!("Zusätzlich exakt über stdin bestätigen: {BACKUP_CONFIRMATION}");
-        read_stdin_line()? == BACKUP_CONFIRMATION
-    } else {
-        false
-    };
-    let run = prepared.confirm(&confirmation, backup_confirmed)?;
+    print_bidirectional_effects(prepared.preview());
+    eprintln!("Bidirektionale Wirkung der gebundenen Vorschau ausführen? [ja/Nein]");
+    let confirmed = read_stdin_line()?.eq_ignore_ascii_case("ja");
+    if !confirmed && new_operation.is_some() {
+        prepared.discard()?;
+        return Err(doppeldecker_core::coded_error(
+            io::ErrorKind::PermissionDenied,
+            ErrorCode::ConfirmationMismatch,
+            "Die angezeigte bidirektionale Wirkung wurde nicht bestätigt",
+        ));
+    }
     let cancel = install_cancel_handler()?;
+    let (prepared, new_owner) = if let Some((queue, operation)) = new_operation {
+        let entry = queue.enqueue_claimed_with_profile_bindings(operation, Vec::new())?;
+        let operation_id = entry.operation_id;
+        let fresh = doppeldecker_core::queue::reprepare_direct_bidirectional_queue_run(
+            queue,
+            &operation_id,
+            Arc::new(KeyringResolver),
+            prepared,
+        );
+        let prepared = match fresh {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                queue.interrupt_bidirectional_coded(&operation_id, Progress::default(), &error)?;
+                return Err(error);
+            }
+        };
+        (prepared, Some((queue, operation_id)))
+    } else {
+        (prepared, None)
+    };
+    let owner = new_owner
+        .as_ref()
+        .map(|(queue, id)| (*queue, id.as_str()))
+        .or(recovery_owner);
+    let run = match prepared.confirm_effects(confirmed) {
+        Ok(run) => run,
+        Err(error) => {
+            if let Some((queue, operation_id)) = &new_owner {
+                queue.interrupt_bidirectional_coded(operation_id, Progress::default(), &error)?;
+            }
+            return Err(error);
+        }
+    };
+    if let Some((queue, operation_id)) = &new_owner {
+        if let Err(error) = queue.mark_running(operation_id) {
+            queue.interrupt_bidirectional_coded(operation_id, Progress::default(), &error)?;
+            return Err(error);
+        }
+    }
     let mut last = Instant::now() - Duration::from_secs(1);
-    let stats = run.execute(&cancel, &mut |progress| {
+    let mut latest = Progress::default();
+    let mut persistence_error = None;
+    let result = run.execute(&cancel, &mut |progress| {
+        latest = progress.clone();
         if last.elapsed() >= Duration::from_millis(100) {
             last = Instant::now();
+            if let Some((queue, operation_id)) = new_owner.as_ref() {
+                if persistence_error.is_none() {
+                    if let Err(error) = queue.update_progress(operation_id, progress) {
+                        persistence_error = Some(error);
+                        cancel.cancel();
+                    }
+                }
+            }
             emit_progress(output, progress);
         }
-    })?;
-    // Der Core hält das Abschlussjournal absichtlich bis zu diesem expliziten
-    // Commit. Nur der erfolgreiche Readback-Cleanup macht die folgende
-    // Ergebniszeile wahr; Resume und ein neuer Lauf teilen dieselbe Grenze.
-    doppeldecker_core::bidirectional::finish_bidirectional_run_completion(baseline_path)?;
+    });
+    let stats = match (result, persistence_error) {
+        (Ok(stats), None) => stats,
+        (result, persistence_error) => {
+            let paths = match &result {
+                Ok(stats) => stats
+                    .runs
+                    .iter()
+                    .flat_map(|run| run.temp_recovery_paths.iter().cloned())
+                    .collect(),
+                Err(error) => doppeldecker_core::error::recovery_paths(error),
+            };
+            let error = match persistence_error {
+                Some(journal_error) => match &result {
+                    Err(execution_error) => queue_commit_error(
+                        execution_error,
+                        &journal_error,
+                        "Queue-Fortschrittscommit",
+                    ),
+                    Ok(_) => queue_commit_error(
+                        &io::Error::other(
+                            "Bidirektionale Ausführung meldete Erfolg oder kontrollierten Abbruch",
+                        ),
+                        &journal_error,
+                        "Queue-Fortschrittscommit",
+                    ),
+                },
+                None => result.unwrap_err(),
+            };
+            let error = doppeldecker_core::error::with_recovery_paths(error, &paths);
+            if let Some((queue, operation_id)) = owner {
+                preserve_bidirectional_interruption_error(
+                    &error,
+                    queue.interrupt_bidirectional_coded(operation_id, latest, &error),
+                )?;
+            }
+            return Err(error);
+        }
+    };
+    let mut recovery_paths: Vec<String> = stats
+        .runs
+        .iter()
+        .flat_map(|run| run.temp_recovery_paths.iter().cloned())
+        .collect();
+    // Der terminale Queuecommit erhält die Recoverypfade, bevor der Core seinen
+    // Abschlussmarker entfernt. Ein Crash darf die Datenwirkung nicht wiederholen.
+    if let Some((queue, operation_id)) = owner {
+        queue
+            .finish_bidirectional_after_effect_with_paths(
+                operation_id,
+                false,
+                latest,
+                &recovery_paths,
+            )
+            .and_then(|()| queue.finish_bidirectional_completion_recovery(operation_id))
+            .map_err(|error| {
+                doppeldecker_core::error::with_recovery_paths(error, &recovery_paths)
+            })?;
+        recovery_paths = bidirectional_queue_recovery_paths(queue, operation_id);
+    } else {
+        doppeldecker_core::bidirectional::finish_bidirectional_run_completion(baseline_path)?;
+    }
+    print_bidirectional_recovery_paths(&recovery_paths);
     output.event(serde_json::json!({
         "event": "bidirectional_result",
+        "operation_id": owner.map(|(_, id)| id),
+        "recovery_paths": recovery_paths,
         "stats": stats,
     }))?;
     output.text(format!(
@@ -2800,6 +3683,179 @@ fn execute_bidirectional_prepared(
         stats.baseline_generation
     ));
     Ok(0)
+}
+
+/// Nur ein echter persistierter Strictlauf darf seine Recovery übernehmen. Alte
+/// direkte Journale bleiben im ausdrücklich getrennten Legacyweg lesbar.
+fn bidirectional_recovery_operation(
+    queue: &OperationQueue,
+    left: &Path,
+    right: &Path,
+    baseline: &Path,
+) -> io::Result<Option<(String, PathBuf)>> {
+    let left = std::fs::canonicalize(left)?;
+    let right = std::fs::canonicalize(right)?;
+    let baseline = canonicalize_existing_prefix(baseline)?;
+    let mut matched = None;
+    for entry in queue.snapshot().entries {
+        if entry.bidirectional_completion_recovery.is_none()
+            && !(matches!(
+                entry.state,
+                doppeldecker_core::QueueState::Failed | doppeldecker_core::QueueState::Interrupted
+            ) && entry.recovery_available)
+        {
+            continue;
+        }
+        let QueueOperation::Bidirectional {
+            left: stored_left,
+            right: stored_right,
+            baseline_path,
+            ..
+        } = entry.operation
+        else {
+            continue;
+        };
+        let (
+            BidirectionalQueueEndpoint::Local { root: stored_left },
+            BidirectionalQueueEndpoint::Local { root: stored_right },
+        ) = (stored_left.as_ref(), stored_right.as_ref())
+        else {
+            continue;
+        };
+        // Persistierte Temp-Pfade können auf macOS /var statt /private/var
+        // enthalten. Identität braucht denselben aufgelösten Namensraum; fehlt
+        // die Erstbaseline noch, bleibt nur ihr fehlender Rest unverändert.
+        if canonicalize_existing_prefix(Path::new(&baseline_path))? != baseline
+            || std::fs::canonicalize(stored_left)? != left
+            || std::fs::canonicalize(stored_right)? != right
+        {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Mehrere Strict-Queueeinträge beanspruchen denselben Recoverylauf",
+            ));
+        }
+        // Der Core prüft anschließend weiterhin den exakten gespeicherten
+        // Ownerpfad. Die CLI überträgt ausschließlich dessen bewiesenen Alias.
+        matched = Some((entry.operation_id, PathBuf::from(baseline_path)));
+    }
+    Ok(matched)
+}
+
+fn finish_bidirectional_cli_completion(
+    queue: &OperationQueue,
+    operation_id: &str,
+    output: &mut Output,
+) -> io::Result<bool> {
+    let entry = queue
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.operation_id == operation_id)
+        .expect("Queueeintrag zuvor geprüft");
+    if entry.bidirectional_completion_recovery.is_none() {
+        return Ok(false);
+    }
+    queue.finish_bidirectional_completion_recovery(operation_id)?;
+    let recovery_paths = bidirectional_queue_recovery_paths(queue, operation_id);
+    print_bidirectional_recovery_paths(&recovery_paths);
+    output.event(serde_json::json!({
+        "event": "bidirectional_completion_result",
+        "operation_id": operation_id,
+        "recovery_paths": recovery_paths,
+    }))?;
+    output.text("Bidirektionaler Queueabschluss bestätigt; Abschlussjournal bereinigt");
+    Ok(true)
+}
+
+fn bidirectional_queue_recovery_paths(queue: &OperationQueue, operation_id: &str) -> Vec<String> {
+    queue
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.operation_id == operation_id)
+        .map(|entry| entry.temp_recovery_paths)
+        .unwrap_or_default()
+}
+
+fn print_bidirectional_recovery_paths(paths: &[String]) {
+    for path in paths {
+        eprintln!("Erhaltener Recoverybestand: {path}");
+    }
+}
+
+fn print_bidirectional_effects(preview: &doppeldecker_core::LocalBidirectionalPreview) {
+    use doppeldecker_core::bidirectional::{BidirectionalAction, SyncDirection};
+    eprintln!(
+        "Links: {} ↔ Rechts: {}",
+        sync_root_label(&preview.plan.left_root_identity),
+        sync_root_label(&preview.plan.right_root_identity)
+    );
+    eprintln!("Gebundener Gesamtplan; Resume führt ausschließlich offene Projektionen aus:");
+    for warning in &preview.scope_warnings {
+        eprintln!("Hinweis: {warning}");
+    }
+    for action in &preview.plan.actions {
+        match action {
+            BidirectionalAction::Copy {
+                path,
+                direction,
+                expected_target,
+                ..
+            } => {
+                let label = if expected_target.is_some() {
+                    "Ersetzen"
+                } else {
+                    "Kopieren"
+                };
+                eprintln!(
+                    "{label} {}: {:?}",
+                    match direction {
+                        SyncDirection::LeftToRight => "Links → Rechts",
+                        SyncDirection::RightToLeft => "Rechts → Links",
+                    },
+                    path.display_lossy()
+                );
+            }
+            BidirectionalAction::Delete {
+                path, direction, ..
+            }
+            | BidirectionalAction::TypeSwap {
+                path, direction, ..
+            } => {
+                let label = if matches!(action, BidirectionalAction::Delete { .. }) {
+                    "In Quarantäne entfernen"
+                } else {
+                    "Typ ersetzen (Altversion in Quarantäne)"
+                };
+                eprintln!(
+                    "{label} {}: {:?}",
+                    match direction {
+                        SyncDirection::LeftToRight => "rechts",
+                        SyncDirection::RightToLeft => "links",
+                    },
+                    path.display_lossy()
+                );
+            }
+            BidirectionalAction::ConflictCopy {
+                source_path,
+                target_path,
+                source_side,
+                target_side,
+                ..
+            } => {
+                eprintln!(
+                    "Konfliktkopie {source_side:?} {:?} → {target_side:?} {:?}",
+                    source_path.display_lossy(),
+                    target_path.display_lossy()
+                );
+            }
+            _ => {}
+        }
+    }
+    eprintln!("Bestehende Fassungen und entfernte Einträge werden in Quarantäne gesichert.");
 }
 
 /// Bindet beide Roots und die Baseline eines bidirektionalen Laufs.
@@ -3389,6 +4445,226 @@ mod default_path_tests {
     use super::*;
 
     #[test]
+    fn bidirectional_doppelter_fehler_erhaelt_execute_und_rollback_nach_echtem_journalfehler() {
+        for stage in ["Execute", "Rollback"] {
+            let area = tempfile::tempdir().unwrap();
+            let root = area.path().canonicalize().unwrap();
+            let left = root.join("left");
+            let right = root.join("right");
+            std::fs::create_dir(&left).unwrap();
+            std::fs::create_dir(&right).unwrap();
+            let retained = right.join("bereits-wirksam");
+            std::fs::write(&retained, b"behalten").unwrap();
+            let queue_path = root.join("config/queue.json");
+            let queue = OperationQueue::open(&queue_path).unwrap();
+            let entry = queue
+                .enqueue(QueueOperation::Bidirectional {
+                    pair_id: PairId([7; 16]),
+                    pair_name: "Künstlicher Doppelerror".into(),
+                    left: Box::new(BidirectionalQueueEndpoint::Local {
+                        root: left.to_string_lossy().into_owned(),
+                    }),
+                    right: Box::new(BidirectionalQueueEndpoint::Local {
+                        root: right.to_string_lossy().into_owned(),
+                    }),
+                    baseline_path: root.join("state/pair.json").to_string_lossy().into_owned(),
+                    resolutions: vec![],
+                    expected_baseline_digest: None,
+                    expected_plan_digest: [1; 32],
+                })
+                .unwrap();
+            queue.claim_next().unwrap().unwrap();
+            queue.mark_running(&entry.operation_id).unwrap();
+            let original = doppeldecker_core::error::with_recovery_paths(
+                doppeldecker_core::coded_error(
+                    io::ErrorKind::Other,
+                    ErrorCode::OutcomeUnclear,
+                    format!("{stage}-Teilwirkung unklar"),
+                ),
+                &[retained.to_string_lossy().into_owned()],
+            );
+            std::fs::remove_file(&queue_path).unwrap();
+            std::fs::create_dir(&queue_path).unwrap();
+            let commit = queue.interrupt_bidirectional_coded(
+                &entry.operation_id,
+                Progress::default(),
+                &original,
+            );
+            assert!(
+                commit.is_err(),
+                "Der echte Journalcommit muss am Verzeichnisziel scheitern"
+            );
+            let journal_text = commit.as_ref().unwrap_err().to_string();
+            let error = preserve_bidirectional_interruption_error(&original, commit).unwrap_err();
+            let value = cli_error_event(&error);
+            assert_eq!(value["code"], "outcome_unclear");
+            assert!(error
+                .to_string()
+                .contains(&format!("{stage}-Teilwirkung unklar")));
+            assert!(error.to_string().contains(&journal_text));
+            assert!(doppeldecker_core::error::recovery_paths(&error)
+                .contains(&retained.to_string_lossy().into_owned()));
+            assert_eq!(std::fs::read(&retained).unwrap(), b"behalten");
+            assert_eq!(
+                queue.snapshot().entries[0].state,
+                doppeldecker_core::QueueState::Running
+            );
+        }
+    }
+
+    #[test]
+    fn bidirectional_doppelfehler_vereinigt_beide_strukturierten_recoverypfade() {
+        let error = doppeldecker_core::error::with_recovery_paths(
+            doppeldecker_core::coded_error(
+                io::ErrorKind::Other,
+                ErrorCode::PlanDrift,
+                "Ausführung driftete",
+            ),
+            &[
+                "/kuenstlich/ausfuehrung".into(),
+                "/kuenstlich/gemeinsam".into(),
+            ],
+        );
+        let journal = doppeldecker_core::error::with_recovery_paths(
+            io::Error::new(io::ErrorKind::StorageFull, "Journalmedium voll"),
+            &["/kuenstlich/journal".into(), "/kuenstlich/gemeinsam".into()],
+        );
+        let merged = preserve_bidirectional_interruption_error(&error, Err(journal)).unwrap_err();
+        let value = cli_error_event(&merged);
+        assert_eq!(value["code"], "outcome_unclear");
+        assert!(merged.to_string().contains("Ausführung driftete"));
+        assert!(merged.to_string().contains("Journalmedium voll"));
+        let paths = doppeldecker_core::error::recovery_paths(&merged)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            paths,
+            [
+                "/kuenstlich/ausfuehrung".into(),
+                "/kuenstlich/gemeinsam".into(),
+                "/kuenstlich/journal".into()
+            ]
+            .into()
+        );
+        preserve_bidirectional_interruption_error(&error, Ok(())).unwrap();
+    }
+
+    #[test]
+    fn routine_dateiloeschungen_brauchen_nur_die_konkrete_option() {
+        assert!(!needs_large_permanent_delete_confirmation(
+            RemoteDeleteMode::Permanent,
+            1000,
+            10 * 1024 * 1024 * 1024
+        ));
+        assert!(needs_large_permanent_delete_confirmation(
+            RemoteDeleteMode::Permanent,
+            1001,
+            0
+        ));
+        assert!(needs_large_permanent_delete_confirmation(
+            RemoteDeleteMode::Permanent,
+            1,
+            10 * 1024 * 1024 * 1024 + 1
+        ));
+        assert!(!needs_large_permanent_delete_confirmation(
+            RemoteDeleteMode::Quarantine,
+            1001,
+            u64::MAX
+        ));
+    }
+
+    #[test]
+    fn verzeichnisstream_bilanz_erreicht_fehler_dto_optional() {
+        use doppeldecker_core::directory_streams::{
+            DirectoryStreamEffect, DirectoryStreamOutcome, DirectoryStreamReport,
+        };
+        let report = DirectoryStreamReport {
+            completed: vec![],
+            uncertain: vec![DirectoryStreamOutcome {
+                directory: "ordner".into(),
+                effect: DirectoryStreamEffect::Remove {
+                    before: doppeldecker_core::metadata::NamedBlobSummary {
+                        name: b"alt".to_vec(),
+                        value: doppeldecker_core::metadata::BlobSummary::from_bytes(b"inhalt"),
+                    },
+                },
+            }],
+        };
+        let error = doppeldecker_core::error::with_directory_stream_report(
+            std::io::Error::other("Antwortverlust"),
+            &report,
+        );
+        let value = cli_error_event(&error);
+        assert_eq!(
+            value["directory_stream_report"],
+            serde_json::to_value(report).unwrap()
+        );
+        assert!(value["message"]
+            .as_str()
+            .unwrap()
+            .contains("Ausgang unklar"));
+        assert!(cli_error_event(&io::Error::other("alt"))
+            .get("directory_stream_report")
+            .is_none());
+    }
+
+    #[test]
+    fn directory_dacl_error_event_keeps_typed_report_optional() {
+        let report = doppeldecker_core::directory_dacl::DirectoryDaclReport {
+            completed: Vec::new(),
+            uncertain: vec![doppeldecker_core::directory_dacl::DirectoryDaclOutcome {
+                directory: "folder".into(),
+                before_digest: [1; 32],
+                after_digest: [2; 32],
+            }],
+        };
+        let error = doppeldecker_core::error::with_directory_dacl_report(
+            io::Error::other("Antwortverlust"),
+            &report,
+        );
+        let value = cli_error_event(&error);
+        assert_eq!(
+            value["directory_dacl_report"],
+            serde_json::to_value(report).unwrap()
+        );
+        assert!(value.get("directory_stream_report").is_none());
+        assert!(cli_error_event(&io::Error::other("plain"))
+            .get("directory_dacl_report")
+            .is_none());
+    }
+
+    #[test]
+    fn directory_dacl_ack_requires_review_before_config_or_provider_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("not-created");
+        let mut output = Output { json: false };
+        let error = acknowledge_directory_dacl_command(
+            AcknowledgeDirectoryDaclArgs {
+                operation_id: "unknown".into(),
+                reviewed: false,
+            },
+            &config,
+            &mut output,
+        )
+        .unwrap_err();
+        assert_eq!(
+            doppeldecker_core::error_code(&error),
+            ErrorCode::ConfirmationMismatch
+        );
+        assert!(!config.exists());
+        let cli = Cli::try_parse_from([
+            "doppeldecker-cli",
+            "acknowledge-directory-dacl",
+            "operation-id",
+            "--reviewed",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::AcknowledgeDirectoryDacl(args) if args.reviewed && args.operation_id == "operation-id")
+        );
+    }
+
+    #[test]
     fn cli_delta_allgemeiner_fehler_erhaelt_core_pruefpfade() {
         let error = doppeldecker_core::error::with_recovery_paths(
             doppeldecker_core::coded_error(
@@ -3854,6 +5130,36 @@ mod default_path_tests {
     }
 
     #[test]
+    fn native_copy_partial_result_names_kept_source_and_returns_nonzero() {
+        for cancelled in [false, true] {
+            let stats = doppeldecker_core::OpStats {
+                files: 1,
+                incomplete_resource_forks: 1,
+                retained_source_paths: vec!["/sandbox/retained-source".into()],
+                cancelled,
+                ..Default::default()
+            };
+            let text = file_result_text(&stats);
+            assert!(text[0].starts_with(if cancelled {
+                "Abgebrochen"
+            } else {
+                "Mit Auslassungen"
+            }));
+            assert!(text.iter().any(|line| line.contains("Quelle erhalten")
+                && line.contains("/sandbox/retained-source")));
+            assert_eq!(
+                emit_queue_result(
+                    &mut Output { json: false },
+                    "partial-native-copy",
+                    QueueExecutionResult::File(stats)
+                )
+                .unwrap(),
+                if cancelled { 130 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
     fn dateiergebnis_verwendet_nur_terminales_stats_cancelled() {
         let mut output = Output { json: false };
         let stats = doppeldecker_core::OpStats {
@@ -3941,5 +5247,128 @@ mod default_path_tests {
             audit.display()
         );
         assert_eq!(audit.file_name().unwrap(), "real-runs.jsonl");
+    }
+}
+
+#[cfg(test)]
+mod content_sync_output_tests {
+    use super::*;
+    #[test]
+    fn ausgelassene_pfade_und_fachliche_gruende_bleiben_sichtbar() {
+        use doppeldecker_core::{Action, SyncPlan};
+        let plan = SyncPlan {
+            actions: vec![
+                Action::SkipSymlink {
+                    path: "symbolischer-link".into(),
+                },
+                Action::SkipConflict {
+                    path: "ohne-dateizeit".into(),
+                },
+                Action::SkipUnsupported {
+                    path: "socket".into(),
+                },
+            ],
+            skip_count: 3,
+            ..SyncPlan::default()
+        };
+        let lines = super::content_sync_omission_text(&plan);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("symbolischer-link") && lines[0].contains("nicht verfolgt"));
+        assert!(lines[1].contains("ohne-dateizeit") && lines[1].contains("Änderungsvorrang"));
+        assert!(lines[2].contains("socket") && lines[2].contains("kein unterstützter"));
+    }
+    #[test]
+    fn created_directory_dacl_error_event_keeps_origin_object_and_normal_creation() {
+        use doppeldecker_core::created_directory_dacl::*;
+        for origin in [
+            CreatedDirectoryOrigin::ExclusiveMinimalCreate,
+            CreatedDirectoryOrigin::ExclusiveMinimalCreateBeforeChildren,
+        ] {
+            let key = CreatedDirectoryEffectKey {
+                origin,
+                directory: "/target/folder".into(),
+                file_id: 42,
+                object_namespace: [1; 32],
+            };
+            let mut report = CreatedDirectoryDaclReport::default();
+            report.observe_created(CreatedDirectoryObservation {
+                effect_key: key,
+                ordinary_metadata_applied: origin == CreatedDirectoryOrigin::ExclusiveMinimalCreate,
+            });
+            report.uncertain.push(CreatedDirectoryDaclOutcome {
+                origin,
+                directory: "/target/folder".into(),
+                file_id: 42,
+                object_namespace: [1; 32],
+                before_digest: [2; 32],
+                after_digest: [3; 32],
+            });
+            let error = doppeldecker_core::error::with_created_directory_dacl_report(
+                doppeldecker_core::coded_error(
+                    std::io::ErrorKind::Other,
+                    doppeldecker_core::ErrorCode::OutcomeUnclear,
+                    "Rechte offen",
+                ),
+                &report,
+            );
+            let combined = queue_commit_error(
+                &error,
+                &io::Error::other("synthetischer Journalfehler"),
+                "Queueabschluss",
+            );
+            let combined_event = cli_error_event(&combined);
+            assert_eq!(
+                combined_event["created_directory_dacl_report"],
+                serde_json::to_value(&report).unwrap()
+            );
+            assert_eq!(combined_event["code"], "outcome_unclear");
+            let value = cli_error_event(&error);
+            assert_eq!(
+                value["created_directory_dacl_report"],
+                serde_json::to_value(&report).unwrap()
+            );
+            assert_eq!(value["code"], "outcome_unclear");
+            assert!(value.get("file_dacl_report").is_none());
+            assert!(value.get("directory_dacl_report").is_none());
+            let text = doppeldecker_core::error::created_directory_dacl_report_text(&report);
+            if origin == CreatedDirectoryOrigin::ExclusiveMinimalCreateBeforeChildren {
+                assert!(text.contains("vor der Kinderarbeit"));
+                assert!(!text.contains("leeren Ordners"));
+                assert!(text.contains("noch nicht bestätigt"));
+            } else {
+                assert!(text.contains("leeren Ordners"));
+            }
+        }
+    }
+
+    #[test]
+    fn created_directory_dacl_ack_requires_review_before_config_access() {
+        let area = tempfile::tempdir().unwrap();
+        let config = area.path().join("absent");
+        let mut output = Output { json: false };
+        let error = acknowledge_created_directory_dacl_command(
+            AcknowledgeDirectoryDaclArgs {
+                operation_id: "operation-id".into(),
+                reviewed: false,
+            },
+            &config,
+            &mut output,
+        )
+        .unwrap_err();
+        assert_eq!(
+            doppeldecker_core::error_code(&error),
+            ErrorCode::ConfirmationMismatch
+        );
+        assert!(!config.exists());
+        let cli = Cli::try_parse_from([
+            "doppeldecker-cli",
+            "acknowledge-created-directory-dacl",
+            "operation-id",
+            "--reviewed",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command,Command::AcknowledgeCreatedDirectoryDacl(args) if args.reviewed && args.operation_id=="operation-id")
+        );
     }
 }

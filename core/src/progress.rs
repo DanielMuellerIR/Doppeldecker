@@ -47,12 +47,13 @@ impl Cancel {
 /// Momentaufnahme des Fortschritts eines Sync-Vorgangs.
 ///
 /// Wird per Callback nach außen gemeldet (mehrfach pro Sekunde bei großen Dateien).
-/// Alle Zähler sind kumulativ über den gesamten Vorgang.
+/// Zähler sind je Wirkung kumulativ. In `delete` und `quarantine` zählen die
+/// Dateifelder bestätigte entfernte Einträge statt vorheriger Kopien; Bytes bleiben null.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Progress {
-    /// Anzahl zu schreibender Dateien insgesamt (Kopien + Aktualisierungen).
+    /// Anzahl zu schreibender Dateien insgesamt, in Entfernungsphasen zu entfernende Einträge.
     pub files_total: u64,
-    /// Bereits fertig geschriebene Dateien.
+    /// Bereits fertig geschriebene Dateien, in Entfernungsphasen bestätigte entfernte Einträge.
     pub files_done: u64,
     /// Insgesamt zu übertragende Bytes (Summe der zu kopierenden/aktualisierenden Dateien).
     pub bytes_total: u64,
@@ -64,6 +65,7 @@ pub struct Progress {
     /// deutschen Text; ein hier ergänzter Wert, den sie nicht kennt, erscheint roh in
     /// der Statuszeile. Deshalb die vollständige Liste:
     ///
+    /// - `"archive_pack"`, `"archive_finalize"`, `"archive_verify"`, `"archive_commit"` — ZIP-Erzeugung
     /// - `"copy"` — Kopieren oder Aktualisieren
     /// - `"move"` — Verschieben
     /// - `"metadata"` — Metadaten übertragen oder anpassen
@@ -77,4 +79,26 @@ pub struct Progress {
     /// `"delete"` und `"quarantine"` sind ausdrücklich verschiedene Wirkungen und
     /// dürfen in der Anzeige nicht denselben Text bekommen.
     pub phase: String,
+    /// Bestätigte und unklare Streamwirkungen werden vor dem Intentabschluss
+    /// dauerhaft in derselben Fensterqueue gesichert.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::directory_streams::DirectoryStreamReport::is_empty"
+    )]
+    pub directory_stream_report: crate::directory_streams::DirectoryStreamReport,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::directory_dacl::DirectoryDaclReport::is_empty"
+    )]
+    pub directory_dacl_report: crate::directory_dacl::DirectoryDaclReport,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::file_dacl::FileDaclReport::is_empty"
+    )]
+    pub file_dacl_report: crate::file_dacl::FileDaclReport,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::created_directory_dacl::CreatedDirectoryDaclReport::is_empty"
+    )]
+    pub created_directory_dacl_report: crate::created_directory_dacl::CreatedDirectoryDaclReport,
 }

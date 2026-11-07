@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use doppeldecker_core::{
-    cleanup_remote_snapshots, expand_home_path, Cancel, Entry, LocalVfs, Vfs, SNAPSHOT_RETENTION,
+    cleanup_remote_snapshots, expand_home_path, Cancel, LocalVfs, SNAPSHOT_RETENTION,
 };
 use tauri::{Manager, WebviewWindow};
 
@@ -26,12 +26,7 @@ pub(crate) struct DirListing {
 /// eindeutig wiedergibt. Bei lokalen Nicht-UTF-8-Namen ist `Entry::name` nur eine
 /// verlustbehaftete Anzeige und darf deshalb nie wieder zu einem Pfad zusammengesetzt
 /// werden.
-#[derive(serde::Serialize)]
-struct BrowserEntry {
-    #[serde(flatten)]
-    entry: Entry,
-    safely_decoded: bool,
-}
+type BrowserEntry = doppeldecker_core::vfs::DirectoryDisplayEntry;
 
 #[derive(serde::Serialize)]
 pub(crate) struct DefaultDirs {
@@ -57,7 +52,7 @@ fn snapshot_cache_path(
     }
 }
 
-fn snapshot_cache(app: &tauri::AppHandle, leaf: &str) -> Result<PathBuf, AppError> {
+pub(crate) fn snapshot_cache(app: &tauri::AppHandle, leaf: &str) -> Result<PathBuf, AppError> {
     let application_cache = app
         .path()
         .app_cache_dir()
@@ -93,18 +88,11 @@ pub(crate) fn default_dirs() -> Result<DefaultDirs, AppError> {
 pub(crate) fn scan_dir(path: String, show_hidden: bool) -> Result<DirListing, AppError> {
     let absolute = std::fs::canonicalize(expand_home_path(&path))
         .map_err(|error| AppError::new("app", format!("{path}: {error}")))?;
-    let mut entries: Vec<_> = LocalVfs::new()
-        .list_complete(&absolute)
-        .map_err(AppError::from)?
-        .entries
-        .into_iter()
-        .map(|listed| BrowserEntry {
-            entry: listed.entry,
-            safely_decoded: listed.safely_decoded,
-        })
-        .collect();
+    let mut entries = LocalVfs::new()
+        .list_display_entries(&absolute)
+        .map_err(AppError::from)?;
     if !show_hidden {
-        entries.retain(|entry| !entry.entry.name.starts_with('.'));
+        entries.retain(|entry| !entry.is_hidden);
     }
     entries.sort_by(|left, right| {
         right.entry.is_dir.cmp(&left.entry.is_dir).then_with(|| {
@@ -225,6 +213,19 @@ pub(crate) fn open_project_page(page: ProjectPage) -> Result<(), AppError> {
 pub(crate) struct OpenRemoteSnapshotRequest {
     endpoint: BidirectionalEndpointRequest,
     path: String,
+    #[serde(default)]
+    mode: RemoteOpenMode,
+    #[serde(default)]
+    verification: doppeldecker_core::SnapshotVerification,
+}
+
+#[derive(Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RemoteOpenMode {
+    Passive,
+    #[default]
+    Original,
+    Edit,
 }
 
 #[tauri::command]
@@ -234,6 +235,7 @@ pub(crate) async fn open_remote_snapshot(
     request: OpenRemoteSnapshotRequest,
 ) -> Result<(), AppError> {
     tauri::async_runtime::spawn_blocking(move || {
+        validate_snapshot_request(&request)?;
         let state = app.state::<AppState>();
         let label = window.label();
         let window_state = state.window(label);
@@ -255,7 +257,7 @@ pub(crate) async fn open_remote_snapshot(
                     "remote-snapshot-started",
                     serde_json::json!({"limitations": limitations}),
                 );
-                open_remote_snapshot_blocking(&app, &state, request, cancel)
+                open_remote_snapshot_blocking(&app, &window, &state, request, cancel)
             },
             |result| match result {
                 Ok(snapshot) => {
@@ -275,7 +277,9 @@ pub(crate) async fn open_remote_snapshot(
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct OpenedRemoteSnapshot {
+    edit_id: Option<String>,
     name: String,
     bytes: u64,
     limitations: Vec<String>,
@@ -292,22 +296,29 @@ fn snapshot_not_cancelled(cancel: &Cancel) -> Result<(), AppError> {
     }
 }
 
+fn validate_snapshot_request(request: &OpenRemoteSnapshotRequest) -> Result<(), AppError> {
+    crate::bidirectional_commands::validate_endpoint_request_root(&request.endpoint)?;
+    validate_diff_path(request.endpoint.root(), &request.path)?;
+    if request.endpoint.provider_kind() == doppeldecker_core::ProviderKind::Sftp {
+        doppeldecker_core::sftp::validate_interactive_content_selection(
+            Path::new(request.endpoint.root()),
+            &[PathBuf::from(&request.path)],
+        )
+        .map_err(AppError::from)?;
+    }
+    Ok(())
+}
+
 fn open_remote_snapshot_blocking(
     app: &tauri::AppHandle,
+    window: &WebviewWindow,
     state: &AppState,
     request: OpenRemoteSnapshotRequest,
     cancel: &Cancel,
 ) -> Result<OpenedRemoteSnapshot, AppError> {
     snapshot_not_cancelled(cancel)?;
-    crate::bidirectional_commands::validate_endpoint_request_root(&request.endpoint)?;
+    validate_snapshot_request(&request)?;
     let source = PathBuf::from(&request.path);
-    if request.endpoint.provider_kind() == doppeldecker_core::ProviderKind::Sftp {
-        doppeldecker_core::sftp::validate_interactive_content_selection(
-            Path::new(request.endpoint.root()),
-            std::slice::from_ref(&source),
-        )
-        .map_err(AppError::from)?;
-    }
     let resolved = resolve_endpoint(app, state, &request.endpoint);
     snapshot_not_cancelled(cancel)?;
     let (endpoint, _, profile_bindings) = resolved?;
@@ -322,11 +333,36 @@ fn open_remote_snapshot_blocking(
         .map_err(AppError::from)?;
     snapshot_not_cancelled(cancel)?;
     let snapshot = endpoint
-        .download_interactive_snapshot(&source, &cache, cancel)
+        .download_interactive_snapshot_with_options(
+            &source,
+            &cache,
+            cancel,
+            doppeldecker_core::SnapshotOptions {
+                open_mode: if matches!(request.mode, RemoteOpenMode::Passive) {
+                    doppeldecker_core::SnapshotOpenMode::Passive
+                } else {
+                    doppeldecker_core::SnapshotOpenMode::OriginalFormat
+                },
+                verification: request.verification,
+            },
+        )
         .map_err(AppError::from)?;
     snapshot_not_cancelled(cancel)?;
     crate::queue_runtime::ensure_profile_bindings_current(app, &profile_bindings)?;
-    let local = validate_openable_file(Path::new(&snapshot.path))?;
+    let (local, edit_id) = if matches!(request.mode, RemoteOpenMode::Edit) {
+        let (id, path) = crate::remote_edit_commands::register_edit(
+            app,
+            window.label(),
+            request.endpoint.clone(),
+            source.clone(),
+            profile_bindings,
+            &snapshot,
+            cancel,
+        )?;
+        (path, Some(id))
+    } else {
+        (validate_openable_file(Path::new(&snapshot.path))?, None)
+    };
     snapshot_not_cancelled(cancel)?;
     spawn_detached(&mut system_open_command(&local)?).map_err(|error| {
         AppError::new(
@@ -335,6 +371,7 @@ fn open_remote_snapshot_blocking(
         )
     })?;
     Ok(OpenedRemoteSnapshot {
+        edit_id,
         name: source
             .file_name()
             .unwrap_or_default()
@@ -501,13 +538,23 @@ pub(crate) struct CompareFilesRequest {
     right: DiffFileRequest,
 }
 
-fn validate_diff_path(root: &str, path: &str) -> Result<(), AppError> {
+pub(crate) fn validate_diff_path(root: &str, path: &str) -> Result<(), AppError> {
     let root = Path::new(root);
     let path = Path::new(path);
-    if !path.is_absolute() || path == root || !path.starts_with(root) {
+    let normalized =
+        doppeldecker_core::validate_file_operation_root(path).map_err(AppError::from)?;
+    // Path-Vergleiche übergehen innere Punktkomponenten; deshalb auch die
+    // ursprüngliche Schreibweise mit dem normalisierten Pfad vergleichen.
+    if path
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+        || normalized.as_os_str() != path.as_os_str()
+        || path == root
+        || !path.starts_with(root)
+    {
         return Err(AppError::new(
             "sandbox_violation",
-            "Diff-Datei verlässt den gebundenen Pane-Root",
+            "Dateipfad muss normalisiert innerhalb des gebundenen Pane-Roots liegen",
         ));
     }
     Ok(())
@@ -659,6 +706,7 @@ fn download_diff_snapshots(
     ),
     AppError,
 > {
+    validate_compare_request(request)?;
     snapshot_not_cancelled(cancel)?;
     let left = left
         .download_interactive_snapshot(Path::new(&request.left.path), cache, cancel)
@@ -737,6 +785,61 @@ fn compare_files_blocking(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scan_dir_filters_native_hidden_flags_and_preserves_display_facts() {
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        std::fs::write(root.join("normal"), b"data").unwrap();
+        std::fs::write(root.join("marked"), b"data").unwrap();
+        std::fs::write(root.join(".dot"), b"data").unwrap();
+        let rows = doppeldecker_core::file_properties::change_local_visibility(
+            &root,
+            &["marked".into()],
+            true,
+            Some(&root),
+            &doppeldecker_core::Cancel::new(),
+        )
+        .unwrap();
+        assert!(rows[0].changed);
+        let visible = scan_dir(root.to_string_lossy().into_owned(), false).unwrap();
+        assert_eq!(
+            visible
+                .entries
+                .iter()
+                .map(|entry| entry.entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["normal"]
+        );
+        let all = scan_dir(root.to_string_lossy().into_owned(), true).unwrap();
+        assert_eq!(all.entries.len(), 3);
+        assert_eq!(
+            all.entries.iter().filter(|entry| entry.is_hidden).count(),
+            2
+        );
+        assert!(all.entries.iter().all(|entry| entry.safely_decoded));
+    }
+
+    #[test]
+    fn remote_oeffnen_unterscheidet_formatwahl_und_optionalen_readback() {
+        let base = serde_json::json!({"endpoint": {"provider":"sftp", "profileId":"test", "root":"/pane"}, "path":"/pane/Datei.html"});
+        let standard: OpenRemoteSnapshotRequest = serde_json::from_value(base.clone()).unwrap();
+        assert!(matches!(standard.mode, RemoteOpenMode::Original));
+        assert_eq!(
+            standard.verification,
+            doppeldecker_core::SnapshotVerification::Streaming
+        );
+        let mut full = base;
+        full["mode"] = serde_json::json!("passive");
+        full["verification"] = serde_json::json!("full_readback");
+        let full: OpenRemoteSnapshotRequest = serde_json::from_value(full).unwrap();
+        assert!(matches!(full.mode, RemoteOpenMode::Passive));
+        assert_eq!(
+            full.verification,
+            doppeldecker_core::SnapshotVerification::FullReadback
+        );
+    }
+
     #[test]
     fn projektlinks_akzeptieren_nur_benannte_feste_https_ziele() {
         for value in ["support", "imprint", "privacy"] {
@@ -832,6 +935,46 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn snapshot_und_diff_pfade_scheitern_lexikalisch_vor_providerzugriff() {
+        for provider in ["local", "sftp", "ftps", "webdav", "smb"] {
+            for path in ["/anders/a", "/pane", "/pane/../anders/a", "/pane/./a"] {
+                let endpoint = if provider == "local" {
+                    serde_json::json!({"provider":provider,"root":"/pane"})
+                } else {
+                    serde_json::json!({"provider":provider,"profileId":"nicht-vorhanden","profileRevision":1,"root":"/pane"})
+                };
+                let request: OpenRemoteSnapshotRequest =
+                    serde_json::from_value(serde_json::json!({"endpoint":endpoint,"path":path}))
+                        .unwrap();
+                assert!(
+                    validate_snapshot_request(&request).is_err(),
+                    "{provider}: {path}"
+                );
+                assert!(validate_diff_path("/pane", path).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn ungueltiger_rechter_diffpfad_beginnt_keinen_linken_download() {
+        let area = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(area.path()).unwrap();
+        let left = root.join("links.txt");
+        std::fs::write(&left, b"links").unwrap();
+        let endpoint = doppeldecker_core::ProviderEndpoint::local(&root).unwrap();
+        let request: CompareFilesRequest = serde_json::from_value(serde_json::json!({
+            "left":{"endpoint":{"provider":"local","root":root},"path":left,"name":"links.txt"},
+            "right":{"endpoint":{"provider":"local","root":root},"path":root.join("../rechts.txt"),"name":"rechts.txt"}
+        })).unwrap();
+        let cache = root.join("cache");
+        assert!(
+            download_diff_snapshots(&endpoint, &endpoint, &request, &cache, &Cancel::new())
+                .is_err()
+        );
+        assert!(!cache.exists());
     }
 
     #[test]

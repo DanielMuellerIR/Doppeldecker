@@ -44,3 +44,10 @@ path = "fuzz_targets/finder_favorites.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "archive_read"
+path = "fuzz_targets/archive_read.rs"
+test = false
+doc = false
+bench = false

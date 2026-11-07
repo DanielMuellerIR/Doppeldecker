@@ -44,14 +44,16 @@ pub(crate) fn ensure_profile_current(
 pub(crate) fn capabilities() -> crate::ProviderFileCapabilities {
     crate::ProviderFileCapabilities {
         provider: crate::ProviderKind::WebDav, copy_new: false, copy_new_best_effort: true,
-        replace: false, replace_best_effort: false, remove_source: false,
+        replace: false, replace_best_effort: true, remove_source: false,
         remove_source_best_effort: false, rename_noreplace: false,
         limitations: vec![
             "WebDAV-Upload als Best Effort: neue Dateien und begrenzte Ordnerbäume unter dem gewählten Ordner; bedingtes PUT/MOVE, vollständige BLAKE3-Prüfung und keine künstliche Collection-/Löschprobe.".into(),
             "Die Serverbedingungen werden ohne Gegenprobe verwendet. Missachtet der Server If-None-Match oder Overwrite:F, kann eine späte Kollision genau ein Ziel ersetzen. Dauerhafte Speicherung und atomare lokale Elternbindung sind nicht bewiesen; unklare Wirkungen werden nicht wiederholt.".into(),
             super::NAMESPACE_BINDING_LIMITATION.into(),
-            "Dateizeit, POSIX-Rechte, Owner, ACL, xattrs, Resource Forks, Sparse- und Hardlinkstruktur werden bei diesem Inhaltsupload nicht übertragen; die pfadgenaue Bilanz nennt Dateien und Ordner. Höchstens 100 Auswahleinträge, 1000 Baumeinträge, 16 Unterordnerebenen, 128 gehaltene Quellhandles, 8 GiB je Datei und 16 GiB je Auswahl; Vorbereitung höchstens 60 Sekunden.".into(),
-        ], blockers: vec![super::FILE_REPLACE_BLOCKER.into(), "Quellentfernung gehört nicht zu dieser additiven Inhaltsklasse".into()],
+            "Nach eigener möglicher Wirkung werden Collectionversionen frisch gebunden, weil deren ETags sich durch geänderte Kinder ändern dürfen. Pfad, Collectiontyp, Profil und Sitzung bleiben geprüft; ein gleichzeitig ausgetauschter Serverelternpfad ist dadurch nicht atomar ausgeschlossen.".into(),
+            "Bestätigtes Ersetzen verwirft die Altversion dauerhaft. If-Match bindet die Tempversion und genau eine getaggte If-Liste die Altziel-ETag. Eltern werden dabei nur frisch vor und nach MOVE geprüft; es gibt keine atomare gemeinsame Elternbindung oder Quarantäne.".into(),
+            "Dateizeit, POSIX-Rechte, Owner, ACL, xattrs, Resource Forks, Sparse- und Hardlinkstruktur werden bei diesem Inhaltsupload nicht übertragen; die pfadgenaue Bilanz nennt Dateien und Ordner. Die Auswahl wird iterativ mit begrenzten Puffern und Handles verarbeitet; Fortschritt, Abbruch und tatsächliche Ressourcen- beziehungsweise Dateisystemgrenzen bestimmen den Lauf.".into(),
+        ], blockers: vec!["Quellentfernung gehört nicht zu dieser Inhaltsklasse".into()],
     }
 }
 
@@ -62,6 +64,7 @@ struct UploadBinding {
     directories: Mutex<BTreeMap<PathBuf, Vec<WebDavResourceIdentity>>>,
     cancel: Cancel,
     owner: Option<InteractiveFileOwner>,
+    content_times: bool,
 }
 #[derive(Clone)]
 struct Upload {
@@ -79,11 +82,16 @@ struct UploadFile {
 struct UploadState {
     temp: Option<PathBuf>,
     hash: Option<blake3::Hash>,
+    preserved_mtime: Option<i64>,
+    hinted_mtime: Option<i64>,
+    mtime_hint_bound: bool,
+    put_observed: bool,
     move_attempted: bool,
     delete_attempted: bool,
     settled: bool,
     directory_attempted: bool,
     directory_complete: bool,
+    replacement: Option<ProofListEntry>,
 }
 
 impl WebDavVfs {
@@ -92,6 +100,23 @@ impl WebDavVfs {
         root: &Path,
         cancel: &Cancel,
         owner: Option<InteractiveFileOwner>,
+    ) -> io::Result<Arc<dyn Vfs>> {
+        self.upload_context(root, cancel, owner, false)
+    }
+    pub(crate) fn content_sync_upload(
+        self: &Arc<Self>,
+        root: &Path,
+        cancel: &Cancel,
+        owner: Option<InteractiveFileOwner>,
+    ) -> io::Result<Arc<dyn Vfs>> {
+        self.upload_context(root, cancel, owner, true)
+    }
+    fn upload_context(
+        self: &Arc<Self>,
+        root: &Path,
+        cancel: &Cancel,
+        owner: Option<InteractiveFileOwner>,
+        content_times: bool,
     ) -> io::Result<Arc<dyn Vfs>> {
         interactive_namespace::validate_path(root)?;
         if cancel.is_cancelled() {
@@ -113,6 +138,7 @@ impl WebDavVfs {
                 directories: Mutex::new(BTreeMap::from([(root.to_path_buf(), parents.clone())])),
                 cancel: cancel.clone(),
                 owner,
+                content_times,
             }),
             file: None,
             parent: root.to_path_buf(),
@@ -130,7 +156,7 @@ impl Upload {
     fn check(&self) -> io::Result<()> {
         self.check_until(Instant::now() + PREPARATION_LIMIT)
     }
-    fn check_until(&self, deadline: Instant) -> io::Result<()> {
+    fn check_binding_until(&self, deadline: Instant) -> io::Result<()> {
         check_deadline(deadline)?;
         let b = &self.binding;
         if let Some(owner) = &b.owner {
@@ -139,17 +165,50 @@ impl Upload {
         b.vfs
             .ensure_mutation_binding_current(&b.binding)
             .map_err(|_| drift("WebDAV-Uploadsitzung änderte sich"))?;
-        let expected = self.parents()?;
-        if directory_chain(&b.binding, &virtual_components(&self.parent)?, deadline)? != expected {
+        check_deadline(deadline)
+    }
+    fn check_until(&self, deadline: Instant) -> io::Result<()> {
+        self.check_binding_until(deadline)?;
+        if directory_chain(
+            &self.binding.binding,
+            &virtual_components(&self.parent)?,
+            deadline,
+        )? != self.parents()?
+        {
             return Err(drift("WebDAV-Uploadeltern änderten sich"));
         }
-        b.vfs
-            .ensure_mutation_binding_current(&b.binding)
-            .map_err(|_| drift("WebDAV-Uploadsitzung änderte sich"))?;
-        if let Some(owner) = &b.owner {
-            ensure_profile_current(&owner.staging.queue, &owner.profiles, &b.vfs.config)?;
+        self.check_binding_until(deadline)
+    }
+    fn observe_after_effect(&self, deadline: Instant) -> io::Result<()> {
+        self.check_binding_until(deadline)?;
+        let fresh = directory_chain(
+            &self.binding.binding,
+            &virtual_components(&self.parent)?,
+            deadline,
+        )?;
+        let previous = self.parents()?;
+        if fresh.len() != previous.len()
+            || fresh
+                .iter()
+                .zip(&previous)
+                .any(|(a, b)| a.remote != b.remote)
+        {
+            return Err(drift("WebDAV-Uploadeltern verlassen den gebundenen Pfad"));
         }
-        check_deadline(deadline)
+        self.check_binding_until(deadline)?;
+        // Collection-ETags sind Inhaltsversionen, keine stabilen Ordneridentitäten.
+        // Eigene PUT/MKCOL/MOVE/DELETE dürfen auch Vorfahrenversionen ändern. Nur
+        // nach einem eigenen Versuch werden die frisch als Collections gelesenen
+        // Pfade neu gebunden; vor weiteren Befehlen gilt wieder der normale Check.
+        // Ein gleichzeitiger Austausch desselben Serverpfads bleibt Best Effort.
+        for chain in lock(&self.binding.directories).values_mut() {
+            for identity in chain {
+                if let Some(observed) = fresh.iter().find(|item| item.remote == identity.remote) {
+                    *identity = observed.clone();
+                }
+            }
+        }
+        Ok(())
     }
     fn parents(&self) -> io::Result<Vec<WebDavResourceIdentity>> {
         lock(&self.binding.directories)
@@ -173,6 +232,12 @@ impl Upload {
                 .iter()
                 .filter(|entry| crate::remote_rename::names_may_collide(&entry.entry.name, name))
                 .collect::<Vec<_>>();
+            if matching.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "WebDAV-Unterordner fehlt im vollständigen Elternbestand",
+                ));
+            }
             if matching.len() != 1
                 || matching[0].entry.name != name
                 || !matching[0].entry.is_dir
@@ -277,22 +342,359 @@ impl Upload {
     }
 }
 
+impl Upload {
+    fn create_upload_directory(
+        &self,
+        path: &Path,
+        name: &str,
+        deadline: Instant,
+    ) -> io::Result<WebDavResourceIdentity> {
+        if self
+            .children()?
+            .iter()
+            .any(|entry| crate::remote_rename::names_may_collide(&entry.entry.name, name))
+        {
+            return Err(coded_error(
+                io::ErrorKind::AlreadyExists,
+                ErrorCode::AlreadyExists,
+                "WebDAV-Uploadordner ist bereits vorhanden; nichts angelegt",
+            ));
+        }
+        self.check_until(deadline)?;
+        if self.binding.cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        let file = self.file()?;
+        let remote = self.remote(path)?;
+        let b = &self.binding.binding.session;
+        let request = with_parent_condition(
+            authenticated(
+                b.http.mutation_client.request(
+                    custom_method(b"MKCOL")?,
+                    resource_url(&b.identity.origin, &remote)?,
+                ),
+                &b.http,
+            ),
+            &b.identity.origin,
+            &self.parents()?,
+            &remote,
+            WebDavRequestClass::OrdinaryCollection,
+        )?
+        .header(IF_NONE_MATCH, "*")
+        .timeout(TLS_IO_TIMEOUT);
+        if let Some(owner) = &self.binding.owner {
+            file.intent
+                .set(RemoteTempIntent::create_bound_with_root(
+                    &owner.staging,
+                    path,
+                    path,
+                    &self.binding.vfs.root_identity(&self.binding.root)?,
+                    self.binding.vfs.identity().account_digest,
+                )?)
+                .map_err(|_| drift("Ordnerintent bereits gebunden"))?;
+        }
+        self.check_until(deadline)?;
+        if self.binding.cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        lock(&file.state).directory_attempted = true;
+        let response = request
+            .send()
+            .map_err(|e| self.unclear("MKCOL", http_error(e)))?;
+        if response.status() != StatusCode::CREATED {
+            if matches!(
+                response.status(),
+                StatusCode::PRECONDITION_FAILED
+                    | StatusCode::METHOD_NOT_ALLOWED
+                    | StatusCode::CONFLICT
+            ) {
+                self.check()
+                    .map_err(|e| self.unclear("MKCOL-Ablehnung", e))?;
+                let exists = self
+                    .children()?
+                    .iter()
+                    .any(|entry| crate::remote_rename::names_may_collide(&entry.entry.name, name));
+                return Err(coded_error(
+                    if exists {
+                        io::ErrorKind::AlreadyExists
+                    } else {
+                        io::ErrorKind::Unsupported
+                    },
+                    if exists {
+                        ErrorCode::AlreadyExists
+                    } else {
+                        ErrorCode::Unsupported
+                    },
+                    "Bedingtes WebDAV-MKCOL abgelehnt; Bestand neu prüfen",
+                ));
+            }
+            return Err(self.unclear("MKCOL", response.status()));
+        }
+        let verify = (|| -> io::Result<WebDavResourceIdentity> {
+            let expected = if response.headers().contains_key(ETAG) {
+                Some(require_strong_etag(response.headers(), "WebDAV-MKCOL")?)
+            } else {
+                None
+            };
+            let deadline = Instant::now() + PREPARATION_LIMIT;
+            self.observe_after_effect(deadline)?;
+            let identity =
+                WebDavVfs::resource_identity_bound(&self.binding.binding, &remote, true)?;
+            if expected.as_ref().is_some_and(|etag| etag != &identity.etag) {
+                return Err(invalid("WebDAV-MKCOL-Readback besitzt eine andere ETag"));
+            }
+            if !read_children(&self.binding.binding, &remote, deadline)?.is_empty() {
+                return Err(invalid(
+                    "Neue WebDAV-Collection ist beim Readback nicht leer",
+                ));
+            }
+            let entries = self.children()?;
+            let matching = entries
+                .iter()
+                .filter(|entry| crate::remote_rename::names_may_collide(&entry.entry.name, name))
+                .collect::<Vec<_>>();
+            if matching.len() != 1
+                || matching[0].entry.name != name
+                || !matching[0].entry.is_dir
+                || matching[0].entry.is_symlink
+                || matching[0].provider_token.as_deref() != Some(identity.etag.as_bytes())
+            {
+                return Err(invalid(
+                    "MKCOL-Elternreadback bestätigt Namen, Typ oder Version nicht",
+                ));
+            }
+            self.check_until(deadline)?;
+            if WebDavVfs::resource_identity_bound(&self.binding.binding, &remote, true)? != identity
+            {
+                return Err(drift("Neue WebDAV-Collection änderte sich beim Readback"));
+            }
+            self.check_until(deadline)?;
+            Ok(identity)
+        })();
+        verify.map_err(|e| self.unclear("MKCOL-Readback", e))
+    }
+    fn commit_move(&self, from: &Path, to: &Path, replace: bool) -> io::Result<()> {
+        let file = self.file()?;
+        {
+            let state = lock(&file.state);
+            if state.temp.as_deref() != Some(from)
+                || file.target != to
+                || state.move_attempted
+                || state.hash.is_none()
+            {
+                return Err(read_only());
+            }
+        }
+        if self.binding.cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        self.check()?;
+        let etag = self.owned_etag(from)?;
+        let proof = self.proof(from)?;
+        if Self::etag(&proof)? != etag
+            || lock(&file.state)
+                .preserved_mtime
+                .is_some_and(|expected| proof.entry.mtime != Some(expected))
+        {
+            return Err(drift(
+                "Uploadtemp oder bestätigte Dateizeit änderte sich vor MOVE",
+            ));
+        }
+        let name = to.file_name().unwrap().to_str().unwrap();
+        let children = self.children()?;
+        let matching = children
+            .iter()
+            .filter(|e| crate::remote_rename::names_may_collide(&e.entry.name, name))
+            .collect::<Vec<_>>();
+        let target_etag = if replace {
+            let expected = lock(&file.state)
+                .replacement
+                .clone()
+                .ok_or_else(|| drift("WebDAV-Altziel war vor dem Upload nicht gebunden"))?;
+            if matching.len() != 1
+                || matching[0].entry.name != name
+                || Self::etag(matching[0])? != Self::etag(&expected)?
+            {
+                return Err(drift("WebDAV-Altziel änderte sich vor dem Ersetzen"));
+            }
+            Some(Self::etag(&expected)?)
+        } else {
+            if !matching.is_empty() {
+                return Err(coded_error(
+                    io::ErrorKind::AlreadyExists,
+                    ErrorCode::AlreadyExists,
+                    "Späte WebDAV-Zielkollision; vorhandenes Ziel bleibt erhalten",
+                ));
+            }
+            None
+        };
+        self.check()?;
+        lock(&file.state).move_attempted = true;
+        let b = &self.binding.binding.session;
+        let response = if let Some(target_etag) = target_etag {
+            move_replace_request(
+                &b.http,
+                &b.identity.origin,
+                &self.remote(from)?,
+                &self.remote(to)?,
+                &etag,
+                &target_etag,
+            )
+        } else {
+            move_request(
+                &b.http,
+                &b.identity.origin,
+                &self.remote(from)?,
+                &self.remote(to)?,
+                &etag,
+                &self.parents()?,
+                WebDavRequestClass::OrdinaryFile,
+            )
+        }
+        .map_err(|e| self.unclear("MOVE", e))?;
+        if response.status() == StatusCode::PRECONDITION_FAILED {
+            // Eine Ablehnung ist keine Freigabe zum Löschen. Erst der unveränderte
+            // eigene Tempbeleg und die frische Elternkette erlauben dessen Cleanup.
+            self.check()
+                .map_err(|e| self.unclear("MOVE-Ablehnung", e))?;
+            let fresh = self
+                .proof(from)
+                .map_err(|e| self.unclear("MOVE-Ablehnung", e))?;
+            if Self::etag(&fresh)? == etag {
+                lock(&file.state).move_attempted = false;
+                return Err(coded_error(
+                    io::ErrorKind::AlreadyExists,
+                    ErrorCode::AlreadyExists,
+                    "Bedingtes WebDAV-MOVE abgelehnt; Zielbestand neu prüfen",
+                ));
+            }
+            return Err(self.unclear("MOVE-Ablehnung", "Tempversion nicht unverändert"));
+        }
+        if !matches!(
+            response.status(),
+            StatusCode::CREATED | StatusCode::NO_CONTENT
+        ) {
+            return Err(self.unclear("MOVE", response.status()));
+        }
+        let verify = (|| -> io::Result<()> {
+            self.observe_after_effect(Instant::now() + PREPARATION_LIMIT)?;
+            let entries = self.children()?;
+            if entries
+                .iter()
+                .any(|e| e.entry.name == from.file_name().unwrap().to_str().unwrap())
+            {
+                return Err(invalid("Tempname ist nach MOVE weiter vorhanden"));
+            }
+            let matching = entries
+                .iter()
+                .filter(|e| crate::remote_rename::names_may_collide(&e.entry.name, name))
+                .collect::<Vec<_>>();
+            if matching.len() != 1
+                || matching[0].entry.name != name
+                || matching[0].entry.size != proof.entry.size
+            {
+                return Err(invalid("MOVE-Readback bestätigt Namen oder Größe nicht"));
+            }
+            if lock(&file.state)
+                .preserved_mtime
+                .is_some_and(|expected| matching[0].entry.mtime != Some(expected))
+            {
+                return Err(invalid(
+                    "MOVE verändert die zuvor exakt bestätigte Dateizeit",
+                ));
+            }
+            // MOVE darf eine neue Ziel-ETag erzeugen. Den frischen Zielstand
+            // damit bedingt lesen und seinen Inhalt am fertigen Transferhash
+            // prüfen, statt die frühere Temp-ETag als unverändert zu behaupten.
+            let target_etag = Self::etag(matching[0])?;
+            let hash = get_hash_with_timeout(
+                &b.http,
+                &b.identity.origin,
+                &self.remote(to)?,
+                &target_etag,
+                Duration::from_secs(300),
+            )?;
+            if Some(hash) != lock(&file.state).hash {
+                return Err(invalid("MOVE-Inhaltsreadback weicht ab"));
+            }
+            self.check()?;
+            Ok(())
+        })();
+        verify.map_err(|e| self.unclear("MOVE-Readback", e))?;
+        lock(&file.state).settled = true;
+        Ok(())
+    }
+}
+
 impl Vfs for Upload {
+    fn root_identity(&self, path: &Path) -> io::Result<crate::RootIdentity> {
+        self.directory_context(path)?;
+        self.binding.vfs.root_identity(path)
+    }
+    fn metadata_capabilities(
+        &self,
+        root: &Path,
+    ) -> io::Result<crate::metadata::MetadataCapabilities> {
+        self.binding.vfs.metadata_capabilities(root)
+    }
+    fn metadata_manifest(&self, path: &Path) -> io::Result<crate::metadata::MetadataManifest> {
+        let remote = self.remote(path)?;
+        let context = if path == self.binding.root {
+            self.directory_context(path)?
+        } else {
+            self.directory_context(
+                path.parent()
+                    .ok_or_else(|| drift("WebDAV-Pfad ohne Eltern"))?,
+            )?
+        };
+        security_read::manifest(&self.binding.binding.session, &remote, || context.check())
+    }
+
     fn interactive_write_limitations(&self) -> Vec<String> {
+        if self.binding.content_times {
+            return vec!["WebDAV-Inhaltssync sendet bekannte Dateizeiten mit X-OC-MTime beim ersten PUT und prüft den Temp exakt; bei ignoriertem Header sowie für Ordner folgt bedingtes PROPPATCH für DAV:getlastmodified mit exaktem Readback. Geschützte, abgelehnte, ignorierte oder gerundete Zeitwerte werden pfadgenau ausgelassen; eine Zeiterhaltung ist vor dem Serverversuch nicht zugesichert.".into()];
+        }
         self.file.as_ref().map(|file| vec![format!("{}: nur Inhalte beziehungsweise Ordnerstruktur übertragen; Dateizeit, Rechte, Owner, ACL, xattrs, Resource Forks, Sparse- und Hardlinkstruktur ausgelassen", file.target.display())]).unwrap_or_default()
     }
 
+    fn observe_content_sync_removals(&self, parent: &Path) -> io::Result<()> {
+        if !self.binding.content_times {
+            return Ok(());
+        }
+        self.remote(parent)?;
+        if !lock(&self.binding.directories).contains_key(parent) {
+            return Err(drift(
+                "Mirror-Eltern fehlen in der gehaltenen Collectionbindung",
+            ));
+        }
+        let context = Self {
+            binding: self.binding.clone(),
+            file: None,
+            parent: parent.to_path_buf(),
+        };
+        context.observe_after_effect(Instant::now() + PREPARATION_LIMIT)
+    }
+
     fn additive_content_target_only(&self) -> bool {
-        true
+        false
+    }
+    fn file_flush_guarantees_at(&self, _: &Path) -> io::Result<(bool, bool)> {
+        Ok((false, false))
+    }
+    fn file_replace_class(&self) -> crate::vfs::FileReplaceClass {
+        crate::vfs::FileReplaceClass::BestEffort
     }
     fn file_commit_class(&self) -> FileCommitClass {
         FileCommitClass::BestEffort
+    }
+    fn best_effort_permanent_delete_blocker(&self, directory: bool) -> Option<String> {
+        ordinary_delete_blocker(directory)
     }
     fn supports_mode_write(&self) -> bool {
         false
     }
     fn supports_mtime_write(&self) -> bool {
-        false
+        self.binding.content_times
     }
     fn list(&self, path: &Path) -> io::Result<Vec<Entry>> {
         Ok(self
@@ -403,39 +805,13 @@ impl Vfs for Upload {
         }
         let deadline = Instant::now() + PREPARATION_LIMIT;
         self.check_until(deadline)?;
-        let result = self.binding.vfs.create_bound_directory(
-            &self.parent,
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| drift("Ordnername fehlt"))?,
-            &self.binding.binding,
-            &self.parents()?,
-            deadline,
-            &mut || {
-                self.check_until(deadline)?;
-                if self.binding.cancel.is_cancelled() {
-                    return Err(cancelled());
-                }
-                if let Some(owner) = &self.binding.owner {
-                    file.intent
-                        .set(RemoteTempIntent::create(&owner.staging, path, path)?)
-                        .map_err(|_| drift("Ordnerintent bereits gebunden"))?;
-                }
-                lock(&file.state).directory_attempted = true;
-                Ok(())
-            },
-        );
+        let result = self.create_upload_directory(path, name, deadline);
         match result {
-            Ok((_, identity)) => {
-                let identity = identity.ok_or_else(|| {
-                    self.unclear(
-                        "MKCOL-Readback",
-                        "neuer Ordner besitzt keinen starken Elternbeleg; keine Kinderwirkung",
-                    )
-                })?;
+            Ok(identity) => {
                 let mut parents = self.parents()?;
                 parents.push(identity);
                 lock(&self.binding.directories).insert(path.to_path_buf(), parents);
+                lock(&file.state).directory_complete = true;
                 Ok(())
             }
             Err(error) => {
@@ -465,17 +841,20 @@ impl Vfs for Upload {
         let etag = Self::etag(&proof)?;
         if let Some(file) = &self.file {
             let state = lock(&file.state);
-            if state.temp.as_deref() != Some(path) && file.target != path {
+            if path.parent() != Some(self.parent.as_path()) {
                 return Err(read_only());
             }
-            let remote = self.remote(
-                state
-                    .temp
-                    .as_deref()
-                    .ok_or_else(|| drift("Uploadtemp fehlt"))?,
-            )?;
-            if lock(&file.owned).get(&remote) != Some(&etag) {
-                return Err(drift("WebDAV-Uploaddatei wurde ausgetauscht"));
+            if state.temp.as_deref() == Some(path) {
+                let remote = self.remote(path)?;
+                if lock(&file.owned).get(&remote) != Some(&etag) {
+                    return Err(drift("WebDAV-Uploaddatei wurde ausgetauscht"));
+                }
+            } else if path == file.target && !state.settled {
+                if let Some(expected) = &state.replacement {
+                    if Self::etag(expected)? != etag {
+                        return Err(drift("WebDAV-Altziel wurde ausgetauscht"));
+                    }
+                }
             }
         }
         let b = &self.binding.binding.session;
@@ -514,14 +893,28 @@ impl Vfs for Upload {
             return Err(cancelled());
         }
         let entries = self.children()?;
+        let target_name = file.target.file_name().unwrap().to_str().unwrap();
+        let matching = entries
+            .iter()
+            .filter(|entry| crate::remote_rename::names_may_collide(&entry.entry.name, target_name))
+            .collect::<Vec<_>>();
+        if matching.len() > 1
+            || matching
+                .first()
+                .is_some_and(|entry| entry.entry.name != target_name)
+        {
+            return Err(coded_error(io::ErrorKind::AlreadyExists, ErrorCode::AlreadyExists,
+                "WebDAV-Zielname ist bereits in möglicherweise gleichwertiger Schreibweise vorhanden"));
+        }
         for entry in entries {
             if crate::remote_rename::names_may_collide(
                 &entry.entry.name,
                 file.target.file_name().unwrap().to_str().unwrap(),
             ) {
-                return Err(drift(
-                    "WebDAV-Uploadziel inzwischen belegt; neu vorbereiten",
-                ));
+                if !entry.entry.is_file || entry.entry.is_symlink {
+                    return Err(drift("WebDAV-Ersetzen benötigt eine reguläre Zieldatei"));
+                }
+                lock(&file.state).replacement = Some(entry.clone());
             }
             if crate::remote_rename::names_may_collide(
                 &entry.entry.name,
@@ -537,10 +930,12 @@ impl Vfs for Upload {
         self.check()?;
         if let Some(owner) = &self.binding.owner {
             file.intent
-                .set(RemoteTempIntent::create(
+                .set(RemoteTempIntent::create_bound_with_root(
                     &owner.staging,
                     &file.target,
                     path,
+                    &self.binding.vfs.root_identity(&self.binding.root)?,
+                    self.binding.vfs.identity().account_digest,
                 )?)
                 .map_err(|_| drift("Uploadintent bereits gebunden"))?;
         }
@@ -555,6 +950,7 @@ impl Vfs for Upload {
         let task_remote = remote.clone();
         let parents = self.parents()?;
         let owned = file.owned.clone();
+        let hinted_mtime = lock(&file.state).hinted_mtime;
         let task = std::thread::spawn(move || {
             put_stream_and_readback(
                 task_session,
@@ -563,6 +959,7 @@ impl Vfs for Upload {
                 reader,
                 owned,
                 Duration::from_secs(300),
+                hinted_mtime,
             )
         });
         Ok(Box::new(UploadWrite {
@@ -622,8 +1019,123 @@ impl Vfs for Upload {
         }
         Ok(())
     }
-    fn set_mtime(&self, _: &Path, _: i64) -> io::Result<()> {
-        Err(read_only())
+    fn hint_content_sync_mtime(&self, mtime: Option<i64>) -> io::Result<()> {
+        if !self.binding.content_times {
+            return Ok(());
+        }
+        let file = self.file()?;
+        let mut state = lock(&file.state);
+        if state.mtime_hint_bound || state.temp.is_some() {
+            return Err(drift(
+                "WebDAV-Zeithinweis benötigt seinen unbenutzten Dateikontext",
+            ));
+        }
+        state.hinted_mtime = mtime.filter(|value| (0..=253_402_300_799).contains(value));
+        state.mtime_hint_bound = true;
+        Ok(())
+    }
+
+    fn set_mtime(&self, path: &Path, mtime: i64) -> io::Result<()> {
+        if !self.binding.content_times {
+            return Err(read_only());
+        }
+        let context = if let Some(file) = &self.file {
+            if lock(&file.state).temp.as_deref() != Some(path) {
+                return Err(read_only());
+            }
+            self.clone()
+        } else {
+            if path == self.binding.root {
+                return Err(read_only());
+            }
+            self.directory_context(path)?
+                .directory_context(path.parent().ok_or_else(read_only)?)?
+        };
+        context.check()?;
+        let before = context.proof(path)?;
+        if before.entry.is_symlink || (!before.entry.is_file && !before.entry.is_dir) {
+            return Err(drift(
+                "WebDAV-Zeitsetter benötigt eine reguläre Datei oder Collection",
+            ));
+        }
+        let etag = before
+            .provider_token
+            .as_deref()
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .ok_or_else(|| drift("WebDAV-Zeitsetter benötigt einen starken ETag"))?;
+        validate_strong_etag(etag)?;
+        if self.file.is_some() && etag != self.owned_etag(path)? {
+            return Err(drift("WebDAV-Zeittemp wurde ausgetauscht"));
+        }
+        // Die Antwort "accepted" ist kein Beleg. Der eigene starke PUT-ETag
+        // und die frisch gelesene Tempzeit erlauben erst gemeinsam das Auslassen
+        // einer weiteren Propertymutation; der spätere MOVE prüft die Zeit erneut.
+        if let Some(file) = &self.file {
+            let mut state = lock(&file.state);
+            if state.hinted_mtime == Some(mtime) && before.entry.mtime == Some(mtime) {
+                state.preserved_mtime = Some(mtime);
+                return Ok(());
+            }
+        }
+        let remote = context.remote(path)?;
+        let rejection = content_mtime::set_time(
+            &context.binding.binding.session,
+            &remote,
+            etag,
+            &context.parents()?,
+            mtime,
+            before.entry.is_dir,
+        )
+        .map_err(|e| context.unclear("Zeit-PROPPATCH", e))?;
+        context
+            .observe_after_effect(Instant::now() + PREPARATION_LIMIT)
+            .map_err(|e| context.unclear("Zeit-Elternreadback", e))?;
+        let after = context
+            .proof(path)
+            .map_err(|e| context.unclear("Zeitreadback", e))?;
+        if before.entry.is_file != after.entry.is_file
+            || before.entry.is_dir != after.entry.is_dir
+            || before.entry.size != after.entry.size
+        {
+            return Err(context.unclear("Zeitreadback", "Ressourcentyp oder Länge geändert"));
+        }
+        if let Some(file) = &self.file {
+            let fresh = Self::etag(&after).map_err(|e| context.unclear("Zeit-ETag", e))?;
+            let actual = get_hash_with_timeout(
+                &context.binding.binding.session.http,
+                &context.binding.binding.session.identity.origin,
+                &remote,
+                &fresh,
+                TLS_IO_TIMEOUT,
+            )
+            .map_err(|e| context.unclear("Zeit-Inhaltsreadback", e))?;
+            if lock(&file.state).hash != Some(actual) {
+                return Err(context.unclear("Zeit-Inhaltsreadback", "Inhalt verändert"));
+            }
+            lock(&file.owned).insert(remote, fresh);
+        } else {
+            // Der eigene Propertyversuch darf den Collection-ETag ändern.
+            let fresh = directory_chain(
+                &context.binding.binding,
+                &virtual_components(path)?,
+                Instant::now() + PREPARATION_LIMIT,
+            )
+            .map_err(|e| context.unclear("Ordnerzeitreadback", e))?;
+            lock(&self.binding.directories).insert(path.to_path_buf(), fresh);
+        }
+        if let Some(reason) = rejection {
+            let header_observation=self.file.as_ref().filter(|file|lock(&file.state).hinted_mtime==Some(mtime)).map(|_|format!("X-OC-MTime wurde beim ersten PUT gesendet, aber der frische Temp-Readback liefert {:?} statt {mtime}; Header ignoriert oder Zeitauflösung abweichend. ",before.entry.mtime)).unwrap_or_default();
+            return Err(crate::content_sync::mtime_omission(format!(
+                "{header_observation}{reason}"
+            )));
+        }
+        if after.entry.mtime != Some(mtime) {
+            return Err(crate::content_sync::mtime_omission(format!("WebDAV bestätigt DAV:getlastmodified, liefert aber {:?} statt {mtime}; Property ignoriert oder Zeitauflösung abweichend",after.entry.mtime)));
+        }
+        if let Some(file) = &self.file {
+            lock(&file.state).preserved_mtime = Some(mtime);
+        }
+        Ok(())
     }
     fn set_mode(&self, _: &Path, _: u32) -> io::Result<()> {
         Err(read_only())
@@ -635,111 +1147,10 @@ impl Vfs for Upload {
         Err(read_only())
     }
     fn rename_plain_once(&self, from: &Path, to: &Path) -> io::Result<()> {
-        let file = self.file()?;
-        {
-            let state = lock(&file.state);
-            if state.temp.as_deref() != Some(from)
-                || file.target != to
-                || state.move_attempted
-                || state.hash.is_none()
-            {
-                return Err(read_only());
-            }
-        }
-        if self.binding.cancel.is_cancelled() {
-            return Err(cancelled());
-        }
-        self.check()?;
-        let etag = self.owned_etag(from)?;
-        let proof = self.proof(from)?;
-        if Self::etag(&proof)? != etag {
-            return Err(drift("Uploadtemp änderte sich vor MOVE"));
-        }
-        let name = to.file_name().unwrap().to_str().unwrap();
-        if self
-            .children()?
-            .iter()
-            .any(|e| crate::remote_rename::names_may_collide(&e.entry.name, name))
-        {
-            return Err(coded_error(
-                io::ErrorKind::AlreadyExists,
-                ErrorCode::AlreadyExists,
-                "Späte WebDAV-Zielkollision; vorhandenes Ziel bleibt erhalten",
-            ));
-        }
-        self.check()?;
-        lock(&file.state).move_attempted = true;
-        let b = &self.binding.binding.session;
-        let response = move_request(
-            &b.http,
-            &b.identity.origin,
-            &self.remote(from)?,
-            &self.remote(to)?,
-            &etag,
-            &self.parents()?,
-        )
-        .map_err(|e| self.unclear("MOVE", e))?;
-        if response.status() == StatusCode::PRECONDITION_FAILED {
-            // Eine Ablehnung ist keine Freigabe zum Löschen. Erst der unveränderte
-            // eigene Tempbeleg und die frische Elternkette erlauben dessen Cleanup.
-            self.check()
-                .map_err(|e| self.unclear("MOVE-Ablehnung", e))?;
-            let fresh = self
-                .proof(from)
-                .map_err(|e| self.unclear("MOVE-Ablehnung", e))?;
-            if Self::etag(&fresh)? == etag {
-                lock(&file.state).move_attempted = false;
-                return Err(coded_error(
-                    io::ErrorKind::AlreadyExists,
-                    ErrorCode::AlreadyExists,
-                    "Bedingtes WebDAV-MOVE abgelehnt; Zielbestand neu prüfen",
-                ));
-            }
-            return Err(self.unclear("MOVE-Ablehnung", "Tempversion nicht unverändert"));
-        }
-        if !matches!(
-            response.status(),
-            StatusCode::CREATED | StatusCode::NO_CONTENT
-        ) {
-            return Err(self.unclear("MOVE", response.status()));
-        }
-        let verify = (|| -> io::Result<()> {
-            let entries = self.children()?;
-            if entries
-                .iter()
-                .any(|e| e.entry.name == from.file_name().unwrap().to_str().unwrap())
-            {
-                return Err(invalid("Tempname ist nach MOVE weiter vorhanden"));
-            }
-            let matching = entries
-                .iter()
-                .filter(|e| crate::remote_rename::names_may_collide(&e.entry.name, name))
-                .collect::<Vec<_>>();
-            if matching.len() != 1
-                || matching[0].entry.name != name
-                || matching[0].entry.size != proof.entry.size
-                || Self::etag(matching[0])? != etag
-            {
-                return Err(invalid(
-                    "MOVE-Readback bestätigt Namen, Größe und eigene Version nicht",
-                ));
-            }
-            let hash = get_hash_with_timeout(
-                &b.http,
-                &b.identity.origin,
-                &self.remote(to)?,
-                &etag,
-                Duration::from_secs(300),
-            )?;
-            if Some(hash) != lock(&file.state).hash {
-                return Err(invalid("MOVE-Inhaltsreadback weicht ab"));
-            }
-            self.check()?;
-            Ok(())
-        })();
-        verify.map_err(|e| self.unclear("MOVE-Readback", e))?;
-        lock(&file.state).settled = true;
-        Ok(())
+        self.commit_move(from, to, false)
+    }
+    fn rename_replace_plain_once(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.commit_move(from, to, true)
     }
     fn cleanup_owned_temp(&self, path: &Path) -> io::Result<bool> {
         let file = self.file()?;
@@ -773,6 +1184,12 @@ impl Vfs for Upload {
                 &self.parents()?,
                 || stat_proof_in_session(b, &remote),
             )?;
+            self.observe_after_effect(Instant::now() + PREPARATION_LIMIT)?;
+            require_absent_after_delete_readback(
+                stat_proof_in_session(b, &remote),
+                &remote,
+                "WebDAV-Upload-Temp-DELETE",
+            )?;
             self.check()?;
             Ok(())
         })();
@@ -792,6 +1209,25 @@ struct UploadWrite {
     inner: WebDavWrite,
     context: Upload,
 }
+impl Drop for UploadWrite {
+    fn drop(&mut self) {
+        // Auch ein vor flush abgebrochener Strom kann den eigenen PUT bereits
+        // ausgeführt haben. Erst den Worker beenden, dann Eltern frisch lesen;
+        // die anschließende Bereinigung verlangt weiterhin die eigene Datei-ETag.
+        self.inner.writer.take();
+        if let Some(task) = self.inner.task.take() {
+            let _ = task.join();
+        }
+        if let Ok(file) = self.context.file() {
+            let observe = !std::mem::replace(&mut lock(&file.state).put_observed, true);
+            if observe {
+                let _ = self
+                    .context
+                    .observe_after_effect(Instant::now() + PREPARATION_LIMIT);
+            }
+        }
+    }
+}
 impl Write for UploadWrite {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         self.inner
@@ -799,12 +1235,19 @@ impl Write for UploadWrite {
             .map_err(|e| self.context.unclear("PUT-Strom", e))
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.inner
-            .flush()
-            .map_err(|e| self.context.unclear("PUT/Readback", e))?;
-        self.context
-            .check()
-            .map_err(|e| self.context.unclear("PUT-Elternreadback", e))?;
+        let result = self.inner.flush();
+        let observe = {
+            let mut state = lock(&self.context.file()?.state);
+            !std::mem::replace(&mut state.put_observed, true)
+        };
+        if observe {
+            self.context
+                .observe_after_effect(Instant::now() + PREPARATION_LIMIT)
+                .map_err(|e| self.context.unclear("PUT-Elternreadback", e))?;
+        } else {
+            self.context.check()?;
+        }
+        result.map_err(|e| self.context.unclear("PUT/Readback", e))?;
         lock(&self.context.file()?.state).hash = Some(self.inner.source_hash.finalize());
         Ok(())
     }

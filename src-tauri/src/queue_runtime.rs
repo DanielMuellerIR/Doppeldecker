@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Prozessweiter Zustand. Nur der Live-Verbindungspool, der einmalige Startbefund
-/// und die bewusst nach Fensterlabel schlüsselnde Ordnergrößen-Laufzeit werden
+/// und die bewusst nach Fensterlabel schlüsselnden lesenden Laufzeiten werden
 /// geteilt. Dateioperationen, vorbereitete Realmodus-Läufe und Queue-Journale liegen
 /// dagegen in `windows`.
 #[derive(Default)]
@@ -36,6 +36,8 @@ pub(crate) struct AppState {
     /// Queue-Befund. Nur ein wirklich unlesbares Queue-Journal darf das Queue-Badge
     /// auf `!` setzen und damit den Eintragszähler überdecken.
     pub(crate) startup_app_error: Mutex<Option<String>>,
+    /// Lesende Namenssuchen besitzen pro Fenster ein eigenes Abbruchsignal.
+    pub(crate) name_searches: crate::name_search_commands::NameSearchRuntime,
     /// Lesende Ordnergrößen besitzen pro Fenster und Pane eigene Sessions. Sie
     /// blockieren die jeweilige Fensterqueue ausdrücklich nicht.
     pub(crate) directory_sizes: crate::directory_size_commands::DirectorySizeRuntime,
@@ -574,6 +576,51 @@ pub(crate) fn invalidate_remote_profile(
         .map(|(label, state)| (label.clone(), state.clone()))
         .collect();
     for (label, window) in windows {
+        take_profile_dependent(
+            &window.pending_content_sync,
+            protocol,
+            profile_id,
+            |pending| &pending.profile_bindings,
+        );
+        {
+            let mut runs = window.content_sync_runs.lock_recover();
+            let affected: Vec<_> = runs
+                .iter()
+                .filter(|(_, run)| {
+                    run.profile_bindings
+                        .iter()
+                        .any(|binding| binding_matches_profile(binding, protocol, profile_id))
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in affected {
+                if let Some(queue) = window.operation_queue.lock_recover().as_ref() {
+                    let awaiting = queue.snapshot().entries.iter().any(|entry| {
+                        entry.operation_id == id
+                            && entry.state == doppeldecker_core::QueueState::AwaitingConfirmation
+                    });
+                    let reset = if awaiting {
+                        queue.discard_remote_preparation(&id)
+                    } else {
+                        Ok(())
+                    };
+                    match reset {
+                        Ok(()) => {
+                            runs.remove(&id);
+                            emit_queue_snapshot(app, &label, queue);
+                        }
+                        Err(error) => {
+                            let _ = emit_to_window_label(
+                                app,
+                                &label,
+                                "queue-error",
+                                AppError::from(error),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         take_profile_dependent(&window.pending_sftp_real, protocol, profile_id, |pending| {
             &pending.profile_bindings
         });
@@ -603,6 +650,14 @@ pub(crate) fn invalidate_remote_profile(
         );
 
         let queue = window.operation_queue.lock_recover().clone();
+        crate::forward_bidirectional_commands::invalidate_profile(
+            app,
+            &label,
+            &window,
+            queue.as_deref(),
+            protocol,
+            profile_id,
+        );
         let mut queue_changed = false;
         macro_rules! discard_queue_preparation {
             ($field:ident) => {
@@ -857,9 +912,16 @@ pub(crate) struct WindowState {
     /// Danach lebt der aktuelle Pane-Zustand ausschließlich im jeweiligen Fenster.
     pub(crate) initial_panes: Mutex<Option<crate::window_commands::WindowStartState>>,
     pub(crate) active_cancel: Mutex<Option<Cancel>>,
+    pub(crate) property_edits: Mutex<crate::file_property_commands::PropertyEditCache>,
+    pub(crate) remote_edits: Mutex<HashMap<String, crate::remote_edit_commands::RemoteEdit>>,
     /// Nicht serialisierbare Realmodus-Vorbereitung samt gehaltenen Deskriptoren. Ein
     /// Neustart oder explizites Verwerfen lässt sie automatisch verschwinden.
     pub(crate) pending_real: Mutex<Option<PreparedLocalRealRun>>,
+    pub(crate) pending_content_sync:
+        Mutex<Option<crate::content_sync_commands::PendingContentSync>>,
+    pub(crate) content_sync_generation: AtomicU64,
+    pub(crate) content_sync_runs:
+        Mutex<HashMap<String, crate::content_sync_commands::QueuedContentSync>>,
     pub(crate) pending_local_sync: Mutex<crate::normal_sync_commands::LocalSyncPreparationSlot>,
     pub(crate) local_sync_runs:
         Mutex<HashMap<String, crate::normal_sync_commands::QueuedLocalSync>>,
@@ -879,6 +941,16 @@ pub(crate) struct WindowState {
         Mutex<Option<crate::provider_sync_commands::PendingProviderRun>>,
     pub(crate) pending_provider_queue: Mutex<Option<PendingRemoteQueueRun>>,
     pub(crate) file_conflict_choices: Mutex<crate::file_commands::FileConflictChoiceCache>,
+    pub(crate) archive_extract_preparation:
+        Mutex<crate::archive_extract_commands::ArchiveExtractCache>,
+    pub(crate) archive_pack_preparation: Mutex<crate::archive_pack_commands::ArchivePackCache>,
+    pub(crate) duplicate_preparation: Mutex<crate::duplicate_commands::DuplicateCache>,
+    pub(crate) pending_forward_bidirectional:
+        Mutex<Option<crate::forward_bidirectional_commands::PendingForwardRun>>,
+    pub(crate) forward_bidirectional_generation: AtomicU64,
+    pub(crate) forward_bidirectional_preparing: AtomicBool,
+    pub(crate) forward_bidirectional_runs:
+        Mutex<HashMap<String, crate::forward_bidirectional_commands::QueuedForwardRun>>,
     pub(crate) pending_bidirectional:
         Mutex<Option<bidirectional_commands::PendingBidirectionalRun>>,
     pub(crate) pending_bidirectional_queue: Mutex<Option<PendingBidirectionalQueueRun>>,
@@ -932,6 +1004,7 @@ impl WindowState {
         }
         record!(pending_real, "local-real");
         record!(pending_local_sync, "local-sync");
+        record!(pending_content_sync, "content-sync");
         record!(pending_sftp_real, "sftp-real");
         record!(pending_sftp_queue, "sftp-queue-confirmation");
         record!(pending_ftps_real, "ftps-real");
@@ -943,6 +1016,7 @@ impl WindowState {
         record!(pending_provider_real, "provider-real");
         record!(pending_provider_queue, "provider-queue-confirmation");
         record!(pending_bidirectional, "bidirectional-real");
+        record!(pending_forward_bidirectional, "forward-bidirectional");
         record!(
             pending_bidirectional_queue,
             "bidirectional-queue-confirmation"
@@ -1445,7 +1519,11 @@ where
     // Die Frontend-Brücke registriert passend dazu jeden Listener am aktuellen
     // Webview. Ein prozessweiter JavaScript-Listener würde auch einen gezielt
     // versandten Menübefehl in jedem geöffneten Fenster empfangen.
-    app.emit_to(webview_event_target(label), event, payload)
+    app.emit_to(
+        webview_event_target(label),
+        event,
+        crate::frontend_payload::FrontendPayload(payload),
+    )
 }
 
 pub(crate) fn emit_queue_snapshot<R: tauri::Runtime>(
@@ -1607,9 +1685,20 @@ fn execute_queue_entry(
     context: &crate::operation_events::OperationViewContext,
 ) -> QueueTerminalEvent {
     let operation_id = entry.operation_id.clone();
-    let local_file = matches!(entry.operation, QueueOperation::File { .. });
+    let local_file = matches!(
+        entry.operation,
+        QueueOperation::File { .. }
+            | QueueOperation::ArchivePack { .. }
+            | QueueOperation::ArchiveExtract { .. }
+    );
     let local_sync = matches!(entry.operation, QueueOperation::LocalSync { .. });
-    let provider_file = matches!(entry.operation, QueueOperation::ProviderFile { .. });
+    let content_sync = matches!(entry.operation, QueueOperation::ContentSync { .. });
+    let forward_bidirectional =
+        matches!(entry.operation, QueueOperation::BidirectionalForward { .. });
+    let provider_file = matches!(
+        entry.operation,
+        QueueOperation::ProviderFile { .. } | QueueOperation::ArchiveUpload { .. }
+    );
     let provider_delete = matches!(entry.operation, QueueOperation::ProviderDelete { .. });
     if matches!(entry.operation, QueueOperation::SftpSync { .. }) {
         return sftp_commands::prepare_remote_queue_entry(app, label, queue, entry);
@@ -1630,15 +1719,28 @@ fn execute_queue_entry(
         return bidirectional_commands::prepare_queue_entry(app, label, queue, entry);
     }
     if let Err(error) = ensure_profile_bindings_current(app, &entry.profile_bindings) {
-        let _ = queue.fail(&operation_id, Progress::default(), error.message.clone());
+        if forward_bidirectional {
+            crate::forward_bidirectional_commands::interrupt_failed_preparation(
+                queue, &entry, &error,
+            );
+        } else {
+            let _ = queue.fail(&operation_id, Progress::default(), error.message.clone());
+        }
         return QueueTerminalEvent::with_progress(None, QueueTerminalOutcome::AppError(error));
     }
     let class = match &entry.operation {
-        QueueOperation::FtpsRecovery { .. }
+        QueueOperation::RenameCycleRecovery { .. }
+        | QueueOperation::FtpsRecovery { .. }
         | QueueOperation::File { .. }
+        | QueueOperation::ArchivePack { .. }
+        | QueueOperation::ArchiveExtract { .. }
+        | QueueOperation::ArchiveUpload { .. }
         | QueueOperation::ProviderFile { .. }
         | QueueOperation::ProviderDelete { .. } => doppeldecker_core::QueueOperationClass::File,
-        QueueOperation::Sync { .. } | QueueOperation::LocalSync { .. } => {
+        QueueOperation::Sync { .. }
+        | QueueOperation::LocalSync { .. }
+        | QueueOperation::ContentSync { .. }
+        | QueueOperation::BidirectionalForward { .. } => {
             doppeldecker_core::QueueOperationClass::Sync
         }
         QueueOperation::SftpSync { .. } => unreachable!("oben behandelt"),
@@ -1653,11 +1755,17 @@ fn execute_queue_entry(
         Err(error) => {
             // Das Queue-Journal speichert nur den Anzeigetext; der Code bleibt
             // ein Konzept der Command-Schnittstelle.
-            let _ = queue.fail(
-                &entry.operation_id,
-                Progress::default(),
-                error.message.clone(),
-            );
+            if forward_bidirectional {
+                crate::forward_bidirectional_commands::interrupt_failed_preparation(
+                    queue, &entry, &error,
+                );
+            } else {
+                let _ = queue.fail(
+                    &entry.operation_id,
+                    Progress::default(),
+                    error.message.clone(),
+                );
+            }
             return QueueTerminalEvent::with_progress(None, QueueTerminalOutcome::AppError(error));
         }
     };
@@ -1692,7 +1800,7 @@ fn execute_queue_entry(
             terminal_progress = Some((class, progress.clone()));
             return;
         }
-        if !announced_running {
+        if !announced_running || progress.phase == "archive_upload_ready" {
             announced_running = true;
             emit_queue_snapshot(app, label, queue);
         }
@@ -1710,7 +1818,39 @@ fn execute_queue_entry(
             let _ = emit_to_window_label(app, label, event, context.wrap(progress));
         }
     };
-    let result = if local_sync {
+    let result = if forward_bidirectional {
+        let result = crate::forward_bidirectional_commands::execute_queue_entry(
+            app,
+            label,
+            queue,
+            &entry,
+            cancel,
+            &mut progress_callback,
+        );
+        if let Err(error) = &result {
+            if let Some(current) = queue.snapshot().entries.into_iter().find(|entry| {
+                entry.operation_id == operation_id
+                    && matches!(
+                        entry.state,
+                        doppeldecker_core::QueueState::Validating
+                            | doppeldecker_core::QueueState::Running
+                    )
+            }) {
+                let _ =
+                    queue.interrupt_bidirectional_forward(&operation_id, current.progress, error);
+            }
+        }
+        result
+    } else if content_sync {
+        crate::content_sync_commands::execute_queue_entry(
+            app,
+            label,
+            queue,
+            &entry,
+            cancel,
+            &mut progress_callback,
+        )
+    } else if local_sync {
         crate::normal_sync_commands::execute_queue_entry(
             app,
             label,
@@ -1728,20 +1868,51 @@ fn execute_queue_entry(
             &mut progress_callback,
         )
     } else if provider_file || local_file {
+        let snapshot_store = if matches!(&entry.operation, QueueOperation::ArchiveExtract { request, .. } if request.snapshot.is_some())
+            || matches!(&entry.operation, QueueOperation::ArchiveUpload {generation,..} if generation.uses_snapshot())
+        {
+            let opened = crate::browser_commands::snapshot_cache(app, "archive-snapshots")
+                .map_err(|error| {
+                    let code = serde_json::from_value(serde_json::Value::String(error.code))
+                        .unwrap_or(doppeldecker_core::ErrorCode::Io);
+                    doppeldecker_core::coded_error(std::io::ErrorKind::Other, code, error.message)
+                })
+                .and_then(|root| doppeldecker_core::remote_snapshot::SnapshotStore::open(&root));
+            match opened {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    let error = doppeldecker_core::coded_error(error.kind(), doppeldecker_core::error_code(&error),
+                            format!("Archivmomentaufnahme ist nicht verfügbar; Archiv erneut öffnen: {error}"));
+                    let error = match queue.fail_file_coded(&operation_id, Progress::default(), &error, &[]) {
+                            Ok(()) => error,
+                            Err(persistence_error) => doppeldecker_core::coded_error(persistence_error.kind(), doppeldecker_core::error_code(&persistence_error), format!("Cacheprüfung scheiterte ({error}); Queueabschluss ebenfalls fehlgeschlagen: {persistence_error}")),
+                        };
+                    return QueueTerminalEvent::with_progress(
+                        None,
+                        QueueTerminalOutcome::AppError(error.into()),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
         let detailed = if provider_file {
-            doppeldecker_core::queue::execute_provider_file_queue_entry_detailed(
+            doppeldecker_core::queue::execute_provider_file_queue_entry_detailed_with_snapshot_store(
                 queue,
                 entry,
                 &execution,
                 std::sync::Arc::new(crate::sftp_commands::KeyringResolver),
+                snapshot_store.as_ref(),
                 cancel,
                 &mut progress_callback,
             )
         } else {
-            doppeldecker_core::queue::execute_local_queue_entry_detailed(
+            doppeldecker_core::queue::execute_local_queue_entry_detailed_with_snapshot_store(
                 queue,
                 entry,
                 &execution,
+                snapshot_store.as_ref(),
                 cancel,
                 &mut progress_callback,
             )
@@ -1786,11 +1957,14 @@ fn execute_queue_entry(
             }
         }
         Err(error) => {
-            let app_error = AppError::new(
+            let mut app_error = AppError::new(
                 doppeldecker_core::error_code(&error).as_str(),
                 error.to_string(),
             );
-            if provider_delete || local_sync {
+            if forward_bidirectional {
+                app_error.recovery_paths = doppeldecker_core::error::recovery_paths(&error);
+            }
+            if provider_delete || local_sync || content_sync {
                 let progress = queue
                     .snapshot()
                     .entries
@@ -2781,11 +2955,13 @@ mod tests {
         declared.sort();
         let mut expected = vec![
             "pending_bidirectional",
+            "pending_forward_bidirectional",
             "pending_bidirectional_queue",
             "pending_bidirectional_rollback",
             "pending_ftps_queue",
             "pending_ftps_real",
             "pending_local_sync",
+            "pending_content_sync",
             "pending_provider_queue",
             "pending_provider_real",
             "pending_real",
@@ -2939,7 +3115,7 @@ mod tests {
                 include_str!("local_sync_commands.rs"),
                 "pub(crate) fn prepare_real_sync(",
                 "pub(crate) fn discard_real_sync(",
-                "doppeldecker_core::prepare_local_real_run(",
+                "doppeldecker_core::prepare_local_real_run_for_queue(",
             ),
             (
                 "SFTP",

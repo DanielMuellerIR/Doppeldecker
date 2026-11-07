@@ -49,6 +49,7 @@ pub(crate) fn build_menu<R: tauri::Runtime>(
             "information",
             shortcut_label("Informationen", "⌘I", "Strg+I"),
         )
+        .text("file_preview", "Vorschau  (F3)")
         .text("compare_files", "Dateien vergleichen")
         .separator()
         .text(
@@ -119,9 +120,14 @@ pub(crate) fn build_menu<R: tauri::Runtime>(
     // Der Sync ist bewusst nur hier (und per Kürzel) erreichbar: Er öffnet einen
     // eigenen Modus mit Vorschau statt dauerhafter Kopfleisten-Steuerung.
     let commands = SubmenuBuilder::new(app, "Befehle")
+        .text("duplicate", shortcut_label("Duplizieren", "⌘D", "Strg+D"))
+        .text("archive_pack", "ZIP-Archiv erstellen …")
+        .text("archive_extract", "ZIP entpacken …")
+        .text("archive_read", "ZIP-Inhalt anzeigen …")
         .text("copy_over", "Ins andere Pane kopieren  (F5)")
         .text("move_over", "Ins andere Pane verschieben  (F6)")
         .text("rename", "Umbenennen  (F2)")
+        .text("batch_rename", "Stapelumbenennen …")
         .separator()
         .text(
             "sync_mode",

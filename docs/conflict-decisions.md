@@ -70,6 +70,9 @@ Journalformat 22 persistiert die vergebenen Aliasziele und Quellbelege. Am Queue
 werden alle Namen und Belege frisch geprüft. Beide behalten benötigt einen
 abgesicherten No-Replace-Commit; fehlt er, erklärt der Dialog die fehlende Variante.
 Die übrigen vorhandenen Copy-/Move-Ausführungsklassen bleiben erreichbar.
+Lokales [Duplizieren](duplicate.md) verwendet dieselben Quellbelege und exklusiven
+Neunamencommits für Kopien im eigenen Elternordner. Seine konkrete Zuordnung
+entsteht ebenfalls im Backend und läuft danach über die vorhandene Copy-Queue.
 Eine Kollision nach der Vorschau oder während des Commits verlangt Neuplanung und
 erlaubt niemals Ersetzen oder ein stilles Zusammenführen am neuen Namen. Das gilt
 auch für ein später fremd angelegtes Kind im neuen Konfliktordner. Kann der

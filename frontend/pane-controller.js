@@ -41,6 +41,9 @@ function makePane() {
     path: "",
     parent: null,
     entries: [],
+    allEntries: [],
+    filterText: "",
+    filterKind: "all",
     listingOmissions: [],
     listingOmissionText: "",
     listingOmissionsExpanded: false,
@@ -124,7 +127,7 @@ export function createPaneController({
     tab.scrollTop = pane.listing?.scrollTop || 0;
     tab.sort = { ...pane.sort };
     tab.viewOptions = structuredClone(pane.viewOptions);
-    tab.runtime.entries = pane.entries;
+    tab.runtime.entries = pane.allEntries;
   }
 
   function renderTabs(side) {
@@ -274,7 +277,7 @@ export function createPaneController({
     pane.directorySizeToken += 1;
     pane.directorySizeRunId = null;
     if (clear) {
-      for (const entry of pane.entries) delete entry.directorySize;
+      for (const entry of pane.allEntries) delete entry.directorySize;
       if (pane.el) renderDirectorySizeChange(side);
     }
     // Ein fehlgeschlagener Abbruch darf Navigation nicht sperren. Das Frontend-
@@ -362,7 +365,7 @@ export function createPaneController({
   function onDirectorySizeResult(payload) {
     const side = payload?.side;
     if (!panes[side] || !directorySizeEventMatches(side, payload)) return;
-    const entry = panes[side].entries.find(item => item.name === payload.name);
+    const entry = panes[side].allEntries.find(item => item.name === payload.name);
     if (!entry || !directorySizeEligible(entry)) return;
     entry.directorySize = payload.result;
     renderDirectorySizeChange(side);
@@ -381,7 +384,7 @@ export function createPaneController({
     if (!panes[side] || !directorySizeEventMatches(side, payload)) return false;
     const pane = panes[side];
     pane.directorySizeRunId = null;
-    for (const entry of pane.entries) {
+    for (const entry of pane.allEntries) {
       if (entry.directorySize?.status === "loading") {
         entry.directorySize = pendingResult;
         onDirectorySizeChange(side, entry);
@@ -413,6 +416,9 @@ export function createPaneController({
     pane.path = "";
     pane.parent = null;
     pane.entries = [];
+    pane.allEntries = [];
+    pane.filterText = "";
+    pane.filterKind = "all";
     pane.listingOmissions = [];
     pane.listingOmissionText = "";
     pane.listingOmissionsExpanded = false;
@@ -532,7 +538,6 @@ export function createPaneController({
       await discardRealPreparation();
       if (seq !== pane.loadSeq) return;
       await cancelDirectorySizeRun(side);
-      if (seq !== pane.loadSeq) return;
       // Unmittelbar vor dem eigentlichen Provideraufruf gilt das Sequenz-Token noch
       // einmal. Ein veralteter Abruf darf den inzwischen gewählten Server nicht
       // einmal kurz ansprechen und seine Sitzung dabei lazy öffnen.
@@ -595,7 +600,12 @@ export function createPaneController({
           anchorName: pane.entries[pane.anchor]?.name,
           scrollTop: pane.listing?.scrollTop || 0 }
         : null);
-      pane.entries = sortEntries(listing.entries, pane);
+      if (!refreshingVisibleLocation) {
+        pane.filterText = "";
+        pane.filterKind = "all";
+      }
+      pane.allEntries = sortEntries(listing.entries, pane);
+      pane.entries = pane.allEntries;
       restoreCursor(pane, keepSelName);
       if (viewRestore) {
         const saved = viewRestore;
@@ -605,12 +615,13 @@ export function createPaneController({
         pane.anchor = Math.max(0, pane.entries.findIndex(entry => entry.name === saved.anchorName));
       }
       pane.typeBuffer = "";
+      applyFilter(side, { renderNow: false });
       render(side);
       if (viewRestore) {
         pane.listing.scrollTop = viewRestore.scrollTop;
         renderRows(side);
       }
-      if (tabRead) pane.tabs.finishRead(tabRead, tab => { tab.runtime.entries = pane.entries; });
+      if (tabRead) pane.tabs.finishRead(tabRead, tab => { tab.runtime.entries = pane.allEntries; });
       saveActiveTab(pane);
       renderTabs(side);
       onStateChanged();
@@ -624,7 +635,7 @@ export function createPaneController({
           && pane.securityNoticeKey !== sftpNoticeKey) {
         pane.securityNoticeKey = sftpNoticeKey;
         showDock(
-          `<span class="pill update">SFTP · pfadbasiertes Best Effort</span>Reguläre Dateien öffnen sich als geprüfte lokale Momentaufnahme; Dateien und begrenzte Verzeichnisbäume lassen sich additiv lokal herunterladen. Umfang und Auslassungen bleiben sichtbar. SFTP v3 bindet OPENDIR und OPEN nicht atomar an den Pane-Root; unbemerkter Pfadtausch bleibt möglich. Ersetzen, Sync und Remote-Mutationen bleiben gesperrt.`,
+          `<span class="pill update">SFTP · pfadbasiertes Best Effort</span>Dateiaktionen einschließlich Upload, Verschieben, Ersetzen und Dauerlöschen sind verfügbar. Gleichzeitig auf dem Server umgeleitete Elternpfade können eine andere Datei treffen; frische Pfad- und Ergebnisprüfungen begrenzen dieses Risiko. Gewöhnlicher Dateisync ist verfügbar. Bidirektionaler Dateisync ist als Best Effort ebenfalls verfügbar. Strikter Sync mit atomarer Rootbindung, strikter bidirektionaler Sync und Providerquarantäne bleiben für diese pfadbasierte Klasse gesperrt.`,
           { closable: true },
         );
       } else if (pane.provider === "ftps"
@@ -661,6 +672,15 @@ export function createPaneController({
     } finally {
       if (seq === pane.loadSeq) pane.navigationPending = false;
     }
+  }
+
+  function revealEntry(side, parent, name, isHidden = false) {
+    const pane = panes[side];
+    clearFilter(side);
+    return loadPane(side, parent, { keepSelName: name, tabRestore: {
+      selectedNames: [name], cursorName: name, anchorName: name, scrollTop: 0,
+      viewOptions: { ...pane.viewOptions, showHidden: pane.viewOptions.showHidden || isHidden || name.startsWith(".") },
+    } });
   }
 
   function restoreCursor(pane, keepSelName) {
@@ -741,23 +761,48 @@ export function createPaneController({
 
   function resortPane(side) {
     const pane = panes[side];
-    // `sortEntries` ordnet dieselben Eintragsobjekte neu. Ihre Referenzen sind
-    // innerhalb dieses Listings eindeutig, auch wenn ein nicht sicher dekodierter
-    // Rohname dieselbe sichtbare Ersatzzeichenfolge wie ein echter UTF-8-Name hat.
-    // Der Anzeigename darf deshalb weder Cursor noch Auswahlidentität bilden.
-    const cursorEntry = pane.entries[pane.cursor] || null;
-    const selectedEntries = new Set(
-      [...pane.sel].map(index => pane.entries[index]).filter(Boolean),
-    );
-    pane.entries = sortEntries(pane.entries, pane);
-    const cursor = cursorEntry ? pane.entries.indexOf(cursorEntry) : -1;
-    pane.cursor = cursor >= 0 ? cursor : (pane.entries.length ? 0 : 0);
+    pane.allEntries = sortEntries(pane.allEntries, pane);
+    applyFilter(side, { renderNow: false });
     pane.anchor = pane.cursor;
-    pane.sel = new Set();
-    pane.entries.forEach((entry, index) => {
-      if (selectedEntries.has(entry)) pane.sel.add(index);
-    });
+  }
+
+  function filteredEntries(pane) {
+    const query = pane.filterText.trim().normalize("NFC").toLocaleLowerCase("de-DE");
+    return pane.allEntries.filter(entry =>
+      (!query || entry.name.normalize("NFC").toLocaleLowerCase("de-DE").includes(query))
+      && (pane.filterKind === "all"
+        || (pane.filterKind === "files" && entry.is_file)
+        || (pane.filterKind === "folders" && entry.is_dir)));
+  }
+
+  function applyFilter(side, { renderNow = true } = {}) {
+    const pane = panes[side];
+    const cursorEntry = pane.entries[pane.cursor];
+    const anchorEntry = pane.entries[pane.anchor];
+    const selected = new Set([...pane.sel].map(index => pane.entries[index]));
+    pane.entries = filteredEntries(pane);
+    pane.cursor = Math.max(0, pane.entries.indexOf(cursorEntry));
+    pane.anchor = Math.max(0, pane.entries.indexOf(anchorEntry));
+    // Sortierung und Filterung ordnen dieselben Eintragsobjekte neu. Ihre
+    // Referenzen sind eindeutig, auch wenn ein unsicherer Rohname genauso aussieht
+    // wie ein echter UTF-8-Name. Anzeigenamen dürfen keine Auswahlidentität bilden.
+    // Ausgeblendete Zeilen gehören nie zur wirksamen Auswahl.
+    pane.sel = new Set(pane.entries.flatMap((entry, index) => selected.has(entry) ? [index] : []));
     if (!pane.sel.size && pane.entries.length) pane.sel.add(pane.cursor);
+    if (renderNow) {
+      pane.typeBuffer = "";
+      pane.typeTime = 0;
+      pane.listing.scrollTop = 0;
+      render(side);
+      onStateChanged();
+    }
+  }
+
+  function clearFilter(side) {
+    const pane = panes[side];
+    pane.filterText = "";
+    pane.filterKind = "all";
+    applyFilter(side);
   }
 
   /** Bei aktiver Größensortierung muss jedes Streaming-Ergebnis die Rohwertreihenfolge
@@ -955,7 +1000,9 @@ export function createPaneController({
       pane.renderEnd = 0;
       pane.listing.dataset.virtualized = "false";
       pane.listing.removeAttribute("aria-activedescendant");
-      const emptyLabel = pane.listingOmissions.length ? "Keine anzeigbaren Einträge" : "Leerer Ordner";
+      const emptyLabel = pane.filterText.trim() || pane.filterKind !== "all"
+        ? "Keine Treffer im geladenen Ordner"
+        : pane.listingOmissions.length ? "Keine anzeigbaren Einträge" : "Leerer Ordner";
       pane.listing.innerHTML = `<div class="empty">${emptyLabel}</div>`;
       syncListGutter(pane);
       return;
@@ -996,6 +1043,7 @@ export function createPaneController({
   function updatePaneFooter(pane) {
     const dirs = pane.entries.filter(entry => entry.is_dir).length;
     $(".count", pane.el).textContent = `${dirs} Ordner · ${pane.entries.length - dirs} Dateien`
+      + (pane.filterText.trim() || pane.filterKind !== "all" ? ` · ${pane.entries.length} von ${pane.allEntries.length} Einträgen` : "")
       + (pane.sel.size > 1 ? ` · ${pane.sel.size} ausgewählt` : "");
     const button = $(".listing-omissions-toggle", pane.el);
     const reportField = $(".listing-omissions-text", pane.el);
@@ -1016,6 +1064,9 @@ export function createPaneController({
   function render(side) {
     const pane = panes[side];
     $(".path", pane.el).value = pane.path;
+    $(".pane-filter-text", pane.el).value = pane.filterText;
+    $(".pane-filter-kind", pane.el).value = pane.filterKind;
+    $(".pane-filter-clear", pane.el).disabled = !pane.filterText && pane.filterKind === "all";
     const providerLabel = pane.provider === "ftps" && pane.securityStatus === "plaintext"
       ? "FTP"
       : pane.provider.toUpperCase();
@@ -1131,7 +1182,7 @@ export function createPaneController({
     refreshSelection(side);
   }
 
-  async function openCursor(side) {
+  async function openCursor(side, mode = "original", verification = "streaming") {
     const pane = panes[side];
     const entry = pane.entries[pane.cursor];
     if (!entry) return;
@@ -1157,9 +1208,10 @@ export function createPaneController({
               root: pane.path,
             },
             path,
+            mode,
+            verification,
           },
         });
-
       }
     } catch (error) {
       showError("Öffnen fehlgeschlagen", error);
@@ -1415,6 +1467,27 @@ export function createPaneController({
     });
     pane.el.addEventListener("mousedown", () => activate(side));
     pane.el.addEventListener("focusin", () => activate(side, { focus: false }));
+    const filter = $(".pane-filter-text", pane.el);
+    filter.addEventListener("input", () => {
+      pane.filterText = filter.value;
+      applyFilter(side);
+    });
+    $(".pane-filter-kind", pane.el).addEventListener("change", event => {
+      pane.filterKind = event.target.value;
+      applyFilter(side);
+    });
+    $(".pane-filter-clear", pane.el).addEventListener("click", () => {
+      clearFilter(side);
+      filter.focus();
+    });
+    pane.el.addEventListener("keydown", event => {
+      if (event.key === "Escape" && (pane.filterText || pane.filterKind !== "all")) {
+        clearFilter(side);
+        pane.listing.focus();
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    });
     pane.listing.addEventListener("click", (event) => {
       const sizeAction = event.target.closest("[data-directory-size]");
       if (sizeAction) {
@@ -1550,6 +1623,7 @@ export function createPaneController({
     goHome,
     goUp,
     loadPane,
+    revealEntry,
     moveCursor,
     moveCursorTo,
     onDirectorySizeDone,

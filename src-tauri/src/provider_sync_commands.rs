@@ -3,14 +3,15 @@
 //! Beide Sitzungen, Handles und das Einmal-Permit bleiben im RAM. Die Queue
 //! persistiert ausschließlich öffentliche Endpunktidentitäten und Secret-Referenzen.
 
+use crate::frontend_payload::FrontendQueueSnapshot;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use doppeldecker_core::{
-    execute_prepared_sftp_queue_entry, prepare_provider_queue_entry, prepare_provider_transfer,
-    OperationQueue, PreparedProviderRealRun, Progress, QueueEntry, QueueExecutionResult,
-    QueueOperation, QueueSnapshot, SftpQueuePreparation, SyncOptions,
+    execute_prepared_sftp_queue_entry_effects, prepare_provider_queue_entry,
+    prepare_provider_transfer_for_queue, OperationQueue, PreparedProviderRealRun, Progress,
+    QueueEntry, QueueExecutionResult, QueueOperation, SftpQueuePreparation, SyncOptions,
 };
 use tauri::{Manager, State, WebviewWindow};
 
@@ -82,8 +83,9 @@ pub(crate) fn prepare_provider_sync(
         let target = queue
             .bind_provider_preparation(&target)
             .map_err(AppError::from)?;
-        let prepared = prepare_provider_transfer(source, target, request.options.clone())
-            .map_err(AppError::from)?;
+        let prepared =
+            prepare_provider_transfer_for_queue(&queue, source, target, request.options.clone())
+                .map_err(AppError::from)?;
         let preview = prepared.preview().clone();
         let operation = QueueOperation::ProviderSync {
             source: source_queue,
@@ -116,20 +118,13 @@ pub(crate) fn discard_provider_sync(window: WebviewWindow, state: State<AppState
 }
 
 fn validate_confirmation(
-    preview: &doppeldecker_core::RealRunPreview,
-    confirmation: &str,
-    backup_confirmed: bool,
+    _preview: &doppeldecker_core::RealRunPreview,
+    effects_confirmed: bool,
 ) -> Result<(), AppError> {
-    if confirmation != preview.confirmation_phrase {
+    if !effects_confirmed {
         return Err(AppError::new(
             "confirmation_mismatch",
-            "Provider-Laufphrase stimmt nicht exakt überein",
-        ));
-    }
-    if preview.backup_confirmation_required && !backup_confirmed {
-        return Err(AppError::new(
-            "confirmation_mismatch",
-            "Provider-Update/Mirror benötigt ein bestätigtes unabhängiges Backup",
+            "Die angezeigte Sync-Wirkung wurde nicht bestätigt",
         ));
     }
     Ok(())
@@ -140,8 +135,7 @@ pub(crate) fn run_provider_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
     state: State<AppState>,
-    confirmation: String,
-    backup_confirmed: bool,
+    effects_confirmed: bool,
 ) -> Result<(), AppError> {
     let label = window.label().to_owned();
     let window_state = state.window(&label);
@@ -154,7 +148,7 @@ pub(crate) fn run_provider_sync(
         "Keine Provider-Vorbereitung vorhanden",
         |pending| {
             crate::queue_runtime::ensure_profile_bindings_current(&app, &pending.profile_bindings)?;
-            validate_confirmation(pending.prepared.preview(), &confirmation, backup_confirmed)
+            validate_confirmation(pending.prepared.preview(), effects_confirmed)
         },
     )?;
     crate::queue_runtime::spawn_confirmed_remote_run(
@@ -165,7 +159,7 @@ pub(crate) fn run_provider_sync(
         move |on_progress| {
             pending_run
                 .prepared
-                .confirm(&confirmation, backup_confirmed)?
+                .confirm_effects(effects_confirmed)?
                 .execute_with_audit(&audit, &cancel, on_progress)
         },
     );
@@ -177,7 +171,7 @@ pub(crate) fn enqueue_provider_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
     state: State<AppState>,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label();
     let window_state = state.window(label);
     let queue = with_queue_extension(&state, &window_state, || {
@@ -203,7 +197,7 @@ pub(crate) fn enqueue_provider_sync(
     })?;
     emit_queue_snapshot(&app, label, &queue);
     start_queue_worker(app, label.to_owned());
-    Ok(queue.snapshot())
+    Ok(queue.snapshot().into())
 }
 
 pub(crate) fn prepare_remote_queue_entry(
@@ -242,7 +236,13 @@ pub(crate) fn prepare_remote_queue_entry(
                 );
                 return QueueTerminalEvent::error("sync-error", error);
             }
-            QueueTerminalEvent::error("sync-error", AppError::new("app", "Provider-Lauf ist geprüft; Queue öffnen und die einmalige Laufphrase bestätigen"))
+            QueueTerminalEvent::error(
+                "sync-error",
+                AppError::new(
+                    "app",
+                    "Provider-Lauf ist geprüft; Queue öffnen und die angezeigte Wirkung bestätigen",
+                ),
+            )
         }
         Ok(SftpQueuePreparation::AwaitingConfirmation { reason }) => {
             QueueTerminalEvent::error("sync-error", AppError::new("app", reason))
@@ -260,9 +260,8 @@ pub(crate) fn approve_provider_queue_entry(
     window: WebviewWindow,
     state: State<AppState>,
     operation_id: String,
-    confirmation: String,
-    backup_confirmed: bool,
-) -> Result<QueueSnapshot, AppError> {
+    effects_confirmed: bool,
+) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label().to_owned();
     let window_state = state.window(&label);
     let queue = operation_queue(&app, &window_state, &label)?;
@@ -292,7 +291,7 @@ pub(crate) fn approve_provider_queue_entry(
                     "Provider-Queue-Vorbereitung gehört zu einem anderen Eintrag",
                 ));
             }
-            validate_confirmation(prepared.prepared.preview(), &confirmation, backup_confirmed)
+            validate_confirmation(prepared.prepared.preview(), effects_confirmed)
         },
     )?;
     let queue_for_worker = queue.clone();
@@ -314,11 +313,10 @@ pub(crate) fn approve_provider_queue_entry(
         let events = window.clone();
         let mut last = Instant::now() - Duration::from_secs(1);
         let mut terminal_progress = None;
-        let result = execute_prepared_sftp_queue_entry(
+        let result = execute_prepared_sftp_queue_entry_effects(
             &queue_for_worker,
             prepared.prepared,
-            &confirmation,
-            backup_confirmed,
+            effects_confirmed,
             &audit,
             &cancel,
             &mut |progress| {
@@ -370,7 +368,7 @@ pub(crate) fn approve_provider_queue_entry(
             }
         });
     });
-    Ok(queue.snapshot())
+    Ok(queue.snapshot().into())
 }
 
 #[cfg(test)]

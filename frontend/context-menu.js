@@ -103,6 +103,16 @@ export function createContextMenu(actions) {
 
     if (entries.length && safeSelection) {
       if (single) items.push({ label: "Öffnen", action: () => actions.open(side) });
+      if (single && entries[0].is_file && !entries[0].is_symlink) {
+        items.push({ label: "Vorschau (F3)", action: () => actions.preview(side) });
+        items.push({ label: "ZIP-Inhalt anzeigen …", action: () => actions.archiveRead(side) });
+        items.push({ label: "ZIP entpacken …", action: () => actions.archiveExtract(side) });
+      }
+      if (single && pane.provider !== "local" && entries[0].is_file && !entries[0].is_symlink) {
+        items.push({ label: "Mit Vollprüfung öffnen", action: () => actions.open(side, "original", "full_readback") });
+        items.push({ label: "Passiv ansehen", action: () => actions.open(side, "passive") });
+        items.push({ label: "Bearbeiten und zurückspeichern", action: () => actions.open(side, "edit") });
+      }
       if (single && entries[0].is_dir) {
         items.push({
           label: "Zu Favoriten hinzufügen",
@@ -113,6 +123,8 @@ export function createContextMenu(actions) {
           ),
         });
       }
+      items.push({ label: "Duplizieren", action: () => actions.duplicate(side) });
+      items.push({ label: "ZIP-Archiv erstellen …", action: () => actions.archivePack(side) });
       items.push({ label: "Ins andere Pane kopieren  (F5)", action: () => actions.transfer("copy") });
       items.push({ label: "Ins andere Pane verschieben  (F6)", action: () => actions.transfer("move") });
       if (pane.provider === "local") {
@@ -130,6 +142,7 @@ export function createContextMenu(actions) {
       items.push({ separator: true });
     }
     if (entries.length) {
+      if (entries.some(isEntryNameSafe)) items.push({ label: "Stapelumbenennen …", action: () => actions.batchRename(side) });
       items.push({ label: "Informationen  (⌘I)", action: () => actions.information(side) });
       items.push({ separator: true });
     }

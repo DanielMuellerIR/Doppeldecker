@@ -1,8 +1,8 @@
-//! Begrenzte interaktive Inhaltslesewege; ausdrücklich kein Sync-VFS.
+//! Interaktive Inhaltslesewege; ausdrücklich kein Sync-VFS.
 //!
 //! SFTP v3 kann den ersten OPEN nicht atomar unter einen Root binden. Wir halten
 //! deshalb Sitzung und Datei-Handle, prüfen alle beobachtbaren Pfadbelege und lesen
-//! den Inhalt vor EOF erneut zurück. Ein unbemerkter Austausch mit identischen
+//! Größe und Attribute nach dem Streaming. Ein unbemerkter Austausch mit identischen
 //! Attributen zwischen diesen Requests bleibt das sichtbar erklärte Restrisiko.
 
 use super::*;
@@ -16,13 +16,11 @@ use std::path::PathBuf;
 mod tree;
 use tree::DirectoryProof;
 
-pub const SFTP_MAX_INTERACTIVE_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const MAX_FILES: usize = 100;
 const READ_CHUNK: u32 = 64 * 1024;
-pub const SFTP_CONTENT_READ_LIMITATION: &str = "SFTP-Inhalte · Best Effort: Hostkey, Sitzung, Pfadkomponenten, READDIR bis EOF, Datei-Handles, Größe und BLAKE3-Readback werden geprüft. SFTP v3 bindet OPENDIR und OPEN nicht atomar an den Pane-Root; ein unbemerkter Pfadtausch zwischen den Prüfungen bleibt möglich. Reguläre Dateien bis 8 GiB und begrenzte additive Verzeichnisbäume: höchstens 100 direkte Auswahleinträge, 1000 Baumeinträge, 16 Unterordnerebenen und 16 GiB Baumgesamtinhalt. Symlinks und nicht belegbare Inhalte werden sichtbar ausgelassen; keine Ersetzung oder Quellentfernung. Ausführungsrechte werden nicht übernommen.";
+pub const SFTP_CONTENT_READ_LIMITATION: &str = "SFTP-Inhalte · Best Effort: Hostkey, Sitzung, Pfadkomponenten, READDIR bis EOF, Datei-Handle, Größe und Attribute werden geprüft; BLAKE3 entsteht während des Transfers. SFTP v3 bindet OPENDIR und OPEN nicht atomar an den Pane-Root; ein unbemerkter Pfadtausch oder eine Änderung mit identischen Attributen bleibt möglich. Vollständiger Inhaltsreadback ist optional. Puffer und gleichzeitig offene Handles sind begrenzt, der vollständige Baumbeleg braucht Speicher proportional zum Bestand. Symlinks und nicht belegbare Inhalte werden sichtbar ausgelassen; keine Ersetzung oder Quellentfernung.";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-struct Attributes {
+pub(super) struct Attributes {
     size: Option<u64>,
     mtime: Option<u32>,
     permissions: Option<u32>,
@@ -72,6 +70,8 @@ struct InteractiveFiles {
     generation: u64,
     files: Arc<BTreeMap<PathBuf, FileProof>>,
     directories: Arc<BTreeMap<PathBuf, DirectoryProof>>,
+    omitted_selections: Arc<BTreeMap<PathBuf, FileProof>>,
+    omission_directories: Arc<Vec<PathBuf>>,
     tree: Option<crate::vfs::InteractiveSourceTree>,
     cancel: Cancel,
 }
@@ -104,8 +104,8 @@ impl SftpVfs {
         Ok(Arc::new(context))
     }
 
-    // Der Metadatenkontext besitzt keine Inhaltsgrößenlimits. Er bleibt deshalb
-    // privat und darf niemals als VFS-Kopierquelle oder Queue-Baumbeleg herausgehen.
+    // Metadaten ohne Änderungszeit reichen nicht als Inhaltsbeleg. Dieser Kontext
+    // bleibt deshalb privat und darf niemals als VFS-Kopierquelle herausgehen.
     pub(super) fn interactive_metadata_summary(
         self: &Arc<Self>,
         root: &Path,
@@ -171,10 +171,12 @@ impl SftpVfs {
             generation,
             files: Arc::new(BTreeMap::new()),
             directories: Arc::new(BTreeMap::new()),
+            omitted_selections: Arc::new(BTreeMap::new()),
+            omission_directories: Arc::new(Vec::new()),
             tree: None,
             cancel: cancel.clone(),
         };
-        let preparation_cancel = cancel.until(std::time::Instant::now() + tree::PREPARATION_LIMIT);
+        let preparation_cancel = cancel.clone();
         let prepared = self.runtime.block_on(async {
             verify_sftp_directory_chain(
                 &session,
@@ -194,17 +196,26 @@ impl SftpVfs {
             )
             .await
         });
-        let prepared = limited_result(
-            prepared,
-            &preparation_cancel,
-            cancel,
-            "SFTP-Baumvorbereitung überschritt die Frist von 60 Sekunden; keine lokale Wirkung",
-        );
         // Auch ein Ausfall vor dem ersten OPEN gehört zum gescheiterten Versuch.
         // Ein sekundärer CLOSE-Verlust wird am gehaltenen Kontext separat erfasst.
-        let (files, directories, tree) = result.record_failure(prepared)?;
+        let (files, directories, omitted_selections, tree) = result.record_failure(prepared)?;
+        // Nur bereits betretene Eltern mit tatsächlichen Auslassungen beobachten.
+        // Direkte ausgelassene Auswahlordner bleiben außerhalb der Verzeichnis-
+        // map: Ihre Teilbäume dürfen auch bei späteren Prüfungen nicht betreten werden.
+        result.omission_directories = Arc::new(
+            tree.as_ref()
+                .into_iter()
+                .flat_map(|summary| &summary.omitted)
+                .filter_map(|omission| Path::new(&omission.path).parent())
+                .filter(|parent| directories.contains_key(*parent))
+                .map(Path::to_path_buf)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        );
         result.files = Arc::new(files);
         result.directories = Arc::new(directories);
+        result.omitted_selections = Arc::new(omitted_selections);
         result.check_session()?;
         Ok((result, tree))
     }
@@ -212,9 +223,9 @@ impl SftpVfs {
 
 pub fn validate_interactive_content_selection(root: &Path, items: &[PathBuf]) -> io::Result<()> {
     validate_content_path(root)?;
-    if !root.is_absolute() || items.is_empty() || items.len() > MAX_FILES {
+    if !root.is_absolute() || items.is_empty() {
         return Err(invalid(
-            "SFTP-Inhaltsauswahl benötigt einen absoluten Pane-Root und 1 bis 100 direkte Einträge",
+            "SFTP-Inhaltsauswahl benötigt einen absoluten Pane-Root und mindestens einen direkten Eintrag",
         ));
     }
     let mut seen = std::collections::BTreeSet::new();
@@ -231,11 +242,10 @@ pub fn validate_interactive_content_selection(root: &Path, items: &[PathBuf]) ->
 }
 
 fn validate_content_path(path: &Path) -> io::Result<()> {
-    if path.as_os_str().len() > 4096 || virtual_components(path)?.len() > 64 {
-        return Err(invalid(
-            "SFTP-Inhaltspfad überschreitet 4096 Bytes oder 64 Komponenten",
-        ));
+    if path.as_os_str().len() > 4096 {
+        return Err(invalid("SFTP-Inhaltspfad überschreitet 4096 Bytes"));
     }
+    virtual_components(path)?;
     Ok(())
 }
 
@@ -330,14 +340,6 @@ async fn capture_node_for(
             message,
         ));
     }
-    if purpose == ReadPurpose::Contents
-        && attrs.is_regular()
-        && attrs.size.unwrap_or(u64::MAX) > SFTP_MAX_INTERACTIVE_FILE_BYTES
-    {
-        return Err(invalid(
-            "SFTP-Einzeldatei überschreitet die Inhaltsgrenze von 8 GiB",
-        ));
-    }
     if session
         .canonicalize(remote.clone())
         .await
@@ -348,33 +350,15 @@ async fn capture_node_for(
     }
     check_cancel(cancel)?;
     let mut entry = entry_from_attributes((*name).to_owned(), &attrs)?;
-    // Inhaltsdownload ist keine native Metadatenübertragung, insbesondere keine
-    // Freigabe für ein vom Server geliefertes Programm oder Sonderbits.
-    entry.mode = Some(if entry.is_dir { 0o700 } else { 0o600 });
+    // Darstellbare Rechte gehören zur Quelle; private Snapshots bestimmen ihren
+    // eigenen Modus unabhängig davon. Set-ID- und Sticky-Bits werden nicht erfunden.
+    entry.mode = attrs.permissions.map(|mode| mode & 0o777);
     Ok(FileProof {
         path: path.to_path_buf(),
         remote,
         chain,
         attributes: Attributes::from(&attrs),
         entry,
-    })
-}
-
-fn limited_result<T>(
-    result: io::Result<T>,
-    limited: &Cancel,
-    original: &Cancel,
-    message: &str,
-) -> io::Result<T> {
-    result.map_err(|error| {
-        if crate::error_code(&error) == ErrorCode::Interrupted
-            && limited.is_cancelled()
-            && !original.is_cancelled()
-        {
-            invalid(message)
-        } else {
-            error
-        }
     })
 }
 
@@ -411,8 +395,52 @@ impl InteractiveFiles {
         }
         Ok(())
     }
-    async fn verify(&self, proof: &FileProof, session: &SftpSession) -> io::Result<()> {
+    async fn verify_omissions(&self, session: &SftpSession) -> io::Result<()> {
         self.check_session()?;
+        for proof in self.omitted_selections.values() {
+            check_cancel(&self.cancel)?;
+            let fresh = capture_node(
+                session,
+                &self.identity.canonical_root,
+                &proof.path,
+                &self.cancel,
+                true,
+            )
+            .await?;
+            if fresh.chain != proof.chain
+                || fresh.attributes != proof.attributes
+                || fresh.remote != proof.remote
+            {
+                return Err(drift(
+                    "Ausgelassene direkte SFTP-Auswahl änderte ihren Pfad- oder Attributbeleg",
+                ));
+            }
+        }
+        if !self.omission_directories.is_empty() {
+            let raw = lock(&self.provider.state).connection.read_session.clone();
+            for path in self.omission_directories.iter() {
+                check_cancel(&self.cancel)?;
+                // Kindattribute können sich ohne Änderung der Elternattribute
+                // ändern. Deshalb den gespeicherten vollständigen READDIR-Beleg
+                // an den Datei-Grenzen prüfen, nicht für jeden gelesenen Block.
+                tree::verify_directory(self, &self.directories[path], session, &raw).await?;
+            }
+        }
+        self.check_session()
+    }
+    fn verify_omissions_now(&self) -> io::Result<()> {
+        if self.omitted_selections.is_empty() && self.omission_directories.is_empty() {
+            return self.check_session();
+        }
+        let session = lock(&self.provider.state).connection.sftp.clone();
+        self.record_failure(
+            self.provider
+                .runtime
+                .block_on(self.verify_omissions(&session)),
+        )
+    }
+    async fn verify(&self, proof: &FileProof, session: &SftpSession) -> io::Result<()> {
+        self.verify_omissions(session).await?;
         let fresh = capture_file(
             session,
             &self.identity.canonical_root,
@@ -437,7 +465,6 @@ struct ContentReader {
     raw: Arc<RawSftpSession>,
     handle: String,
     offset: u64,
-    hash: blake3::Hasher,
     verified: bool,
     failed: bool,
 }
@@ -472,54 +499,7 @@ impl ContentReader {
     async fn finish(&self) -> io::Result<()> {
         self.files.verify(&self.proof, &self.session).await?;
         self.verify_handle(&self.handle).await?;
-        // Ein frischer Handle zum gleichen geprüften Pfad erkennt auch einen
-        // Austausch mit gleicher Größe/Zeit, den FSTAT allein nicht unterscheiden kann.
-        let second = self
-            .raw
-            .open(&self.proof.remote, OpenFlags::READ, FileAttributes::empty())
-            .await
-            .map_err(sftp_error)?
-            .handle;
-        let result = async {
-            self.verify_handle(&second).await?;
-            let mut offset = 0;
-            let mut hash = blake3::Hasher::new();
-            loop {
-                let remaining = self.proof.entry.size.saturating_sub(offset);
-                let data = self
-                    .read_at(
-                        &second,
-                        offset,
-                        u64::from(READ_CHUNK).min(remaining.saturating_add(1)) as u32,
-                    )
-                    .await?;
-                if data.is_empty() {
-                    break;
-                }
-                offset += data.len() as u64;
-                if offset > self.proof.entry.size {
-                    return Err(drift("SFTP-Inhalt wuchs beim BLAKE3-Readback"));
-                }
-                hash.update(&data);
-            }
-            if offset != self.proof.entry.size || hash.finalize() != self.hash.finalize() {
-                return Err(drift(
-                    "SFTP-Inhalt änderte sich beim vollständigen BLAKE3-Readback",
-                ));
-            }
-            self.verify_handle(&second).await?;
-            self.verify_handle(&self.handle).await?;
-            self.files.verify(&self.proof, &self.session).await
-        }
-        .await;
-        // Der primäre Inhaltsfehler bleibt führend. Ein zusätzlich gemeldeter
-        // Verbindungsverlust muss die Sitzung trotzdem vor dem nächsten Leser entwerten.
-        let closed = self
-            .files
-            .record_failure(self.raw.close(second).await.map_err(sftp_error));
-        result?;
-        closed?;
-        Ok(())
+        self.files.check_session()
     }
 }
 impl Read for ContentReader {
@@ -566,7 +546,6 @@ impl Read for ContentReader {
                 return Err(drift("SFTP-Inhalt überschreitet die gebundene Größe"));
             }
             buffer[..data.len()].copy_from_slice(&data);
-            self.hash.update(&data);
             self.offset += data.len() as u64;
             Ok(data.len())
         })();
@@ -611,7 +590,7 @@ impl Vfs for InteractiveFiles {
         &self,
         path: &Path,
     ) -> io::Result<Option<Vec<crate::vfs::ProofListEntry>>> {
-        self.check_session()?;
+        self.verify_omissions_now()?;
         let Some(proof) = self.directories.get(path) else {
             return Ok(None);
         };
@@ -650,7 +629,7 @@ impl Vfs for InteractiveFiles {
         ))
     }
     fn interactive_source_tree(&self) -> io::Result<Option<crate::vfs::InteractiveSourceTree>> {
-        self.check_session()?;
+        self.verify_omissions_now()?;
         Ok(self.tree.clone())
     }
     fn list(&self, _: &Path) -> io::Result<Vec<Entry>> {
@@ -658,7 +637,7 @@ impl Vfs for InteractiveFiles {
     }
     fn stat(&self, path: &Path) -> io::Result<Entry> {
         if let Some(directory) = self.directories.get(path) {
-            self.check_session()?;
+            self.verify_omissions_now()?;
             let session = lock(&self.provider.state).connection.sftp.clone();
             let fresh = self.record_failure(self.provider.runtime.block_on(capture_node(
                 &session,
@@ -712,7 +691,6 @@ impl Vfs for InteractiveFiles {
             raw,
             handle,
             offset: 0,
-            hash: blake3::Hasher::new(),
             verified: false,
             failed: false,
         };
@@ -727,6 +705,12 @@ impl Vfs for InteractiveFiles {
                 .block_on(self.verify(&reader.proof, &reader.session)),
         )?;
         Ok(Box::new(reader))
+    }
+    fn verify_transferred_source(&self, path: &Path, _: &blake3::Hash) -> io::Result<()> {
+        if self.omitted_selections.is_empty() && self.omission_directories.is_empty() {
+            return Ok(());
+        }
+        self.stat(path).map(|_| ())
     }
     fn create_dir_all(&self, _: &Path) -> io::Result<()> {
         read_only()
@@ -763,46 +747,5 @@ impl Vfs for InteractiveFiles {
     }
     fn rename_noreplace(&self, _: &Path, _: &Path) -> io::Result<()> {
         read_only()
-    }
-}
-
-#[cfg(test)]
-mod budget_tests {
-    use super::*;
-
-    #[test]
-    fn vorbereitungsfrist_erhaelt_verbindungsfehler_und_setzt_nicht_den_nutzerabbruch() {
-        let original = Cancel::new();
-        let expired = original.until(std::time::Instant::now());
-        let lost = limited_result::<()>(
-            Err(coded_error(
-                io::ErrorKind::ConnectionAborted,
-                ErrorCode::ConnectionLost,
-                "künstlicher Antwortverlust",
-            )),
-            &expired,
-            &original,
-            "Frist",
-        )
-        .unwrap_err();
-        assert_eq!(crate::error_code(&lost), ErrorCode::ConnectionLost);
-        let stopped = limited_result::<()>(
-            Err(io::Error::new(io::ErrorKind::Interrupted, "Frist")),
-            &expired,
-            &original,
-            "Vorbereitungsfrist",
-        )
-        .unwrap_err();
-        assert_eq!(crate::error_code(&stopped), ErrorCode::InvalidInput);
-        assert!(!original.is_cancelled());
-        original.cancel();
-        let stopped = limited_result::<()>(
-            Err(io::Error::new(io::ErrorKind::Interrupted, "Nutzerabbruch")),
-            &expired,
-            &original,
-            "Vorbereitungsfrist",
-        )
-        .unwrap_err();
-        assert_eq!(crate::error_code(&stopped), ErrorCode::Interrupted);
     }
 }

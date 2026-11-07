@@ -1,7 +1,5 @@
 //! Opt-in-Abnahme des normalen Syncs auf ausschließlich eigenen Mounts.
-use doppeldecker_core::{
-    prepare_local_sync_run, Cancel, Compare, ErrorCode, LocalVfs, SyncMode, SyncOptions, Vfs,
-};
+use doppeldecker_core::{Cancel, Compare, ErrorCode, LocalVfs, SyncMode, SyncOptions, Vfs};
 use std::path::{Path, PathBuf};
 
 fn root() -> PathBuf {
@@ -358,4 +356,21 @@ fn normal_local_sync_queue_crash_recovers_weak_volume_temps() {
         "Echter Prozessabbruch: Queue unterbrochen, kein Retry, Prüfpfade {:?}",
         recovered.temp_recovery_paths
     );
+}
+
+thread_local! {static REGISTRY_ROOTS:std::cell::RefCell<Vec<tempfile::TempDir>>=const {std::cell::RefCell::new(Vec::new())};}
+fn prepare_local_sync_run(
+    source: &Path,
+    target: &Path,
+    options: SyncOptions,
+) -> std::io::Result<doppeldecker_core::PreparedLocalSyncRun> {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
+    let queue = doppeldecker_core::OperationQueue::open(root.path().join("operations-queue.json"))?;
+    let result =
+        doppeldecker_core::prepare_local_sync_run_for_queue(&queue, source, target, options, None);
+    REGISTRY_ROOTS.with(|roots| roots.borrow_mut().push(root));
+    result
 }

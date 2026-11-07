@@ -3,13 +3,16 @@
 //! Eine reale Ausführung entsteht ausschließlich aus einer frischen, descriptor-
 //! gebundenen Vorbereitung. Der Aufrufer erhält keinen konstruierbaren Bool-Schalter,
 //! sondern ein kurzlebiges Objekt mit vollständigen Listing-Proofs, Restore-Probe,
-//! Speicherbilanz, Zufallsphrase und einmaligem Permit.
+//! Speicherbilanz, konkreter Wirkungsbestätigung und einmaligem Permit.
 
+use crate::local_staging::StagingOwner;
+use crate::staging_guard::{KnownStagingRegistry, StagingEndpoint};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::progress::{Cancel, Progress};
@@ -20,9 +23,6 @@ use crate::vfs::{
 use crate::{coded_error, ErrorCode};
 
 pub const REAL_PERMIT_LIFETIME: Duration = Duration::from_secs(10 * 60);
-const REAL_MAX_REPLACEMENTS: u64 = 100;
-const REAL_MAX_DELETE_ENTRIES: u64 = 50;
-const REAL_MAX_DELETE_PERCENT: u128 = 5;
 const PROBE_BYTES: usize = 4096;
 static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -108,6 +108,8 @@ pub struct RealRunPreview {
     pub impact: RealRunImpact,
     pub plan_digest: [u8; 32],
     pub confirmation_phrase: String,
+    /// Konkrete Bereichs- und Mengenwarnungen für den gemeinsamen Wirkungsdialog.
+    pub scope_warnings: Vec<String>,
     pub prepared_at_unix_ms: u128,
     pub expires_at_unix_ms: u128,
     pub restore_probe_ok: bool,
@@ -164,6 +166,80 @@ impl LocalSyncExecution {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct RunStagingBinding {
+    registry: KnownStagingRegistry,
+    endpoints: [StagingEndpoint; 2],
+    epoch: [u8; 32],
+    owner: StagingOwner,
+    bidirectional: bool,
+}
+impl RunStagingBinding {
+    pub(crate) fn new(
+        registry: KnownStagingRegistry,
+        endpoints: [StagingEndpoint; 2],
+        owner: StagingOwner,
+    ) -> io::Result<Self> {
+        registry.check(&endpoints, None)?;
+        let epoch = registry.check(&endpoints, Some(&owner))?;
+        Ok(Self {
+            registry,
+            endpoints,
+            epoch,
+            owner,
+            bidirectional: false,
+        })
+    }
+
+    pub(crate) fn new_bidirectional(
+        registry: KnownStagingRegistry,
+        endpoints: [StagingEndpoint; 2],
+        owner: StagingOwner,
+    ) -> io::Result<Self> {
+        registry.check(&endpoints, None)?;
+        let epoch = registry.check_both(&endpoints, Some(&owner))?;
+        Ok(Self {
+            registry,
+            endpoints,
+            epoch,
+            owner,
+            bidirectional: true,
+        })
+    }
+
+    pub(crate) fn owner(&self) -> &StagingOwner {
+        &self.owner
+    }
+
+    pub(crate) fn check(&self, executing: bool, complete: bool) -> io::Result<()> {
+        // Einwegoperationen dürfen nur eigene Zieltemps ausnehmen. Der strikte
+        // bidirektionale Kontext arbeitet nacheinander auf beiden ursprünglichen
+        // Endpunkten und nimmt deshalb seinen Owner auf beiden Seiten aus dem
+        // Epochvergleich aus. Fremde Owner bleiben immer geprüft; außerhalb einer
+        // aktiven Wirkung und beim Abschluss gilt keine Ausnahme für eigene Reste.
+        let current = if self.bidirectional {
+            self.registry
+                .check_both(&self.endpoints, Some(&self.owner))?
+        } else {
+            self.registry.check(&self.endpoints, Some(&self.owner))?
+        };
+        if current != self.epoch {
+            return Err(plan_drift("Registrierte Zwischenstände änderten sich seit der bestätigten Vorschau; frisch planen"));
+        }
+        if !executing || complete {
+            self.registry.check(&self.endpoints, None)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn bind_digest(&self, digest: [u8; 32]) -> io::Result<[u8; 32]> {
+        hash_serializable(&("local-staging-v1", digest, self.epoch))
+    }
+}
+fn queue_context_required() -> io::Error {
+    coded_error(io::ErrorKind::Unsupported,ErrorCode::Unsupported,
+        "Eine reale lokale Vorbereitung benötigt den privaten Registrykontext der verursachenden Fensterqueue; reine Vorschauen verwenden plan()")
+}
+
 /// Nicht serialisierbare Vorbereitung. Die gehaltenen VFS-Deskriptoren bleiben von
 /// der letzten Vorschau bis zur Ausführung Bestandteil dieses Objekts.
 pub struct PreparedLocalRealRun {
@@ -174,6 +250,7 @@ pub struct PreparedLocalRealRun {
     quarantine_root: PathBuf,
     quarantine_run: PathBuf,
     preview: RealRunPreview,
+    staging: RunStagingBinding,
     prepared_at: SystemTime,
     expires_at: SystemTime,
 }
@@ -192,6 +269,19 @@ pub fn prepare_local_sync_run(
 }
 
 pub fn prepare_local_sync_run_with_sandbox(
+    _source: &Path,
+    _target: &Path,
+    options: SyncOptions,
+    _sandbox: Option<&Path>,
+) -> io::Result<PreparedLocalSyncRun> {
+    options.validate()?;
+    Err(queue_context_required())
+}
+
+/// Bereitet ausschließlich unter dem gehaltenen privaten Registrykontext dieser
+/// Fensterqueue vor; fremde registrierte Zwischenstände werden nie Nutzdaten.
+pub fn prepare_local_sync_run_for_queue(
+    queue: &crate::OperationQueue,
     source: &Path,
     target: &Path,
     options: SyncOptions,
@@ -204,12 +294,25 @@ pub fn prepare_local_sync_run_with_sandbox(
             "Mirror benötigt weiterhin den getrennten Realmodus-Assistenten",
         ));
     }
-    let mut prepared = prepare_local_real_run_bound(source, target, options, sandbox, true)?;
+    let registry = KnownStagingRegistry::for_queue(queue)?;
+    let (owner, _, _) = queue.ftps_owner(None)?;
+    let mut prepared =
+        prepare_local_real_run_bound(source, target, options, sandbox, true, registry, owner)?;
     prepared.preview.backup_confirmation_required = false;
     Ok(PreparedLocalSyncRun(prepared))
 }
 
 impl PreparedLocalSyncRun {
+    pub(crate) fn require_queue(&self, queue: &crate::OperationQueue) -> io::Result<()> {
+        let (owner, _, _) = queue.ftps_owner(None)?;
+        if owner.queue != self.0.staging.owner.queue {
+            return Err(plan_drift(
+                "Lokale Vorbereitung gehört zu einer anderen Fensterqueue",
+            ));
+        }
+        self.0.staging.check(false, false)
+    }
+
     pub fn preview(&self) -> &RealRunPreview {
         self.0.preview()
     }
@@ -296,6 +399,7 @@ pub struct RealRunPermit {
     issued_at: SystemTime,
     expires_at: SystemTime,
     consumed: AtomicBool,
+    staging: Option<Mutex<RunStagingBinding>>,
     local_execution: Option<LocalSyncExecution>,
 }
 
@@ -312,28 +416,53 @@ impl std::fmt::Debug for RealRunPermit {
     }
 }
 
-/// Lokalen Realmodus vorbereiten. Diese Funktion verändert keine Nutzerdaten. Sie
-/// erzeugt und entfernt lediglich eine zufällige eigene Restore-Probe und darf dafür
-/// nur exklusive Namen verwenden.
+/// Alter Einstieg ohne Registrykontext. Er lehnt vor jeder mutierenden Probe ab;
+/// tatsächliche lokale Vorbereitungen verwenden `prepare_local_real_run_for_queue`.
 pub fn prepare_local_real_run(
     source: &Path,
     target: &Path,
     options: SyncOptions,
 ) -> io::Result<PreparedLocalRealRun> {
-    prepare_local_real_run_bound(source, target, options, None, false)
+    prepare_local_real_run_with_sandbox(source, target, options, None)
 }
 
+pub fn prepare_local_real_run_with_sandbox(
+    _source: &Path,
+    _target: &Path,
+    options: SyncOptions,
+    _sandbox: Option<&Path>,
+) -> io::Result<PreparedLocalRealRun> {
+    options.validate()?;
+    Err(queue_context_required())
+}
+
+/// Starker lokaler Lauf einschließlich Mirror mit derselben all-owner Registry
+/// wie gewöhnlicher Inhaltssync, vor Listings und vor Restore-Proben gebunden.
+pub fn prepare_local_real_run_for_queue(
+    queue: &crate::OperationQueue,
+    source: &Path,
+    target: &Path,
+    options: SyncOptions,
+    sandbox: Option<&Path>,
+) -> io::Result<PreparedLocalRealRun> {
+    options.validate()?;
+    let registry = KnownStagingRegistry::for_queue(queue)?;
+    let (owner, _, _) = queue.ftps_owner(None)?;
+    prepare_local_real_run_bound(source, target, options, sandbox, false, registry, owner)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prepare_local_real_run_bound(
     source: &Path,
     target: &Path,
     options: SyncOptions,
     sandbox: Option<&Path>,
     ordinary: bool,
+    registry: KnownStagingRegistry,
+    owner: StagingOwner,
 ) -> io::Result<PreparedLocalRealRun> {
     let (source_root, target_root) = sync::validate_local_sync_roots(source, target)?;
-    if !ordinary {
-        validate_real_target(&target_root)?;
-    }
+    validate_real_target(&target_root)?;
     let target_parent = target_root.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -365,6 +494,16 @@ fn prepare_local_real_run_bound(
             LocalVfs::rooted(&target_parent)?,
         )
     };
+    let internal_quarantine = is_home_root(&target_root)?;
+    let protect_quarantine = internal_quarantine || is_home_root(&source_root)?;
+    let (source_vfs, target_vfs) = if protect_quarantine {
+        (
+            source_vfs.with_sync_protected_entry(&source_root),
+            target_vfs.with_sync_protected_entry(&target_root),
+        )
+    } else {
+        (source_vfs, target_vfs)
+    };
     let target_vfs = if ordinary {
         target_vfs.with_file_commit_root(&LocalVfs::rooted(&target_root)?)
     } else {
@@ -379,10 +518,35 @@ fn prepare_local_real_run_bound(
 
     let source_identity = RootIdentity::Local(source_vfs.local_root_identity(&source_root)?);
     let target_identity = RootIdentity::Local(target_vfs.local_root_identity(&target_root)?);
+    let endpoints = [
+        StagingEndpoint {
+            vfs: Arc::new(source_vfs.clone()),
+            root: source_root.clone(),
+            binding: crate::EndpointBinding::local(&source_identity)?,
+        },
+        StagingEndpoint {
+            vfs: Arc::new(target_vfs.clone()),
+            root: target_root.clone(),
+            binding: crate::EndpointBinding::local(&target_identity)?,
+        },
+    ];
+    let epoch = registry.check(&endpoints, None)?;
+    let staging = RunStagingBinding {
+        registry,
+        endpoints,
+        epoch,
+        owner,
+        bidirectional: false,
+    };
     let source_listing = build_listing_proof(&source_vfs, &source_root, source_identity.clone());
     let target_listing = build_listing_proof(&target_vfs, &target_root, target_identity.clone());
     require_complete("Quelle", &source_listing)?;
     require_complete("Ziel", &target_listing)?;
+
+    #[cfg(test)]
+    if let Some(hook) = staging_tests::take_scan_hook() {
+        hook();
+    }
 
     let plan = sync::plan(
         &source_vfs,
@@ -391,6 +555,7 @@ fn prepare_local_real_run_bound(
         &target_root,
         &options,
     )?;
+    staging.check(false, false)?;
     validate_real_plan(&plan, &options)?;
     let target_vfs = if ordinary {
         target_vfs.with_sync_parents(&target_root, &plan)?
@@ -425,8 +590,18 @@ fn prepare_local_real_run_bound(
         if ordinary {
             validate_real_target(&target_root)?;
         }
-        let root = target_parent.join(".doppeldecker-quarantine");
-        ensure_quarantine_root(&target_vfs, &target_parent, &root)?;
+        let quarantine_parent = if internal_quarantine {
+            &target_root
+        } else {
+            &target_parent
+        };
+        let root = quarantine_parent.join(".doppeldecker-quarantine");
+        staging.check(false, false)?;
+        ensure_quarantine_root(&target_vfs, quarantine_parent, &root)?;
+        if internal_quarantine {
+            protect_internal_quarantine(&target_vfs, &root)?;
+        }
+        staging.check(false, false)?;
         run_restore_probe(&target_vfs, &target_root, &root)?;
         let run = reserve_quarantine_run_name(&target_vfs, &root)?;
         let identity = RootIdentity::Local(target_vfs.local_root_identity(&root)?);
@@ -461,8 +636,20 @@ fn prepare_local_real_run_bound(
     if let Some(execution) = &local_execution {
         plan_digest = execution.bind_digest(plan_digest)?;
     }
+    staging.check(false, false)?;
+    plan_digest = staging.bind_digest(plan_digest)?;
     let confirmation_phrase = confirmation_phrase(&target_root)?;
     let backup_confirmation_required = options.mode != SyncMode::AddOnly;
+    let mut scope_warnings = sync_scope_warnings(&source_root, &target_root, &plan)?;
+    if let Some(root) = sandbox {
+        scope_warnings.push(format!("Echter Schreibtest: Quelle, Ziel und Sicherungsbereich bleiben innerhalb der markierten Testsandbox {}.", root.display()));
+    }
+    if protect_quarantine {
+        scope_warnings.push(format!(
+            "Der direkte Unterordner .doppeldecker-quarantine bleibt auf beiden Seiten ausdrücklich vom Sync ausgeschlossen. Sicherungsbereich für dieses Ziel: {}.",
+            if internal_quarantine { target_root.join(".doppeldecker-quarantine") } else { quarantine_root.clone() }.display()
+        ));
+    }
     let preview = RealRunPreview {
         source_identity,
         target_identity,
@@ -474,6 +661,7 @@ fn prepare_local_real_run_bound(
         impact,
         plan_digest,
         confirmation_phrase,
+        scope_warnings,
         prepared_at_unix_ms: unix_millis(prepared_at)?,
         expires_at_unix_ms: unix_millis(expires_at)?,
         restore_probe_ok,
@@ -490,6 +678,7 @@ fn prepare_local_real_run_bound(
         quarantine_root,
         quarantine_run,
         preview,
+        staging,
         prepared_at,
         expires_at,
     })
@@ -498,6 +687,20 @@ fn prepare_local_real_run_bound(
 impl PreparedLocalRealRun {
     pub fn preview(&self) -> &RealRunPreview {
         &self.preview
+    }
+
+    /// Bestätigt die angezeigte Wirkung ohne Abschreiben einer Zufallsphrase oder
+    /// Behauptung eines externen Backups. Alle technischen Belege werden danach
+    /// unverändert frisch geprüft. Auch der additive Start braucht eine bewusste
+    /// Zustimmung; eine abgelehnte Wirkung erzeugt niemals ein Permit.
+    pub fn confirm_effects(self, effects_confirmed: bool) -> io::Result<LocalRealRun> {
+        if !effects_confirmed {
+            return Err(confirmation_mismatch(
+                "Die angezeigten Ersetzungen, Metadatenänderungen oder Quarantäneverschiebungen wurden nicht bestätigt",
+            ));
+        }
+        let phrase = self.preview.confirmation_phrase.clone();
+        self.confirm(&phrase, true)
     }
 
     /// Führt den gemeinsamen Frontend-unabhängigen Abschluss in einem Zug aus:
@@ -543,6 +746,7 @@ impl PreparedLocalRealRun {
                 "Quelle oder Ziel wurde seit der Realmodus-Vorschau ausgetauscht",
             ));
         }
+        self.staging.check(false, false)?;
         let source_identity =
             RootIdentity::Local(self.source_vfs.local_root_identity(&self.source_root)?);
         let target_identity =
@@ -597,6 +801,7 @@ impl PreparedLocalRealRun {
                 ));
             }
         }
+        self.staging.check(false, false)?;
         let mut permit = create_real_permit(RealPermitRequest {
             plan_digest: self.preview.plan_digest,
             target_capabilities_digest: None,
@@ -613,6 +818,8 @@ impl PreparedLocalRealRun {
             expires_at: self.expires_at,
         })?;
         permit.local_execution = self.preview.local_execution.clone();
+        let staging_owner = self.staging.owner.clone();
+        permit.staging = Some(Mutex::new(self.staging));
         let audit = RealAuditContext {
             local_execution: self.preview.local_execution.clone(),
             plan_digest: self.preview.plan_digest,
@@ -632,7 +839,8 @@ impl PreparedLocalRealRun {
         let plan = self.preview.plan;
         let target_vfs = self
             .target_vfs
-            .with_sync_execution(self.preview.local_execution.clone());
+            .with_sync_execution(self.preview.local_execution.clone())
+            .with_staging_owner(&staging_owner.queue, &staging_owner.operation);
         let safety = Safety::real(permit, self.quarantine_run);
         Ok(LocalRealRun {
             source_vfs: self.source_vfs,
@@ -647,9 +855,34 @@ impl PreparedLocalRealRun {
 }
 
 impl LocalRealRun {
-    pub(crate) fn with_queue_staging_owner(mut self, queue: &Path, operation: &str) -> Self {
-        self.target_vfs = self.target_vfs.with_staging_owner(queue, operation);
-        self
+    pub(crate) fn with_queue_staging_owner(
+        mut self,
+        queue: &crate::OperationQueue,
+        operation: &str,
+    ) -> io::Result<Self> {
+        let (owner, _, _) = queue.ftps_owner(Some(operation))?;
+        let permit = self
+            .safety
+            .real_permit()
+            .ok_or_else(queue_context_required)?;
+        let mut binding = permit
+            .staging
+            .as_ref()
+            .ok_or_else(queue_context_required)?
+            .lock()
+            .map_err(|_| io::Error::other("Lokale Stagingbindung ist gesperrt"))?;
+        if binding.owner.queue != owner.queue {
+            return Err(plan_drift(
+                "Lokale Vorbereitung gehört zu einer anderen Fensterqueue",
+            ));
+        }
+        binding.check(false, false)?;
+        binding.owner = owner.clone();
+        self.target_vfs = self
+            .target_vfs
+            .with_staging_owner(&owner.queue, &owner.operation);
+        drop(binding);
+        Ok(self)
     }
 
     pub fn plan(&self) -> &SyncPlan {
@@ -661,7 +894,7 @@ impl LocalRealRun {
         cancel: &Cancel,
         on_progress: &mut dyn FnMut(&Progress),
     ) -> io::Result<SyncStats> {
-        sync::execute(
+        let result = sync::execute(
             sync::ExecuteRequest {
                 src: &self.source_vfs,
                 src_root: &self.source_root,
@@ -672,7 +905,13 @@ impl LocalRealRun {
             },
             cancel,
             on_progress,
-        )
+        );
+        let stats = result?;
+        self.safety
+            .real_permit()
+            .ok_or_else(queue_context_required)?
+            .check_staging(true, true)?;
+        Ok(stats)
     }
 
     /// Reale Ausführung mit append-only Audit. Bereits der Startdatensatz wird vor
@@ -747,6 +986,7 @@ pub(crate) struct RealAuditExecutionSuccess {
     latest: Progress,
     audit: RealAuditContext,
     audit_path: PathBuf,
+    staging: Option<RunStagingBinding>,
 }
 
 impl RealAuditExecutionSuccess {
@@ -754,6 +994,12 @@ impl RealAuditExecutionSuccess {
         &self.stats
     }
 
+    pub(crate) fn validate_staging_completion(&self) -> io::Result<()> {
+        if let Some(binding) = &self.staging {
+            binding.check(true, true)?;
+        }
+        Ok(())
+    }
     pub(crate) fn append_completion_audit(self) -> io::Result<SyncStats> {
         let status = if self.stats.cancelled {
             "cancelled"
@@ -777,8 +1023,9 @@ pub(crate) fn execute_real_with_audit(
     cancel: &Cancel,
     on_progress: &mut dyn FnMut(&Progress),
 ) -> io::Result<SyncStats> {
-    execute_real_with_audit_detailed(run, cancel, on_progress)
-        .and_then(RealAuditExecutionSuccess::append_completion_audit)
+    let success = execute_real_with_audit_detailed(run, cancel, on_progress)?;
+    success.validate_staging_completion()?;
+    success.append_completion_audit()
 }
 
 pub(crate) fn execute_real_with_audit_detailed(
@@ -813,12 +1060,28 @@ pub(crate) fn execute_real_with_audit_detailed(
             on_progress(progress);
         },
     );
+    let result = result.and_then(|stats| {
+        if let Some(permit) = safety.real_permit() {
+            permit.check_staging(true, false)?;
+        }
+        Ok(stats)
+    });
     match result {
         Ok(stats) => Ok(RealAuditExecutionSuccess {
             stats,
             latest,
             audit: audit.clone(),
             audit_path: audit_path.to_path_buf(),
+            staging: safety
+                .real_permit()
+                .and_then(|permit| permit.staging.as_ref())
+                .map(|binding| {
+                    binding
+                        .lock()
+                        .map(|value| value.clone())
+                        .map_err(|_| io::Error::other("Lokale Stagingbindung ist gesperrt"))
+                })
+                .transpose()?,
         }),
         Err(error) => {
             let audit_result = append_audit(
@@ -902,6 +1165,7 @@ pub(crate) fn create_real_permit(request: RealPermitRequest) -> io::Result<RealR
         issued_at,
         expires_at,
         consumed: AtomicBool::new(false),
+        staging: None,
         local_execution: None,
     })
 }
@@ -987,7 +1251,7 @@ fn append_audit(
 /// Öffnet ausschließlich die bereits gebundene reguläre Auditdatei oder legt sie
 /// exklusiv neu an. So kann ein parallel eingesetzter Symlink oder Hardlink nicht als
 /// scheinbar harmloses append-only Ziel eine andere Nutzerdatei beschädigen.
-fn open_audit_append(path: &Path) -> io::Result<(std::fs::File, bool)> {
+pub(crate) fn open_audit_append(path: &Path) -> io::Result<(std::fs::File, bool)> {
     let expected = match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.nlink() != 1 {
@@ -1040,6 +1304,20 @@ impl RealRunPermit {
         self.expires_at = UNIX_EPOCH;
     }
 
+    pub(crate) fn check_staging(&self, executing: bool, complete: bool) -> io::Result<()> {
+        if let Some(binding) = &self.staging {
+            return binding
+                .lock()
+                .map_err(|_| io::Error::other("Lokale Stagingbindung ist gesperrt"))?
+                .check(executing, complete);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bind_staging_context(&mut self, binding: RunStagingBinding) {
+        self.staging = Some(Mutex::new(binding));
+    }
+
     pub(crate) fn consume_and_validate(
         &self,
         src: &dyn Vfs,
@@ -1070,6 +1348,7 @@ impl RealRunPermit {
                 "RealRunPermit wurde für andere Quell- oder Zielpfade ausgestellt",
             ));
         }
+        self.check_staging(true, true)?;
         self.validate_roots(src, dst)?;
         let base_digest = binding_digest(
             plan,
@@ -1091,6 +1370,12 @@ impl RealRunPermit {
         if let Some(execution) = &self.local_execution {
             current_digest = execution.bind_digest(current_digest)?;
         }
+        if let Some(binding) = &self.staging {
+            current_digest = binding
+                .lock()
+                .map_err(|_| io::Error::other("Lokale Stagingbindung ist gesperrt"))?
+                .bind_digest(current_digest)?;
+        }
         if current_digest != self.plan_digest {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -1101,6 +1386,7 @@ impl RealRunPermit {
     }
 
     pub(crate) fn validate_roots(&self, src: &dyn Vfs, dst: &dyn Vfs) -> io::Result<()> {
+        self.check_staging(true, false)?;
         if !src.anchor_is_current()? || !dst.anchor_is_current()? {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -1198,6 +1484,7 @@ impl RealRunPermit {
             }
         }
         let fresh = sync::plan(src, src_root, dst, dst_root, &self.options)?;
+        self.check_staging(true, false)?;
         let expected = deletion_digest(original)?;
         let actual = deletion_digest(&fresh)?;
         let has_other_changes = fresh.actions.iter().any(|action| {
@@ -1314,6 +1601,15 @@ pub fn build_listing_proof(
     root: &Path,
     root_identity: RootIdentity,
 ) -> ListingProof {
+    build_listing_proof_with_cancel(vfs, root, root_identity, None)
+}
+
+pub(crate) fn build_listing_proof_with_cancel(
+    vfs: &dyn Vfs,
+    root: &Path,
+    root_identity: RootIdentity,
+    cancel: Option<&Cancel>,
+) -> ListingProof {
     struct State {
         started: u64,
         completed: u64,
@@ -1324,7 +1620,20 @@ pub fn build_listing_proof(
         listing: blake3::Hasher,
     }
 
-    fn visit(vfs: &dyn Vfs, path: &Path, relative: &[Vec<u8>], state: &mut State) {
+    fn visit(
+        vfs: &dyn Vfs,
+        path: &Path,
+        relative: &[Vec<u8>],
+        state: &mut State,
+        cancel: Option<&Cancel>,
+    ) {
+        if cancel.is_some_and(Cancel::is_cancelled) {
+            state.errors.push(ListingError {
+                path: display_relative(relative),
+                reason: "Listing abgebrochen".into(),
+            });
+            return;
+        }
         state.started = state.started.saturating_add(1);
         let listing = match vfs.list_complete(path) {
             Ok(listing) => listing,
@@ -1356,7 +1665,7 @@ pub fn build_listing_proof(
             child.push(listed.raw_name.clone());
             hash_listing_entry(&mut state.listing, &child, &listed);
             if listed.entry.is_dir && !listed.entry.is_symlink {
-                visit(vfs, &path.join(&listed.entry.name), &child, state);
+                visit(vfs, &path.join(&listed.entry.name), &child, state, cancel);
             }
         }
         state.completed = state.completed.saturating_add(1);
@@ -1372,7 +1681,7 @@ pub fn build_listing_proof(
         saw_token: false,
         listing: blake3::Hasher::new(),
     };
-    visit(vfs, root, &[], &mut state);
+    visit(vfs, root, &[], &mut state, cancel);
     let identity_after = vfs.root_identity(root).ok();
     if identity_before.as_ref() != Some(&root_identity)
         || identity_after.as_ref() != Some(&root_identity)
@@ -1514,37 +1823,81 @@ pub(crate) fn validate_real_target(target: &Path) -> io::Result<()> {
             "Dateisystemwurzel darf kein Realmodus-Ziel sein",
         ));
     }
-    if let Ok(home_raw) = std::env::var("HOME") {
-        if let Ok(home) = std::fs::canonicalize(home_raw) {
-            if target == home {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Benutzerordner darf nicht selbst Realmodus-Ziel sein",
-                ));
-            }
+    Ok(())
+}
+
+/// Speicherorte sind keine pauschalen Mutationsverbote. Die konkrete Auswahl wird
+/// stattdessen vor der Bestätigung sichtbar; Fehler bei der Bereichsprüfung bleiben
+/// Fehler und werden nicht in eine vermeintlich harmlose Auswahl umgedeutet.
+pub(crate) fn is_home_root(root: &Path) -> io::Result<bool> {
+    std::env::var_os("HOME")
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map(|home| home.is_some_and(|home| home == root))
+}
+
+pub(crate) fn target_scope_warnings(target: &Path) -> io::Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    if let Some(home_raw) = std::env::var_os("HOME") {
+        let home = std::fs::canonicalize(home_raw)?;
+        if target == home {
+            warnings.push(format!(
+                "Ziel ist der gesamte Benutzerordner {}. Persönliche Dateien, Konfiguration und versteckte Einträge gehören zur Auswahl; Ausschlüsse vor dem Start prüfen.",
+                target.display()
+            ));
         }
     }
     for ancestor in target.ancestors() {
         match std::fs::symlink_metadata(ancestor.join(".git")) {
             Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Git-Repository darf kein Realmodus-Ziel enthalten",
+                warnings.push(format!(
+                    "Ziel {} liegt im Git-Repository {}. Arbeitskopie und ausgewählte Git-Verwaltungsdaten können verändert werden; Ausschlüsse prüfen.",
+                    target.display(), ancestor.display()
                 ));
+                break;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "Git-Schutzpfad unter {} konnte nicht sicher geprüft werden: {error}",
-                        ancestor.display()
-                    ),
-                ));
-            }
+            Err(error) => return Err(error),
         }
     }
-    Ok(())
+    Ok(warnings)
+}
+
+pub(crate) fn sync_scope_warnings(
+    source: &Path,
+    target: &Path,
+    plan: &SyncPlan,
+) -> io::Result<Vec<String>> {
+    let mut warnings = target_scope_warnings(target)?;
+    warnings.extend(sync_impact_warnings(source, target, plan));
+    Ok(warnings)
+}
+
+pub(crate) fn sync_impact_warnings(source: &Path, target: &Path, plan: &SyncPlan) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if plan.update_count > 100 {
+        warnings.push(format!(
+            "{} bestehende Zieldateien werden ersetzt. Richtung {} → {} und Sicherungsbedarf prüfen.",
+            plan.update_count, source.display(), target.display()
+        ));
+    }
+    if plan.delete_count > 0 {
+        if plan.source_count == 0 {
+            warnings.push(format!(
+                "Die vollständig gescannte Quelle {} ist leer. Alle {} Zieleinträge werden aus {} in Quarantäne verschoben.",
+                source.display(), plan.delete_count, target.display()
+            ));
+        }
+        if plan.delete_count > 50
+            || u128::from(plan.delete_count) * 100 > u128::from(plan.target_count) * 5
+        {
+            warnings.push(format!(
+                "Mirror verschiebt {} von {} Zieleinträgen aus {} in Quarantäne. Der Zielbestand ist danach entsprechend kleiner; Platzbedarf und Wiederherstellung prüfen.",
+                plan.delete_count, plan.target_count, target.display()
+            ));
+        }
+    }
+    warnings
 }
 
 pub(crate) fn validate_real_plan(plan: &SyncPlan, options: &SyncOptions) -> io::Result<()> {
@@ -1564,12 +1917,6 @@ pub(crate) fn validate_real_plan(plan: &SyncPlan, options: &SyncOptions) -> io::
                     "Real-Update verlangt ContentHash",
                 ));
             }
-            if plan.update_count > REAL_MAX_REPLACEMENTS {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("Real-Update erlaubt höchstens {REAL_MAX_REPLACEMENTS} Ersetzungen"),
-                ));
-            }
             if plan.delete_count > 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -1584,12 +1931,6 @@ pub(crate) fn validate_real_plan(plan: &SyncPlan, options: &SyncOptions) -> io::
                     "Real-Mirror verlangt ContentHash",
                 ));
             }
-            if plan.source_count == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Eine vollständig leere Quelle ist im Real-Mirror gesperrt",
-                ));
-            }
             // Ein ausgelassener Eintrag macht nur eine Mirror-Entfernung unsicher:
             // Ohne geplante Entfernung dürfen unabhängige Ergänzungen und
             // Aktualisierungen weiterlaufen. Der allgemeine Safety-Validator und
@@ -1598,23 +1939,6 @@ pub(crate) fn validate_real_plan(plan: &SyncPlan, options: &SyncOptions) -> io::
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "Ausgelassene Einträge sperren sämtliche Real-Mirror-Entfernungen",
-                ));
-            }
-            if plan.delete_count > REAL_MAX_DELETE_ENTRIES {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Real-Mirror erlaubt höchstens {REAL_MAX_DELETE_ENTRIES} entfernte Einträge"
-                    ),
-                ));
-            }
-            let deletion_percent = u128::from(plan.delete_count).saturating_mul(100);
-            let maximum_percent =
-                u128::from(plan.target_count).saturating_mul(REAL_MAX_DELETE_PERCENT);
-            if plan.target_count > 0 && deletion_percent > maximum_percent {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Real-Mirror überschreitet die Grenze von 5 % des Zielbestands",
                 ));
             }
         }
@@ -1642,6 +1966,37 @@ pub(crate) fn ensure_quarantine_root(
     }
     vfs.create_dir(quarantine)?;
     vfs.sync_dir(parent)
+}
+
+/// Der interne HOME-Sicherungsbereich enthält frühere persönliche Fassungen.
+/// Eigentümer, Modus und ACL werden unabhängig von den sichtbaren Syncmetadaten
+/// geprüft; eine geerbte macOS-ACL darf 0700 nicht heimlich wieder öffnen.
+pub(crate) fn protect_internal_quarantine(vfs: &dyn Vfs, root: &Path) -> io::Result<()> {
+    let before = vfs.metadata_manifest(root)?;
+    if before
+        .owner
+        .is_none_or(|owner| owner.uid != unsafe { libc::geteuid() })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Interner Quarantäneordner gehört nicht dem aktuellen Benutzer",
+        ));
+    }
+    if before.acl.is_some() {
+        vfs.write_acl_exact(root, None)?;
+    }
+    if before.mode & 0o7777 != 0o700 {
+        vfs.set_mode(root, 0o700)?;
+    }
+    vfs.sync_dir(root)?;
+    let after = vfs.metadata_manifest(root)?;
+    if after.owner != before.owner || after.mode & 0o7777 != 0o700 || after.acl.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Interner Quarantäneordner konnte nicht privat gebunden werden",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn reserve_quarantine_run_name(vfs: &dyn Vfs, base: &Path) -> io::Result<PathBuf> {
@@ -2001,6 +2356,58 @@ fn unix_millis(time: SystemTime) -> io::Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {static TEST_REGISTRY_ROOTS:std::cell::RefCell<Vec<tempfile::TempDir>>=const {std::cell::RefCell::new(Vec::new())};}
+    fn with_test_queue<T>(
+        prepare: impl FnOnce(&crate::OperationQueue) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let queue = crate::OperationQueue::open(root.path().join("operations-queue.json"))?;
+        let result = prepare(&queue);
+        TEST_REGISTRY_ROOTS.with(|roots| roots.borrow_mut().push(root));
+        result
+    }
+    fn prepare_local_real_run(
+        source: &Path,
+        target: &Path,
+        options: SyncOptions,
+    ) -> io::Result<PreparedLocalRealRun> {
+        with_test_queue(|queue| {
+            super::prepare_local_real_run_for_queue(queue, source, target, options, None)
+        })
+    }
+    fn prepare_local_real_run_with_sandbox(
+        source: &Path,
+        target: &Path,
+        options: SyncOptions,
+        sandbox: Option<&Path>,
+    ) -> io::Result<PreparedLocalRealRun> {
+        with_test_queue(|queue| {
+            super::prepare_local_real_run_for_queue(queue, source, target, options, sandbox)
+        })
+    }
+    fn prepare_local_sync_run(
+        source: &Path,
+        target: &Path,
+        options: SyncOptions,
+    ) -> io::Result<PreparedLocalSyncRun> {
+        with_test_queue(|queue| {
+            super::prepare_local_sync_run_for_queue(queue, source, target, options, None)
+        })
+    }
+    fn prepare_local_sync_run_with_sandbox(
+        source: &Path,
+        target: &Path,
+        options: SyncOptions,
+        sandbox: Option<&Path>,
+    ) -> io::Result<PreparedLocalSyncRun> {
+        with_test_queue(|queue| {
+            super::prepare_local_sync_run_for_queue(queue, source, target, options, sandbox)
+        })
+    }
+
     use tempfile::TempDir;
 
     #[test]
@@ -2091,7 +2498,7 @@ mod tests {
         assert!(!result.unwrap().dry_run);
         assert_eq!(std::fs::read(target.join("neu.txt")).unwrap(), b"neu");
         assert!(!parent.join(".doppeldecker-quarantine").exists());
-        assert!(prepare_local_real_run(&source, &target, SyncOptions::default()).is_err());
+        assert!(prepare_local_real_run(&source, &target, SyncOptions::default()).is_ok());
     }
 
     #[test]
@@ -3102,49 +3509,290 @@ mod tests {
     }
 
     #[test]
-    fn mengenlimits_und_leere_mirror_quelle_sperren_vor_probe() {
+    fn update_ersetzt_101_dateien_nach_einer_wirkungsbestaetigung() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("quelle");
         let target = temp.path().join("ziel");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(target.join("extra"), b"x").unwrap();
-        assert!(prepare_local_real_run(
-            &source,
-            &target,
-            SyncOptions {
-                mode: SyncMode::Mirror,
-                compare: Compare::ContentHash,
-                ..Default::default()
-            }
-        )
-        .is_err());
-
         for index in 0..101 {
             let name = format!("ersetzen-{index:03}");
             std::fs::write(source.join(&name), b"neu").unwrap();
             std::fs::write(target.join(&name), b"alt").unwrap();
-            filetime::set_file_mtime(
-                source.join(&name),
-                filetime::FileTime::from_unix_time(20, 0),
-            )
-            .unwrap();
-            filetime::set_file_mtime(
-                target.join(&name),
-                filetime::FileTime::from_unix_time(10, 0),
-            )
-            .unwrap();
         }
-        assert!(prepare_local_real_run(
+        let options = SyncOptions {
+            mode: SyncMode::Update,
+            compare: Compare::ContentHash,
+            ..Default::default()
+        };
+        let prepared = prepare_local_sync_run(&source, &target, options.clone()).unwrap();
+        assert_eq!(prepared.preview().impact.replacements, 101);
+        assert!(!prepared.preview().scope_warnings.is_empty());
+        assert!(prepared.confirm(false).is_err());
+        let stats = prepare_local_sync_run(&source, &target, options)
+            .unwrap()
+            .confirm(true)
+            .unwrap()
+            .execute(&Cancel::new(), &mut |_| {})
+            .unwrap();
+        assert_eq!(stats.files_copied, 101);
+        let scope = crate::quarantine::QuarantineScope::for_target(&target).unwrap();
+        let runs = scope.runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(scope.entries(&runs[0].id).unwrap().len(), 101);
+        assert_eq!(std::fs::read(target.join("ersetzen-100")).unwrap(), b"neu");
+    }
+
+    #[test]
+    fn mirror_bestaetigt_hohe_anteile_grosse_mengen_und_bewusst_leere_quelle() {
+        for (keep, remove) in [(9, 1), (1, 51), (0, 101)] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("quelle");
+            let target = temp.path().join("ziel");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            for index in 0..keep {
+                let name = format!("gleich-{index}");
+                std::fs::write(source.join(&name), b"gleich").unwrap();
+                std::fs::write(target.join(&name), b"gleich").unwrap();
+            }
+            for index in 0..remove {
+                std::fs::write(target.join(format!("extra-{index}")), b"alt").unwrap();
+            }
+            let options = SyncOptions {
+                mode: SyncMode::Mirror,
+                compare: Compare::ContentHash,
+                ..Default::default()
+            };
+            let prepared = prepare_local_real_run(&source, &target, options.clone()).unwrap();
+            assert_eq!(prepared.preview().plan.delete_count, remove);
+            assert!(!prepared.preview().scope_warnings.is_empty());
+            if keep == 0 {
+                assert!(prepared
+                    .preview()
+                    .scope_warnings
+                    .iter()
+                    .any(|warning| warning.contains("ist leer")));
+            }
+            assert!(prepared.confirm_effects(false).is_err());
+            let stats = prepare_local_real_run(&source, &target, options)
+                .unwrap()
+                .confirm_effects(true)
+                .unwrap()
+                .execute(&Cancel::new(), &mut |_| {})
+                .unwrap();
+            assert_eq!(stats.files_deleted, remove);
+            assert_eq!(std::fs::read_dir(&target).unwrap().count() as u64, keep);
+            let scope = crate::quarantine::QuarantineScope::for_target(&target).unwrap();
+            let runs = scope.runs().unwrap();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(scope.entries(&runs[0].id).unwrap().len() as u64, remove);
+            scope.restore(&runs[0].id, "extra-0").unwrap();
+            assert_eq!(std::fs::read(target.join("extra-0")).unwrap(), b"alt");
+        }
+    }
+
+    #[test]
+    fn mirror_schreibtest_bleibt_am_markierten_sandboxroot_gebunden() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(
+            root.join(crate::TEST_SANDBOX_MARKER),
+            crate::TEST_SANDBOX_MARKER_CONTENT,
+        )
+        .unwrap();
+        let source = root.join("quelle");
+        let target = root.join("ziel");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("entfernen"), b"gesichert").unwrap();
+        let options = SyncOptions {
+            mode: SyncMode::Mirror,
+            compare: Compare::ContentHash,
+            ..Default::default()
+        };
+        let prepared =
+            prepare_local_real_run_with_sandbox(&source, &target, options.clone(), Some(&root))
+                .unwrap();
+        assert!(prepared
+            .preview()
+            .scope_warnings
+            .iter()
+            .any(|warning| warning.contains("markierten Testsandbox")));
+        prepared
+            .confirm_effects(true)
+            .unwrap()
+            .execute(&Cancel::new(), &mut |_| {})
+            .unwrap();
+        assert!(!target.join("entfernen").exists());
+        let outside = tempfile::tempdir().unwrap();
+        assert!(
+            prepare_local_real_run_with_sandbox(&source, outside.path(), options, Some(&root))
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn git_unterbaum_erlaubt_abgesicherte_ersetzung_mit_bereichswarnung() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("quelle");
+        let repo = temp.path().join("repo");
+        let target = repo.join("unterbaum");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(source.join("datei"), b"neu").unwrap();
+        std::fs::write(target.join("datei"), b"alt").unwrap();
+        let prepared = prepare_local_real_run(
             &source,
             &target,
             SyncOptions {
                 mode: SyncMode::Update,
                 compare: Compare::ContentHash,
                 ..Default::default()
-            }
+            },
         )
-        .is_err());
+        .unwrap();
+        assert!(prepared
+            .preview()
+            .scope_warnings
+            .iter()
+            .any(|warning| warning.contains("Git-Repository")));
+        prepared
+            .confirm_effects(true)
+            .unwrap()
+            .execute(&Cancel::new(), &mut |_| {})
+            .unwrap();
+        assert_eq!(std::fs::read(target.join("datei")).unwrap(), b"neu");
+        assert!(validate_real_target(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn home_sync_verwendet_eigenen_internen_sicherungsbereich() {
+        const CHILD: &str = "DOPPELDECKER_TEST_HOME_SYNC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("benutzer");
+            std::fs::create_dir(&home).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "real_mode::tests::home_sync_verwendet_eigenen_internen_sicherungsbereich",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", &home)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let target = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let parent = target.parent().unwrap();
+        let source = parent.join("quelle");
+        let exported = parent.join("ausgabe");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&exported).unwrap();
+        std::fs::write(target.join("extra"), b"sichern").unwrap();
+        std::fs::create_dir(source.join(".doppeldecker-quarantine")).unwrap();
+        std::fs::write(
+            source.join(".doppeldecker-quarantine/fremd"),
+            b"nie kopieren",
+        )
+        .unwrap();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = (|| -> io::Result<()> {
+            let prepared = prepare_local_real_run(
+                &source,
+                &target,
+                SyncOptions {
+                    mode: SyncMode::Mirror,
+                    compare: Compare::ContentHash,
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(prepared.preview().plan.source_count, 0);
+            assert_eq!(prepared.preview().plan.delete_count, 1);
+            assert!(prepared
+                .preview()
+                .scope_warnings
+                .iter()
+                .any(|warning| warning.contains("Benutzerordner")));
+            prepared
+                .confirm_effects(true)?
+                .execute(&Cancel::new(), &mut |_| {})?;
+            assert!(!target.join("extra").exists());
+            assert!(!target.join(".doppeldecker-quarantine/fremd").exists());
+            let scope = crate::quarantine::QuarantineScope::for_target(&target)?;
+            let runs = scope.runs()?;
+            assert_eq!(runs.len(), 1);
+            scope.restore(&runs[0].id, "extra")?;
+            assert_eq!(std::fs::read(target.join("extra"))?, b"sichern");
+            let prepared = prepare_local_real_run(
+                &source,
+                &target,
+                SyncOptions {
+                    mode: SyncMode::Mirror,
+                    compare: Compare::ContentHash,
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(prepared.preview().plan.source_count, 0);
+            prepared
+                .confirm_effects(true)?
+                .execute(&Cancel::new(), &mut |_| {})?;
+            assert!(!target.join("extra").exists());
+            assert!(!target.join(".doppeldecker-quarantine/fremd").exists());
+            assert_eq!(scope.runs()?.len(), 2);
+            std::fs::write(source.join("datei"), b"alt")?;
+            std::fs::write(target.join("datei"), b"alt")?;
+            let baseline_temp = tempfile::tempdir()?;
+            let baseline = baseline_temp.path().join("pair.json");
+            let pair = crate::PairId([99; 16]);
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&baseline),
+                pair,
+                "HOME-Paar",
+                &source,
+                &target,
+                &baseline,
+                &[],
+                None,
+            )?
+            .confirm_effects(true)?
+            .execute(&Cancel::new(), &mut |_| {})?;
+            crate::bidirectional::finish_bidirectional_run_completion(&baseline)?;
+            std::fs::write(source.join("datei"), b"neu")?;
+            crate::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+                &crate::bidirectional::strict_test_queue(&baseline),
+                pair,
+                "HOME-Paar",
+                &source,
+                &target,
+                &baseline,
+                &[],
+                None,
+            )?
+            .confirm_effects(true)?
+            .execute(&Cancel::new(), &mut |_| {})?;
+            crate::bidirectional::finish_bidirectional_run_completion(&baseline)?;
+            assert_eq!(std::fs::read(target.join("datei"))?, b"neu");
+            assert!(!target.join(".doppeldecker-quarantine/fremd").exists());
+            prepare_local_sync_run(&target, &exported, SyncOptions::default())?
+                .confirm(false)?
+                .execute(&Cancel::new(), &mut |_| {})?;
+            assert_eq!(std::fs::read(exported.join("datei"))?, b"neu");
+            assert!(!exported.join(".doppeldecker-quarantine").exists());
+            Ok(())
+        })();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
     }
 
     #[test]
@@ -3253,3 +3901,7 @@ mod tests {
             .any(|error| error.reason.contains("UTF-8")));
     }
 }
+
+#[cfg(test)]
+#[path = "real_mode_staging_tests.rs"]
+mod staging_tests;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stoppt, wenn ein Release-Binary lokale Build-Pfade offenlegt."""
+"""Stoppt, wenn ein Release-Paket lokale Build-Pfade offenlegt."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def single_artifact(pattern: str, label: str) -> Path:
 
 
 def linux_bundle_binaries(root: Path) -> list[tuple[str, Path]]:
-    """Extrahiert beide Linux-Pakete getrennt und liefert ihre echten Binaries."""
+    """Extrahiert beide Linux-Pakete und erfasst auch Hooks und Symlinks."""
     deb = single_artifact(f"deb/Doppeldecker_{VERSION}_*.deb", "DEB")
     appimage = single_artifact(
         f"appimage/Doppeldecker_{VERSION}_*.AppImage", "AppImage"
@@ -54,12 +54,44 @@ def linux_bundle_binaries(root: Path) -> list[tuple[str, Path]]:
         check=True,
         stdout=subprocess.DEVNULL,
     )
-    return [
+    binaries = [
         ("DEB", deb_root / "usr/bin/doppeldecker"),
         ("DEB-CLI", deb_root / "usr/bin/doppeldecker-cli"),
         ("AppImage", root / "squashfs-root/usr/bin/doppeldecker"),
         ("AppImage-CLI", root / "squashfs-root/usr/bin/doppeldecker-cli"),
     ]
+    return binaries + runtime_entries(deb_root, "DEB-Datei") + runtime_entries(
+        root / "squashfs-root", "AppImage-Datei"
+    )
+
+
+def runtime_entries(root: Path, label: str) -> list[tuple[str, Path]]:
+    return [
+        (label, path)
+        for path in sorted(root.rglob("*"))
+        if path.is_symlink() or path.is_file()
+    ]
+
+
+def scan_entries(entries: list[tuple[str, Path]], prefixes: dict[str, Path]) -> int:
+    checked = set()
+    for label, path in entries:
+        if path in checked:
+            continue
+        checked.add(path)
+        if path.is_symlink():
+            contents = os.fsencode(os.readlink(path))
+        elif path.is_file():
+            contents = path.read_bytes()
+        else:
+            raise SystemExit(f"Release-Datenschutzprüfung: {label} fehlt.")
+        for prefix_label, prefix in prefixes.items():
+            if os.fsencode(prefix) in contents:
+                raise SystemExit(
+                    "Release-Datenschutzprüfung fehlgeschlagen: lokaler "
+                    f"{prefix_label} ist in {label} ({path.name}) enthalten."
+                )
+    return len(checked)
 
 
 @contextmanager
@@ -84,21 +116,24 @@ def release_binaries():
                 / "macos/Doppeldecker.app/Contents/MacOS/doppeldecker-cli",
             )
         )
+        binaries.append(
+            (
+                "macOS-Metadatenhelfer",
+                BUNDLE_ROOT
+                / "macos/Doppeldecker.app/Contents/Library/LaunchServices/doppeldecker-metadata-helper",
+            )
+        )
+        binaries.extend(runtime_entries(BUNDLE_ROOT / "macos/Doppeldecker.app", "macOS-Datei"))
         yield binaries
     else:
         yield binaries
 
-with release_binaries() as binaries:
-    for bundle_label, binary in binaries:
-        if not binary.is_file():
-            raise SystemExit(f"Release-Datenschutzprüfung: {bundle_label}-Binary fehlt.")
-        contents = binary.read_bytes()
-        for prefix_label, prefix in local_prefixes().items():
-            if os.fsencode(prefix) in contents:
-                raise SystemExit(
-                    "Release-Datenschutzprüfung fehlgeschlagen: lokaler "
-                    f"{prefix_label} ist im {bundle_label}-Binary enthalten."
-                )
 
-    labels = ", ".join(label for label, _ in binaries)
-    print(f"Release-Datenschutzprüfung grün: keine lokalen Build-Pfade in {labels}")
+def main() -> None:
+    with release_binaries() as binaries:
+        count = scan_entries(binaries, local_prefixes())
+    print(f"Release-Datenschutzprüfung grün: {count} Dateien/Symlinks ohne lokale Build-Pfade")
+
+
+if __name__ == "__main__":
+    main()

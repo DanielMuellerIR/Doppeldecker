@@ -1,5 +1,6 @@
+import { confirmContentSync, contentSyncPlanPresentation, identityDisplay } from "./content-sync-ui.js";
 import { fingerprint } from "./connections-ui.js";
-import { executionChoiceModal, hideModal, showOwnedModal } from "./modal.js";
+import { hideModal, showOwnedModal } from "./modal.js";
 import { invoke } from "./tauri-api.js";
 import { $, digestHex, escapeHtml, fmtTransferBytes } from "./ui-utils.js";
 
@@ -11,23 +12,6 @@ function stableKey(value) {
   return JSON.stringify(value);
 }
 
-function identityDisplay(root) {
-  const identity = root?.identity || {};
-  if (root?.provider === "Sftp") {
-    return `sftp://${identity.server?.host || "?"}:${identity.server?.port || 22}${identity.virtual_root || "/"}`;
-  }
-  if (root?.provider === "Ftps") {
-    const scheme = identity.server?.transport_security === "plaintext" ? "ftp" : "ftps";
-    return `${scheme}://${identity.server?.host || "?"}:${identity.server?.port || 21}${identity.virtual_root || "/"}`;
-  }
-  if (root?.provider === "WebDav") {
-    return `${identity.server?.origin || "https://?"}${identity.virtual_root || "/"}`;
-  }
-  if (root?.provider === "Smb") {
-    return `smb://${identity.server?.host || "?"}/${identity.server?.share || "?"}${identity.virtual_root || "/"}`;
-  }
-  return identity.display_path || "unbekanntes Ziel";
-}
 
 function mountSummary(identity) {
   if (!identity?.mount) {
@@ -53,6 +37,7 @@ function mountSummary(identity) {
  * kurzlebigen Frontendzustand. Das nicht serialisierbare Permit bleibt im Backend. */
 export function createRealModeUi({
   currentSourceTarget,
+  dockRevision = () => 0,
   syncScope,
   endProgress,
   ensureContentHash,
@@ -132,9 +117,9 @@ export function createRealModeUi({
   function showBanner(preview, active = false) {
     if (bannerTimer) clearInterval(bannerTimer);
     const banner = $("#real-mode-banner");
-    const target = identityDisplay(preview.target_identity);
+    const target = preview.target_root || identityDisplay(preview.target_identity);
     const render = () => {
-      const remaining = Math.max(0, Math.ceil((Number(preview.expires_at_unix_ms) - Date.now()) / 1000));
+      const remaining = Math.max(0, Math.ceil((Number(preview.expires_unix_ms ?? preview.expires_at_unix_ms) - Date.now()) / 1000));
       const time = active
         ? "Permit wird einmalig verbraucht"
         : `noch ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`;
@@ -171,7 +156,7 @@ export function createRealModeUi({
   }
 
   function prepareRemotePreview(remote) {
-    if (remote.protocol === "webdav"
+    if (remote.protocol === "content" && mode() !== "AddOnly" || remote.protocol === "webdav"
       || remote.source?.provider === "webdav"
       || remote.target?.provider === "webdav") ensureContentHash();
     const current = currentAction();
@@ -191,7 +176,7 @@ export function createRealModeUi({
       preparedScope = scope;
       if (!await checkCurrent(current)) return;
       showBanner(next);
-      showPlan(next.plan);
+      showPlan(next.plan, protocol === "content" ? contentSyncPlanPresentation(next) : {});
       return next;
     });
   }
@@ -208,7 +193,7 @@ export function createRealModeUi({
     if (running() || !current()) return;
     const protocol = remote.protocol;
     const scope = syncScope();
-    const label = protocol === "provider" ? "REMOTE↔REMOTE" : protocol.toUpperCase();
+    const label = protocol === "content" ? "Dateisync" : protocol === "provider" ? "REMOTE↔REMOTE" : protocol.toUpperCase();
     const { protocol: _protocol, ...request } = remote;
     const identityCheck = protocol === "sftp"
       ? "Hostkey"
@@ -242,44 +227,29 @@ export function createRealModeUi({
     }
     if (!await checkCurrent(current)) return;
     showBanner(next);
-    showPlan(next.plan);
+    showPlan(next.plan, protocol === "content" ? contentSyncPlanPresentation(next) : {});
     if (!next.plan.actions.length) {
       await discardPrepared();
       return;
     }
-    const execution = await executionChoiceModal(
-      `${label}-Ausführung`,
-      "Der sichtbare Plan ist vollständig gebunden. Direkter Start verbraucht das Permit sofort; die persistente Queue speichert nur die geheimnisfreie Absicht und verlangt vor Ausführung eine neue Prüfung samt neuer Zufallsphrase.",
-    );
-    if (!await checkCurrent(current)) return;
-    if (execution === "queue") {
-      try {
-        if (protocol === "provider") {
-          await invoke("enqueue_provider_sync");
-        } else {
-          await invoke(`enqueue_${protocol}_sync`, { request: { ...requestWithOptions, expectedPlan: next.plan } });
-        }
-        prepared = null;
-        remoteProtocol = null;
-        preparedKey = null;
-        preparedScope = null;
-        hideBanner();
-        showDock(`<span class="pill copy">${label} eingereiht</span>Die Queue verbindet frisch und fordert danach die einmalige Laufphrase an.`, { closable: true });
-        return true;
-      } catch (error) {
-        showError(`${label}-Queue`, error);
-      }
-      return;
-    }
-    if (execution !== "direct") {
-      await discardPrepared();
-      return;
-    }
-    const confirmation = await confirmationModal(next, `${label}-Realmodus bestätigen`);
+    const confirmation = protocol === "content"
+      ? await confirmContentSync(next) : await confirmationModal(next, `${label}-Sync ausführen`);
+    if (protocol === "content" && confirmation) confirmation.preparationDigest = next.digest;
     if (!await checkCurrent(current)) return;
     if (!confirmation) {
       await discardPrepared();
       return showDock(`<span class="pill none">${label}-Lauf verworfen</span>Es wurde nichts verändert.`, { closable: true });
+    }
+    if (protocol === "content") {
+      try {
+        const presentation = dockRevision();
+        await invoke("enqueue_content_sync", confirmation);
+        prepared = null; remoteProtocol = null; preparedKey = null; preparedScope = null; hideBanner();
+        if (current() && dockRevision() === presentation) {
+          showDock('<span class="pill copy">Eingereiht</span>Dateisync wartet in der Fensterqueue.', { closable: true });
+        }
+        return true;
+      } catch (error) { showError("Dateisync", error); return; }
     }
     runActive = true;
     showBanner(next, true);
@@ -299,7 +269,7 @@ export function createRealModeUi({
     }
   }
 
-  function confirmationModal(preview, title = "Lokalen Realmodus bestätigen") {
+  function confirmationModal(preview, title = "Sync ausführen") {
     return new Promise(resolve => {
       showOwnedModal("real-mode", leaseToken => {
       const modal = $("#modal .modal");
@@ -315,10 +285,7 @@ export function createRealModeUi({
       const spaceText = impact.available_bytes_known
         ? `${fmtTransferBytes(impact.required_available_bytes)} benötigt / ${fmtTransferBytes(impact.available_bytes)} verfügbar`
         : `${fmtTransferBytes(impact.required_available_bytes)} benötigt / Provider meldet keine verlässliche Quota`;
-      const backupHtml = preview.backup_confirmation_required
-        ? '<label class="real-check"><input id="real-backup" type="checkbox" />' +
-          "<span>Ich bestätige ein unabhängiges Backup und eine jüngste erfolgreiche Restore-Probe dieses Backups. Doppeldecker hat dieses externe Backup nicht technisch geprüft.</span></label>"
-        : '<input id="real-backup" type="checkbox" checked hidden />';
+      const warningsHtml = (preview.scope_warnings || []).map(warning => `<p class="real-warning">${escapeHtml(warning)}</p>`).join("");
       const capabilities = preview.provider_capabilities;
       const capabilityHtml = capabilities
         ? `<div class="real-card"><strong>Verbindungsfähigkeiten</strong><small>` +
@@ -330,7 +297,8 @@ export function createRealModeUi({
           `</small></div>`
         : "";
       $("#modal-body").innerHTML = `
-        <div class="real-warning">Dies ist kein Testlauf. Das Permit gilt genau einmal, höchstens zehn Minuten und ausschließlich für den unten gebundenen Plan.</div>
+        <p>Dieser Sync verändert Dateien. Richtung, Bestand und Plan werden unmittelbar vor dem Start erneut geprüft.</p>
+        ${warningsHtml}
         <div class="real-grid">
           <div class="real-card"><strong>Quelle</strong><code title="${escapeHtml(identityDisplay(preview.source_identity))}">${escapeHtml(identityDisplay(preview.source_identity))}</code><small>${escapeHtml(mountSummary(source))} · ${preview.source_listing.entries_seen} Einträge vollständig</small></div>
           <div class="real-card"><strong>Ziel</strong><code title="${escapeHtml(identityDisplay(preview.target_identity))}">${escapeHtml(identityDisplay(preview.target_identity))}</code><small>${escapeHtml(mountSummary(target))} · ${preview.target_listing.entries_seen} Einträge vollständig</small></div>
@@ -339,9 +307,7 @@ export function createRealModeUi({
           ${capabilityHtml}
         </div>
         <div class="real-card"><strong>Plan-Digest</strong><code>${digestHex(preview.plan_digest)}</code></div>
-        ${backupHtml}
-        <label class="real-phrase-label" for="real-phrase">Exakt eingeben: <code>${escapeHtml(preview.confirmation_phrase)}</code></label>
-        <input id="real-phrase" class="modal-input" spellcheck="false" autocomplete="off" />`;
+`;
       $("#modal-body").onclick = null;
       const bar = $("#modal .modal-buttons");
       bar.innerHTML = "";
@@ -350,14 +316,9 @@ export function createRealModeUi({
       cancel.textContent = "Vorbereitung verwerfen";
       const start = document.createElement("button");
       start.className = "btn danger";
-      start.textContent = "Einmalig real starten";
-      start.disabled = true;
+      start.textContent = preview.plan.delete_count > 0 ? "Verschieben in Quarantäne bestätigen und starten"
+        : impact.replacements > 0 ? "Ersetzungen bestätigen und starten" : "Sync starten";
       bar.append(cancel, start);
-      const phrase = $("#real-phrase");
-      const backup = $("#real-backup");
-      const update = () => {
-        start.disabled = phrase.value !== preview.confirmation_phrase || !backup.checked;
-      };
       let finished = false;
       const finish = value => {
         if (finished || !leaseToken || !hideModal(leaseToken)) return;
@@ -365,17 +326,9 @@ export function createRealModeUi({
         if ($("#modal").hidden) modal.classList.remove("real-mode-modal");
         resolve(value);
       };
-      phrase.addEventListener("input", update);
-      backup.addEventListener("change", update);
-      phrase.addEventListener("keydown", event => {
-        if (event.key === "Enter" && !start.disabled) {
-          event.preventDefault();
-          finish({ confirmation: phrase.value, backupConfirmed: backup.checked });
-        }
-      });
       cancel.addEventListener("click", () => finish(null));
-      start.addEventListener("click", () => finish({ confirmation: phrase.value, backupConfirmed: backup.checked }));
-      return { focusTarget: phrase, onEscape: () => finish(null) };
+      start.addEventListener("click", () => finish({ effectsConfirmed: true }));
+      return { focusTarget: cancel, onEscape: () => finish(null) };
       });
     });
   }

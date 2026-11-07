@@ -1,16 +1,14 @@
 # Realmodus-Sicherheitsvertrag
 
-Stand: 2026-10-19
+Stand: 2026-10-20
 
-Ergänzung 2026-10-18: Der [normale lokale AddOnly-/Update-Start](local-sync.md)
-verwendet dieselben technischen Root-/Listing-/Digest- und Einmal-Permitprüfungen
-mit wirkungsbezogener Zustimmung. Reine Additionen benötigen keine Restore-Probe
-oder Quarantäne. Sein separates lokales Wirkungsprofil bindet außerdem
-Neunamencommit und Flushzusagen; begrenzte Best-Effort-Ersetzungen bestätigen
-fehlende Wiederherstellung ausdrücklich. Dieses Profil lockert keine strikte
-Remote-, Mirror- oder bidirektionale Vorbereitung. Die folgenden Zufallsphrasen-, Backup- und Mirror-Gates gelten
-weiter für den getrennten Assistenten; sie sind keine allgemeine Eintrittsschranke
-für den normalen lokalen Start.
+Normale lokale, Remote- und bidirektionale Starts bestätigen die sichtbare
+Wirkung ohne Routine-Laufphrase oder behauptete externe Backupprobe. Gehaltene
+Roots, vollständige Listings, Digest, Driftprüfung und einmalige Permits bleiben
+erforderlich. Mengenlimits sind Warnschwellen; Git- und HOME-Ziele erhalten
+Bereichswarnungen. Die folgenden Verträge beschreiben die technischen Belege;
+ältere Phrasen-APIs bleiben nur als kompatible interne Einstiegspunkte bestehen.
+[Normaler lokaler Sync](local-sync.md), [Audit-Umsetzung](usability-audit-2026-10-20.md#umsetzungsstand).
 
 Status: Verbindlicher und lokal vollständig umgesetzter Sicherheitsvertrag.
 FTPS, WebDAV und SMB sind providerweise angebunden; die jeweils fehlenden
@@ -19,7 +17,8 @@ Zielmodi. Für schwächere, aber begrenzbare Providerwirkungen gilt zusätzlich 
 Best-Effort-Vertrag aus [`product-principles.md`](product-principles.md).
 SFTP v3 erlaubt interaktives Best-Effort-Listing sowie begrenzte Inhalts-Snapshots
 und additive lokale Downloads über eine eigene beobachtete Inhaltsklasse.
-Strikte Planung und Remote-Mutationen bleiben ohne atomare Rootbindung gesperrt.
+Strikte Planung bleibt getrennt; gewöhnliche Remote-Mutationen besitzen den
+[interaktiven Best-Effort-Vertrag](sftp-writes.md).
 Die [Fähigkeitsmatrix](function-audit.md) beschreibt die heutigen Richtungen.
 
 ## Ziel
@@ -78,8 +77,8 @@ pub enum ExecutionMode {
   denselben gehaltenen Sandbox-Deskriptor gebunden sind.
 - `HeadlessTestPermit` hat private Felder, ist nur für isolierte Kerntests bestimmt und
   existiert in Release-Builds nicht.
-- `RealRunPermit` entsteht ausschließlich aus `PreparedLocalRealRun::confirm` nach
-  vollständiger Vorprüfung, exakter Zufallsphrase und gegebenenfalls Backup-Häkchen.
+- `RealRunPermit` entsteht ausschließlich aus `PreparedLocalRealRun::confirm_effects` nach
+  vollständiger Vorprüfung und wirkungsbezogener Zustimmung.
 
 `Safety::default()` ist garantiertes Dry-Run. Headless-Tests erhalten explizite
 Test-Permits; „kein Sandboxpfad“ erlaubt im Kern keine implizite Mutation mehr. Eine
@@ -251,9 +250,10 @@ Quell- und Zielscan durchgeführt. Beide Proofs müssen vollständig sein; Root-
 Quellbestand und die noch zu entfernenden Zielzustände müssen zum bestätigten Plan
 passen. Ein einziges unsicheres Verzeichnis sperrt alle Entfernungen des Laufs.
 
-Eine leere Quelle allein ist niemals Löschbeweis. Der erste Real-Mirror unterstützt
-keine vollständig leere Quelle. Ein späterer Sonderfall bräuchte eine eigene
-Wiederherstellungsprobe, erneuten Scan und eine deutlich getrennte Freigabe.
+Eine leere Quelle allein ist kein Löschbeweis. Ein vollständig und fehlerfrei
+beobachteter leerer Quellbaum darf jedoch bewusst gespiegelt werden: Warnung über
+sämtliche Entfernungen, Quarantäne und erneuter vollständiger Scan bleiben Pflicht.
+Scanfehler und Auslassungen werden niemals zu einem leeren Quellbaum umgedeutet.
 
 ## Verbindlicher Inhaltsvergleich
 
@@ -270,9 +270,12 @@ Wiederherstellungsprobe, erneuten Scan und eine deutlich getrennte Freigabe.
 Update/Mirror benötigen eine Quarantäne auf demselben Dateisystem beziehungsweise im
 selben atomaren Rename-Namespace wie das Ziel. Copy-and-delete ist kein Ersatz.
 
-Für lokale Ziele liegt sie als reservierter Geschwisterordner des Zielroots unter
-dessen Elternhandle. Dateisystemwurzel, Benutzerordner, Repo-Wurzel und ein Ziel ohne
-sicher beschreibbaren Geschwisterbereich sind im ersten Realmodus unzulässig.
+Lokale Ziele verwenden einen reservierten Geschwisterordner unter dem gehaltenen
+Elternhandle. Für HOME liegt die Quarantäne stattdessen im privaten direkten
+Unterordner `.doppeldecker-quarantine`, der auf beiden Syncseiten ausdrücklich
+ausgeschlossen wird. Git- und HOME-Ziele sind mit Bereichswarnungen zulässig;
+`/` bleibt als Ganzbaumziel gesperrt. Ein fehlender sicher nutzbarer Sicherungsort
+ist weiterhin eine konkrete Fehlerursache.
 
 Vor der Freigabe prüft Doppeldecker:
 
@@ -316,17 +319,15 @@ Die Vorschau zählt getrennt:
 - zu quarantänierende Dateien, rekursive Einträge und Bytes,
 - erwarteten Platzbedarf für Ziel und Quarantäne.
 
-Erste Realmodus-Grenzen:
+Aktuelle Wirkungsregeln:
 
-- `AddOnly`: keine Ersetzungen und keine Entfernungen.
-- `Update`: höchstens 100 Ersetzungen pro Lauf; jede alte Version muss vorher
-  quarantänierbar sein.
-- `Mirror`: in der ersten freigegebenen Stufe höchstens 50 entfernte Einträge und
-  höchstens 5 % des vollständigen Zielbestands. Beide Grenzen gelten gleichzeitig.
-- Leere Quelle, ausgelassene Einträge, unvollständige Metadaten im strikten Profil oder
-  ungenügender Platz sperren jede Entfernung.
-- Grenzen sind nicht über einen simplen UI-Schalter deaktivierbar. Größere Änderungen
-  werden in neue, erneut geprüfte Läufe aufgeteilt.
+- `AddOnly` verändert keine vorhandenen Ziele und entfernt nichts.
+- `Update` benötigt ContentHash und den angezeigten Sicherungs-/Ersetzungsweg,
+  besitzt aber keine feste 100-Ersetzungs-Sperre.
+- `Mirror` warnt bei hohen Entfernungszahlen und -anteilen sowie bei leerer Quelle.
+  Die früheren 50-/100-Eintrags- und 5-/25-Prozent-Grenzen sperren den Lauf nicht.
+- Ausgelassene Einträge, unvollständige strikte Metadaten und ungenügender Platz
+  sperren weiterhin die konkret davon abhängige Wirkung.
 
 Diese Grenzen definieren den vollständig abgesicherten Realmodus. Provider, die eine
 einzelne Garantie nicht liefern, sollen zusätzlich einen klar getrennten
@@ -337,22 +338,19 @@ Provider tatsächlich liefert.
 
 ## Aktivierungsablauf in der UI
 
-Der Test-Sandbox-Schalter wird nie zum Realmodus-Schalter umgedeutet. Der Realmodus
-besitzt einen getrennten Assistenten und eine dauerhaft rote Fensterkennzeichnung.
+Simulation und echte Ausführung sind getrennte Aktionen. Der normale Syncknopf
+führt auch Mirror zu einem einzelnen Wirkungsdialog. Eine markierte Testsandbox
+begrenzt alle geplanten Schreibwirkungen auf ihren gehaltenen Root.
 
-1. Exakte Quelle und Zielwurzel mit Volume-/Serveridentität anzeigen.
-2. Fähigkeiten, Metadaten-Grenzen und vollständige Listing-Proofs anzeigen.
-3. Für Update/Mirror BLAKE3, Quarantäneplatz und Restore-Probe erfolgreich prüfen.
-4. Unabhängiges Backup und dessen jüngste Restore-Probe bewusst bestätigen lassen.
-5. Alle Ersetzungen/Entfernungen und Bytes anzeigen.
-6. Zielbasename plus zufällige Laufphrase eingeben, beispielsweise
-   `REAL Archiv K7M4Q2`.
-7. Einmaliges Permit erzeugen; danach sind Pfad-, Richtungs- und Modusfelder gesperrt.
-8. Unmittelbar vor Start Root-/Serveridentität und Plan-Digest erneut prüfen.
+1. Quelle, Ziel, Volume-/Serveridentität, Umfang und konkrete Warnungen zeigen.
+2. Benötigte Fähigkeiten, Metadaten, Listings, Platz und Restore-Probe prüfen.
+3. Ersetzungen, Entfernungen und Wiederherstellungsweg einmal bestätigen lassen.
+4. Einmaliges Permit erzeugen und unmittelbar vor Start Identität und Plan erneut
+   prüfen. Änderungen an Richtung, Modus oder Endpunkten verwerfen die Vorbereitung.
 
-Die rote Kennzeichnung enthält Modus, Ziel und verbleibende Permit-Zeit. Nach Erfolg,
-Fehler, Abbruch, zehn Minuten oder irgendeiner Auswahländerung fällt die App automatisch
-in Dry-Run zurück.
+Lauf und Fortschritt bleiben an Fenster und ursprüngliche Endpunkte gebunden.
+Erfolg, Fehler und Abbruch beenden die aktive Vorbereitung; eine abgelaufene
+Vorbereitung wird frisch erstellt und wirkungsbezogen bestätigt.
 
 ## Audit und Geheimnisse
 
@@ -424,11 +422,11 @@ absichtlich den jeweiligen Remote-Provider-Meilensteinen zugeordnet.
    Dry-Run-Default und descriptor-gehaltene Root-Handles sind vorhanden.
 1. **Lokal AddOnly (umgesetzt):** echte Daten nur hinzufügen; keine Ersetzung, keine
    Entfernung; schneller Vergleich bleibt zulässig.
-2. **Lokal Update (umgesetzt):** höchstens 100 Ersetzungen, zwingender ContentHash,
+2. **Lokal Update (umgesetzt):** keine feste Ersetzungszahl, zwingender ContentHash,
    vollständige Listings, Platzbilanz und Quarantäne-/Restore-Probe.
 3. **Lokal Mirror (umgesetzt):** Metadatenvertrag Stufe 2, ContentHash-Zweitscan nach
-   allen Kopien, höchstens 50 Einträge und zugleich höchstens 5 %, keine leere Quelle
-   oder Auslassung. Der echte GUI-Agententest mit Nutzerdaten bleibt bewusst aus;
+   allen Kopien, deutliche Mengen-/Leerquellenwarnungen und keine übergangenen
+   Auslassungen. Der echte GUI-Agententest mit Nutzerdaten bleibt bewusst aus;
    Plattformtests verwenden ausschließlich temporäre künstliche Bäume.
 4. **Remote AddOnly (providerweise umgesetzt):** FTP/FTPS und SMB sind als strikte
    Ziele capability-geprüft angebunden. WebDAV-Ziele bleiben im strikten Sync

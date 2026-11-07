@@ -1,6 +1,6 @@
 # Remote-Provider
 
-Stand: 2026-10-18
+Stand: 2026-10-23
 
 ## Produktmaßstab
 
@@ -19,65 +19,59 @@ keine dauerhafte Produktentscheidung.
 
 ## Aktuell angebotene Providerwirkungen
 
-Die [Funktionsmatrix](function-audit.md) ist die Übersicht der heutigen Freigaben:
+Die [Funktionsmatrix](function-audit.md) trennt normale Dateiaktionen von strikten
+Sync-Zielverträgen. Der [Audit-Umsetzungsstand](usability-audit-2026-10-20.md#umsetzungsstand)
+fasst den Abbau unnötiger Einschränkungen zusammen.
 
-- SFTP v3: gepinnte Verbindung und interaktive Ordnerliste als ausdrücklich
-  pfadbasiertes Best Effort. Eine eigene interaktive Inhaltsklasse erlaubt geprüfte
-  Snapshots und additive lokale Downloads begrenzter Bäume; das erste OPEN bleibt
-  ausdrücklich pfadbasiert. Sicherheitsplanung und sämtliche Remote-Mutationen
-  bleiben ohne atomare Root-/Elternbindung gesperrt. Die vier
-  Capability-Abfragen sind passiv und setzen keine Schreibfähigkeit.
-- FTP/FTPS: interaktive Dateiaktionen gemäß ihren getrennten Proben;
-  bestätigtes reguläres Ersetzen kann sichtbar irreversibel als Best Effort laufen.
-  Zielseitiger Sync bietet höchstens AddOnly, keine Update-/Mirror-Quarantäne.
-- WebDAV: gewöhnliche additive lokale Uploads, mkdir und Rename verwenden eigene
-  bestätigte Best-Effort-Verträge. Genau eine unmittelbare Elternbedingung ergänzt
-  die Request-Bedingung. Allgemeine strikte Mutationen und ihre künstlichen Proben
-  bleiben ohne gemeinsame Root-/Elternbindung passiv gesperrt.
-  [Wirkungsgrenze](webdav-mutation-boundary.md).
-- Gewöhnliches WebDAV-mkdir verwendet eine eigene Best-Effort-Klasse mit
-  Elternbedingungen und Readback, ohne künstliche Schreib- oder Löschprobe.
-  Antwortverlust wird nicht wiederholt. [Vertrag und Grenzen](webdav-folder.md).
-- SMB: interaktive Neuanlage, Rename und AddOnly-Uploads nach frischen Proben;
-  Ersetzen, Update/Mirror sowie mutierendes Quarantäne-Restore/Purge bleiben ohne
-  vollständigen identitätsgebundenen Restore-Proofvertrag gesperrt. Vorhandene
-  Quarantäneläufe können gelesen werden.
-- FTPS, WebDAV und SMB können alle drei Einwegmodi in ein starkes lokales Ziel
-  speisen. Bidirektionale Remote-Zielwirkungen brauchen zusätzlich den starken
-  Rollbackvertrag und bleiben derzeit gesperrt.
-- Dauerhaftes Remote-Löschen ist bei allen aktuellen Providern gesperrt. WebDAV
-  bindet zwar einen Datei-Token an DELETE, aber keine vollständige Elternkette;
-  seine bisherige strikte Probenfreigabe ist aufgehoben. FTPS-DELE/RMD bindet den
-  bestätigten Objekt-Token nicht an die Wirkung. Begrenzte Move-Quellentfernung
-  anderer Provider ist ein eigener Vertrag; WebDAV erhält daraus keine Freigabe.
+- SFTP v3 bietet Listing, Streaminginhalte und gewöhnliche Uploads, mkdir, Rename,
+  Move, bestätigtes Ersetzen und dauerhaftes Löschen als Best Effort. Pfade werden
+  frisch geprüft; eine gleichzeitige serverseitige Elternpfadumleitung bleibt
+  ausdrücklich akzeptiertes Restrisiko. Serverhelpers sind nicht erforderlich.
+  Striktes VFS, Sync und Quarantäne erhalten keine allgemeine Freigabe.
+- FTP/FTPS und SMB bieten normale Dateiaktionen einschließlich Ersetzen und
+  dauerhaftem Löschen ohne vorgeschaltete künstliche Schreib-/Rename-/Löschproben.
+  Die tatsächliche Temp-/Ordner-/Renameoperation liefert ihren ersten
+  Fähigkeitsnachweis. Fehlende Quarantäne wird als irreversible Wirkung angezeigt.
+  Strikte Sync- und Restoreverträge werden dadurch nicht erfunden.
+- WebDAV nutzt private bedingte Best-Effort-Verträge für Uploads, reguläres
+  Ersetzen, mkdir, Rename und dauerhaftes Löschen. Getaggte `If`-Listen gelten
+  alternativ; sie behaupten keine gemeinsame atomare Bindung sämtlicher Eltern.
+  Ersetzen verwendet fertig übertragenen Tempinhalt und eine Altzielbedingung,
+  Delete die verfügbare Objektbedingung. Vorfahren werden frisch geprüft;
+  beobachtete Drift nach möglicher Wirkung bleibt ein unklarer Ausgang.
+- FTPS, WebDAV und SMB können Einwegmodi in ein starkes lokales Ziel speisen.
+  Remote-Ziel-Sync und bidirektionaler Rollback behalten ihre konkreten stärkeren
+  Anforderungen. Normale Ersetzung ersetzt keinen solchen Vertrag.
 
+Gewöhnliches Remote-Löschen plant die vollständige Auswahl und prüft jeden Record
+vor seiner Einzelwirkung. Symlinks, Spezialdateien und unvollständige Listings
+erteilen kein rekursives Löschrecht. Es gibt keinen mutierenden Blind-Retry oder
+stillen Wechsel zwischen Quarantäne und Dauerlöschen. Mehr als 1000 Einträge oder
+10 GiB verlangen zusätzlich eine exakte Löschphrase; normale Auswahlen bestätigen
+Ziel, Umfang und Irreversibilität mit einer Entscheidung.
 
-Die früheren SFTP-Transfers mit Temp-/fsync-/Rename-Proben sind historische
-Implementierungsschritte. Der aktuelle SFTP-E2E prüft die mutationsfreien Sperren, das getrennte
-interaktive Listing und einen erfolgreichen begrenzten Inhalts-Snapshot. `tools/run-sftp-e2e.sh` verwendet
-weiterhin einen eigenen Loopback-sshd, kurzlebige Schlüssel, isolierten Agenten
-und manifestierten künstlichen Root; er ist kein Beleg für erlaubte SFTP-Uploads.
-Die ungenutzte testinterne mkdir-/Probenmaschinerie wurde entfernt, die 16
-produktiven Schutz-/Listing-/Identitäts- und Fehlerzuordnungstests bleiben erhalten.
+Standardsnapshots lesen Inhalte einmal remote mit Streaminghash und abschließenden
+Attributchecks. Zusätzlicher vollständiger Readback ist optional. Interaktive
+Downloads und lokale WebDAV-Quellen haben keine festen Datei-/Auswahl-/Baumgrößen-
+oder Tiefengrenzen und keine pauschale 60-Sekunden-Vorbereitungsfrist. Lokale
+Quellhandles werden pro übertragener Datei geöffnet; Transferhash und frische
+Versionsprüfung ersetzen vollständiges Vorhashen.
 
 ## Verbindungen und konkrete Providerverträge
 
-AP13R korrigiert die RFC-ODER-Grenze: Der gemeinsame Helfer sendet ausschließlich
-die unmittelbare Elternbedingung. Die übrige Kette wird vor/nach der Wirkung geprüft,
-aber nicht gemeinsam atomar gebunden. Strikte Proben, allgemeine VFS-Schreibwege,
-Quellentfernung und Dauerlöschen bleiben ohne Wirkung gesperrt. Additionen, mkdir
-und Rename benennen den verbleibenden Vorfahrenwettlauf.
-[Aktueller Mutationsvertrag](webdav-mutation-boundary.md).
+Die öffentlichen strikten Providerfähigkeiten bleiben von den privaten normalen
+Dateiaktionssichten getrennt. Die nachfolgenden älteren Implementierungsschritte
+beschreiben teilweise frühere Freigaben oder Absagen; maßgeblich für das heutige
+Angebot sind die obige Übersicht und die Funktionsmatrix.
 
-Gewöhnliche additive lokale WebDAV-Datei- und begrenzte Baumuploads laufen über
-[eine private Best-Effort-Klasse](webdav-upload.md) ohne Collection-/Löschprobe.
-Bedingtes MKCOL bindet neue Unterordner, PUT/MOVE deren geprüfte Inhalte; starke
-Elternketten und private Fensterintents begrenzen Teilwirkungen. Ersetzen und Move
-übernehmen diese Freigabe nicht.
-
-Gewöhnliche WebDAV-Umbenennungen besitzen einen eigenen bestätigten
-[Best-Effort-Vertrag](webdav-rename.md). Die private Einzelwirkung gibt keine
-zusätzliche allgemeine VFS- oder Sync-Capability frei.
+- [SFTP-Inhalte und Remote-Bearbeitung](sftp-contents.md)
+- [SFTP-Schreibaktionen](sftp-writes.md)
+- [Additive SMB-Downloads](smb-contents.md)
+- [Additive WebDAV-Downloads](webdav-contents.md)
+- [Additive FTP-/FTPS-Downloads](ftp-contents.md)
+- [WebDAV-Uploads und Ersetzen](webdav-upload.md)
+- [WebDAV-Mutationsvertrag](webdav-mutation-boundary.md)
+- [WebDAV-Umbenennung](webdav-rename.md)
 
 Jede Profildatei führt seit W2b einen pro Protokoll monotonen Revisionszähler und
 behält entfernte Profil-IDs als geheimnisfreie Tombstones. Listen, aktive
@@ -91,11 +85,14 @@ nur abhängige Vorbereitungen und meldet Protokoll, Profil-ID, Revision und
 FTP/FTPS ist als zweite Providerfamilie umgesetzt. Das Profil wählt ausdrücklich
 Klartext-FTP oder explizites TLS: FTPS verwendet `AUTH TLS` und `PROT P` für private
 Kontroll- und Datenkanäle; FTP sendet auch Anmeldung und Dateiinhalte unverschlüsselt.
-FTPS-Profile binden den SHA-256-Fingerabdruck des vollständigen DER-Zertifikats.
-Öffentliche WebPKI samt Hostnamen, ein außerhalb Doppeldeckers geprüfter Pin und ein
-bewusst ungeprüfter Zertifikatspin sind getrennte sichtbare Zustände. Der letzte
-verschlüsselt und erkennt spätere Zertifikatswechsel, behauptet aber keine bestätigte
-Serveridentität.
+Neue öffentliche FTPS-Profile prüfen Zertifikatskette, Gültigkeit und Servernamen
+ohne dauerhaften Profilpin. Eine reguläre Erneuerung eines dafür gültigen Zertifikats
+sperrt neue Verbindungen nicht. Öffentliche WebPKI mit zusätzlichem Pin, ein außerhalb
+Doppeldeckers geprüfter privater Pin und ein bewusst ungeprüfter Zertifikatspin
+bleiben ausdrückliche getrennte Optionen. Der letzte verschlüsselt und erkennt
+spätere Zertifikatswechsel, behauptet aber keine bestätigte Serveridentität.
+Der Editor kann bestehende Profile nach öffentlicher TLS-Probe ohne Anmeldung
+umstellen oder einen bewusst gewählten festen Pin ausdrücklich erneuern.
 
 Root, Transportmodus, optionales Zertifikat, FEAT- und der längengebundene
 Rohbyte-Digest des FTP-Willkommenstexts sowie
@@ -227,8 +224,9 @@ allerdings mit einer ETag, die es unmittelbar vorher selbst liest. Das verkleine
 das Fenster für WebDAV, schließt es aber ebenfalls nicht. Der Quell-Austausch
 betrifft genau einen umbenannten Eintrag. In der
 Best-Effort-Klasse kommt das gesondert ausgewiesene Zielkollisionsfenster hinzu:
-Ein inzwischen entstandenes Ziel kann ersetzt werden. SFTP bietet derzeit keine
-Rename-Klasse an.
+Ein inzwischen entstandenes Ziel kann ersetzt werden. SFTP bietet dafür
+inzwischen die getrennte gewöhnliche Best-Effort-Klasse; beobachtete Kollisionen
+stoppen vor dem Rename.
 
 Neue Dateien folgen seit demselben Schnitt derselben Abstufung: Die zweistufige
 AddOnly-Probe trennt STOU-Eindeutigkeit, unabhängigen Inhalts-Readback und das
@@ -317,6 +315,15 @@ Queue und bidirektionale Wirkungen ausschließlich auf das lokale Ziel.
 Eigentumskennung und geplante Einträge; ein erfolgreicher Lauf entfernt seinen
 eigenen `/tmp`-Root, ein Fehler lässt exakt diesen Recoverypfad zur Analyse stehen.
 
+Gewöhnliche additive Kopien lokaler Quellen nach SMB lassen vollständige
+mehrdeutige Case-/NFC-Namensgruppen in direkter Auswahl und in ausgewählten Bäumen
+aus. Unabhängige Dateien und Ordner bleiben übertragbar; ausgelassene Ordner
+werden nicht betreten. Die bestehende lokale Quellenbindung hält auch ausgelassene
+Mitglieder und prüft sie vor weiteren Wirkungen. Nach Queue-Neustart verlangt ein
+geänderter Baum eine neue Umfangsbestätigung. Der SMB-Zielvertrag einschließlich
+No-Replace und Readback bleibt erhalten. Move, Ersetzen und strikter Sync verwenden
+weiter ihre bisherigen Quellenverträge.
+
 Die Provider-Matrix ist seit 2026-07-13 GUI-frei verallgemeinert. Ein nicht
 serialisierbarer `ProviderEndpoint` kann jede lokale oder bereits verbundene
 Remote-Seite als Quelle beziehungsweise Ziel halten. Die Vorbereitung leitet
@@ -333,59 +340,28 @@ Remote↔Remote-Übertragung, F2-Rename, Remote-Favoriten und schreibgeschützte
 einer lokalen Momentaufnahme. F5/F6 laufen durch die persistente Queue; Quell- und
 Zielzustand, Konflikte, Fähigkeiten und Reconnect werden vor dem Claim erneut
 gebunden. Ordner-`Skip` führt vorhandene Ordner zusammen, überspringt aber nur
-kollidierende Blätter. SFTP erlaubt davon ausschließlich geprüfte Inhaltsöffnung und additive lokale
-Datei- und Baumdownloads als [eigene Leseklasse](sftp-contents.md); SMB bietet
-ohne bedingtes identitätsgebundenes Parken kein Ersetzen an. FTPS nutzt
-nur nach der eigenen Ersetzungsprobe den
-sichtbar irreversiblen Best-Effort-Weg für reguläre Dateien; die Queue bindet diese
-bestätigte Klasse.
+kollidierende Blätter. SFTP trennt die interaktive
+[Leseklasse](sftp-contents.md) von gewöhnlichen [Schreibaktionen](sftp-writes.md).
+FTPS, WebDAV und SMB liefern gewöhnliches reguläres Ersetzen als sichtbar
+irreversible Best-Effort-Wirkung; die Queue bindet die angezeigte Klasse.
 
-Der frühere SFTP-Best-Effort-Upload ohne `fsync@openssh.com` ist keine aktuelle
-Ausführungsklasse. Die strikte VFS-Negativmatrix sperrt weiterhin rootungebundene Lese- und
-Schreibzugriffe; weder eine angekündigte fsync-Erweiterung noch ein nachträglicher
-Readback würde einen zwischenzeitlichen Eltern-Symlinktausch verhindern.
+Der neue gewöhnliche SFTP-Upload benötigt `fsync@openssh.com` nicht als
+Eintrittsschranke; fehlt die Erweiterung, bleibt die Dauerhaftigkeit sichtbar
+schwächer. Strikte VFS-/Sync-Zugriffe werden daraus nicht freigegeben. Weder fsync
+noch Inhaltsreadback beseitigen den ausdrücklich akzeptierten Elternpfadwettlauf.
 
-Das Öffnen einer Remote-Datei streamt in einen privaten lokalen Snapshot, prüft
-BLAKE3, Größe, Änderungszeit sowie den providerspezifischen Token erneut und startet
-erst danach die Standardanwendung. Der Snapshot ist kein Live-Mount und kein
-Rückschreibpfad; Abbruch oder Drift entfernt nur die eigene Tempdatei und das eigene
-Manifest.
+Das Öffnen einer Remote-Datei streamt in einen privaten lokalen Snapshot. Normales
+Öffnen erhält das Originalformat; passives Ansehen ist separat wählbar. Die
+Remote-Bearbeitung hält Originalbeleg und Arbeitskopie fenstereigen und reiht ein
+explizites Zurückspeichern über die normale Provider-Dateiqueue ein. Ein frischer
+Originalvergleich und gebundene Konfliktbelege verhindern das stille Ersetzen
+einer seit dem Öffnen veränderten Version. Die Liste gilt bis zum Fensterende
+oder Neustart; lokale Arbeitskopien bleiben privat erhalten.
 
-Löschen besitzt einen getrennten, rekursiven `RemoteDeletePlan`. Er bindet alle
-Einträge und Bytes, blockt Symlinks/Spezialdateien/unvollständige Listings und prüft
-vor der ersten Mutation nochmals auf Drift. SFTP, SMB und WebDAV bieten ohne den
-vollständigen gebundenen Namespace-/Restore-Proofvertrag kein Löschen an. FTPS bietet kein endgültiges Löschen an: DELE/RMD kann den beim
-Plan bestätigten Objekt-Token nicht atomar bis in die Wirkung tragen. Kein Provider
-wechselt still zwischen Quarantäne und Dauerlöschen.
-
-Die interne SMB-Löschprimitive ist vom Datei-Upload getrennt. Eine eigene Probe
-prüft eine künstliche Datei und einen leeren Ordner; ihr sitzungsgebundenes
-`entry_delete` erlaubt keine Quarantäne oder endgültige rekursive Löschung.
-FTPS ermittelt seine begrenzte Move-Quellentfernung getrennt; WebDAV bleibt dafür gesperrt.
-SFTP führt keine mutierende Löschprobe aus. Die Oberfläche darf eine
-wiederherstellbare Quarantäne erst nach dem vollständigen stärkeren Vertrag
-versprechen; die aktuellen Remote-Provider erreichen ihn nicht.
-
-Ein Verbindungsabbruch beim letzten `stat` vor dem Dauerlöschen bleibt
-`connection_lost`, weil noch keine Mutation gesendet wurde. Geht dagegen die
-Antwort auf genau ein bedingtes DELETE verloren, wird die Mutation niemals wiederholt:
-Doppeldecker baut höchstens einmal eine identitätsgleiche Lesesitzung auf. Ein
-fehlender Pfad belegt die Löschwirkung, der nach Typ und Größe unveränderte Eintrag
-belegt die Nichtwirkung; ein anderer Eintrag, ein gescheiterter Reconnect oder ein
-gescheiterter Readback liefert `outcome_unclear`. Nach dem Reconnect stoppt der Lauf
-vor jedem weiteren DELETE, weil die verhaltensgeprüften Fähigkeiten der alten
-Sitzung verfallen sind; der Rest braucht eine neue Vorschau und neue Proben.
-
-Favoriten speichern neben dem Anzeigenamen ausschließlich Providerart, Profil-ID und
-virtuellen Pfad. Das v1-Format lokaler Pfadstrings wird atomar nach v2 migriert;
-Sitzungen, Pins und Secrets werden nicht dupliziert.
-
-Reines FTP ist ein ausdrücklich unterstützter Transportmodus derselben Providerfamilie.
-`ftp://` wählt Klartext ohne zusätzliche Bestätigungsfrage; `ftps://` wählt explizites
-TLS und fällt niemals still auf Klartext zurück. Eine fehlende öffentliche
-Zertifikatsidentität darf FTPS dagegen sichtbar auf „TLS, Identität ungeprüft“
-zurückstufen: Verschlüsselung und Pin bleiben aktiv. Ohne Schema prüft der CLI-Import
-weiterhin SFTP und danach FTPS; Klartext wird nur durch `ftp://` ausdrücklich gewählt.
+Löschen besitzt einen eigenen rekursiven `RemoteDeletePlan` mit Umfang, frischem
+Vergleich und Einzelreadback. Alle vier Remoteprovider besitzen eine normale
+Best-Effort-Dauerlöschklasse. Sie behauptet weder Quarantäne noch atomare Bindung
+aller Eltern. Fehlerhafte oder unvollständige Listings sind keine leeren Bäume.
 
 ## Historische bidirektionale Implementierungsstufen
 
@@ -519,11 +495,13 @@ Irreversibilität sichtbar Teil von Vorschau und Bestätigung sein.
 ### SFTP
 
 Der erste implementierte Provider besitzt eine klare Hostkey-Identität. Aktuell
-sind interaktives Best-Effort-Listing und begrenzte Inhalte freigegeben. Die
+sind interaktives Best-Effort-Listing und Streaminginhalte freigegeben. Die
 Inhaltsklasse hält Datei-Handles und prüft BLAKE3, behauptet aber keine atomare
-Rootbindung. Rekursive additive lokale Downloads besitzen eine eigene begrenzte
-Baumvorbereitung; Remote-Mutationen bleiben eigene offene Schnitte;
-exklusives Create, fsync oder eine gewöhnliche Rename-Probe allein genügen nicht.
+Rootbindung. Rekursive lokale Downloads besitzen eine iterative Baumvorbereitung ohne feste
+Datei-/Auswahl-/Gesamtgrößen- oder Tiefengrenzen. Gewöhnliche Mutationen besitzen inzwischen eine eigene
+[interaktive Best-Effort-Klasse](sftp-writes.md). Exklusives Create, fsync und
+Rename werden dabei nicht als atomare Rootgarantie ausgegeben. Strikter Sync und
+Quarantäne behalten ihre getrennten Sperren.
 
 ### FTP/FTPS
 
@@ -532,8 +510,8 @@ und vollständiges `MLSD`-Listing. Klartext und eine ungeprüfte FTPS-Identität
 sichtbar, sperren Browse und Transfer aber nicht allein wegen ihrer Transportstufe.
 Server ohne verlässliches MLSD oder sichere Rename-/Existenzsemantik bleiben dagegen
 auf die tatsächlich begrenzbaren Operationen und Best-Effort-Wirkungen beschränkt.
-Es gibt keinen stillen Transportwechsel. Zielwirkungen werden einzeln aus den
-Probe-Ergebnissen abgeleitet; fehlende Sync-Garantien sperren normale interaktive
+Es gibt keinen stillen Transportwechsel. Gewöhnliche Zielwirkungen werden aus dem konkreten Auftrag und seiner
+stärksten verfügbaren Ausführungsklasse abgeleitet; fehlende Sync-Garantien sperren normale interaktive
 Best-Effort-Wirkungen nicht pauschal.
 
 ### WebDAV
@@ -542,8 +520,8 @@ Origin, TLS-Identität, Collection-Root, ETag und vollständige `PROPFIND`-Antwo
 gebunden. Partielle 403-Antworten, wechselnde ETags oder unklare `MOVE`-Semantik
 sperren Update/Mirror.
 Lesende Richtungen bleiben umgesetzt. Zielseitige strikte Datei-/Syncwirkungen
-bleiben seit AP13R passiv gesperrt; normale additive Uploads, mkdir und Rename
-besitzen getrennte bestätigte Best-Effort-Verträge.
+bleiben seit AP13R passiv gesperrt; normale Uploads, reguläres Ersetzen, mkdir, Rename und Dauerlöschen
+besitzen getrennte Best-Effort-Verträge.
 
 ### SMB
 

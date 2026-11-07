@@ -8,15 +8,8 @@ use reqwest::{Method, StatusCode};
 use std::sync::Arc;
 use std::time::Duration;
 
-struct NoSecrets;
-impl SecretResolver for NoSecrets {
-    fn resolve(&self, _: &KeychainSecretReference) -> std::io::Result<SecretString> {
-        panic!("Die abgelehnte Ersetzung darf keinen Schlüsselbund lesen");
-    }
-}
-
 #[test]
-fn persistiertes_webdav_overwrite_erhaelt_auch_nach_reopen_keine_freigabe() {
+fn persistiertes_webdav_overwrite_verlangt_nach_reopen_den_echten_konfliktbeleg() {
     use std::os::unix::fs::PermissionsExt;
     let server = server::Server::new();
     let source_directory = tempfile::tempdir().unwrap();
@@ -28,8 +21,8 @@ fn persistiertes_webdav_overwrite_erhaelt_auch_nach_reopen_keine_freigabe() {
         .tempdir()
         .unwrap();
     let journal = config.path().join("queue.json");
-    let mut queue = OperationQueue::open(&journal).unwrap();
-    let id = queue
+    let queue = OperationQueue::open(&journal).unwrap();
+    queue
         .enqueue(QueueOperation::ProviderFile {
             kind: FileQueueKind::Copy,
             source: Box::new(BidirectionalQueueEndpoint::Local {
@@ -52,14 +45,10 @@ fn persistiertes_webdav_overwrite_erhaelt_auch_nach_reopen_keine_freigabe() {
             replace_best_effort_expected: Some(true),
             remove_source_best_effort_expected: None,
         })
-        .unwrap()
-        .operation_id;
-    for reopen in [false, true] {
-        if reopen {
-            drop(queue);
-            queue = OperationQueue::open(&journal).unwrap();
-            queue.retry(&id).unwrap();
-        }
+        .unwrap();
+    drop(queue);
+    let queue = OperationQueue::open(&journal).unwrap();
+    {
         let entry = queue.claim_next().unwrap().unwrap();
         let result = execute_provider_file_queue_entry(
             &queue,
@@ -70,19 +59,22 @@ fn persistiertes_webdav_overwrite_erhaelt_auch_nach_reopen_keine_freigabe() {
                 max_delete_entries: 100,
                 max_delete_fraction: 0.25,
             },
-            Arc::new(NoSecrets),
+            Arc::new(server::TestSecrets),
             &Cancel::new(),
             &mut |_| {},
         );
-        assert_eq!(error_code(&result.unwrap_err()), ErrorCode::Unsupported);
-        // Das gespeicherte Ergebnis selbst muss lesbar bleiben; Open migriert
-        // hier keine Vorbereitung und erzeugt keine neue Ausführungsbefugnis.
-        if !reopen {
-            let snapshot = queue.snapshot();
-            assert_eq!(snapshot.entries[0].error_code, Some(ErrorCode::Unsupported));
-        }
+        assert!(matches!(
+            result.unwrap(),
+            QueueExecutionResult::AwaitingConfirmation { .. }
+        ));
     }
-    assert!(server.state.lock().unwrap().requests.is_empty());
+    assert!(!server
+        .state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .any(|(m, _)| matches!(m.as_str(), "PUT" | "MOVE" | "MKCOL" | "DELETE")));
     assert_eq!(std::fs::read(source.join("Datei.txt")).unwrap(), b"neu");
     assert_eq!(
         std::fs::read(server.root.path().join("pane/Datei.txt")).unwrap(),
@@ -266,7 +258,7 @@ fn strikte_webdav_abfragen_bleiben_auch_im_unterordner_ohne_providerzugriff() {
     let files = endpoint.probe_file_capabilities().unwrap();
     assert!(!files.copy_new && !files.replace && !files.remove_source);
     let deletion = endpoint.probe_delete_capabilities().unwrap();
-    assert!(!deletion.quarantine && !deletion.permanent);
+    assert!(!deletion.quarantine && deletion.permanent);
     assert_eq!(server.state.lock().unwrap().requests.len(), before);
     assert_eq!(
         std::fs::read(server.root.path().join("pane/sentinel")).unwrap(),

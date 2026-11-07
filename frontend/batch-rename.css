@@ -1,0 +1,50 @@
+.modal.batch-rename-modal { width: min(1020px, 96vw); }
+.batch-rename-description { margin: 0 0 14px; overflow-wrap: anywhere; }
+.batch-rename-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+.batch-rename-fields label { display: grid; gap: 5px; color: var(--text); }
+.batch-rename-fields .modal-input { box-sizing: border-box; width: 100%; min-width: 0; }
+.batch-rename-extension { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: var(--text); }
+.batch-rename-extension input { width: 16px; height: 16px; accent-color: var(--accent); }
+.batch-rename-help { margin: 8px 0 12px; font-size: 11px; }
+.batch-rename-status { margin: 12px 0; color: var(--text); }
+.batch-rename-results { max-height: 34vh; overflow: auto; border-radius: 6px; }
+.batch-rename-results:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.batch-rename-results table { border-collapse: collapse; table-layout: fixed; width: 100%; font-size: 12px; }
+.batch-rename-results th, .batch-rename-results td { padding: 8px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.batch-rename-results th { position: sticky; top: 0; background: var(--panel); color: var(--text); }
+.batch-rename-results td { color: var(--text); }
+.batch-rename-results td strong, .batch-rename-results td span { display: block; }
+.batch-rename-results td span { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
+.batch-rename-results tr[data-status="blocked"] strong,
+.batch-rename-results tr[data-status="failed_unchanged"] strong,
+.batch-rename-results tr[data-status="outcome_unclear"] strong { color: var(--danger); }
+.batch-rename-results tr[data-status="renamed"] strong { color: var(--accent); }
+.batch-rename-modal .modal-buttons { flex-wrap: wrap; }
+@media (max-width: 600px) {
+  .modal.batch-rename-modal { padding: 16px; }
+  .batch-rename-fields { gap: 10px; }
+  .batch-rename-results table { font-size: 11px; }
+  .batch-rename-results th, .batch-rename-results td { padding: 6px; }
+  .batch-rename-modal .modal-buttons .btn { flex: 1 1 auto; }
+}
+
+.batch-rename-limitations { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); overflow-wrap: anywhere; }
+.batch-rename-limitations strong { color: var(--text); }
+.batch-rename-limitations p { margin: 8px 0 0; font-size: 12px; }
+
+.batch-rename-numbering { min-width: 0; margin: 14px 0 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; }
+.batch-rename-numbering legend { padding: 0 5px; color: var(--text); font-size: 12px; font-weight: 600; }
+.batch-rename-numbering-toggle { display: flex; align-items: center; gap: 8px; color: var(--text); }
+.batch-rename-numbering-toggle input { width: 16px; height: 16px; accent-color: var(--accent); }
+.batch-rename-numbering-fields { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 16px; margin-top: 12px; }
+.batch-rename-numbering-fields label { display: grid; gap: 5px; color: var(--text); }
+.batch-rename-numbering-fields .modal-input { box-sizing: border-box; min-width: 0; }
+.batch-rename-numbering .batch-rename-help { margin-bottom: 0; }
+@media (max-width: 600px) {
+  .batch-rename-numbering-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+}
+
+.batch-rename-limitations details { margin-top: 8px; }
+.batch-rename-limitations summary { color: var(--text); cursor: pointer; }
+.batch-rename-limitations summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+.batch-rename-results td:nth-child(-n+2) { white-space: pre-wrap; }

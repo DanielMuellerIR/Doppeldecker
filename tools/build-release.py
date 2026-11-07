@@ -34,6 +34,9 @@ NOTARY_PROFILE_PROMPT_DEFAULT = "notary"
 # weder committet noch zu GitHub gepusht werden — ideal für den internen Namen.
 NOTARY_PROFILE_GIT_KEY = "doppeldecker.notaryProfile"
 SIDECAR_NAME = "doppeldecker-cli"
+METADATA_HELPER_NAME = "doppeldecker-metadata-helper"
+METADATA_HELPER_ID = "com.doppeldecker.desktop.metadata-helper"
+METADATA_HELPER_PROGRAM = f"Contents/Library/LaunchServices/{METADATA_HELPER_NAME}"
 # Der selbstgepackte DMG-Name deklariert diese Architektur; der Release ist
 # fail-closed daran gebunden (siehe require_macos_release_arch).
 MACOS_RELEASE_TARGET = "aarch64-apple-darwin"
@@ -114,6 +117,19 @@ def prepare_cli_sidecar(environment: dict[str, str]) -> str:
     staged = sidecars / f"{SIDECAR_NAME}-{target}{extension}"
     shutil.copy2(built, staged)
     staged.chmod(staged.stat().st_mode | 0o111)
+    if target.endswith("apple-darwin") or "linux" in target:
+        helper = ROOT / "target" / target / "release" / METADATA_HELPER_NAME
+        if not helper.is_file():
+            raise SystemExit("Gebauter Metadatenhelfer wurde nicht gefunden.")
+        staged_helper = sidecars / (METADATA_HELPER_NAME if target.endswith("apple-darwin") else f"{METADATA_HELPER_NAME}-{target}")
+        shutil.copy2(helper, staged_helper)
+        staged_helper.chmod(staged_helper.stat().st_mode | 0o111)
+        if target.endswith("apple-darwin"):
+            identity = environment.get("APPLE_SIGNING_IDENTITY", "-")
+            command = ["codesign", "--force", "--options", "runtime", "--identifier", METADATA_HELPER_ID, "--sign", identity]
+            if identity != "-":
+                command.append("--timestamp")
+            subprocess.run((*command, str(staged_helper)), check=True, env=environment)
     return f"../target/sidecars/{SIDECAR_NAME}"
 
 
@@ -160,11 +176,22 @@ def run_tauri_build(
     create_updater_artifacts: bool = False,
 ) -> None:
     """Baut GUI und CLI als ein gemeinsam signiertes/gepacktes Artefakt."""
+    if create_updater_artifacts and "appimage" in bundles.split(","):
+        raise SystemExit("AppImage erst fertig packen und prüfen, danach separat signieren.")
+    if "appimage" in bundles.split(","):
+        require_appimage_prerequisites(environment)
     if create_updater_artifacts:
         require_updater_signing_key(environment)
     install_node_dependencies(environment)
     sidecar = prepare_cli_sidecar(environment)
     bundle = {"externalBin": [sidecar]}
+    if bundles in {"app", "app,dmg"}:
+        bundle["macOS"] = {"files": {
+            f"Library/LaunchServices/{METADATA_HELPER_NAME}": f"../target/sidecars/{METADATA_HELPER_NAME}",
+            f"Library/LaunchDaemons/{METADATA_HELPER_ID}.plist": f"../native/{METADATA_HELPER_ID}.plist",
+        }}
+    elif "appimage" in bundles.split(",") or "deb" in bundles.split(","):
+        bundle["externalBin"].append(f"../target/sidecars/{METADATA_HELPER_NAME}")
     if create_updater_artifacts:
         bundle["createUpdaterArtifacts"] = True
     bundle_override = json.dumps({"bundle": bundle})
@@ -183,6 +210,150 @@ def run_tauri_build(
         env=environment,
         check=True,
     )
+    if "appimage" in bundles.split(","):
+        finalize_appimage_runtime(environment)
+
+
+def require_appimage_prerequisites(environment: dict[str, str]) -> None:
+    if not shutil.which("patchelf", path=environment.get("PATH")):
+        raise SystemExit("AppImage mit GStreamer benötigt patchelf im Build-PATH.")
+    inspect = shutil.which("gst-inspect-1.0", path=environment.get("PATH"))
+    if inspect is None or subprocess.run(
+        (inspect, "appsink"),
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode != 0:
+        raise SystemExit("AppImage benötigt gstreamer1.0-tools und gstreamer1.0-plugins-base (appsink).")
+
+
+def elf_machine(path: Path) -> int:
+    with path.open("rb") as handle:
+        header = handle.read(20)
+    if len(header) != 20 or header[:4] != b"\x7fELF" or header[5] not in (1, 2):
+        raise SystemExit(f"AppImage: keine gültige ELF-Datei: {path.name}")
+    return int.from_bytes(header[18:20], "little" if header[5] == 1 else "big")
+
+
+def repair_appimage_gtk_hook(app_dir: Path) -> bool:
+    """Ersetzt die fehlerhafte mehrzeilige GIO-Pfadliste des GTK-Bundlers."""
+    hook = app_dir / "apprun-hooks/linuxdeploy-plugin-gtk.sh"
+    if not hook.is_file() or hook.is_symlink():
+        raise SystemExit("AppImage: generierter GTK-Starthook fehlt")
+    machine = elf_machine(app_dir / "usr/bin/doppeldecker")
+    module_dirs = set()
+    for module in app_dir.glob("usr/lib*/**/gio/modules/libgiognutls.so"):
+        if not module.resolve().is_relative_to(app_dir.resolve()):
+            raise SystemExit("AppImage: GIO-Modul verweist außerhalb des Pakets")
+        if elf_machine(module) == machine:
+            relative = module.parent.relative_to(app_dir).as_posix()
+            if not re.fullmatch(r"usr/lib[A-Za-z0-9_./+-]*/gio/modules", relative):
+                raise SystemExit("AppImage: GIO-Modulpfad nicht sicher darstellbar")
+            module_dirs.add(relative)
+    if not module_dirs:
+        raise SystemExit("AppImage: passendes GIO-TLS-Modul fehlt")
+    paths = ":".join("${APPDIR}/" + path for path in sorted(module_dirs))
+    original = hook.read_text()
+    # Tauri 2.11.4 entfernt den Buildpräfix nur von der ersten gefundenen
+    # Architektur. Weitere Treffer bleiben absolute Pfade hinter einem Umbruch.
+    updated, count = re.subn(
+        r'(?m)^export GIO_EXTRA_MODULES="[^"]*"$',
+        lambda _match: f'export GIO_EXTRA_MODULES="{paths}"',
+        original,
+    )
+    if count != 1:
+        raise SystemExit("AppImage: unbekanntes Format des GIO-Starthooks")
+    if updated == original:
+        return False
+    hook.write_text(updated)
+    return True
+
+
+def remove_bundled_wayland_client(app_dir: Path) -> int:
+    """Mesa und Wayland-Client müssen aus demselben Host-Grafikstack kommen."""
+    removed = 0
+    for path in app_dir.rglob("libwayland-client.so*"):
+        if not path.parent.resolve().is_relative_to(app_dir.resolve()):
+            raise SystemExit("AppImage: Wayland-Bibliothek liegt außerhalb des Pakets")
+        if not path.is_symlink() and not path.is_file():
+            raise SystemExit("AppImage: ungültiger Wayland-Bibliothekseintrag")
+        # Finale Links selbst entfernen, niemals deren möglicherweise externes Ziel.
+        path.unlink()
+        removed += 1
+    return removed
+
+
+def finalize_appimage_runtime(environment: dict[str, str]) -> None:
+    """Repariert den erzeugten AppDir vor der abschließenden Paketsignierung."""
+    config = json.loads((ROOT / "src-tauri/tauri.conf.json").read_text())
+    product = config["productName"]
+    directory = ROOT / "target/release/bundle/appimage"
+    app_dir = directory / f"{product}.AppDir"
+    artifacts = list(directory.glob(f"{product}_{workspace_version()}_*.AppImage"))
+    if len(artifacts) != 1 or artifacts[0].is_symlink() or app_dir.is_symlink():
+        raise SystemExit("AppImage: genau ein eigenes Paket und AppDir wurden erwartet")
+    artifact = artifacts[0]
+    if artifact.with_name(artifact.name + ".sig").exists():
+        raise SystemExit("AppImage darf erst nach der Runtime-Fertigstellung signiert werden")
+    machine = elf_machine(app_dir / "usr/bin/doppeldecker")
+    for relative in (
+        "usr/lib/gstreamer-1.0/libgstapp.so",
+        "usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner",
+    ):
+        path = app_dir / relative
+        if (
+            not path.is_file()
+            or not path.resolve().is_relative_to(app_dir.resolve())
+            or elf_machine(path) != machine
+        ):
+            raise SystemExit(f"AppImage: benötigte GStreamer-Runtime fehlt: {relative}")
+    # Nach einem fehlgeschlagenen Packversuch kann der Hook schon korrigiert,
+    # das bisherige Paket aber noch unverändert sein. Deshalb erneut packen.
+    repair_appimage_gtk_hook(app_dir)
+    # Der Host liefert Mesa/EGL. Ein älterer gebündelter Wayland-Client kann
+    # dessen neue Symbole nicht erfüllen und lässt WebKit vor dem ersten Bild
+    # abbrechen. Die übrige WebKit-/GStreamer-Runtime bleibt im Paket.
+    remove_bundled_wayland_client(app_dir)
+    home = Path(environment.get("HOME") or Path.home())
+    cache = Path(environment.get("XDG_CACHE_HOME") or home / ".cache")
+    tool_name = "linuxdeploy-plugin-appimage.AppImage"
+    tools = [cache / "tauri" / tool_name]
+    local_tools = [
+        ROOT / "target/.tauri" / tool_name,
+        ROOT / "target/release/.tauri" / tool_name,
+    ]
+    if config.get("bundle", {}).get("useLocalToolsDir"):
+        tools = local_tools + tools
+    else:
+        tools += local_tools
+    tool = next((path for path in tools if path.is_file() and os.access(path, os.X_OK)), None)
+    if tool is None:
+        raise SystemExit("AppImage: der von Tauri verwendete Paketpacker fehlt")
+    with tempfile.TemporaryDirectory(prefix=".appimage-runtime-", dir=directory) as temporary:
+        staged = Path(temporary) / artifact.name
+        architecture = {3: "i686", 40: "armhf", 62: "x86_64", 183: "aarch64"}.get(machine)
+        if architecture is None:
+            raise SystemExit("AppImage: nicht unterstützte ELF-Architektur")
+        packed_environment = dict(
+            environment,
+            APPIMAGE_EXTRACT_AND_RUN="1",
+            LDAI_OUTPUT=str(staged),
+            ARCH=architecture,
+        )
+        subprocess.run(
+            (str(tool), "--appimage-extract-and-run", "--appdir", str(app_dir)),
+            env=packed_environment,
+            check=True,
+        )
+        if (
+            not staged.is_file()
+            or staged.is_symlink()
+            or not os.access(staged, os.X_OK)
+            or elf_machine(staged) != machine
+        ):
+            raise SystemExit("AppImage: korrigiertes Paket fehlt oder hat die falsche Architektur")
+        os.replace(staged, artifact)
 
 
 def developer_id_identity(environment: dict[str, str]) -> str:
@@ -347,6 +518,7 @@ def notarize_and_staple_app(profile: str) -> None:
     app = ROOT / "target/release/bundle/macos/Doppeldecker.app"
     if not app.is_dir():
         raise SystemExit("Erwartete App unter target/release/bundle/macos fehlt.")
+    verify_metadata_helper(app)
     archive = app.parent / "Doppeldecker.zip"
     if archive.exists():
         archive.unlink()
@@ -361,6 +533,33 @@ def notarize_and_staple_app(profile: str) -> None:
         archive.unlink(missing_ok=True)
     subprocess.run(("xcrun", "stapler", "staple", str(app)), check=True)
     subprocess.run(("xcrun", "stapler", "validate", str(app)), check=True)
+
+
+def verify_metadata_helper(app: Path, *, run_command=None) -> None:
+    """Prüft den echten Servicepfad und beide Signaturen ohne Registrierung."""
+    runner = run_command or subprocess.run
+    helper = app / METADATA_HELPER_PROGRAM
+    plist = app / f"Contents/Library/LaunchDaemons/{METADATA_HELPER_ID}.plist"
+    if not helper.is_file() or helper.is_symlink() or not helper.stat().st_mode & 0o111 or not plist.is_file() or plist.is_symlink():
+        raise SystemExit("App-Paket enthält keinen regulären Metadatenhelfer samt Servicebeschreibung.")
+    with plist.open("rb") as stream:
+        service = plistlib.load(stream)
+    if service != {
+        "Label": METADATA_HELPER_ID, "BundleProgram": METADATA_HELPER_PROGRAM,
+        "MachServices": {METADATA_HELPER_ID: True}, "RunAtLoad": False, "ProcessType": "Interactive",
+    }:
+        raise SystemExit("Unerwarteter Metadaten-Servicevertrag im App-Paket.")
+    teams = []
+    for binary, identifier in [(app, "com.doppeldecker.desktop"), (helper, METADATA_HELPER_ID)]:
+        runner(("codesign", "--verify", "--strict", str(binary)), check=True)
+        info = runner(("codesign", "-dv", "--verbose=4", str(binary)), check=True, capture_output=True, text=True)
+        fields = dict(line.split("=", 1) for line in (info.stdout + info.stderr).splitlines() if "=" in line)
+        team = fields.get("TeamIdentifier", "")
+        if fields.get("Identifier") != identifier or len(team) != 10 or not team.isalnum() or team != team.upper():
+            raise SystemExit("Metadatenhelfer und App benötigen gültige Identifier und Developer-ID-Signaturen.")
+        teams.append(team)
+    if teams[0] != teams[1]:
+        raise SystemExit("Metadatenhelfer und App gehören nicht zum selben Entwicklerteam.")
 
 
 def updater_signature_path(artifact: Path) -> Path:
@@ -480,6 +679,7 @@ def verify_macos_updater_archive(
             raise SystemExit(
                 f"Updaterarchiv enthält Version {archived_version!r}, erwartet wurde {version!r}."
             )
+        verify_metadata_helper(app, run_command=runner)
         runner(("codesign", "--verify", "--deep", "--strict", str(app)), check=True)
         runner(("xcrun", "stapler", "validate", str(app)), check=True)
         require_macos_release_arch(app, environment)
@@ -551,6 +751,7 @@ def require_macos_release_arch(app: Path, environment: dict[str, str]) -> None:
     for binary in (
         app / "Contents/MacOS/doppeldecker",
         app / f"Contents/MacOS/{SIDECAR_NAME}",
+        app / METADATA_HELPER_PROGRAM,
     ):
         if not binary.is_file():
             raise SystemExit(f"Erwartetes Binary fehlt für die Architekturprüfung: {binary}")
@@ -768,7 +969,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "platform",
-        choices=("macos", "macos-public", "macos-install", "macos-release", "linux"),
+        choices=("macos", "macos-public", "macos-install", "macos-release", "linux", "linux-local"),
     )
     parser.add_argument(
         "--no-finder-layout",

@@ -6,22 +6,22 @@
 use std::convert::Infallible;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use doppeldecker_core::bidirectional::finish_bidirectional_run_completion;
+use doppeldecker_core::bidirectional::prepare_provider_bidirectional_with_decisions_bound_for_queue;
 use doppeldecker_core::{
     discover_webdav_certificate, download_remote_snapshot, error_code,
     execute_prepared_sftp_queue_entry, execute_provider_file_queue_entry,
-    prepare_provider_bidirectional_with_decisions, prepare_webdav_download,
-    prepare_webdav_queue_entry, prepare_webdav_upload, BidirectionalQueueEndpoint,
-    BinaryRelativePath, Cancel, Compare, ConflictDecision, ConflictResolution, ErrorCode,
-    FileQueueKind, FtpsCertificatePolicy, KeychainSecretReference, LocalQueueExecution,
-    OperationQueue, PairId, ProviderEndpoint, QueueOperation, QueueState, RootIdentity,
-    SecretResolver, SecretString, SftpQueueDirection, SftpQueuePreparation, SyncMode, SyncOptions,
-    Vfs, WebDavConnectionConfig, WebDavVfs,
+    prepare_provider_transfer_for_queue, prepare_webdav_queue_entry, prepare_webdav_upload,
+    BidirectionalQueueEndpoint, BinaryRelativePath, Cancel, Compare, ConflictDecision,
+    ConflictResolution, ErrorCode, FileQueueKind, FtpsCertificatePolicy, KeychainSecretReference,
+    LocalQueueExecution, OperationQueue, PairId, ProviderEndpoint, QueueOperation, QueueState,
+    RootIdentity, SecretResolver, SecretString, SftpQueueDirection, SftpQueuePreparation, SyncMode,
+    SyncOptions, Vfs, WebDavConnectionConfig, WebDavVfs,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::{server::conn::http1, service::service_fn, Request, Response, StatusCode};
@@ -276,9 +276,8 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
     assert_eq!(f5_queue.snapshot().entries[0].state, QueueState::Completed);
     drop(f5_queue);
 
-    // Eine frühere Ersetzungsprobe bindet die bestätigte Altzielversion nicht
-    // gemeinsam mit allen Eltern. Auch persistierte Best-Effort-Flags dürfen
-    // diese fehlende Freigabe für lokales Copy nicht ersetzen.
+    // Gewöhnliches Ersetzen bestätigt die dauerhafte Best-Effort-Wirkung und
+    // bindet den Altzielbeleg; der stärkere Syncvertrag bleibt davon getrennt.
     std::fs::write(
         f5_source.path().join("ersetzen.txt"),
         b"neue WebDAV-Version mit anderer Laenge\n",
@@ -318,7 +317,7 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
             .unwrap(),
             best_effort_commit_expected: None,
             local_copy_new_best_effort_expected: None,
-            copy_new_best_effort_expected: Some(false),
+            copy_new_best_effort_expected: Some(true),
             replace_best_effort_expected: Some(true),
             remove_source_best_effort_expected: None,
         })
@@ -336,15 +335,21 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
         &Cancel::new(),
         &mut |_| {},
     )
-    .unwrap_err();
-    assert_eq!(error_code(&replace_result), ErrorCode::Unsupported);
+    .unwrap();
+    assert!(
+        matches!(replace_result, doppeldecker_core::QueueExecutionResult::File(stats) if stats.files == 1 && stats.target_replace_best_effort)
+    );
     assert_eq!(
         std::fs::read(root.path().join("f5-target/ersetzen.txt")).unwrap(),
-        b"alte WebDAV-Version\n"
+        b"neue WebDAV-Version mit anderer Laenge\n"
+    );
+    assert_eq!(
+        std::fs::read(f5_source.path().join("ersetzen.txt")).unwrap(),
+        b"neue WebDAV-Version mit anderer Laenge\n"
     );
     assert_eq!(
         replace_queue.snapshot().entries[0].state,
-        QueueState::Failed
+        QueueState::Completed
     );
     drop(replace_queue);
 
@@ -378,15 +383,79 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
     let files = endpoint.probe_file_capabilities().unwrap();
     assert!(
         !files.copy_new
-            && !files.copy_new_best_effort
+            && files.copy_new_best_effort
             && !files.replace
-            && !files.replace_best_effort
+            && files.replace_best_effort
             && !files.remove_source
     );
     let deletion = endpoint.probe_delete_capabilities().unwrap();
-    assert!(!deletion.quarantine && !deletion.permanent);
+    assert!(!deletion.quarantine && deletion.permanent);
     assert!(endpoint.probe_quarantine_restore_capability().is_err());
     assert!(endpoint.probe_quarantine_purge_capability().is_err());
+    std::fs::create_dir(root.path().join("confirmed-delete")).unwrap();
+    let delete_endpoint =
+        ProviderEndpoint::webdav(vfs.clone(), Path::new("/confirmed-delete")).unwrap();
+    for after_proof in [false, true] {
+        let file = root.path().join("confirmed-delete/version.txt");
+        std::fs::write(&file, b"vorher!").unwrap();
+        let (deletion, delete_root) = delete_endpoint.ordinary_file_context().unwrap();
+        let plan = doppeldecker_core::plan_remote_delete(
+            deletion.as_ref(),
+            &delete_root,
+            &["/confirmed-delete/version.txt".into()],
+        )
+        .unwrap();
+        let mut armed = false;
+        let error = doppeldecker_core::execute_remote_delete(
+            deletion.as_ref(),
+            &plan,
+            doppeldecker_core::RemoteDeleteMode::Permanent,
+            &Cancel::new(),
+            &mut |progress| {
+                if progress.current == "version.txt" && !armed {
+                    std::fs::write(
+                        root.path().join(".ordinary-delete-race"),
+                        if after_proof { b"stat" } else { b"list" },
+                    )
+                    .unwrap();
+                    armed = true;
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&error), ErrorCode::PlanDrift);
+        assert_eq!(std::fs::read(&file).unwrap(), b"nachher");
+        let request = root.path().join(".ordinary-delete-request");
+        assert_eq!(request.exists(), after_proof);
+        if after_proof {
+            assert_eq!(
+                std::fs::read_to_string(&request).unwrap(),
+                etag_for(b"vorher!")
+            );
+            std::fs::remove_file(request).unwrap();
+        }
+        std::fs::remove_file(file).unwrap();
+    }
+    std::fs::create_dir_all(root.path().join("confirmed-delete/tree/child")).unwrap();
+    std::fs::write(
+        root.path().join("confirmed-delete/tree/child/file.txt"),
+        b"remove",
+    )
+    .unwrap();
+    let (deletion, delete_root) = delete_endpoint.ordinary_file_context().unwrap();
+    let error = doppeldecker_core::plan_remote_delete(
+        deletion.as_ref(),
+        &delete_root,
+        &["/confirmed-delete/tree".into()],
+    )
+    .unwrap_err();
+    assert_eq!(error_code(&error), ErrorCode::Unsupported);
+    assert_eq!(
+        std::fs::read(root.path().join("confirmed-delete/tree/child/file.txt")).unwrap(),
+        b"remove"
+    );
+    std::fs::remove_dir_all(root.path().join("confirmed-delete/tree")).unwrap();
+    std::fs::remove_dir(root.path().join("confirmed-delete")).unwrap();
     assert_eq!(
         std::fs::read(root.path().join("f5-target/auswahl.txt")).unwrap(),
         b"WebDAV F5 Auswahl\n"
@@ -398,15 +467,18 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
     let bidi_area = tempfile::tempdir().unwrap();
     let bidi_local = bidi_area.path().join("lokal");
     std::fs::create_dir(&bidi_local).unwrap();
+    let bidi_queue = OperationQueue::open(bidi_area.path().join("config/queue.json")).unwrap();
     let bidi_baseline = bidi_area.path().join("state/webdav-pair.json");
     let pair = PairId([111; 16]);
-    let initial = prepare_provider_bidirectional_with_decisions(
+    let initial = prepare_provider_bidirectional_with_decisions_bound_for_queue(
+        &bidi_queue,
         pair,
         "WebDAV-E2E-Paar",
         ProviderEndpoint::local(&bidi_local).unwrap(),
         ProviderEndpoint::webdav(vfs.clone(), Path::new("/bidirektional")).unwrap(),
         &bidi_baseline,
         &[],
+        None,
     )
     .unwrap();
     let phrase = initial.preview().confirmation_phrase.clone();
@@ -421,13 +493,15 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
         b"WebDAV bidirektional\n",
     )
     .unwrap();
-    let remote_to_local = prepare_provider_bidirectional_with_decisions(
+    let remote_to_local = prepare_provider_bidirectional_with_decisions_bound_for_queue(
+        &bidi_queue,
         pair,
         "WebDAV-E2E-Paar",
         ProviderEndpoint::local(&bidi_local).unwrap(),
         ProviderEndpoint::webdav(vfs.clone(), Path::new("/bidirektional")).unwrap(),
         &bidi_baseline,
         &[],
+        None,
     )
     .unwrap();
     assert!(remote_to_local.preview().stage_blocker.is_none());
@@ -447,13 +521,15 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
         b"WebDAV bidirektional aktualisiert\n",
     )
     .unwrap();
-    let replacement = prepare_provider_bidirectional_with_decisions(
+    let replacement = prepare_provider_bidirectional_with_decisions_bound_for_queue(
+        &bidi_queue,
         pair,
         "WebDAV-E2E-Paar",
         ProviderEndpoint::local(&bidi_local).unwrap(),
         ProviderEndpoint::webdav(vfs.clone(), Path::new("/bidirektional")).unwrap(),
         &bidi_baseline,
         &[],
+        None,
     )
     .unwrap();
     let phrase = replacement.preview().confirmation_phrase.clone();
@@ -471,13 +547,15 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
         )
         .unwrap();
     }
-    let fill = prepare_provider_bidirectional_with_decisions(
+    let fill = prepare_provider_bidirectional_with_decisions_bound_for_queue(
+        &bidi_queue,
         pair,
         "WebDAV-E2E-Paar",
         ProviderEndpoint::local(&bidi_local).unwrap(),
         ProviderEndpoint::webdav(vfs.clone(), Path::new("/bidirektional")).unwrap(),
         &bidi_baseline,
         &[],
+        None,
     )
     .unwrap();
     let phrase = fill.preview().confirmation_phrase.clone();
@@ -487,13 +565,15 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
         .unwrap();
     finish_bidirectional_run_completion(&bidi_baseline).unwrap();
     std::fs::remove_file(root.path().join("bidirektional/bestand-00.txt")).unwrap();
-    let deletion = prepare_provider_bidirectional_with_decisions(
+    let deletion = prepare_provider_bidirectional_with_decisions_bound_for_queue(
+        &bidi_queue,
         pair,
         "WebDAV-E2E-Paar",
         ProviderEndpoint::local(&bidi_local).unwrap(),
         ProviderEndpoint::webdav(vfs.clone(), Path::new("/bidirektional")).unwrap(),
         &bidi_baseline,
         &[],
+        None,
     )
     .unwrap();
     let phrase = deletion.preview().confirmation_phrase.clone();
@@ -515,7 +595,8 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
         b"WebDAV Typwechsel\n",
     )
     .unwrap();
-    let type_swap = prepare_provider_bidirectional_with_decisions(
+    let type_swap = prepare_provider_bidirectional_with_decisions_bound_for_queue(
+        &bidi_queue,
         pair,
         "WebDAV-E2E-Paar",
         ProviderEndpoint::local(&bidi_local).unwrap(),
@@ -525,6 +606,7 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
             path: BinaryRelativePath(vec![b"remote.txt".to_vec()]),
             decision: ConflictDecision::KeepRight,
         }],
+        None,
     )
     .unwrap();
     assert!(type_swap.preview().stage_blocker.is_none());
@@ -540,10 +622,16 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
         b"WebDAV Typwechsel\n"
     );
 
-    let download_area = tempfile::tempdir().unwrap();
+    let download_area = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let download_queue =
+        OperationQueue::open(download_area.path().join("download-queue.json")).unwrap();
     let download_target = download_area.path().join("ziel");
     std::fs::create_dir(&download_target).unwrap();
     let prepared = prepare_webdav_download(
+        &download_queue,
         vfs.clone(),
         Path::new("/"),
         &download_target,
@@ -566,6 +654,7 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
 
     std::fs::write(root.path().join("inhalt.txt"), b"WebDAV aktualisiert\n").unwrap();
     let update = prepare_webdav_download(
+        &download_queue,
         vfs.clone(),
         Path::new("/"),
         &download_target,
@@ -595,6 +684,7 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
         .unwrap();
     }
     let fill = prepare_webdav_download(
+        &download_queue,
         vfs.clone(),
         Path::new("/"),
         &download_target,
@@ -611,6 +701,7 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
         .unwrap();
     std::fs::write(download_target.join("ueberzaehlig.txt"), b"weg\n").unwrap();
     let mirror = prepare_webdav_download(
+        &download_queue,
         vfs.clone(),
         Path::new("/"),
         &download_target,
@@ -635,12 +726,21 @@ fn webdav_pin_auth_listing_stream_und_reconnect_bleiben_gebunden() {
         compare: Compare::ContentHash,
         ..SyncOptions::default()
     };
-    let preview =
-        prepare_webdav_download(vfs, Path::new("/"), &queue_target, queue_options.clone()).unwrap();
+    let queue_dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let queue = OperationQueue::open(queue_dir.path().join("queue.json")).unwrap();
+    let preview = prepare_webdav_download(
+        &queue,
+        vfs,
+        Path::new("/"),
+        &queue_target,
+        queue_options.clone(),
+    )
+    .unwrap();
     let expected_plan = preview.preview().plan.clone();
     drop(preview);
-    let queue_dir = tempfile::tempdir().unwrap();
-    let queue = OperationQueue::open(queue_dir.path().join("queue.json")).unwrap();
     let queued = queue
         .enqueue(QueueOperation::WebDavSync {
             direction: SftpQueueDirection::Download,
@@ -773,6 +873,21 @@ async fn mock_response(
         {
             swap_probe_collection(root, local.parent().unwrap(), "cleanup");
         }
+        let race = root.join(".ordinary-delete-race");
+        if depth == "1" && path.trim_end_matches('/') == "/confirmed-delete" && race.exists() {
+            let mode = std::fs::read(&race).unwrap();
+            std::fs::remove_file(&race).unwrap();
+            if mode == b"list" {
+                std::fs::write(local.join("version.txt"), b"nachher").unwrap();
+            } else {
+                std::fs::write(root.join(".ordinary-delete-stat-race"), b"armed").unwrap();
+            }
+        }
+        let stat_race = root.join(".ordinary-delete-stat-race");
+        if depth == "0" && path == "/confirmed-delete/version.txt" && stat_race.exists() {
+            std::fs::remove_file(stat_race).unwrap();
+            std::fs::write(&local, b"nachher").unwrap();
+        }
         if depth == "0" && path.ends_with("/etag-race.txt") && local.is_file() {
             // Die Antwort trägt noch die ETag von „vorher!“. Erst danach entsteht
             // der gleich große Austausch, sodass DELETE nur mit If-Match sicher
@@ -822,7 +937,7 @@ async fn mock_response(
     }
     if request.method().as_str() == "MKCOL" {
         record_probe_swap_followup(root, path, "MKCOL");
-        if !tagged_collection_conditions_match(&request, root) {
+        if !tagged_resource_conditions_match(&request, root) {
             return empty_response(StatusCode::PRECONDITION_FAILED);
         }
         let Some(local) = local_path(root, path) else {
@@ -942,7 +1057,7 @@ async fn mock_response(
     if request.method() == hyper::Method::PUT {
         record_probe_swap_followup(root, path, "PUT");
         record_rename_child_followup(root, path, "PUT");
-        if !tagged_collection_conditions_match(&request, root) {
+        if !tagged_resource_conditions_match(&request, root) {
             return empty_response(StatusCode::PRECONDITION_FAILED);
         }
         if root.join(".reject-put-during-mkdir-probe").exists()
@@ -987,7 +1102,7 @@ async fn mock_response(
     if request.method().as_str() == "MOVE" {
         record_probe_swap_followup(root, path, "MOVE");
         record_rename_child_followup(root, path, "MOVE");
-        if !tagged_collection_conditions_match(&request, root) {
+        if !tagged_resource_conditions_match(&request, root) {
             return empty_response(StatusCode::PRECONDITION_FAILED);
         }
         let destination = request
@@ -1061,9 +1176,16 @@ async fn mock_response(
         };
     }
     if request.method() == hyper::Method::DELETE {
+        if path == "/confirmed-delete/version.txt" {
+            std::fs::write(
+                root.join(".ordinary-delete-request"),
+                request.headers().get("if-match").unwrap().to_str().unwrap(),
+            )
+            .unwrap();
+        }
         record_probe_swap_followup(root, path, "DELETE");
         record_rename_child_followup(root, path, "DELETE");
-        if !tagged_collection_conditions_match(&request, root) {
+        if !tagged_resource_conditions_match(&request, root) {
             return empty_response(StatusCode::PRECONDITION_FAILED);
         }
         let Some(local) = local_path(root, path) else {
@@ -1125,16 +1247,15 @@ async fn mock_response(
     empty_response(StatusCode::METHOD_NOT_ALLOWED)
 }
 
-fn tagged_collection_conditions_match(
-    request: &Request<hyper::body::Incoming>,
-    root: &Path,
-) -> bool {
+fn tagged_resource_conditions_match(request: &Request<hyper::body::Incoming>, root: &Path) -> bool {
     let Some(mut value) = request
         .headers()
         .get("if")
         .and_then(|value| value.to_str().ok())
     else {
-        return false;
+        // Gewöhnliche Dateiaktionen binden Collections per frischem Readback.
+        // Nur tatsächlich gesendete If-Bedingungen werden hier ausgewertet.
+        return true;
     };
     let mut count = 0;
     let mut matched = false;
@@ -1154,10 +1275,17 @@ fn tagged_collection_conditions_match(
         let Ok(url) = url::Url::parse(url) else {
             return false;
         };
-        let Some(local) = local_path(root, url.path()).filter(|path| path.is_dir()) else {
+        let Some(local) =
+            local_path(root, url.path()).filter(|path| path.is_dir() || path.is_file())
+        else {
             return false;
         };
-        matched |= etag == directory_etag(&local);
+        let current = if local.is_dir() {
+            directory_etag(&local)
+        } else {
+            etag_for(&std::fs::read(&local).unwrap())
+        };
+        matched |= etag == current;
         count += 1;
         value = after_etag.strip_prefix(' ').unwrap_or(after_etag);
     }
@@ -1298,4 +1426,19 @@ fn wait_for_server(port: u16) {
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("WebDAV-Testserver startete nicht");
+}
+
+fn prepare_webdav_download(
+    queue: &OperationQueue,
+    webdav: Arc<WebDavVfs>,
+    remote_source: &Path,
+    local_target: &Path,
+    options: SyncOptions,
+) -> std::io::Result<doppeldecker_core::PreparedProviderRealRun> {
+    prepare_provider_transfer_for_queue(
+        queue,
+        ProviderEndpoint::webdav(webdav, remote_source)?,
+        ProviderEndpoint::local(local_target)?,
+        options,
+    )
 }

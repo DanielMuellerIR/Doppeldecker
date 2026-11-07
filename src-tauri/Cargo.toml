@@ -9,6 +9,7 @@ license.workspace = true
 description = "Eleganter, plattformübergreifender Dual-Pane-Dateimanager (macOS + Linux)"
 
 [build-dependencies]
+cc = "1"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
@@ -25,18 +26,21 @@ url = "2" # native Datei-URIs der Systemzwischenablage
 tokio = { version = "1", features = ["time"] } # Ablauf nativer Secret-Einmalwerte ohne Blockierthread
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-services = { version = "0.3.2", default-features = false, features = ["AE", "AEDataModel", "AEPackObject"] }
 objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
-# AppKit setzt das Laufzeiticon und das dauerhafte Finder-/Dockicon am Bundle.
+# AppKit setzt das Laufzeiticon im Dock; das signierte Bundle bleibt unverändert.
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "std", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSResponder",
   "NSSecureTextField", "NSTextField", "NSView", "NSImage", "NSWorkspace", "NSPasteboard", "NSPasteboardItem"
 ] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
-  "std", "NSGeometry", "NSObject", "NSString", "NSData", "NSBundle", "NSArray", "NSURL"
+  "std", "NSGeometry", "NSObject", "NSString", "NSData", "NSBundle", "NSArray", "NSURL",
+  "NSAppleEventDescriptor", "NSDate", "NSError", "objc2-core-services"
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18.2"
+tempfile = "3" # kurzlebiger Administratorhelfer außerhalb des FUSE-Mounts
 # Nur Linux setzt ein Fenstericon über `tauri::image`; macOS setzt das Dockicon
 # direkt über AppKit und zieht den PNG-Decoder deshalb nicht in das App-Binary.
 tauri = { version = "2", features = ["image-png"] }

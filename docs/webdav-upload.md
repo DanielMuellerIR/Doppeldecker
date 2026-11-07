@@ -1,4 +1,63 @@
-# Gewöhnliche additive WebDAV-Uploads
+# Gewöhnliche WebDAV-Uploads und Ersetzungen
+
+Stand: 2026-10-23. F5, Dateimenü und CLI verwenden die private interaktive Zielsicht
+für neue Inhalte und ausdrücklich bestätigte Ersetzungen regulärer Dateien. Die
+Fähigkeitsanzeige ist mutationsfrei. Die echte bedingte Tempanlage samt Inhaltsreadback
+ist der erste Schreibversuch; künstliche Collections und Löschproben entfallen.
+Strikter Sync und Quarantäne übernehmen diese Freigabe nicht.
+
+Bei einer Addition trägt das abschließende MOVE `Overwrite: F`, `If-Match` für die
+Tempdatei und genau eine getaggte Elternbedingung. Bei einer Ersetzung trägt es
+`Overwrite: T`, `If-Match` für die Tempdatei und **genau eine** getaggte Bedingung
+für die vor dem Upload beobachtete Altziel-ETag. Zusätzliche Elternlisten würden
+wegen der ODER-Semantik ein inzwischen fremdes Ziel freigeben. Deshalb werden
+Eltern und Vorfahren beim Ersetzen ausschließlich frisch vor und nach der Wirkung
+geprüft. Die Altversion geht ohne Quarantäne dauerhaft verloren; ein gleichzeitiger
+Vorfahrenwechsel bleibt ein sichtbares Best-Effort-Risiko.
+
+Der gemeinsame Corekopierer bindet Konfliktentscheidungen, Tempgröße, Transferhash
+und den vollständigen Zielreadback. Ein verändertes Altziel verweigert den Commit.
+Nach Antwortverlust folgt kein zweiter mutierender Versuch; bekannte Prüfpfade
+bleiben im privaten Queuejournal. Die gewöhnliche CLI-Option `--replace` ist die
+Wirkungsentscheidung und verlangt keine zusätzliche Routinephrase.
+
+Die HTTPS-Tests in `core/tests/webdav_ordinary_actions.rs` belegen echte Ersetzung,
+erhaltene Nachbardateien, eine Altzielbedingung ohne zusätzliche ODER-Liste, späte
+Zielkollision und genau einen MOVE bei Antwortverlust. Frühere Prüfstände im
+folgenden Abschnitt beschreiben die damals ausschließlich additive Umsetzung.
+Lokale Quellbelege werden ohne vollständiges Vorhashen vorbereitet. Root und
+beobachtete Dateiversionen bleiben gebunden; nur die aktuelle Datei wird zum
+Transfer geöffnet und dabei gehasht. Feste Auswahl-, Baum-, Größen-, Tiefen-,
+Handle- und pauschale Vorbereitungszeitlimits sind entfallen. Request-, Parser-
+und Speichergrenzen bleiben sichtbar. Nach MOVE wird die frische Ziel-ETag
+verwendet und der damit gelesene Inhalt gegen den Transferhash geprüft; ein
+zulässiger ETagwechsel ist kein Fehler.
+
+Auch Collection-ETags dürfen sich durch eigene PUT-, MKCOL-, MOVE- oder
+Temp-DELETE-Wirkungen ändern. Danach werden die beobachteten Elternbelege frisch
+gebunden; Profil, Sitzung, Pfad und Collectiontyp bleiben geprüft. Eine ETag
+beweist keine dauerhafte Ordneridentität. Ein gleichzeitiger fremder
+Elternpfadtausch bleibt deshalb Teil des sichtbaren Best-Effort-Risikos.
+
+Auch direkte lokale Mehrfachauswahlen lassen möglicherweise gleichwertige Case-/Unicode-Namen
+als vollständige Gruppe aus, etwa `a`/`A` oder NFC-/NFD-Schreibweisen. Unabhängige
+Dateien und Ordner bleiben übertragbar. Ein ausgelassener Ordner wird nicht geöffnet
+oder rekursiv gelesen; sein ganzer Teilbaum zählt als eine Auslassung. Zweimal
+exakt derselbe Quellpfad bleibt eine ungültige Auswahl.
+
+Die einzelnen ausgelassenen Quellen bleiben descriptor-relativ mit Identität,
+Typ, Größe, Rechten und hochauflösender mtime/ctime gebunden. Änderungen werden vor
+weiteren Wirkungen erkannt; auch eine frische Queuevorbereitung bindet diese
+Auslassungen an ihren neuen Umfang. Konfliktsuche und Fortschrittssummen lassen
+solche Top-Level-Quellen aus: Ein gleichnamiges vorhandenes Ziel erzeugt keinen
+Konflikt für Inhalt, der überhaupt nicht übertragen wird. Unterstützte unabhängige
+Inhalte behalten ihren normalen Upload-, Konflikt- und Readbackvertrag.
+
+## Historischer Stand bis 2026-10-18
+
+Die folgenden Detailbelege dokumentieren die frühere additive Klasse. Aussagen
+über eine allgemeine Ersetzungsabsage und feste Produktgrößen sind kein aktueller
+Eintrittsvertrag.
 
 Stand: 2026-10-18. F5, Dateimenü und CLI `copy` verwenden für lokale reguläre
 Dateien und begrenzte Verzeichnisbäume unter einem vorhandenen WebDAV-Pane-Ordner
@@ -81,9 +140,18 @@ Rohnamen erscheinen als ausdrücklich erklärte Prozent-Hex-Anzeige. Auch Namen,
 die eine Eingabenormalisierung verändern würde, werden innerhalb eines Baums
 ausgelassen; ein direkt gewählter solcher Ordner wird vor der Zielvorbereitung
 abgelehnt. Der Core legt niemals einen still getrimmten Ersatznamen an. Möglicherweise
-gleichwertige unterstützte Case-/Unicode-Namen sperren die Auswahl vor der ersten
-Zielwirkung. Die Inhaltsvorbereitung ist vom gemeinsamen rekursiven Kopierer
-getrennt; es gibt keinen zweiten Baumkopieralgorithmus.
+gleichwertige unterstützte Case-/Unicode-Namen innerhalb ausgewählter Ordner
+werden seit 2026-10-23 als vollständige Namensgruppe pfadgenau ausgelassen.
+Unabhängige Kinder bleiben übertragbar; ein ausgelassener Ordner steht für seinen
+gesamten unangetasteten Teilbaum. Die Bilanz zählt jeden ausgelassenen Eintrag oder
+Teilbaum einmal. Der vollständige beobachtete Elternbestand einschließlich dieser
+Namen bleibt an Digest und Driftprüfung gebunden. Die konservative NFC-/Case-Prüfung
+gilt auch für namensgenaue Quellen, weil die Zielsemantik davon abweichen kann.
+Eine normalisierende Quelle mit nur einem tatsächlichen Eintrag erzeugt dagegen
+keine künstliche Namenskollision. Mehrdeutige Namen in der direkten Mehrfachauswahl werden ebenfalls als ganze
+Gruppe ausgelassen; unabhängige ausgewählte Inhalte bleiben übertragbar. Diese Auslassungssicht
+gilt ausschließlich für lokale WebDAV-Kopien; Move verwendet sie nicht. Die
+Inhaltsvorbereitung ist vom gemeinsamen rekursiven Kopierer getrennt; es gibt keinen zweiten Baumkopieralgorithmus.
 
 Bestehende exakt zugeordnete echte Zielordner werden additiv zusammengeführt.
 Reguläre vorhandene Dateien und Typkonflikte werden übersprungen oder führen zum

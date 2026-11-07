@@ -20,7 +20,7 @@ use crate::{
     start_queue_worker, with_queue_extension, with_reserved_operation, AppError, AppState,
 };
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderFileRequest {
     kind: String,
@@ -28,6 +28,8 @@ pub(crate) struct ProviderFileRequest {
     target: BidirectionalEndpointRequest,
     items: Vec<String>,
     destination: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generated_operation_id: Option<String>,
 }
 
 /// Tauri-Payload der Dateifähigkeiten in der Schreibweise, die das Frontend
@@ -364,11 +366,12 @@ fn prepare_provider_delete_request(
             capabilities.blockers.join("; "),
         ));
     };
-    let (vfs, root) = endpoint.file_context().map_err(AppError::from)?;
+    let (vfs, root) = endpoint.ordinary_file_context().map_err(AppError::from)?;
     let plan = doppeldecker_core::plan_remote_delete(vfs.as_ref(), &root, &items)
         .map_err(AppError::from)?;
     crate::queue_runtime::ensure_profile_bindings_current(app, &profile_bindings)?;
-    let confirmation = (mode == RemoteDeleteMode::Permanent)
+    let confirmation = (mode == RemoteDeleteMode::Permanent
+        && (plan.entries > 1_000 || plan.bytes > 10 * 1024 * 1024 * 1024))
         .then(|| permanent_delete_confirmation(&request.endpoint, &plan));
     Ok((
         queue_endpoint,
@@ -391,12 +394,8 @@ pub(crate) async fn check_provider_delete(
     let worker_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = worker_app.state::<AppState>();
-        // Die Capability-Probe legt künstliche Einträge unter dem Pane-Root an und
-        // entfernt sie wieder — eine echte Providermutation. Innerhalb dieses Fensters
-        // darf sie deshalb nicht mit dessen Queue-/Sync-Lauf überlappen: erst die
-        // Single-Flight-Schranke reservieren, dann proben. Ein paralleles anderes
-        // Fenster bleibt erlaubt; sieht dessen frischer Scan den kurzlebigen Zufallsnamen,
-        // führt das bei der Driftprüfung zu einem sichtbaren Fehler statt zu Überschreiben.
+        // Vorbereitung und Queue desselben Fensters teilen ihre Schranke;
+        // andere Fenster behalten ihre unabhängige Queue.
         let label = window.label();
         let window_state = state.window(label);
         let (_, preview, _) = with_reserved_operation(&app, label, &window_state, || {
@@ -416,6 +415,8 @@ pub(crate) struct EnqueueProviderDeleteRequest {
     mode: RemoteDeleteMode,
     expected_plan: RemoteDeletePlan,
     confirmation: Option<String>,
+    #[serde(default)]
+    effects_confirmed: bool,
 }
 
 #[tauri::command]
@@ -431,9 +432,7 @@ pub(crate) async fn enqueue_provider_delete(
             endpoint: request.endpoint,
             items: request.items,
         };
-        // Auch der Enqueue-Weg probt mutierend (siehe check_provider_delete) und
-        // läuft deshalb vollständig unter der Single-Flight-Schranke. Den Worker
-        // startet `with_reserved_operation` nach der Freigabe selbst.
+        // Plan und Profil werden unter der Fensterschranke frisch gebunden.
         let label = window.label();
         let window_state = state.window(label);
         with_reserved_operation(&app, label, &window_state, || {
@@ -445,8 +444,9 @@ pub(crate) async fn enqueue_provider_delete(
                     "Remote-Löschplan oder Capability änderte sich seit der Vorschau",
                 ));
             }
-            if preview.mode == RemoteDeleteMode::Permanent
-                && request.confirmation.as_deref() != preview.confirmation.as_deref()
+            if !request.effects_confirmed
+                || (preview.confirmation.is_some()
+                    && request.confirmation.as_deref() != preview.confirmation.as_deref())
             {
                 return Err(AppError::new(
                     "confirmation_mismatch",
@@ -484,6 +484,9 @@ fn file_kind(value: &str) -> Result<FileQueueKind, AppError> {
 }
 
 struct PreparedProviderFileRequest {
+    items: Vec<String>,
+    destination: String,
+    generated_previous: Option<doppeldecker_core::QueueEntry>,
     kind: FileQueueKind,
     source: Box<doppeldecker_core::BidirectionalQueueEndpoint>,
     target: Box<doppeldecker_core::BidirectionalQueueEndpoint>,
@@ -516,7 +519,9 @@ fn same_namespace_rename_capabilities(
     }
 }
 
-fn file_endpoint_label(endpoint: &doppeldecker_core::BidirectionalQueueEndpoint) -> String {
+pub(crate) fn file_endpoint_label(
+    endpoint: &doppeldecker_core::BidirectionalQueueEndpoint,
+) -> String {
     use doppeldecker_core::BidirectionalQueueEndpoint as Endpoint;
     match endpoint {
         Endpoint::Local { root } => format!("Lokal · {root}"),
@@ -561,6 +566,104 @@ struct FilePreparationConfirmation<'a> {
     prepare_aliases: bool,
 }
 
+fn validate_generated_file_request(request: &ProviderFileRequest) -> Result<(), AppError> {
+    if request
+        .generated_operation_id
+        .as_ref()
+        .is_none_or(|id| id.is_empty() || id.len() > 128)
+    {
+        return Err(AppError::new("invalid_input", "Ungültige Archivupload-ID"));
+    }
+    if request.kind != "copy"
+        || !request.items.is_empty()
+        || !request.destination.is_empty()
+        || request.source
+            != (BidirectionalEndpointRequest::Local {
+                root: String::new(),
+            })
+        || request.target
+            != (BidirectionalEndpointRequest::Local {
+                root: String::new(),
+            })
+    {
+        return Err(AppError::new(
+            "invalid_input",
+            "Archivupload wird ausschließlich über seine Queue-ID gebunden",
+        ));
+    }
+    Ok(())
+}
+
+fn generated_upload_source_label(
+    reference: &doppeldecker_core::generated_source::GeneratedSourceReference,
+) -> String {
+    let kind = match reference.kind {
+        doppeldecker_core::generated_source::GeneratedSourceKind::Zip => "Erzeugtes ZIP",
+        doppeldecker_core::generated_source::GeneratedSourceKind::ZipExtraction => {
+            "Entpackte Auswahl"
+        }
+    };
+    format!("{kind} · {}", reference.label)
+}
+
+fn bind_generated_file_request(
+    request: &ProviderFileRequest,
+    prepared: &doppeldecker_core::queue::GeneratedUploadPreparation,
+) -> Result<ProviderFileRequest, AppError> {
+    validate_generated_file_request(request)?;
+    let QueueOperation::ProviderFile { target, .. } = &prepared.entry.operation else {
+        return Err(AppError::new("invalid_input", "Keine Uploadphase"));
+    };
+    let protocol = match target.as_ref() {
+        doppeldecker_core::BidirectionalQueueEndpoint::Sftp { .. } => {
+            doppeldecker_core::RemoteProfileProtocol::Sftp
+        }
+        doppeldecker_core::BidirectionalQueueEndpoint::Ftps { .. } => {
+            doppeldecker_core::RemoteProfileProtocol::Ftps
+        }
+        doppeldecker_core::BidirectionalQueueEndpoint::WebDav { .. } => {
+            doppeldecker_core::RemoteProfileProtocol::Webdav
+        }
+        doppeldecker_core::BidirectionalQueueEndpoint::Smb { .. } => {
+            doppeldecker_core::RemoteProfileProtocol::Smb
+        }
+        _ => {
+            return Err(AppError::new(
+                "invalid_input",
+                "Archivupload benötigt Remoteziel",
+            ))
+        }
+    };
+    let binding = prepared
+        .entry
+        .profile_bindings
+        .iter()
+        .find(|binding| binding.protocol == protocol)
+        .ok_or_else(|| {
+            AppError::new(
+                "replan_required",
+                "Dieser Upload besitzt kein gespeichertes Zielprofil für die Oberfläche",
+            )
+        })?;
+    let value = serde_json::json!({"provider":protocol.as_str(),"root":target.root(),"profileId":binding.profile_id,"profileRevision":binding.revision});
+    Ok(ProviderFileRequest {
+        kind: "copy".into(),
+        source: BidirectionalEndpointRequest::Local {
+            root: prepared.source.path().to_string_lossy().into_owned(),
+        },
+        target: serde_json::from_value(value)
+            .map_err(|error| AppError::new("invalid_input", error.to_string()))?,
+        items: prepared
+            .source
+            .items()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        destination: target.root().to_owned(),
+        generated_operation_id: None,
+    })
+}
+
 fn prepare_provider_file_request(
     app: &tauri::AppHandle,
     window: &WebviewWindow,
@@ -570,6 +673,26 @@ fn prepare_provider_file_request(
     confirmation: Option<FilePreparationConfirmation<'_>>,
 ) -> Result<PreparedProviderFileRequest, AppError> {
     file_preparation_not_cancelled(cancel)?;
+    if request.generated_operation_id.is_some() {
+        validate_generated_file_request(request)?;
+    }
+    let window_state = state.window(window.label());
+    let queue = crate::operation_queue(app, &window_state, window.label())?;
+    let generated = request
+        .generated_operation_id
+        .as_ref()
+        .map(|id| {
+            queue
+                .prepare_generated_upload(id, cancel)
+                .map_err(AppError::from)
+        })
+        .transpose()?;
+    let bound_request = generated
+        .as_ref()
+        .map(|prepared| bind_generated_file_request(request, prepared))
+        .transpose()?;
+    let request = bound_request.as_ref().unwrap_or(request);
+
     let kind = file_kind(&request.kind)?;
     let overwrite = confirmation.as_ref().is_some_and(|value| value.overwrite);
     let skip_conflicts_confirmed = confirmation
@@ -586,13 +709,7 @@ fn prepare_provider_file_request(
     }
     let requested_items = request.items.iter().map(PathBuf::from).collect::<Vec<_>>();
     if request.source.provider_kind() == ProviderKind::Sftp {
-        if request.target.provider_kind() != ProviderKind::Local || kind != FileQueueKind::Copy {
-            return Err(AppError::new(
-                "unsupported",
-                "SFTP-Inhalte erlauben nur additive Downloads in ein lokales Ziel",
-            ));
-        }
-        doppeldecker_core::sftp::validate_interactive_content_selection(
+        doppeldecker_core::sftp::validate_interactive_write_selection(
             Path::new(request.source.root()),
             &requested_items,
         )
@@ -626,6 +743,9 @@ fn prepare_provider_file_request(
         &sandbox_root()?,
     )
     .map_err(AppError::from)?;
+    if let Some(prepared) = &generated {
+        prepared.source.ensure_current()?;
+    }
     let ((source, source_queue, source_profiles), (target, target_queue, target_profiles)) =
         resolve_validated_registry_pair(
             &request.source,
@@ -635,8 +755,6 @@ fn prepare_provider_file_request(
         )?;
     let profile_bindings =
         crate::queue_runtime::merge_profile_bindings([source_profiles, target_profiles]);
-    let window_state = state.window(window.label());
-    let queue = crate::operation_queue(app, &window_state, window.label())?;
     let source = queue
         .bind_provider_preparation_with_cancel(&source, cancel)
         .map_err(AppError::from)?;
@@ -647,7 +765,7 @@ fn prepare_provider_file_request(
         .validate_interactive_file_transfer(&target, kind == FileQueueKind::Move, overwrite)
         .map_err(AppError::from)?;
     let doppeldecker_core::InteractiveFileContexts {
-        source_vfs,
+        mut source_vfs,
         target_vfs,
         target_capabilities: target_capabilities_override,
     } = source
@@ -659,6 +777,10 @@ fn prepare_provider_file_request(
             cancel,
         )
         .map_err(AppError::from)?;
+    if let Some(prepared) = &generated {
+        prepared.source.ensure_current()?;
+        source_vfs = std::sync::Arc::new(prepared.source.read_vfs(cancel)?);
+    }
     let source_tree = source_vfs
         .interactive_source_tree()
         .map_err(AppError::from)?;
@@ -722,8 +844,13 @@ fn prepare_provider_file_request(
         &conflicts,
     )
     .map_err(AppError::from)?;
+    let source_label = generated
+        .as_ref()
+        .and_then(|prepared| prepared.entry.generated_source.as_ref())
+        .map(generated_upload_source_label)
+        .unwrap_or_else(|| file_endpoint_label(&source_queue));
     for conflict in &mut conflict_details {
-        conflict.source.endpoint = file_endpoint_label(&source_queue);
+        conflict.source.endpoint = source_label.clone();
         conflict.target.endpoint = file_endpoint_label(&target_queue);
     }
     let prepared_target = source
@@ -745,20 +872,12 @@ fn prepare_provider_file_request(
     let skip_only = prepared_target.skip_only;
     let source_removal_required = prepared_target.source_removal_required;
     let same_namespace_move = prepared_target.rename_only;
-    let mut target_capabilities = prepared_target.capabilities.unwrap_or_else(|| {
+    let target_capabilities = prepared_target.capabilities.unwrap_or_else(|| {
         same_namespace_rename_capabilities(
             target.kind(),
             vec!["Ersetzen ist für den No-Replace-Rename-Schnellweg nicht erlaubt".into()],
         )
     });
-    if source.kind() == ProviderKind::Sftp {
-        target_capabilities.replace = false;
-        target_capabilities.replace_best_effort = false;
-        target_capabilities.blockers.push(
-            "SFTP-Inhaltsdownloads sind ausschließlich additiv; vorhandene Ziele bleiben erhalten"
-                .into(),
-        );
-    }
     let target_transfer_available =
         target_capabilities.copy_new || target_capabilities.copy_new_best_effort;
     let selected_replacement_available =
@@ -804,6 +923,9 @@ fn prepare_provider_file_request(
     crate::queue_runtime::ensure_profile_bindings_current(app, &profile_bindings)?;
     file_preparation_not_cancelled(cancel)?;
     Ok(PreparedProviderFileRequest {
+        items: request.items.clone(),
+        destination: request.destination.clone(),
+        generated_previous: generated.map(|prepared| prepared.entry),
         kind,
         source: source_queue,
         target: target_queue,
@@ -884,10 +1006,9 @@ pub(crate) async fn check_provider_file_operation(
 ) -> Result<ProviderFilePreview, AppError> {
     let worker_app = app.clone();
     let window_state = app.state::<AppState>().window(window.label());
-    if choice
-        .as_ref()
-        .is_some_and(|value| !["skip", "overwrite", "both"].contains(&value.policy.as_str()))
-    {
+    if choice.as_ref().is_some_and(|value| {
+        !["skip", "overwrite", "both", "inspect"].contains(&value.policy.as_str())
+    }) {
         return Err(AppError::new(
             "invalid_input",
             "Unbekannte Konfliktentscheidung",
@@ -900,10 +1021,8 @@ pub(crate) async fn check_provider_file_operation(
     };
     tauri::async_runtime::spawn_blocking(move || {
         let state = worker_app.state::<AppState>();
-        // Die erste FTPS-Konfliktvorschau bleibt passiv. Erst die am Fenster und
-        // Snapshot gebundene Entscheidung erlaubt ihre benötigten Teilproben.
-        // Auch diese Phase hält dieselbe Single-Flight-/Abbruchschranke; andere
-        // Fenster behalten ihre eigene Queue und Vorbereitung.
+        // Metadaten erscheinen zuerst; vollständige Belege und Aliasnamen
+        // ergänzen denselben Dialog ohne mutierende Fähigkeitsproben.
         let mut prepared = with_provider_file_preparation(
             &app,
             &window,
@@ -922,7 +1041,7 @@ pub(crate) async fn check_provider_file_operation(
                     id: Some(&value.id),
                     overwrite: value.policy == "overwrite",
                     skip_conflicts: value.policy == "skip",
-                    prepare_aliases: value.policy == "both",
+                    prepare_aliases: matches!(value.policy.as_str(), "both" | "inspect"),
                 });
                 prepare_provider_file_request(&app, &window, &state, &request, cancel, confirmation)
             },
@@ -1030,6 +1149,7 @@ pub(crate) async fn enqueue_provider_file_operation(
             let keep_both_targets = bound_file_choices(&window_state, &key, request.keep_both_preparation_id.as_deref())?;
             if request.overwrite && !keep_both_targets.is_empty() { return Err(AppError::new("invalid_input", "Beide behalten darf nicht überschreiben")); }
             let PreparedProviderFileRequest {
+                items, destination, generated_previous,
                 kind,
                 source,
                 target,
@@ -1104,8 +1224,8 @@ pub(crate) async fn enqueue_provider_file_operation(
                     kind,
                     source,
                     target,
-                    items: request.operation.items.clone(),
-                    destination: request.operation.destination.clone(),
+                    items,
+                    destination,
                     overwrite: request.overwrite,
                     expected_conflicts: expected,
                     source_tree_expected: preview.source_tree.clone().map(Box::new),
@@ -1121,13 +1241,13 @@ pub(crate) async fn enqueue_provider_file_operation(
                     replace_best_effort_expected: request.replace_best_effort_expected,
                     remove_source_best_effort_expected,
                 };
-                crate::queue_runtime::enqueue_operation_with_profile_bindings(
-                    &app,
-                    &window_state,
-                    label,
-                    &operation,
-                    &profile_bindings,
-                )
+                if let Some(previous) = generated_previous {
+                    let queue = crate::operation_queue(&app, &window_state, label)?;
+                    let entry = queue.resume_generated_upload(&previous, operation, profile_bindings, cancel)?;
+                    Ok((queue,entry))
+                } else {
+                    crate::queue_runtime::enqueue_operation_with_profile_bindings(&app, &window_state, label, &operation, &profile_bindings)
+                }
             })?;
             emit_queue_snapshot(&app, label, &queue);
             Ok(entry.operation_id)
@@ -1644,8 +1764,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn erzeugte_konfliktquelle_zeigt_herkunft_statt_internem_cachepfad() {
+        use doppeldecker_core::generated_source::{GeneratedSourceKind, GeneratedSourceReference};
+        let mut reference:GeneratedSourceReference=serde_json::from_value(serde_json::json!({"id":"generated-00000000000000000000000000000000","manifest_digest":vec![9;32],"kind":"zip","label":"Ergebnis.zip","files":1,"directories":0,"bytes":42,"issues":[]})).unwrap();
+        assert_eq!(
+            generated_upload_source_label(&reference),
+            "Erzeugtes ZIP · Ergebnis.zip"
+        );
+        reference.kind = GeneratedSourceKind::ZipExtraction;
+        assert_eq!(
+            generated_upload_source_label(&reference),
+            "Entpackte Auswahl · Ergebnis.zip"
+        );
+    }
+
+    #[test]
+    fn erzeugter_upload_akzeptiert_camelcase_id_aber_keine_frontend_pfade() {
+        let value = serde_json::json!({"kind":"copy","source":{"provider":"local","root":""},"target":{"provider":"local","root":""},"items":[],"destination":"","generatedOperationId":"operation-id"});
+        let request: ProviderFileRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            request.generated_operation_id.as_deref(),
+            Some("operation-id")
+        );
+        validate_generated_file_request(&request).unwrap();
+        for field in [
+            "kind",
+            "source",
+            "target",
+            "items",
+            "destination",
+            "generatedOperationId",
+        ] {
+            let mut changed = value.clone();
+            changed[field] = match field {
+                "kind" => serde_json::json!("move"),
+                "source" | "target" => serde_json::json!({"provider":"local","root":"/injected"}),
+                "items" => serde_json::json!(["/injected/file"]),
+                "destination" => serde_json::json!("/injected"),
+                _ => serde_json::json!(""),
+            };
+            let request: ProviderFileRequest = serde_json::from_value(changed).unwrap();
+            assert_eq!(
+                validate_generated_file_request(&request).unwrap_err().code,
+                "invalid_input"
+            );
+        }
+    }
+
+    #[test]
     fn ordnervertrag_deserialisiert_pane_endpunkt_und_liefert_die_frontend_schreibweise() {
-        for (provider, expected) in [("webdav", Some("best_effort")), ("sftp", None)] {
+        for (provider, expected) in [
+            ("webdav", Some("best_effort")),
+            ("sftp", Some("best_effort")),
+        ] {
             let endpoint = serde_json::from_value(serde_json::json!({"provider":provider,"profileId":"nur-test","profileRevision":1,"root":"/pane"})).unwrap();
             let value = serde_json::to_value(provider_folder_contract(endpoint)).unwrap();
             assert_eq!(value["execution_class"].as_str(), expected);

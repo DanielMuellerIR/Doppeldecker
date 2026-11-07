@@ -1,4 +1,65 @@
-# FTP-/FTPS-STOU: Transportabschluss und Probenreste
+# FTP-/FTPS: gewöhnliche Wirkungen und STOU-Transport
+
+Stand: 2026-10-23. Gewöhnliche Dateiaktionen ermitteln ihre Wirkungsklasse ohne
+künstliche MKD-, STOU-, Rename- oder Löschprobe. mkdir führt die echte Anlage mit
+frischem Kollisionslisting und Readback aus. Dateiübertragung verwendet die echte
+STOU-Tempdatei, den vorhandenen Transportabschluss und Inhaltsreadback; anschließend
+folgt genau ein RNFR/RNTO. Unbelegte No-Replace-Semantik wird als Best Effort
+benannt. Eine bestätigte Ersetzung darf die Altversion dauerhaft verwerfen.
+
+Gewöhnliches dauerhaftes Löschen benötigt keine Quarantäne. Ein vollständiger
+Löschplan bindet Auswahl, Umfang und Server-/Rootidentität. Direkt vor jeder
+Blatt-/Leerordnerentfernung werden Typ, Bestand und verfügbare Tokens geprüft.
+DELE/RMD können keinen Objekt-Token atomar bis in die Wirkung tragen. Ein später
+Name-/Elternwechsel bleibt daher akzeptiertes Best-Effort-Risiko; fehlende
+Wiederherstellung ist Teil der Entscheidung. Ein vollständiges Elternlisting
+muss nach der Antwort die Abwesenheit bestätigen.
+
+Private Queueowner, gebundene Pane-Roots und Sitzungsgenerationen bleiben erhalten.
+Vor jeder echten MKD-/STOU-/Rename-/Löschwirkung entsteht ein dauerhafter Intent.
+Unbekannte STOU-Namen, unvollständige Übertragungen und verlorene Antworten bleiben
+sichtbare Prüfbestände. Mutationen werden nie blind wiederholt. Normale
+Copy-/Move-/Replace-Aufrufe im CLI verlangen keine zusätzliche Routinephrase;
+große dauerhafte Löschungen über 1000 Einträge oder 10 GiB behalten eine exakte
+Wirkungsphrase. Strikte Sync-/Restoreproben bleiben getrennt und werden durch die
+gewöhnliche Freigabe weder entfernt noch still als bewiesen behandelt.
+
+Der künstliche FTP-/TLS-Transporttest
+`gewoehnliche_ftps_wirkungen_brauchen_keine_kuenstlichen_proben` belegt echte Anlage,
+Kollision, Ersetzung und rekursives Löschen ohne globale Capabilityfreigabe.
+Die nachfolgenden Abschnitte dokumentieren frühere, probegebundene Ausbaustände.
+
+## Additive lokale Kopien und Namensgruppen
+
+Seit 2026-10-23 lassen gewöhnliche additive Kopien aus lokalen Panes nach FTP
+und FTPS vollständige möglicherweise gleichwertige Case-/NFC-Namensgruppen aus.
+Das gilt für direkte Mehrfachauswahlen und für Kinder ausgewählter Ordner.
+Unabhängige Dateien und Ordner bleiben übertragbar. Ein ausgelassener Ordner
+wird nicht rekursiv gelesen; die Bilanz benennt seine ganze Gruppe pfadgenau.
+Ein identischer Quellpfad in mehrfacher Auswahl bleibt ungültig.
+
+Die vorhandene lokale Uploadbindung hält den beobachteten Bestand einschließlich
+ausgelassener Mitglieder. Direkte Gruppenmitglieder bleiben an lokale Identität
+und hochauflösende mtime/ctime gebunden; eine Änderung nach dem ersten Commit
+stoppt weitere Dateiwirkungen. Ausgelassene Kinder einer Baumgruppe bleiben an
+die beobachteten Listingdaten mit Identität, Größe und sekundengenauer mtime
+gebunden. Inhaltliche Änderungen bei identischen beobachteten Belegen werden
+damit nicht vollständig erkannt. Die persistente Queue vergleicht den Umfang
+beim Wiederanlauf frisch; auch eine erst danach entstandene Gruppe verlangt eine
+neue Umfangsbestätigung, bevor ein Ziel verändert wird.
+
+Nur tatsächlich beobachtete Namensgruppen aktivieren diese gebundene Quellsicht.
+Auswahlen ohne solche Gruppen behalten ihre bisherige Inhaltsklasse und Bilanz;
+Vorbereitungs-, Stat- und Abbruchfehler bleiben sichtbar. Move, Ersetzen,
+Downloads und andere Zielprovider übernehmen dadurch keine zusätzliche Freigabe.
+FTP und explizites FTPS behalten ihren jeweiligen Transportstatus und den
+bestehenden Best-Effort-Commit mit Temptransfer und Inhaltsreadback.
+
+## Historischer Stand bis 2026-10-18
+
+Frühere Aussagen über eine Probe als Voraussetzung gewöhnlicher mkdir-, Rename-,
+Upload- oder Löschaktionen sind durch den vorstehenden Vertrag ersetzt. Die
+Transport- und Recoverygegenbelege bleiben als Historie erhalten.
 
 Stand: 2026-10-18.
 

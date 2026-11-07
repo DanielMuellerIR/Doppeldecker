@@ -1,11 +1,18 @@
+import { createdDirectoryDaclReportHtml, createdDirectoryBeforeChildrenPendingHtml } from "./created-directory-dacl-effects.js";
+import { fileDaclReportHtml } from "./file-dacl-effects.js";
+import { directoryDaclReportHtml } from "./directory-dacl-effects.js";
+import { directoryStreamReportHtml } from "./directory-stream-effects.js";
+import { archiveExtractSourceLabel, archiveExtractFailureMessage, archiveExtractScope, archiveExtractSummary, confirmArchiveExtractPreview } from "./archive-extract-ui.js";
+import { archivePackSummary, confirmArchivePackPreview, bindArchivePackPages, archiveIssuesHtml } from "./archive-pack-ui.js";
 import {
   cancelOwnedModal,
   confirmModal,
   hideModal,
-  promptModal,
   showLatestOwnedModal,
+  showOwnedModal,
 } from "./modal.js";
 import { invoke } from "./tauri-api.js";
+import { confirmContentSync } from "./content-sync-ui.js";
 import { confirmLocalSync } from "./local-sync-ui.js";
 import { $, escapeHtml, fmtTransferBytes } from "./ui-utils.js";
 
@@ -21,24 +28,65 @@ const STATE_LABELS = {
 };
 const LEGACY_UNBOUND_WEBDAV_ETAG = "__doppeldecker_legacy_unbound__";
 
+function renameCycleRecoveryHtml(operation) {
+  if (operation.type !== "RenameCycleRecovery") return "";
+  const record = operation.record;
+  const names = record.old_names.map((name, index) => {
+    const current = record.pending?.member === index
+      ? `${JSON.stringify(record.pending.from)} oder ${JSON.stringify(record.pending.to)} (Ausgang unklar)`
+      : JSON.stringify(record.current_names[index]);
+    return `${JSON.stringify(name)} → Ziel ${JSON.stringify(record.new_names[index])}; letzter Stand: ${current}`;
+  }).join("\n");
+  return `<details class="queue-cycle-details"><summary>Namenslage · ${record.old_names.length} Einträge</summary>
+    <p>Letzter bestätigter Stand; nach einem Abbruch vor Ort prüfen. Zwischenname: <code>${escapeHtml(record.temp_name)}</code></p>
+    <textarea readonly rows="4" aria-label="Gespeicherte Namenslage des Dateinamenzyklus">${escapeHtml(names)}</textarea></details>`;
+}
+
 function legacyWebdavDelete(entry) {
   return entry.operation?.type === "ProviderDelete"
     && entry.operation.expected_plan?.root_identity?.identity?.root_etag
       === LEGACY_UNBOUND_WEBDAV_ETAG;
 }
 
-function endpointLabel(endpoint) {
+function endpointLabel(endpoint, includeServer = false) {
   if (!endpoint) return "?";
   const provider = endpoint.provider === "Local"
     ? "Lokal"
     : endpoint.provider === "Ftps" && endpoint.connection?.transport_security === "plaintext"
       ? "FTP"
-      : endpoint.provider;
-  return `${provider} · ${endpoint.root}`;
+      : ({ Sftp: "SFTP", Ftps: "FTPS", WebDav: "WebDAV", Smb: "SMB" }[endpoint.provider] || endpoint.provider);
+  const connection = endpoint.connection;
+  const server = includeServer && connection ? connection.origin || `${connection.host || ""}${connection.port ? `:${connection.port}` : ""}${connection.share ? `/${connection.share}` : ""}` : "";
+  return `${provider}${server ? ` · ${server}` : ""} · ${endpoint.root}`;
 }
 
+function archiveOperation(entry) {
+  return entry.operation.type === "ArchiveUpload" ? entry.operation.generation : entry.operation;
+}
 function operationLabel(entry) {
   const operation = entry.operation;
+  if (operation.type === "RenameCycleRecovery") {
+    const record = operation.record;
+    const server = record.identity.identity?.server;
+    const provider = record.identity.provider === "Ftps"
+      ? server?.transport_security === "plaintext" ? "FTP" : "FTPS"
+      : ({ Sftp: "SFTP", Smb: "SMB", WebDav: "WebDAV" }[record.identity.provider] || record.identity.provider);
+    const serverLabel = server?.origin || `${server?.host || ""}${server?.port ? `:${server.port}` : ""}${server?.share ? `/${server.share}` : ""}`;
+    return `${record.finished ? "Dateinamenzyklus abgeschlossen" : "Entfernten Namenstausch prüfen"} · ${provider} · ${serverLabel} · ${record.root}`;
+  }
+  if (operation.type === "ArchiveUpload") {
+    return `${operation.generation.kind === "pack" ? "ZIP erstellen" : "ZIP entpacken"} und hochladen → ${endpointLabel(operation.target,true)}`;
+  }
+  if (entry.generated_source) {
+    return `${entry.generated_source.kind === "zip" ? "ZIP erstellt" : "ZIP lokal entpackt"} · Upload ${entry.generated_source.label} → ${endpointLabel(operation.target,true)}`;
+  }
+  if (operation.type === "ArchiveExtract") {
+    const preview = (entry.attention?.type === "ArchiveExtractChanged" ? entry.attention.current : operation.expected).preview;
+    return `ZIP entpacken · ${archiveExtractScope(preview)} · ${archiveExtractSourceLabel(preview)} → ${operation.request.target_dir}${preview.relative_root ? ` · Zielname: ${preview.relative_root}` : ""}`;
+  }
+  if (operation.type === "ArchivePack") {
+    return `ZIP erstellen · ${operation.request.options.compression === "stored" ? "Stored" : "Deflate"} · ${operation.expected.preview.target}`;
+  }
   if (operation.type === "FtpsRecovery") {
     const identity = operation.identity;
     const provider = identity.server.transport_security === "plaintext" ? "FTP" : "FTPS";
@@ -61,11 +109,11 @@ function operationLabel(entry) {
     return `${mode} · ${operation.expected_plan.items.length} Auswahl(en) · ` +
       `${operation.expected_plan.entries} Objekte · ${endpointLabel(operation.endpoint)}`;
   }
-  if (operation.type === "Bidirectional") {
-    return `Bidirektional · ${operation.pair_name} · ${endpointLabel(operation.left)} ↔ ${endpointLabel(operation.right)}`;
+  if (["Bidirectional", "BidirectionalForward"].includes(operation.type)) {
+    return `Bidirektional${operation.type === "BidirectionalForward" ? " · Best Effort" : ""} · ${operation.pair_name} · ${endpointLabel(operation.left)} ↔ ${endpointLabel(operation.right)}`;
   }
-  if (operation.type === "ProviderSync") {
-    return `Provider ${operation.options.mode} · ${endpointLabel(operation.source)} → ${endpointLabel(operation.target)}`;
+  if (["ProviderSync", "ContentSync"].includes(operation.type)) {
+    return `${operation.type === "ContentSync" ? "Dateisync" : "Provider"} ${operation.options.mode} · ${endpointLabel(operation.source)} → ${endpointLabel(operation.target)}`;
   }
   const plan = operation.expected_plan;
   let provider = {
@@ -99,6 +147,8 @@ export function createQueueUi({
   showError,
   startFileProgress,
   startSyncProgress,
+  resumeGeneratedUpload,
+  showGeneratedSource,
 }) {
   let snapshot = { revision: 0, paused: false, stop_on_error: false, entries: [] };
   let activeOperationId = null;
@@ -127,22 +177,29 @@ export function createQueueUi({
     $("#queue-count").textContent = queueErrorActive() ? "!" : String(count);
     $("#btn-queue").title = `${count} offene/zu prüfende Operation(en) · ${next.paused ? "pausiert" : "aktiv"}`;
 
-    const active = next.entries.find(entry => entry.state === "Running");
-    const activeRun = active ? `${active.operation_id}/${active.attempts || 0}` : null;
+    const active = next.entries.find(entry => entry.state === "Running"
+      || entry.state === "Validating" && ["ArchivePack", "ArchiveExtract", "ArchiveUpload"].includes(entry.operation.type));
+    const activeRun = active ? `${active.operation_id}/${active.attempts || 0}/${active.operation.type}` : null;
     if (active && activeRun !== activeOperationId && !realRunActive()) {
       activeOperationId = activeRun;
       const context = { operationId: active.operation_id, attempt: active.attempts || 0 };
       // Alle einseitigen Sync-Provider verwenden dieselbe Plan-/Fortschrittsanzeige.
       // SMB fehlte früher in dieser Matrix und erschien dadurch fälschlich als Move.
-      if (["Sync", "LocalSync", "SftpSync", "FtpsSync", "WebDavSync", "SmbSync", "ProviderSync"].includes(active.operation.type)) {
-        startSyncProgress(active.operation.expected_plan, { ...context, localExecution: active.operation.execution_hint, simulated: active.operation.type === "Sync" && !active.operation.sandbox });
-      } else if (active.operation.type === "Bidirectional") {
+      if (["Sync", "LocalSync", "SftpSync", "FtpsSync", "WebDavSync", "SmbSync", "ProviderSync", "ContentSync"].includes(active.operation.type)) {
+        startSyncProgress(active.operation.expected_plan, { ...context, localExecution: active.operation.execution_hint, bestEffort: active.operation.type === "ContentSync", simulated: active.operation.type === "Sync" && !active.operation.sandbox });
+      } else if (["Bidirectional", "BidirectionalForward"].includes(active.operation.type)) {
         // Der bidirektionale Eintrag besitzt zwei Teilpläne statt eines
         // `expected_plan`. Bis zum ersten Progress-Event zeigen wir deshalb einen
         // neutralen Starttext und niemals fälschlich „Verschieben“.
-        startFileProgress("Bidirektionaler Sync aus Queue …", context);
+        startFileProgress(active.operation.type === "BidirectionalForward" ? "Bidirektionaler Sync als Best Effort aus Queue …" : "Bidirektionaler Sync aus Queue …", context);
       } else {
-        if (active.operation.type === "ProviderDelete") {
+        if (active.operation.type === "ArchiveUpload") {
+          startFileProgress(active.operation.generation.kind === "pack" ? "Erstelle ZIP vor dem Upload …" : "Entpacke ZIP vor dem Upload …", context);
+        } else if (active.operation.type === "ArchiveExtract") {
+          startFileProgress(active.state === "Validating" ? "Prüfe ZIP und Entpackziel …" : "Entpacke ZIP aus Queue …", context);
+        } else if (active.operation.type === "ArchivePack") {
+          startFileProgress(active.state === "Validating" ? "Prüfe ZIP-Quellen aus Queue …" : "Erstelle ZIP-Archiv aus Queue …", context);
+        } else if (active.operation.type === "ProviderDelete") {
           // `RemoteDeleteMode` serialisiert snake_case ("quarantine"/"permanent").
           startFileProgress(active.operation.mode === "quarantine"
             ? "Verschiebe in Doppeldecker-Quarantäne …"
@@ -186,7 +243,9 @@ export function createQueueUi({
     const attention = entry.attention
       ? `<div class="quarantine-meta queue-attention">${escapeHtml(entry.error || "Neue Bestätigung nötig")}</div>`
       : entry.error
-        ? `<div class="quarantine-meta queue-attention">${escapeHtml(entry.error)}</div>`
+        ? entry.operation.type === "ArchiveExtract"
+          ? `<div class="quarantine-meta queue-attention">${escapeHtml(archiveExtractFailureMessage(entry.error_code))}</div><details class="operation-error-details"><summary>Vollständiger Entpackfehler</summary><div class="operation-error-body" tabindex="0">${escapeHtml(entry.error)}</div></details>`
+          : `<div class="quarantine-meta queue-attention">${escapeHtml(entry.error)}</div>`
         : "";
     const sourceTree = entry.attention?.type === "SourceTreeChanged"
       ? entry.attention.current_tree : entry.operation.source_tree_expected;
@@ -198,59 +257,94 @@ export function createQueueUi({
     const backupRecovery = retainedBackups.map(path => `<div class="quarantine-meta queue-attention">${backupLabel}: <code>${escapeHtml(path)}</code></div>`).join("");
     const tempRecovery = backupRecovery + (entry.temp_recovery_paths || [])
       .filter(path => !retainedBackups.includes(path))
-      .map(path => `<div class="quarantine-meta queue-attention">Temp-Recoverypfad prüfen, nicht automatisch löschen: <code>${escapeHtml(path)}</code></div>`)
+      .map(path => `<div class="quarantine-meta queue-attention">${(entry.directory_dacl_recovery || entry.file_dacl_recovery || entry.created_directory_dacl_recovery) ? "Prüfpfad der Rechteänderung, nicht automatisch löschen:" : "Temp-Recoverypfad prüfen, nicht automatisch löschen:"} <code>${escapeHtml(path)}</code></div>`)
       .join("");
+    const createdDaclRecovery=entry.created_directory_dacl_recovery === true && ["Failed", "Interrupted"].includes(entry.state);
+    const fileDaclRecovery = entry.file_dacl_recovery === true && ["Failed", "Interrupted"].includes(entry.state);
+    const daclRecovery = entry.directory_dacl_recovery === true && ["Failed", "Interrupted"].includes(entry.state);
+    const hasDaclEffects = [entry.directory_dacl_report, progress.directory_dacl_report, entry.file_dacl_report, progress.file_dacl_report,entry.created_directory_dacl_report,progress.created_directory_dacl_report].some(report => report?.completed?.length || report?.uncertain?.length);
     const pending = entry.state === "Pending";
     const legacyDelete = legacyWebdavDelete(entry);
     const completionMarker = entry.bidirectional_completion_recovery;
-    const completionRecovery = entry.operation.type === "Bidirectional"
+    const completionRecovery = ["Bidirectional", "BidirectionalForward"].includes(entry.operation.type)
       && (entry.state === "Interrupted"
         || (entry.state === "Completed" && completionMarker === "complete")
         || (entry.state === "Cancelled" && completionMarker === "rolled_back"))
       && Boolean(completionMarker);
     const recovery = !completionRecovery
-      && entry.operation.type === "Bidirectional"
+      && ["Bidirectional", "BidirectionalForward"].includes(entry.operation.type)
       && entry.recovery_available === true
       && ["Failed", "Interrupted"].includes(entry.state);
-    const retry = !completionRecovery
+    const retry = !createdDaclRecovery && !daclRecovery && !fileDaclRecovery && !hasDaclEffects && !completionRecovery
       && !recovery
       && !legacyDelete
+      && entry.operation.type !== "ArchiveExtract"
+      && entry.operation.type !== "ArchiveUpload"
+      && entry.operation.type !== "RenameCycleRecovery"
       && entry.error_code !== "outcome_unclear"
       && entry.error_code !== "replan_required"
       && ["Failed", "Cancelled", "Interrupted"].includes(entry.state);
-    const replanRequired = !completionRecovery
+    const replanRequired = !createdDaclRecovery && !daclRecovery && !fileDaclRecovery && !completionRecovery
       && !recovery
       && entry.error_code === "replan_required"
       && entry.state === "Failed";
-    const unclearOutcome = !completionRecovery
+    const unclearOutcome = !createdDaclRecovery && !daclRecovery && !fileDaclRecovery && !completionRecovery
       && !recovery
       && !legacyDelete
+      && entry.operation.type !== "ArchiveExtract"
+      && entry.operation.type !== "ArchiveUpload"
       && entry.error_code === "outcome_unclear"
       && ["Failed", "Interrupted"].includes(entry.state);
     const approve = entry.state === "AwaitingConfirmation";
     // Eine wartende Remote-Vorbereitung hält Permit und Verbindung im Backend und
     // wird über ihren eigenen Weg abgebaut; alle anderen Rückfragen darf der
     // Nutzer hier ablehnen, ohne die Lage zu bestätigen, die er ablehnen will.
-    const discard = approve && (entry.attention?.type !== "RemoteRun" || entry.operation.type === "LocalSync");
+    const discard = approve && (entry.attention?.type !== "RemoteRun" || ["LocalSync", "BidirectionalForward"].includes(entry.operation.type));
     const label = operationLabel(entry);
-    return `<div class="quarantine-row queue-row" data-queue-id="${escapeHtml(entry.operation_id)}">
+    const incompleteNotice = entry.file_incomplete ? `<div class="quarantine-meta queue-attention">Dateiinhalt nicht vollständig übertragen${entry.operation.kind === "Move" ? "; betroffene Quellen erhalten" : ""}.</div>` : "";
+    const archive = archiveOperation(entry);
+    const generated = Boolean(entry.generated_source);
+    const parent = entry.operation.type === "ArchiveUpload";
+    const generatedConflict = generated && approve && entry.attention?.type === "ConflictsChanged" && Boolean(resumeGeneratedUpload);
+    const cycleRecovery = entry.operation.type === "RenameCycleRecovery";
+    return `<div class="quarantine-row queue-row${["ArchivePack", "ArchiveExtract", "ArchiveUpload"].includes(entry.operation.type) || generated ? " queue-archive-row" : ""}${cycleRecovery ? " queue-cycle-row" : ""}" data-queue-id="${escapeHtml(entry.operation_id)}">
       <div class="quarantine-main">
         <div class="quarantine-name" title="${escapeHtml(label)}">${escapeHtml(label)}</div>
-        <div class="quarantine-meta">${STATE_LABELS[entry.state] || entry.state} · Versuch ${entry.attempts}${detail}</div>
-        ${attention}
+        <div class="quarantine-meta">${entry.operation.type === "RenameCycleRecovery" && entry.state === "Interrupted" ? "manuell prüfen" : entry.file_incomplete && entry.state === "Completed" ? "mit Auslassungen abgeschlossen" : STATE_LABELS[entry.state] || entry.state} · Versuch ${entry.attempts}${detail}</div>
+        ${attention}${incompleteNotice}
+        ${generated ? `<div class="quarantine-meta">Lokale ${entry.generated_source.kind === "zip" ? "ZIP-Erzeugung" : "Entpackphase"} abgeschlossen · ${entry.generated_source.files} Datei(en), ${entry.generated_source.directories} Ordner, ${fmtTransferBytes(entry.generated_source.bytes)}. ${entry.state === "Completed" ? "Upload abgeschlossen." : "Upload noch nicht vollständig abgeschlossen."}</div>` : ""}
+        ${parent ? `<div class="quarantine-meta">Zuerst lokal ${archive.kind === "pack" ? "packen" : "entpacken"}, anschließend denselben Zwischenstand hochladen. Der Upload hat noch nicht begonnen.</div>` : ""}
         ${sourceTreeDetail}
-        ${tempRecovery}
+        ${renameCycleRecoveryHtml(entry.operation)}
+        ${entry.operation.type === "ArchivePack" || parent && archive.kind === "pack" ? `<div class="quarantine-meta">${escapeHtml(archivePackSummary((entry.attention?.type === "ArchivePackChanged" ? entry.attention.current : archive.expected).preview))}</div>` : ""}
+        ${entry.operation.type === "ArchiveExtract" || parent && archive.kind === "extract" ? `<div class="quarantine-meta">${escapeHtml(archiveExtractSummary((entry.attention?.type === "ArchiveExtractChanged" ? entry.attention.current : archive.expected).preview))}</div>` : ""}
+        ${entry.archive_extract_report ? `<div class="quarantine-meta queue-attention">Entpackbilanz: ${entry.archive_extract_report.files} Dateien, ${entry.archive_extract_report.directories} neue Ordner, ${entry.archive_extract_report.skipped} übersprungen, ${entry.archive_extract_report.failed} fehlgeschlagen, ${entry.archive_extract_report.unstarted} noch offen (ohne abgeschlossenen Commit). Bereits entpackte Inhalte bleiben erhalten.</div>` : ""}
+        ${directoryStreamReportHtml(entry.directory_stream_report, progress.directory_stream_report)}
+        ${directoryDaclReportHtml(entry.directory_dacl_report, progress.directory_dacl_report)}
+        ${fileDaclReportHtml(entry.file_dacl_report, progress.file_dacl_report)}
+        ${createdDirectoryDaclReportHtml(entry.created_directory_dacl_report, progress.created_directory_dacl_report)}
+        ${createdDirectoryBeforeChildrenPendingHtml(entry.operation, createdDaclRecovery && ![entry.created_directory_dacl_report, progress.created_directory_dacl_report].some(report => report?.created?.length || report?.completed?.length || report?.uncertain?.length))}
+        ${cycleRecovery && tempRecovery ? `<details class="queue-cycle-details"><summary>Vollständige Prüfpfade</summary>${tempRecovery}</details>` : tempRecovery}
       </div>
       <div class="quarantine-actions">
+        ${entry.operation.type === "ArchiveExtract" || parent && archive.kind === "extract" ? '<button class="btn ghost small" data-queue-action="extract-preview">Entpackhinweise</button>' : ""}
+        ${entry.operation.type === "ArchivePack" || parent && archive.kind === "pack" ? '<button class="btn ghost small" data-queue-action="archive-preview">ZIP-Hinweise</button>' : ""}
+        ${generated && entry.generated_source.issues?.length ? '<button class="btn ghost small" data-queue-action="generated-hints">Archivhinweise</button>' : ""}
+        ${(generated || parent) && (entry.state !== "Completed" || entry.temp_recovery_paths?.includes(entry.operation.source?.root)) && showGeneratedSource ? '<button class="btn ghost small" data-queue-action="generated-show">Zwischenstand zeigen</button>' : ""}
+        ${generatedConflict ? '<button class="btn primary small" data-queue-action="generated-conflicts">Konflikte prüfen …</button>' : ""}
         ${pending ? '<button class="btn ghost small" data-queue-action="up" aria-label="Nach oben" title="Nach oben">↑</button><button class="btn ghost small" data-queue-action="down" aria-label="Nach unten" title="Nach unten">↓</button><button class="btn ghost small" data-queue-action="remove">Entfernen</button>' : ""}
+        ${createdDaclRecovery ? '<button class="btn primary small" data-queue-action="created-dacl-recovery">Rechte neuer Ordner prüfen</button>' : ""}
+        ${fileDaclRecovery ? '<button class="btn primary small" data-queue-action="file-dacl-recovery">Objektweite Dateirechte prüfen</button>' : ""}
+        ${daclRecovery ? '<button class="btn primary small" data-queue-action="dacl-recovery">Zugriffsrechte prüfen</button>' : ""}
         ${retry ? '<button class="btn primary small" data-queue-action="retry">Neu prüfen</button>' : ""}
         ${replanRequired ? '<button class="btn danger small" data-queue-action="replan-discard">Altplan verwerfen</button>' : ""}
+        ${["ArchiveExtract", "ArchiveUpload"].includes(entry.operation.type) && ["Failed", "Interrupted"].includes(entry.state) ? '<button class="btn ghost small" data-queue-action="extract-ack">Bilanz geprüft und schließen</button>' : ""}
         ${unclearOutcome ? '<button class="btn danger small" data-queue-action="unclear-ack">Wirkung geprüft und schließen</button>' : ""}
         ${legacyDelete && entry.state === "Failed" ? '<button class="btn danger small" data-queue-action="legacy-ack">Nicht gestarteten Altplan verwerfen</button>' : ""}
         ${legacyDelete && entry.state === "Interrupted" ? '<button class="btn danger small" data-queue-action="legacy-ack">Wirkung geprüft und schließen</button>' : ""}
-        ${recovery ? '<button class="btn danger small" data-queue-action="recovery">Recovery</button>' : ""}
+        ${recovery ? `<button class="btn danger small" data-queue-action="recovery">${entry.operation.type === "BidirectionalForward" ? "Neu abgleichen" : "Recovery"}</button>` : ""}
         ${completionRecovery ? '<button class="btn primary small" data-queue-action="recovery">Abschluss prüfen</button>' : ""}
-        ${approve ? '<button class="btn danger small" data-queue-action="approve">Plan bestätigen</button>' : ""}
+        ${approve && !generatedConflict ? '<button class="btn danger small" data-queue-action="approve">Plan bestätigen</button>' : ""}
         ${discard ? '<button class="btn ghost small" data-queue-action="discard">Verwerfen</button>' : ""}
       </div>
     </div>`;
@@ -316,8 +410,9 @@ export function createQueueUi({
     if (restoreFocus) $("#btn-queue").focus();
   }
 
-  async function open() {
-    if (!$("#queue-popover").hidden) {
+  async function open(operationId = null) {
+    operationId = typeof operationId === "string" ? operationId : null;
+    if (!$("#queue-popover").hidden && !operationId) {
       close();
       return;
     }
@@ -329,7 +424,10 @@ export function createQueueUi({
     renderPopover();
     $("#queue-popover").hidden = false;
     $("#btn-queue").setAttribute("aria-expanded", "true");
-    $("#queue-popover-close").focus();
+    const row = operationId ? [...$("#queue-popover").querySelectorAll("[data-queue-id]")]
+      .find(candidate => candidate.dataset.queueId === operationId) : null;
+    if (row) row.scrollIntoView({ block: "nearest" });
+    (row?.querySelector("button") || $("#queue-popover-close")).focus({ preventScroll: true });
   }
 
   async function handleRowAction(event) {
@@ -346,6 +444,46 @@ export function createQueueUi({
       rowIndex: [...$("#queue-popover").querySelectorAll("[data-queue-id]")].indexOf(row),
     };
     let succeeded = false;
+    if (selectedAction === "generated-hints") {
+      await new Promise(resolve => showOwnedModal("generated-source-hints", token => {
+        $("#modal .modal").classList.add("archive-pack-modal");
+        $("#modal-title").textContent = "Archivhinweise";
+        const body = $("#modal-body"); body.innerHTML = `<p>${escapeHtml(entry.generated_source.label)}</p>` + archiveIssuesHtml("Vollständige Archivhinweise seitenweise");
+        bindArchivePackPages(body, entry.generated_source);
+        const buttons = $("#modal .modal-buttons"); buttons.replaceChildren();
+        const close = document.createElement("button"); close.className = "btn ghost"; close.textContent = "Schließen";
+        const finish = () => { if (hideModal(token)) resolve(); }; close.addEventListener("click", finish); buttons.append(close);
+        return { focusTarget: close, onEscape: finish };
+      }));
+      await restoreAfterQueueModal(selectedFocus); return;
+    }
+    if (selectedAction === "generated-show") {
+      try { await showGeneratedSource(await invoke("generated_source_path", { operationId })); }
+      catch (error) { showError("Zwischenstand", error); }
+      return;
+    }
+    if (selectedAction === "generated-conflicts") {
+      await resumeGeneratedUpload(entry);
+      await refresh(); await restoreAfterQueueModal(selectedFocus); return;
+    }
+    if (selectedAction === "extract-ack") {
+      const parent = entry.operation.type === "ArchiveUpload";
+      const confirmed = await confirmModal(parent ? "Archivzwischenstand geprüft?" : "Entpackbilanz geprüft?", parent
+        ? "Der lokale Zwischenstand bleibt erhalten. Der Upload hat noch nicht begonnen. Bitte Bilanz und Prüfpfade durchsehen; dieser Auftrag wird ohne Wiederholung geschlossen."
+        : "Bereits entpackte Inhalte bleiben erhalten. Bitte Ziel und angezeigte Recoverypfade prüfen. Der Auftrag wird ohne Wiederholung geschlossen; Inhalte ohne abgeschlossenen Commit werden nicht nachträglich entpackt.");
+      if (confirmed) await action("acknowledge_archive_extract_outcome", { operationId, effectsReviewed: true });
+      await restoreAfterQueueModal(selectedFocus); return;
+    }
+    if (selectedAction === "extract-preview") {
+      const binding = entry.attention?.type === "ArchiveExtractChanged" ? entry.attention.current : archiveOperation(entry).expected;
+      await confirmArchiveExtractPreview(binding.preview, { confirm: false, overwrite: archiveOperation(entry).request.options.overwrite, ...(entry.operation.type === "ArchiveUpload" ? {upload:true,targetLabel:endpointLabel(entry.operation.target,true)} : {}) });
+      await restoreAfterQueueModal(selectedFocus); return;
+    }
+    if (selectedAction === "archive-preview") {
+      const binding = entry.attention?.type === "ArchivePackChanged" ? entry.attention.current : archiveOperation(entry).expected;
+      await confirmArchivePackPreview(binding.preview, { confirm: false, ...(entry.operation.type === "ArchiveUpload" ? {upload:true,targetLabel:endpointLabel(entry.operation.target,true)} : {}) });
+      await restoreAfterQueueModal(selectedFocus); return;
+    }
     if (selectedAction === "up" || selectedAction === "down") {
       succeeded = await action("move_queue_entry", {
         operationId,
@@ -357,6 +495,21 @@ export function createQueueUi({
       succeeded = await action("retry_queue_entry", { operationId });
     } else if (selectedAction === "replan-discard") {
       succeeded = await action("discard_replan_required_queue_entry", { operationId });
+    } else if (selectedAction === "created-dacl-recovery") {
+      const confirmed = await confirmModal("Rechte neuer Ordner prüfen und abschließen", "Es werden nur Identität und aktueller Rechtezustand geprüft. Der Eintrag kann nur bei einem bekannten Vorher- oder Nachherzustand geschlossen werden. Doppeldecker setzt keine Rechte erneut, stellt keinen früheren Zustand wieder her und setzt keine Kinderarbeit fort.");
+      if (confirmed) await action("acknowledge_created_directory_dacl_outcome", { operationId, possibleEffectReviewed: true });
+      await restoreAfterQueueModal(selectedFocus); return;
+    } else if (selectedAction === "file-dacl-recovery") {
+      const confirmed = await confirmModal("Objektweite Dateirechte prüfen und abschließen",
+        "Es werden nur Identität und aktueller Rechtezustand geprüft. Der Eintrag kann nur bei einem bekannten Vorher- oder Nachherzustand geschlossen werden. Die Rechteänderung betrifft alle bestehenden und neuen Namen dieses Dateiobjekts, auch außerhalb der ausgewählten Ordner. Die Liste zeigt nur die hier bekannten Namen. Doppeldecker setzt keine Rechte erneut und stellt keinen früheren Zustand wieder her.");
+      if (confirmed) await action("acknowledge_file_dacl_outcome", { operationId, possibleEffectReviewed: true });
+      await restoreAfterQueueModal(selectedFocus); return;
+    } else if (selectedAction === "dacl-recovery") {
+      const confirmed = await confirmModal("Ordnerrechte prüfen und abschließen",
+        "Doppeldecker liest den aktuellen Rechtezustand der gebundenen Ordner frisch. Wenn er einem gespeicherten Vorher- oder Nachherzustand entspricht, wird der Eintrag ohne erneutes Setzen geschlossen. Andere Zustände bleiben zur Prüfung offen.");
+      if (confirmed) await action("acknowledge_directory_dacl_outcome", { operationId, possibleEffectReviewed: true });
+      await restoreAfterQueueModal(selectedFocus);
+      return;
     } else if (selectedAction === "unclear-ack") {
       await acknowledgeUnclearOutcome(entry, selectedFocus);
       return;
@@ -375,7 +528,9 @@ export function createQueueUi({
       });
     } else if (selectedAction === "recovery") {
       close({ restoreFocus: false });
-      await recoverBidirectional(entry);
+      if (entry.operation.type === "BidirectionalForward") {
+        try { await recoverBidirectional(entry); } finally { await restoreAfterQueueModal(selectedFocus); }
+      } else await recoverBidirectional(entry);
       return;
     } else if (selectedAction === "approve") {
       succeeded = await approveEntry(entry, selectedFocus);
@@ -393,9 +548,11 @@ export function createQueueUi({
   }
 
   async function acknowledgeUnclearOutcome(entry, selectedFocus) {
+    const remainingTemp = entry.operation.type === "RenameCycleRecovery"
+      ? " Ein noch vorhandener Zwischenname bleibt erhalten und sperrt weiterhin den davon betroffenen Sync. Erst nach bewusstem Sichern oder Auflösen außerhalb der Sync-Wurzeln wird dieser wieder planbar." : "";
     const confirmed = await confirmModal(
       "Unklaren Ausgang schließen",
-      "Die letzte Mutation kann bereits ganz oder teilweise gewirkt haben. Bestätigen Sie nur, wenn Quelle, Ziel und angezeigte Recoverypfade manuell geprüft wurden. Doppeldecker wiederholt die Operation nicht.",
+      "Die letzte Mutation kann bereits ganz oder teilweise gewirkt haben. Bestätigen Sie nur, wenn Quelle, Ziel und angezeigte Recoverypfade manuell geprüft wurden. Doppeldecker wiederholt die Operation nicht." + remainingTemp,
     );
     if (confirmed) {
       const succeeded = await action("acknowledge_unclear_queue_outcome", {
@@ -410,7 +567,9 @@ export function createQueueUi({
   }
 
   async function discardEntry(entry, selectedFocus) {
-    const earlierAttemptWarning = entry.attempts > 1
+    const earlierAttemptWarning = entry.operation.type === "BidirectionalForward"
+      ? " Die aktuelle Vorbereitung wird verworfen. Bereits ausgeführte Teilwirkungen bleiben erhalten und können einen Neuabgleich erfordern."
+      : entry.attempts > 1
       ? " Dieser Versuch wurde vor seiner ersten Mutation angehalten. Ein früherer Versuch kann Quelle oder Ziel bereits verändert haben; prüfen Sie den sichtbaren Zustand."
       : " In diesem Versuch wurde vor der ersten Mutation nichts geschrieben.";
     const schedulerMessage = snapshot.paused
@@ -435,7 +594,21 @@ export function createQueueUi({
   }
 
   async function approveEntry(entry, selectedFocus) {
-    const attention = entry.attention;
+    const attention = structuredClone(entry.attention);
+    if (entry.operation.type === "BidirectionalForward" && attention?.type === "RemoteRun") {
+      try { return await recoverBidirectional(entry); }
+      finally { await restoreAfterQueueModal(selectedFocus); }
+    }
+    if (entry.operation.type === "ContentSync" && attention?.type === "RemoteRun") {
+      try {
+        const preview = await invoke("content_sync_queue_preview", { operationId: entry.operation_id });
+        const confirmation = await confirmContentSync(preview);
+        if (!confirmation) return false;
+        return await action("approve_content_sync_queue_entry", { operationId: entry.operation_id,
+          preparationDigest: preview.digest, ...confirmation });
+      } catch (error) { showError("Dateisync", error); return false; }
+      finally { await restoreAfterQueueModal(selectedFocus); }
+    }
     if (entry.operation.type === "LocalSync" && attention?.type === "RemoteRun") {
       try {
         const preview = await invoke("local_sync_queue_preview", { operationId: entry.operation_id });
@@ -453,7 +626,36 @@ export function createQueueUi({
         await restoreAfterQueueModal(selectedFocus);
       }
     }
-    const phrase = attention?.confirmation || "";
+    if (attention?.type === "RemoteRun") {
+      const confirmed = await confirmModal("Sync ausführen",
+        `<p>${escapeHtml(operationLabel(entry))}</p><p>${escapeHtml(attention.reason || entry.error || "Frisch geprüften Sync ausführen.")}</p>`);
+      if (!confirmed) {
+        await restoreAfterQueueModal(selectedFocus);
+        return false;
+      }
+      const succeeded = await action(approvalCommand(attention, entry.operation.type), {
+        operationId: entry.operation_id, effectsConfirmed: true,
+      });
+      await restoreAfterQueueModal(selectedFocus);
+      return succeeded;
+    }
+    if (attention?.type === "ArchiveExtractChanged") {
+      if (!attention.current.preview.catalog_complete && !archiveOperation(entry).request.options.allow_partial) {
+        showError("ZIP entpacken", new Error("Das Archiv ist jetzt unvollständig lesbar. Bitte diesen Auftrag verwerfen und den bekannten Teil ausdrücklich neu auswählen."));
+        await restoreAfterQueueModal(selectedFocus); return false;
+      }
+      const confirmed = await confirmArchiveExtractPreview(attention.current.preview, { overwrite: archiveOperation(entry).request.options.overwrite, ...(entry.operation.type === "ArchiveUpload" ? {upload:true,targetLabel:endpointLabel(entry.operation.target,true)} : {}) });
+      if (!confirmed) { await restoreAfterQueueModal(selectedFocus); return false; }
+      const succeeded = await action("approve_queue_entry", { operationId: entry.operation_id, expectedAttention: attention, effectsConfirmed: true });
+      await restoreAfterQueueModal(selectedFocus); return succeeded;
+    }
+    if (attention?.type === "ArchivePackChanged") {
+      const confirmed = await confirmArchivePackPreview(attention.current.preview, entry.operation.type === "ArchiveUpload" ? {upload:true,targetLabel:endpointLabel(entry.operation.target,true)} : {});
+      if (!confirmed) { await restoreAfterQueueModal(selectedFocus); return false; }
+      const succeeded = await action("approve_queue_entry", { operationId: entry.operation_id,
+        expectedAttention: attention, effectsConfirmed: true });
+      await restoreAfterQueueModal(selectedFocus); return succeeded;
+    }
     let description = entry.error || "Die Operation hat sich geändert.";
     if (attention?.type === "PlanChanged") {
       const plan = attention.current_plan;
@@ -468,52 +670,29 @@ export function createQueueUi({
     } else if (attention?.type === "BidirectionalPlanChanged") {
       description += " Baseline, vollständige Bäume oder Konfliktentscheidungen besitzen jetzt einen anderen Digest.";
     }
-    let backupConfirmed = true;
-    // Die semantische ID des angeklickten Knopfs ist stabiler als
-    // `document.activeElement`: Pointer-Aktivierung fokussiert je Plattform nicht
-    // zwingend den Knopf, der den Dialog ausgelöst hat.
-    const backupReturnFocus = selectedFocus || capturePopoverFocus();
-    if (attention?.type === "RemoteRun"
-      && (entry.operation.type === "Bidirectional" || entry.operation.options.mode !== "AddOnly")) {
-      backupConfirmed = await confirmModal(
-        "Unabhängiges Backup bestätigen",
-        "Ich bestätige ein unabhängiges Backup und eine jüngste erfolgreiche Restore-Probe dieses Backups. Doppeldecker hat dieses externe Backup nicht technisch geprüft.",
-      );
-    }
-    if (!backupConfirmed) {
-      // Der Bestätigungsdialog liegt über dem bereits offenen Popover. `open()`
-      // würde es in diesem Fall als Toggle schließen. Ein erneutes Rendern erhält
-      // stattdessen den fachlich gleichen Queue-Knopf und dessen Tastaturfokus.
-      if ($("#queue-popover").hidden) {
-        await open();
-        restorePopoverFocus(backupReturnFocus);
-      } else {
-        renderPopover();
-        restorePopoverFocus(backupReturnFocus);
-      }
+    const title = attention?.type === "SourceTreeChanged" ? "Quellbaumumfang bestätigen"
+      : ["LocalFileCommit", "BestEffortCommitDowngrade"].includes(attention?.type) ? "Best-Effort-Kopie bestätigen"
+      : "Queue-Wirkung bestätigen";
+    const selectedSources = entry.operation.items?.length
+      ? `\nAusgewählte Quellen:\n${entry.operation.items.join("\n")}` : "";
+    const boundSource = typeof entry.operation.source === "string"
+      ? `\nQuelle: ${entry.operation.source}` : "";
+    const confirmed = await confirmModal(title,
+      `<div class="modal-description modal-description-scroll" tabindex="0" role="region" aria-label="Wirkung und Einschränkungen">` +
+        `<p>${escapeHtml(operationLabel(entry))}</p><p>${escapeHtml(description + selectedSources + boundSource)}</p></div>`);
+    if (!confirmed) {
+      await restoreAfterQueueModal(selectedFocus);
       return false;
     }
-    const typed = ["LocalFileCommit", "SourceTreeChanged", "BestEffortCommitDowngrade"].includes(attention?.type)
-      ? await promptModal(attention.type === "SourceTreeChanged" ? "Quellbaumumfang bestätigen" : "Best-Effort-Kopie bestätigen", "", {
-        description,
-        inputLabel: `Exakt „${phrase}“ eingeben`,
-      })
-      : await promptModal(`${description} Exakt „${phrase}“ eingeben`, "");
-    if (typed !== phrase) {
-      showDock(`<span class="pill none">Nicht bestätigt</span>Queue-Eintrag bleibt gesperrt.`, { closable: true });
-      return false;
-    }
-    const command = approvalCommand(attention, entry.operation.type);
-    const succeeded = await action(command, {
+    const succeeded = await action("approve_queue_entry", {
       operationId: entry.operation_id,
-      confirmation: typed,
-      backupConfirmed,
+      expectedAttention: attention,
+      effectsConfirmed: true,
     });
     if (succeeded) {
-      if (attention?.type !== "RemoteRun") {
-        showDock(`<span class="pill ok">Neu bestätigt</span>Der sichtbare Queue-Plan wurde übernommen und wird vor Mutation nochmals geprüft.`, { closable: true });
-      }
+      showDock(`<span class="pill ok">Neu bestätigt</span>Der sichtbare Queue-Plan wurde übernommen und wird vor Mutation nochmals geprüft.`, { closable: true });
     }
+    await restoreAfterQueueModal(selectedFocus);
     return succeeded;
   }
 
@@ -531,7 +710,11 @@ export function createQueueUi({
 
   function warnBeforeExit(value) {
     const generation = ++exitGeneration;
-    const count = Math.max(1, Number(value?.openEntries) || openCount());
+    const unreadable = Array.isArray(value?.unreadableQueues)
+      ? value.unreadableQueues.filter(label => typeof label === "string") : [];
+    const reported = Number(value?.openEntries);
+    const count = Number.isSafeInteger(reported) && reported >= 0
+      ? reported : Math.max(0, openCount());
     const confirmationToken = value?.token;
     if (!confirmationToken) {
       if (exitModalToken) cancelOwnedModal(exitModalToken);
@@ -544,8 +727,9 @@ export function createQueueUi({
       $("#modal .modal").classList.remove("quarantine-modal", "real-mode-modal");
       $("#modal-title").textContent = "Doppeldecker beenden?";
       $("#modal-body").innerHTML =
-        `<p>${count} offene oder zu prüfende Operation(en) liegen in der persistenten Queue.</p>` +
-        "<p>Die Queue bleibt auf diesem Gerät gespeichert. Ein laufender Eintrag wird beim nächsten Start als unterbrochen angezeigt und muss sicher neu geprüft oder wiederhergestellt werden.</p>";
+        (count > 0 ? `<p>${count} offene oder zu prüfende Operation(en) liegen in der persistenten Queue.</p>` +
+          "<p>Die Queue bleibt auf diesem Gerät gespeichert. Ein laufender Eintrag wird beim nächsten Start als unterbrochen angezeigt und muss sicher neu geprüft oder wiederhergestellt werden.</p>" : "") +
+        (unreadable.length ? `<p>Die Queue-Journale dieser Fenster konnten nicht gelesen werden: ${unreadable.map(escapeHtml).join(", ")}. Ihr offener Arbeitsstand ist unbekannt. Die Journaldateien bleiben beim Beenden unverändert erhalten.</p>` : "");
       $("#modal-body").onclick = null;
       const bar = $("#modal .modal-buttons");
       bar.innerHTML = "";

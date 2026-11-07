@@ -250,12 +250,16 @@ den gut auffindbaren Menüeintrag `⌘J` beziehungsweise `Ctrl+J`; der bisherige
 Drei-Linien-Knopf bleibt als pane-eigener Direkteinstieg erhalten. Damit ist auch
 G6 abgeschlossen.
 
+Normale Unix-Rechte ausgewählter lokaler Objekte lassen sich inzwischen im
+Dialog bearbeiten; [Vertrag und offene Paritätsgrenzen](file-properties.md).
+Lokale macOS-Tags sind Teil der offenen [ForkLift-Parität](forklift-parity.md).
+
 ## Bewusst verworfen / verschoben
 
 - SCM-Status: fremder Scope, Performance-Falle, stille Repo-Introspektion.
 - „Zuletzt geöffnet" (atime): auf modernen Systemen (`noatime`/`relatime`)
   systematisch falsch — eine plausibel lügende Spalte ist schlechter als keine.
-- „Hinzugefügt am", Tags: macOS-only-Metadaten; höchstens später als
+- „Hinzugefügt am“: macOS-spezifisches Feld; höchstens später als
   macOS-only-Anzeige.
 - Scope „Dieser Ordner und Unterordner": Vererbungssemantik erst, wenn sich
   per-Ordner-Einstellungen bewährt haben.

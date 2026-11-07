@@ -10,6 +10,10 @@
 #[path = "ftps_transport_tests.rs"]
 mod transport_tests;
 
+#[path = "ftps_read.rs"]
+mod content_read;
+pub(crate) use content_read::FTP_CONTENT_READ_LIMITATION;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -47,6 +51,8 @@ const REQUIRED_MLST_FACTS: &str = "Type;Size;Modify;";
 struct FtpsSession {
     stream: RustlsFtpStream,
     identity: FtpsServerIdentity,
+    read_mlst_facts: Option<String>,
+    mode_facts_selected: bool,
 }
 
 struct ProviderState {
@@ -76,6 +82,8 @@ pub struct FtpsVfs {
     /// gemacht hat. Cleanup darf niemals allein anhand eines Temp-Präfixes löschen.
     owned_files: Arc<Mutex<BTreeSet<String>>>,
     operation: Option<Arc<FtpsOperation>>,
+    ordinary_root: Option<std::path::PathBuf>,
+    content_sync_metadata: bool,
 }
 
 struct FtpsOperation {
@@ -119,6 +127,149 @@ pub struct FtpsInteractiveDirectoryListing {
 }
 
 impl FtpsVfs {
+    pub(crate) fn connection_config(&self) -> &FtpsConnectionConfig {
+        &self.config
+    }
+
+    pub(crate) fn batch_rename_source(
+        &self,
+        path: &Path,
+        cancel: &crate::Cancel,
+    ) -> io::Result<(Entry, [u8; 32])> {
+        if cancel.is_cancelled() {
+            return Err(coded_error(
+                io::ErrorKind::Interrupted,
+                ErrorCode::Interrupted,
+                "FTP-Stapel abgebrochen",
+            ));
+        }
+        let entry = self.stat(path)?;
+        let digest = blake3::hash(&serde_json::to_vec(&entry).map_err(io::Error::other)?);
+        if cancel.is_cancelled() {
+            return Err(coded_error(
+                io::ErrorKind::Interrupted,
+                ErrorCode::Interrupted,
+                "FTP-Stapel abgebrochen",
+            ));
+        }
+        Ok((entry, *digest.as_bytes()))
+    }
+
+    pub(crate) fn batch_rename_parents(
+        &self,
+        root: &Path,
+        cancel: &crate::Cancel,
+    ) -> io::Result<crate::remote_batch_rename::ParentProof> {
+        let root = normalize_virtual_path(root)?;
+        let mut current = std::path::PathBuf::from("/");
+        let mut entries = Vec::new();
+        let paths = std::iter::once(None).chain(
+            Path::new(&root)
+                .components()
+                .filter(|component| matches!(component, Component::Normal(_)))
+                .map(Some),
+        );
+        for component in paths {
+            if let Some(component) = component {
+                current.push(component.as_os_str());
+            }
+            let (entry, full) = self.batch_rename_source(&current, cancel)?;
+            if !entry.is_dir || entry.is_symlink {
+                return Err(crate::real_mode::plan_drift(
+                    "FTP-Stapeleltern sind kein regulärer Ordner",
+                ));
+            }
+            // Nur erwartbare Größe/Zeit des selbst umbenannten Paneordners dürfen
+            // nach einem belegten Erfolg nachgeführt werden; andere Fakten bleiben.
+            let stable = blake3::hash(
+                &serde_json::to_vec(&(
+                    &entry.name,
+                    entry.is_dir,
+                    entry.is_file,
+                    entry.is_symlink,
+                    entry.created,
+                    &entry.owner,
+                    &entry.group,
+                    entry.mode,
+                ))
+                .map_err(io::Error::other)?,
+            );
+            entries.push((
+                current.to_string_lossy().into_owned(),
+                full,
+                *stable.as_bytes(),
+            ));
+        }
+        Ok(crate::remote_batch_rename::ParentProof { entries, root })
+    }
+
+    /// Eigene gewöhnliche Sicht: echte Tempwirkung statt künstlicher Probe.
+    /// Globale und strikte Syncfähigkeiten werden dadurch nicht verändert.
+    pub(crate) fn ordinary_mutations(&self, root: &Path) -> io::Result<Arc<dyn Vfs>> {
+        let mut value = self.clone();
+        value.ordinary_root = Some(Path::new(&normalize_virtual_path(root)?).to_path_buf());
+        value.check_ordinary_path(root, false)?;
+        Ok(Arc::new(value))
+    }
+
+    /// Nur gewöhnlicher Inhaltssync versucht MFMT und SITE CHMOD am echten Ziel.
+    /// FEAT ist kein Wirkungsbeleg; die jeweilige Metadatenklasse zählt erst nach
+    /// exaktem Readback. Globale und strikte Providerfähigkeiten bleiben unverändert.
+    pub(crate) fn content_sync_mutations(&self, root: &Path) -> io::Result<Arc<dyn Vfs>> {
+        let mut value = self.clone();
+        value.ordinary_root = Some(Path::new(&normalize_virtual_path(root)?).to_path_buf());
+        value.content_sync_metadata = true;
+        value.check_ordinary_path(root, false)?;
+        Ok(Arc::new(value))
+    }
+
+    pub(crate) fn ordinary_preparation_ready(&self) -> io::Result<()> {
+        if self.operation.is_some() {
+            self.check_preparation_cancel()?;
+        }
+        Ok(())
+    }
+
+    fn check_ordinary_path(&self, path: &Path, mutation: bool) -> io::Result<()> {
+        let Some(root) = &self.ordinary_root else {
+            return Ok(());
+        };
+        let normalized = normalize_virtual_path(path)?;
+        let path = Path::new(&normalized);
+        if !path.starts_with(root) || (mutation && path == root) {
+            return Err(invalid(
+                "FTP-/FTPS-Wirkung liegt außerhalb des gewählten Roots",
+            ));
+        }
+        if mutation {
+            self.operation()?;
+        }
+        let parent = if mutation {
+            path.parent().unwrap_or(root)
+        } else {
+            path
+        };
+        let mut current = root.clone();
+        for component in
+            std::iter::once(None).chain(parent.strip_prefix(root).unwrap().components().map(Some))
+        {
+            if let Some(component) = component {
+                current.push(component.as_os_str());
+            }
+            let entry = self.stat(&current)?;
+            if !entry.is_dir || entry.is_symlink {
+                return Err(crate::real_mode::plan_drift(
+                    "FTP-/FTPS-Elternpfad ist kein echter Ordner mehr",
+                ));
+            }
+        }
+        if mutation {
+            self.operation().map(|_| ())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn connect(
         config: FtpsConnectionConfig,
         secrets: Arc<dyn SecretResolver>,
@@ -142,6 +293,8 @@ impl FtpsVfs {
             reconnect: Arc::new(Mutex::new(())),
             owned_files: Arc::new(Mutex::new(BTreeSet::new())),
             operation: None,
+            ordinary_root: None,
+            content_sync_metadata: false,
         })
     }
 
@@ -211,6 +364,10 @@ impl FtpsVfs {
 
     fn operation(&self) -> io::Result<&FtpsOperation> {
         self.operation_in_state(&lock(&self.state))
+    }
+
+    pub(crate) fn staging_owner_context(&self) -> io::Result<crate::local_staging::StagingOwner> {
+        Ok(self.operation()?.owner.clone())
     }
 
     pub(crate) fn require_mutation_owner(&self) -> io::Result<()> {
@@ -404,6 +561,16 @@ impl FtpsVfs {
     }
 
     pub fn capabilities(&self) -> RemoteCapabilities {
+        if self.ordinary_root.is_some() {
+            return RemoteCapabilities {
+                complete_listing: true,
+                best_effort_rename: true,
+                best_effort_file_commit: true,
+                best_effort_file_replace: true,
+                permanent_delete: true,
+                ..RemoteCapabilities::default()
+            };
+        }
         let state = lock(&self.state);
         match self.operation.as_deref() {
             Some(operation)
@@ -745,12 +912,15 @@ impl FtpsVfs {
     /// Knoten als den, auf dem eine frühere Probe lief. Die Folgen dieser Grenze
     /// stehen bei `probe_add_only_capabilities_at`.
     fn fresh_session(&self) -> io::Result<FtpsSession> {
-        let session = connect_once(&self.config, self.secrets.as_ref())?;
+        let mut session = connect_once(&self.config, self.secrets.as_ref())?;
         if session.identity != self.identity() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "FTPS-Identität änderte sich für den Datenstrom",
             ));
+        }
+        if self.content_sync_metadata {
+            select_mode_facts(&mut session)?;
         }
         Ok(session)
     }
@@ -766,6 +936,9 @@ impl FtpsVfs {
     fn complete_list(&self, path: &Path) -> io::Result<(Vec<ProofListEntry>, u64)> {
         let remote = self.remote_path(path)?;
         let mut state = lock(&self.state);
+        if self.content_sync_metadata {
+            select_mode_facts(&mut state.session)?;
+        }
         let generation = state.generation;
         let entries = list_remote_directory(&mut state.session.stream, &remote)?;
         Ok((entries, generation))
@@ -921,6 +1094,14 @@ impl FtpsVfs {
     /// gewöhnliches Rename bewiesen). Sync-Modi bleiben davon unberührt — sie
     /// prüfen weiterhin ausschließlich `permits_add_only()` über die Sync-Matrix.
     fn require_file_write(&self, path: &Path) -> io::Result<RenameProof> {
+        if let Some(root) = &self.ordinary_root {
+            self.check_ordinary_path(path, true)?;
+            return Ok(RenameProof {
+                root: self.remote_path(root)?,
+                revision: 0,
+                no_replace: false,
+            });
+        }
         let capabilities = self.capabilities();
         if capabilities.permits_add_only()
             || (capabilities.complete_listing && capabilities.best_effort_file_commit)
@@ -941,6 +1122,9 @@ impl FtpsVfs {
     }
 
     fn require_directory_create(&self) -> io::Result<()> {
+        if self.ordinary_root.is_some() {
+            return self.operation().map(|_| ());
+        }
         if self.capabilities().permits_directory_create() {
             Ok(())
         } else {
@@ -982,6 +1166,13 @@ impl FtpsVfs {
     }
 
     fn require_directory_proof(&self, path: &Path) -> io::Result<DirectoryProof> {
+        if let Some(root) = &self.ordinary_root {
+            self.check_ordinary_path(path, true)?;
+            return Ok(DirectoryProof {
+                root: self.remote_path(root)?,
+                revision: 0,
+            });
+        }
         let remote = self.remote_path(path)?;
         let state = lock(&self.state);
         let operation = self.operation_in_state(&state)?;
@@ -1093,80 +1284,6 @@ impl FtpsVfs {
             ));
         }
         Ok(())
-    }
-
-    pub(crate) fn rename_assured_at(&self, root: &Path, directory: bool) -> io::Result<bool> {
-        let root = self.remote_path(root)?;
-        let state = lock(&self.state);
-        let operation = self.operation_in_state(&state)?;
-        let proofs = lock(&operation.rename_proofs);
-        let Some(proof) = &proofs[usize::from(directory)] else {
-            return Ok(false);
-        };
-        if proof.root != root {
-            return Ok(false);
-        }
-        if proof.no_replace {
-            self.validate_rename_proof(&state, directory, proof)?;
-        }
-        Ok(proof.no_replace)
-    }
-
-    pub(crate) fn file_capabilities_at(&self, root: &Path) -> io::Result<RemoteCapabilities> {
-        let root = self.remote_path(root)?;
-        let state = lock(&self.state);
-        let operation = self.operation_in_state(&state)?;
-        let proofs = lock(&operation.rename_proofs);
-        let proof = proofs[0]
-            .as_ref()
-            .filter(|proof| proof.root == root)
-            .ok_or_else(|| {
-                capability_probe_required(
-                    "Für diesen FTPS-Zielroot besteht kein eigener Dateibeleg",
-                )
-            })?;
-        if proof.no_replace {
-            self.validate_rename_proof(&state, false, proof)?;
-        }
-        Ok(*lock(&operation.capabilities))
-    }
-
-    pub(crate) fn probe_rename_kind_at(
-        &self,
-        root: &Path,
-        directory: bool,
-    ) -> io::Result<(bool, bool)> {
-        if directory {
-            let capabilities = self.probe_rename_capability_at(root)?;
-            return Ok((
-                self.rename_assured_at(root, true)?,
-                capabilities.best_effort_rename,
-            ));
-        }
-        match self.probe_add_only_capabilities_at(root) {
-            Ok(capabilities) => Ok((
-                self.rename_assured_at(root, false)?,
-                capabilities.best_effort_rename,
-            )),
-            Err(error)
-                if matches!(
-                    crate::error_code(&error),
-                    ErrorCode::ConnectionLost
-                        | ErrorCode::OutcomeUnclear
-                        | ErrorCode::PlanDrift
-                        | ErrorCode::Interrupted
-                ) =>
-            {
-                Err(error)
-            }
-            Err(_) => {
-                // Ein sauber abgelehntes STOU verhindert keine gewöhnliche
-                // Umbenennung. Die flache Ordnerprobe belegt dann nur den
-                // Best-Effort-Befehl; sie gibt keinen Datei-No-Replace-Beleg.
-                let capabilities = self.probe_rename_capability_at(root)?;
-                Ok((false, capabilities.best_effort_rename))
-            }
-        }
     }
 
     fn require_plain_rename(&self) -> io::Result<()> {
@@ -1379,6 +1496,14 @@ fn revoke_probe_capabilities(capabilities: &mut RemoteCapabilities, kind: ProbeK
 }
 
 impl Vfs for FtpsVfs {
+    fn interactive_write_limitations(&self) -> Vec<String> {
+        if self.content_sync_metadata {
+            vec!["FTP/FTPS versucht normale rwx-Rechte mit SITE CHMOD zu setzen und über unix.mode exakt zurückzulesen. Konkrete Serverablehnung oder fehlender/abweichender Modusreadback wird je Eintrag als Metadatenauslassung bilanziert; Sonderbits besitzen einen getrennten Vertrag.".into(), "FTP/FTPS versucht Dateizeiten am eigenen Uploadtemp und an bestätigten neuen oder vorhandenen Ordnern mit MFMT zu setzen und exakt zurückzulesen. Nur tatsächlich bestätigte Zeitwerte gelten als übertragen; konkrete Serverablehnung oder Zeitrundung wird je Eintrag als Metadatenauslassung bilanziert.".into()]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn safety_capabilities_digest(&self) -> io::Result<Option<[u8; 32]>> {
         crate::remote::capabilities_digest(self.capabilities()).map(Some)
     }
@@ -1408,6 +1533,10 @@ impl Vfs for FtpsVfs {
         }
     }
 
+    fn file_flush_guarantees_at(&self, _: &Path) -> io::Result<(bool, bool)> {
+        Ok((false, false))
+    }
+
     fn file_replace_class(&self) -> crate::vfs::FileReplaceClass {
         if self.capabilities().best_effort_file_replace {
             crate::vfs::FileReplaceClass::BestEffort
@@ -1416,12 +1545,16 @@ impl Vfs for FtpsVfs {
         }
     }
 
+    fn supports_best_effort_permanent_delete(&self) -> bool {
+        self.ordinary_root.is_some()
+    }
+
     fn supports_mode_write(&self) -> bool {
-        false
+        self.content_sync_metadata && self.ordinary_root.is_some()
     }
 
     fn supports_mtime_write(&self) -> bool {
-        false
+        self.content_sync_metadata && self.ordinary_root.is_some()
     }
 
     fn list(&self, path: &Path) -> io::Result<Vec<Entry>> {
@@ -1502,6 +1635,7 @@ impl Vfs for FtpsVfs {
     }
 
     fn create_dir(&self, path: &Path) -> io::Result<()> {
+        self.check_ordinary_path(path, true)?;
         self.require_directory_create()?;
         let directory_proof = self
             .directories_only()
@@ -1524,9 +1658,10 @@ impl Vfs for FtpsVfs {
         self.track_intent(intent.clone())?;
         let mut state = lock(&self.state);
         let operation = self.operation_in_state(&state)?;
-        if directory_proof
-            .as_ref()
-            .is_some_and(|proof| lock(&operation.directory_proof).as_ref() != Some(proof))
+        if self.ordinary_root.is_none()
+            && directory_proof
+                .as_ref()
+                .is_some_and(|proof| lock(&operation.directory_proof).as_ref() != Some(proof))
         {
             return Err(crate::real_mode::plan_drift(
                 "FTPS-Ordnerbeleg wechselte vor MKD",
@@ -1543,6 +1678,12 @@ impl Vfs for FtpsVfs {
             .stat(path)
             .map_err(|error| intent_unclear(&intent, error))?;
         if entry.is_dir && !entry.is_symlink {
+            // MKD samt eindeutigem Readback ist abgeschlossen. Nur dieser Intent
+            // darf vor einem späteren unabhängigen Sync aus der Registry fallen.
+            intent
+                .finish()
+                .map_err(|error| intent_unclear(&intent, error))?;
+            lock(&self.operation()?.intents).retain(|tracked| !Arc::ptr_eq(tracked, &intent));
             Ok(())
         } else {
             Err(intent_unclear(
@@ -1597,9 +1738,19 @@ impl Vfs for FtpsVfs {
         }
         let intent = self.intent(&remote, "stou", &[&remote])?;
         self.track_intent(intent.clone())?;
-        let (unique, data) = self
-            .effect(|| start_stou(&mut session.stream))
-            .map_err(|error| intent_unclear(&intent, error))?;
+        let (unique, data) = match self.effect(|| start_stou(&mut session.stream)) {
+            Ok(value) => value,
+            Err(error) if crate::error_code(&error) == ErrorCode::Unsupported => {
+                // Eine eindeutige 5xx-Befehlsablehnung hat keinen Datenstrom
+                // begonnen. Ihr eigener Intent kann ohne Remote-Cleanup enden.
+                intent
+                    .finish()
+                    .map_err(|failure| intent_unclear(&intent, failure))?;
+                lock(&self.operation()?.intents).retain(|known| !Arc::ptr_eq(known, &intent));
+                return Err(error);
+            }
+            Err(error) => return Err(intent_unclear(&intent, error)),
+        };
         intent
             .ftps_stou_name(Path::new(&join_server_path(&parent, &unique)))
             .map_err(|error| intent_unclear(&intent, error))?;
@@ -1644,17 +1795,185 @@ impl Vfs for FtpsVfs {
         }
     }
 
-    fn set_mtime(&self, _path: &Path, _mtime: i64) -> io::Result<()> {
-        Err(read_only())
+    fn set_mtime(&self, path: &Path, mtime: i64) -> io::Result<()> {
+        if !self.supports_mtime_write() {
+            return Err(read_only());
+        }
+        self.check_ordinary_path(path, true)?;
+        let remote = self.remote_path(path)?;
+        let timestamp = mfmt_timestamp(mtime)?;
+        let mut session = self.fresh_session()?;
+        let before = stat_remote(&mut session.stream, &remote)?;
+        if before.is_symlink || (!before.is_file && !before.is_dir) {
+            return Err(invalid(
+                "FTP-Dateizeit benötigt eine reguläre Datei oder einen Ordner",
+            ));
+        }
+        if before.is_file && !lock(&self.owned_files).contains(&remote) {
+            return Err(invalid(
+                "FTP-Dateizeit regulärer Dateien darf nur am eigenen Uploadtemp geändert werden",
+            ));
+        }
+        // MFMT setzt UTC nach dem MFxx-Vertrag (u. a. ProFTPD mod_facts).
+        // MDTM nach RFC 3659 bleibt eine reine Abfrage und ist kein Setterfallback.
+        // Genau ein mutierender Versuch. Auch bei verlorener Antwort wird MFMT
+        // niemals auf einer neuen Verbindung wiederholt; der vorhandene Temp-
+        // oder bestätigte Ordnerkontext bleibt für die Zustandsklärung gebunden.
+        let result = self.effect(|| {
+            session
+                .stream
+                .custom_command(format!("MFMT {timestamp} {remote}"), &[Status::File])
+                .map(|_| ())
+                .map_err(mfmt_error)
+        });
+        if let Err(error) = result {
+            if error.kind() == io::ErrorKind::Unsupported
+                || crate::error_code(&error) == ErrorCode::PlanDrift
+            {
+                return Err(error);
+            }
+            return Err(mfmt_unclear(error, &remote));
+        }
+        let after = stat_remote(&mut session.stream, &remote)
+            .map_err(|error| mfmt_unclear(error, &remote))?;
+        if after.is_symlink
+            || after.is_file != before.is_file
+            || after.is_dir != before.is_dir
+            || after.size != before.size
+        {
+            return Err(mfmt_unclear(
+                invalid("FTP-Zeitreadback meldet einen geänderten Eintrag"),
+                &remote,
+            ));
+        }
+        if after.mtime != Some(mtime) {
+            return Err(crate::content_sync::mtime_omission(format!("FTP/FTPS akzeptierte MFMT, liest die angeforderte Dateizeit {mtime} aber als {:?} zurück; der Server stellt diesen Zeitwert nicht exakt dar", after.mtime)));
+        }
+        Ok(())
     }
 
-    fn set_mode(&self, _path: &Path, _mode: u32) -> io::Result<()> {
-        Err(read_only())
+    fn set_mode(&self, path: &Path, mode: u32) -> io::Result<()> {
+        if !self.supports_mode_write() {
+            return Err(read_only());
+        }
+        if mode & !0o777 != 0 {
+            return Err(crate::content_sync::normal_mode_omission("SITE CHMOD überträgt hier ausschließlich normale rwx-Rechte; setuid, setgid und sticky benötigen ihren getrennten Sonderbitvertrag"));
+        }
+        self.check_ordinary_path(path, true)?;
+        let remote = self.remote_path(path)?;
+        let mut session = self.fresh_session()?;
+        let before = stat_remote(&mut session.stream, &remote)?;
+        if before.is_symlink || (!before.is_file && !before.is_dir) {
+            return Err(invalid(
+                "FTP-Rechte benötigen eine reguläre Datei oder einen Ordner",
+            ));
+        }
+        // Neue Dateien sind eigene Temps, neue Ordner werden postorder gesetzt.
+        // Bestehende Ziele erreichen diesen privaten Setter nur über SetMode mit
+        // bestätigtem Plan und unmittelbar frischen Inhalts-/Mode-/Elternbelegen.
+        let result = self.effect(|| {
+            session
+                .stream
+                .site(format!("CHMOD {mode:03o} {remote}"))
+                .map(|_| ())
+                .map_err(chmod_error)
+        });
+        if let Err(error) = result {
+            if crate::content_sync::normal_mode_omission_reason(&error).is_some()
+                || crate::error_code(&error) == ErrorCode::PlanDrift
+            {
+                return Err(error);
+            }
+            return Err(chmod_unclear(error, &remote));
+        }
+        let after = stat_remote(&mut session.stream, &remote)
+            .map_err(|error| chmod_unclear(error, &remote))?;
+        if after.is_symlink
+            || after.is_file != before.is_file
+            || after.is_dir != before.is_dir
+            || after.size != before.size
+        {
+            return Err(chmod_unclear(
+                invalid("FTP-Rechtereadback meldet einen geänderten Eintrag"),
+                &remote,
+            ));
+        }
+        if after.mode != Some(mode) {
+            return Err(crate::content_sync::normal_mode_omission(match after.mode {
+                None => "FTP/FTPS bestätigte SITE CHMOD, liefert aber kein unix.mode im vollständigen MLSD-Readback; normale Rechte sind nicht exakt überprüfbar".into(),
+                Some(actual) => format!("FTP/FTPS bestätigte SITE CHMOD {mode:03o}, liest aber unix.mode={actual:03o} zurück; der Server stellt die angeforderten normalen Rechte nicht exakt dar"),
+            }));
+        }
+        Ok(())
+    }
+
+    fn set_metadata_normal_mode(&self, path: &Path, mode: u32) -> io::Result<()> {
+        self.set_mode(path, mode)
+    }
+
+    fn set_interactive_mode(&self, path: &Path, expected: &Entry, mode: u32) -> io::Result<Entry> {
+        if !self.supports_mode_write() || mode & !0o777 != 0 {
+            return Err(invalid("Ungültige gewöhnliche FTP-/FTPS-Rechteänderung"));
+        }
+        self.check_ordinary_path(path, true)?;
+        let remote = self.remote_path(path)?;
+        let mut session = self.fresh_session()?;
+        let (before, full_mode) = stat_remote_full_mode(&mut session.stream, &remote)?;
+        if before.is_symlink
+            || (!before.is_file && !before.is_dir)
+            || !crate::file_properties::same_observation(expected, &before)
+        {
+            return Err(crate::real_mode::plan_drift(
+                "FTP-Objekt änderte sich vor SITE CHMOD",
+            ));
+        }
+        let requested = full_mode & 0o7000 | mode;
+        let attempted = requested != full_mode;
+        if attempted {
+            self.check_preparation_cancel()?;
+            let result = self.effect(|| {
+                session
+                    .stream
+                    .site(format!("CHMOD {requested:04o} {remote}"))
+                    .map(|_| ())
+                    .map_err(chmod_error)
+            });
+            if let Err(error) = result {
+                if crate::content_sync::normal_mode_omission_reason(&error).is_some()
+                    || crate::error_code(&error) == ErrorCode::PlanDrift
+                {
+                    return Err(error);
+                }
+                return Err(chmod_unclear(error, &remote));
+            }
+        }
+        let checked = (|| {
+            self.check_ordinary_path(path, true)?;
+            let (actual, actual_mode) = stat_remote_full_mode(&mut session.stream, &remote)?;
+            let mut changed = expected.clone();
+            changed.mode = Some(mode);
+            if actual_mode != requested
+                || !crate::file_properties::same_observation(&changed, &actual)
+            {
+                return Err(crate::real_mode::plan_drift(
+                    "FTP-Rechte oder Objektfakten nach SITE CHMOD abweichend",
+                ));
+            }
+            Ok(actual)
+        })();
+        checked.map_err(|error| {
+            if attempted {
+                chmod_unclear(error, &remote)
+            } else {
+                error
+            }
+        })
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         self.reject_directory_content()?;
         self.operation()?;
+        self.check_ordinary_path(path, true)?;
         if self.capabilities().permanent_delete {
             let remote = self.remote_path(path)?;
             let mut session = self.fresh_session()?;
@@ -1703,6 +2022,7 @@ impl Vfs for FtpsVfs {
     }
 
     fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        self.check_ordinary_path(path, true)?;
         self.require_permanent_delete()?;
         let remote = self.remote_path(path)?;
         let mut session = self.fresh_session()?;
@@ -1715,7 +2035,7 @@ impl Vfs for FtpsVfs {
     }
 
     fn remove_move_empty_dir_best_effort(&self, path: &Path) -> io::Result<()> {
-        if !self.directories_only() {
+        if self.ordinary_root.is_some() || !self.directories_only() {
             return self.remove_dir(path);
         }
         let proof = self.require_directory_proof(path)?;
@@ -1788,11 +2108,22 @@ impl Vfs for FtpsVfs {
     }
 
     fn rename_plain_once(&self, from: &Path, to: &Path) -> io::Result<()> {
-        self.reject_directory_content()?;
+        self.check_ordinary_path(from, true)?;
+        self.check_ordinary_path(to, true)?;
+        if self.ordinary_root.is_none() {
+            self.reject_directory_content()?;
+        }
         // Best-Effort-Umbenennung: exakt ein RNFR/RNTO auf der gehaltenen Sitzung.
         // Die Kollisionsprüfung (frisches Elternlisting) und der Readback liegen
         // beim Aufrufer; hier gibt es bewusst weder Wiederholung noch Fallback.
         self.require_plain_rename()?;
+        let expected = if self.ordinary_root.is_some() {
+            Some(self.stat(from)?)
+        } else {
+            None
+        };
+        let source_path = from.to_path_buf();
+        let target_path = to.to_path_buf();
         let from = self.remote_path(from)?;
         let to = self.remote_path(to)?;
         let intent = self.intent(&to, "rename", &[&from, &to])?;
@@ -1814,6 +2145,31 @@ impl Vfs for FtpsVfs {
                     ],
                 )
             })?;
+        drop(state);
+        if let Some(expected) = expected {
+            let readback = (|| -> io::Result<()> {
+                self.check_ordinary_path(&target_path, true)?;
+                match self.stat(&source_path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Ok(_) => return Err(invalid("FTP-Movequelle ist nach Rename noch sichtbar")),
+                    Err(error) => return Err(error),
+                }
+                let actual = self.stat(&target_path)?;
+                if actual.is_symlink
+                    || actual.is_dir != expected.is_dir
+                    || actual.is_file != expected.is_file
+                    || (actual.is_file && actual.size != expected.size)
+                    || (self.content_sync_metadata
+                        && (actual.mtime != expected.mtime || actual.mode != expected.mode))
+                {
+                    return Err(invalid(
+                        "FTP-Moveziel stimmt nicht mit dem Quellbeleg überein",
+                    ));
+                }
+                Ok(())
+            })();
+            readback.map_err(|error| intent_unclear(&intent, error))?;
+        }
         let mut owned = lock(&self.owned_files);
         if owned.remove(&from) {
             owned.insert(to);
@@ -1822,7 +2178,18 @@ impl Vfs for FtpsVfs {
     }
 
     fn rename_replace_plain_once(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.check_ordinary_path(from, true)?;
+        self.check_ordinary_path(to, true)?;
         self.require_file_replace()?;
+        let expected_mtime = if self.content_sync_metadata {
+            Some({
+                let entry = self.stat(from)?;
+                (entry.mtime, entry.mode)
+            })
+        } else {
+            None
+        };
+        let target = to.to_path_buf();
         let from = self.remote_path(from)?;
         let to = self.remote_path(to)?;
         let intent = self.intent(&to, "rename", &[&from, &to])?;
@@ -1835,18 +2202,44 @@ impl Vfs for FtpsVfs {
             .rename(&from, &to)
             .map_err(ftp_error)
             .map_err(|error| intent_unclear(&intent, error))?;
+        drop(state);
+        if let Some(expected) = expected_mtime {
+            let actual = self
+                .stat(&target)
+                .map_err(|error| intent_unclear(&intent, error))?;
+            if (actual.mtime, actual.mode) != expected {
+                return Err(intent_unclear(
+                    &intent,
+                    invalid("FTP-Zeitwert oder Rechte änderten sich beim abschließenden Rename"),
+                ));
+            }
+        }
         let mut owned = lock(&self.owned_files);
         owned.remove(&from);
         Ok(())
     }
 
+    fn metadata_manifest(&self, path: &Path) -> io::Result<crate::metadata::MetadataManifest> {
+        let entry = self.stat(path)?;
+        crate::metadata::MetadataManifest::new(
+            None,
+            entry.mode.unwrap_or_default() & 0o7777,
+            None,
+            vec![],
+            None,
+            None,
+            None,
+        )
+    }
     fn metadata_capabilities(&self, _root: &Path) -> io::Result<MetadataCapabilities> {
         Ok(MetadataCapabilities {
             owner: Capability::Unsupported,
             special_mode_bits: Capability::Unsupported,
             acl_model: AclModel::Unsupported,
+            acl: crate::metadata::Capability::Unknown,
             xattrs: Capability::Unsupported,
             resource_fork: Capability::Unsupported,
+            named_streams: Capability::Unsupported,
             sparse_extents: Capability::Unsupported,
             hardlinks: Capability::Unsupported,
         })
@@ -2079,14 +2472,31 @@ where
 /// Es folgen weder Anmeldung noch Dateibefehl. Der Aufrufer muss den Fingerabdruck
 /// außerhalb dieser Verbindung prüfen, bevor er ihn in ein Profil übernimmt.
 pub fn discover_ftps_certificate(host: &str, port: u16) -> io::Result<FtpsCertificatePin> {
+    inspect_ftps_certificate(host, port, false)
+}
+
+/// Prüft öffentliche Kette, Gültigkeit und Hostnamen ohne Anmeldung oder Dateibefehl.
+pub fn verify_ftps_certificate(host: &str, port: u16) -> io::Result<FtpsCertificatePin> {
+    inspect_ftps_certificate(host, port, true)
+}
+
+fn inspect_ftps_certificate(
+    host: &str,
+    port: u16,
+    verify_public: bool,
+) -> io::Result<FtpsCertificatePin> {
     validate_endpoint(host, port)?;
     let observed = Arc::new(Mutex::new(None));
-    let verifier = Arc::new(PinnedCertificateVerifier::discovery(observed.clone()));
-    let config = tls_config(verifier)?;
+    let mut verifier = PinnedCertificateVerifier::discovery(observed.clone());
+    if verify_public {
+        verifier.webpki = Some(public_certificate_verifier()?);
+    }
+    let verifier = Arc::new(verifier);
+    let config = tls_config(verifier.clone())?;
     let (plain, _welcome) = connect_plain(std::iter::once(host), port)?;
     let mut secured = plain
         .into_secure(RustlsConnector::from(config), host)
-        .map_err(ftp_error)?;
+        .map_err(|error| certificate_handshake_error(error, &verifier))?;
     secured.noop().map_err(ftp_error)?;
     let digest = lock(&observed)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "FTPS-Zertifikat fehlt"))?;
@@ -2099,29 +2509,30 @@ fn connect_once(
 ) -> io::Result<FtpsSession> {
     config.validate()?;
     let (plain, welcome) = connect_plain(config.candidate_hosts(), config.port)?;
-    let mut stream = match config.transport_security {
-        FtpTransportSecurity::Plaintext => plain,
+    let (mut stream, certificate) = match config.transport_security {
+        FtpTransportSecurity::Plaintext => (plain, None),
         FtpTransportSecurity::ExplicitTls => {
-            let certificate = config
-                .certificate
-                .as_ref()
-                .ok_or_else(|| invalid("FTPS-Zertifikat fehlt"))?;
             let policy = config
                 .certificate_policy
                 .ok_or_else(|| invalid("FTPS-Zertifikatsrichtlinie fehlt"))?;
-            let verifier = Arc::new(PinnedCertificateVerifier::new(certificate.sha256, policy)?);
+            let verifier = Arc::new(if policy == FtpsCertificatePolicy::WebPki {
+                PinnedCertificateVerifier::public()?
+            } else {
+                let certificate = config
+                    .certificate
+                    .as_ref()
+                    .ok_or_else(|| invalid("FTPS-Zertifikat fehlt"))?;
+                PinnedCertificateVerifier::new(certificate.sha256, policy)?
+            });
             let tls = tls_config(verifier.clone())?;
-            match plain.into_secure(RustlsConnector::from(tls), &config.host) {
-                Ok(stream) => stream,
-                Err(_) if verifier.public_identity_rejected() => {
-                    return Err(coded_error(
-                        io::ErrorKind::InvalidData,
-                        ErrorCode::TlsIdentityUnverified,
-                        "FTPS-Zertifikat bestätigt den angesprochenen Server nicht öffentlich",
-                    ));
-                }
-                Err(error) => return Err(ftp_error(error)),
-            }
+            let stream = plain
+                .into_secure(RustlsConnector::from(tls), &config.host)
+                .map_err(|error| certificate_handshake_error(error, &verifier))?;
+            // Ein Profilpin ist Vertrauenskonfiguration. Laufende Pläne und
+            // Reconnects binden dagegen das tatsächlich geprüfte Zertifikat.
+            let sha256 = lock(&verifier.observed)
+                .ok_or_else(|| invalid("FTPS-Zertifikat fehlt nach TLS-Handshake"))?;
+            (stream, Some(FtpsCertificatePin { sha256 }))
         }
     };
     let password: SecretString = secrets.resolve(&config.password_reference)?;
@@ -2162,14 +2573,20 @@ fn connect_once(
         host: config.normalized_host(),
         port: config.port,
         transport_security: config.transport_security,
-        certificate: config.certificate.clone(),
+        certificate,
         canonical_root,
         features_digest: features_digest(&features)?,
         welcome_digest: welcome_identity_digest(&welcome),
         legacy_welcome_digest: legacy_welcome_identity_digest(&welcome),
     };
     identity.validate()?;
-    Ok(FtpsSession { stream, identity })
+    let read_mlst_facts = content_read::mlst_read_facts(&features);
+    Ok(FtpsSession {
+        stream,
+        identity,
+        read_mlst_facts,
+        mode_facts_selected: false,
+    })
 }
 
 fn connect_plain<'host>(
@@ -2279,7 +2696,18 @@ fn legacy_welcome_identity_digest(raw: &[u8]) -> [u8; 32] {
 fn start_stou(stream: &mut RustlsFtpStream) -> io::Result<(String, Box<dyn FtpsDataStream>)> {
     let (response, data) = stream
         .custom_data_command("STOU", &[Status::AboutToSend, Status::AlreadyOpen])
-        .map_err(ftp_error)?;
+        .map_err(|error| match error {
+            FtpError::UnexpectedResponse(ref response)
+                if matches!(response.status.code(), 500 | 501 | 502 | 504) =>
+            {
+                coded_error(
+                    io::ErrorKind::Unsupported,
+                    ErrorCode::Unsupported,
+                    "FTP-/FTPS-Server lehnte STOU vor der Datenwirkung ab",
+                )
+            }
+            other => ftp_error(other),
+        })?;
     let body = std::str::from_utf8(&response.body)
         .map_err(|_| invalid("FTPS-STOU-Antwort ist nicht UTF-8"))?
         .trim();
@@ -2628,6 +3056,32 @@ fn stat_remote(stream: &mut RustlsFtpStream, path: &str) -> io::Result<Entry> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "FTPS-Pfad fehlt"))
 }
 
+fn stat_remote_full_mode(stream: &mut RustlsFtpStream, path: &str) -> io::Result<(Entry, u32)> {
+    let (parent, name) = split_server_path(path)?;
+    stream.cwd(&parent).map_err(ftp_error)?;
+    let item = raw_mlsd_current_for(stream, true)?
+        .into_iter()
+        .find(|item| item.entry.name == name)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "FTP-Rechteziel fehlt"))?;
+    let facts: BTreeMap<String, String> = serde_json::from_slice(
+        item.provider_token
+            .as_deref()
+            .ok_or_else(|| invalid("FTP-Rechtefakten fehlen"))?,
+    )
+    .map_err(io::Error::other)?;
+    let full_mode = facts
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("unix.mode"))
+        .and_then(|(_, value)| u32::from_str_radix(value, 8).ok())
+        .filter(|mode| mode & !0o7777 == 0)
+        .ok_or_else(|| {
+            invalid(
+                "FTP-Server meldet keine vollständigen Unix-Rechte; noch keine Änderung begonnen",
+            )
+        })?;
+    Ok((item.entry, full_mode))
+}
+
 fn split_server_path(path: &str) -> io::Result<(String, String)> {
     let path = Path::new(path);
     let parent = path
@@ -2707,6 +3161,13 @@ fn list_remote_directory(
 }
 
 fn raw_mlsd_current(stream: &mut RustlsFtpStream) -> io::Result<Vec<ProofListEntry>> {
+    raw_mlsd_current_for(stream, false)
+}
+
+fn raw_mlsd_current_for(
+    stream: &mut RustlsFtpStream,
+    bind_facts: bool,
+) -> io::Result<Vec<ProofListEntry>> {
     let (_, mut data) = stream
         .custom_data_command("MLSD", &[Status::AboutToSend, Status::AlreadyOpen])
         .map_err(ftp_error)?;
@@ -2740,7 +3201,16 @@ fn raw_mlsd_current(stream: &mut RustlsFtpStream) -> io::Result<Vec<ProofListEnt
         if !names.insert(name) {
             return Err(invalid("FTPS-MLSD enthält einen doppelten Namen"));
         }
-        if let Some(entry) = entry {
+        if let Some(mut entry) = entry {
+            if bind_facts {
+                let (facts, name) = line.split_once(' ').expect("MLSD bereits validiert");
+                // Private Inhaltsbelege behalten insbesondere unique und die
+                // volle modify-Präzision; der allgemeine Sync-Token bleibt gleich.
+                entry.provider_token = Some(
+                    serde_json::to_vec(&validate_mlsd_facts(facts, name)?)
+                        .map_err(io::Error::other)?,
+                );
+            }
             result.push(entry);
         }
     }
@@ -3136,6 +3606,89 @@ fn read_only() -> io::Error {
     )
 }
 
+fn select_mode_facts(session: &mut FtpsSession) -> io::Result<()> {
+    if session.mode_facts_selected {
+        return Ok(());
+    }
+    if let Some(facts) = session.read_mlst_facts.as_deref().filter(|facts| {
+        facts
+            .split(';')
+            .any(|fact| fact.eq_ignore_ascii_case("unix.mode"))
+    }) {
+        // Optionale Unix-Fakten müssen auf jeder neuen Verbindung angefordert
+        // werden. Ein abgelehntes OPTS ist kein Schreibverbot: der echte Readback
+        // entscheidet später über diese einzelne Metadatenklasse.
+        if let Err(error) = session.stream.opts("MLST", Some(facts)) {
+            if !opts_mlst_rejection_is_tolerable(&error) {
+                return Err(ftp_error(error));
+            }
+        }
+    }
+    session.mode_facts_selected = true;
+    Ok(())
+}
+
+fn chmod_error(error: FtpError) -> io::Error {
+    match error {
+        FtpError::UnexpectedResponse(response) if matches!(response.status.code(),500 | 501 | 502 | 504 | 550 | 553) => crate::content_sync::normal_mode_omission(format!("FTP/FTPS verweigert SITE CHMOD für diesen Eintrag (Antwortcode {}); normale Rechte werden ausgelassen",response.status.code())),
+        other => ftp_error(other),
+    }
+}
+fn chmod_unclear(error: io::Error, path: &str) -> io::Error {
+    crate::error::with_recovery_paths(
+        coded_error(
+            error.kind(),
+            ErrorCode::OutcomeUnclear,
+            format!("FTP/FTPS-Rechtewirkung ist nicht bestätigt: {error}"),
+        ),
+        &[path.to_owned()],
+    )
+}
+
+fn mfmt_timestamp(mtime: i64) -> io::Result<String> {
+    let time = time::OffsetDateTime::from_unix_timestamp(mtime).map_err(|_| {
+        crate::content_sync::mtime_omission(
+            "FTP-Dateizeit liegt außerhalb des darstellbaren Zeitbereichs von MFMT",
+        )
+    })?;
+    if !(1..=9999).contains(&time.year()) {
+        return Err(crate::content_sync::mtime_omission(
+            "FTP-Dateizeit ist mit dem vierstelligen Jahr von MFMT nicht darstellbar",
+        ));
+    }
+    Ok(format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}",
+        time.year(),
+        u8::from(time.month()),
+        time.day(),
+        time.hour(),
+        time.minute(),
+        time.second()
+    ))
+}
+
+fn mfmt_error(error: FtpError) -> io::Error {
+    match error {
+        FtpError::UnexpectedResponse(response)
+            if matches!(response.status.code(), 500 | 501 | 502 | 504 | 550 | 553) =>
+        {
+            crate::content_sync::mtime_omission(format!("FTP/FTPS verweigert MFMT für diesen Zeitwert oder Eintrag (Antwortcode {}); die Dateizeit wird ausgelassen", response.status.code()))
+        }
+        other => ftp_error(other),
+    }
+}
+
+fn mfmt_unclear(error: io::Error, path: &str) -> io::Error {
+    crate::error::with_recovery_paths(
+        coded_error(
+            error.kind(),
+            ErrorCode::OutcomeUnclear,
+            format!("FTP/FTPS-Dateizeitwirkung ist nicht bestätigt: {error}"),
+        ),
+        &[path.to_owned()],
+    )
+}
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -3218,6 +3771,12 @@ impl fmt::Debug for PinnedCertificateVerifier {
 }
 
 impl PinnedCertificateVerifier {
+    fn public() -> io::Result<Self> {
+        let mut verifier = Self::discovery(Arc::new(Mutex::new(None)));
+        verifier.webpki = Some(public_certificate_verifier()?);
+        Ok(verifier)
+    }
+
     pub(crate) fn discovery(observed: Arc<Mutex<Option<[u8; 32]>>>) -> Self {
         let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
         Self {
@@ -3230,14 +3789,12 @@ impl PinnedCertificateVerifier {
     }
 
     pub(crate) fn new(expected: [u8; 32], policy: FtpsCertificatePolicy) -> io::Result<Self> {
+        if policy == FtpsCertificatePolicy::WebPki {
+            return Self::public();
+        }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let webpki = if policy == FtpsCertificatePolicy::WebPkiAndPin {
-            let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            Some(
-                WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-                    .build()
-                    .map_err(|error| io::Error::other(error.to_string()))?,
-            )
+            Some(public_certificate_verifier()?)
         } else {
             None
         };
@@ -3252,6 +3809,28 @@ impl PinnedCertificateVerifier {
 
     fn public_identity_rejected(&self) -> bool {
         self.public_identity_rejected.load(Ordering::Relaxed)
+    }
+}
+
+fn public_certificate_verifier() -> io::Result<Arc<WebPkiServerVerifier>> {
+    let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()
+    .map_err(|error| io::Error::other(error.to_string()))
+}
+
+fn certificate_handshake_error(error: FtpError, verifier: &PinnedCertificateVerifier) -> io::Error {
+    if verifier.public_identity_rejected() {
+        coded_error(
+            io::ErrorKind::InvalidData,
+            ErrorCode::TlsIdentityUnverified,
+            "FTPS-Zertifikat ist für diesen Servernamen nicht öffentlich gültig (Name, Gültigkeitszeit oder Zertifikatskette)",
+        )
+    } else {
+        ftp_error(error)
     }
 }
 
@@ -3327,6 +3906,10 @@ pub(crate) fn tls_config(
             .with_no_client_auth(),
     ))
 }
+
+#[cfg(test)]
+#[path = "ftps_certificate_tests.rs"]
+mod certificate_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3692,6 +4275,21 @@ mod tests {
         );
         // Größen sind reine Ziffern.
         assert!(mlsd_line_entry("type=file;size=1x;modify=20250101120000; datei").is_err());
+    }
+
+    #[test]
+    fn mfmt_formatiert_utc_kalender_ohne_locale_oder_zeitzonenrundung() {
+        for (epoch, expected) in [
+            (0, "19700101000000"),
+            (-1, "19691231235959"),
+            (951_825_600, "20000229120000"),
+            (1_700_000_013, "20231114221333"),
+        ] {
+            assert_eq!(mfmt_timestamp(epoch).unwrap(), expected);
+            assert_eq!(mlsd_epoch_seconds(expected).unwrap(), epoch);
+        }
+        assert!(mfmt_timestamp(i64::MIN).is_err());
+        assert!(mfmt_timestamp(i64::MAX).is_err());
     }
 
     #[test]

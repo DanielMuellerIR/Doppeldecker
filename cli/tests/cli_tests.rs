@@ -5,6 +5,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use doppeldecker_core::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue;
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_doppeldecker-cli")
 }
@@ -64,11 +66,15 @@ impl CliSandbox {
             .join("cli-config")
     }
 
-    /// Einziger Ort dieser Datei, an dem ein CLI-Prozess entsteht — hier noch ohne
-    /// `--config-dir`. Nur `cli()` und der Gegentest, der die Abweisung belegt, dürfen
-    /// diese Funktion benutzen.
+    /// Gewöhnliches CLI zunächst ohne `--config-dir`, nur für den gemeinsamen
+    /// Einstieg und den Gegentest der Konfigurationssperre.
     fn command_without_config_dir(&self) -> Command {
-        let mut command = Command::new(binary());
+        self.command_for(binary())
+    }
+
+    /// Auch der parserlose Metadatenhelfer erhält dieselbe isolierte Umgebung.
+    fn command_for(&self, executable: &str) -> Command {
+        let mut command = Command::new(executable);
         command
             .env("HOME", self.home())
             .env("XDG_CONFIG_HOME", self.home().join(".config"))
@@ -92,6 +98,10 @@ impl CliSandbox {
         command
     }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/metadata_helper_linux.rs"]
+mod metadata_helper_linux;
 
 #[test]
 fn jeder_cli_start_bekommt_einen_isolierten_konfigurationsordner() {
@@ -355,7 +365,7 @@ fn real_add_only_bleibt_im_selben_prozess_und_schreibt_audit() {
         &target,
         &audit,
         &["--mode", "add-only", "--exclude", "*.tmp"],
-        |preview| format!("{}\n", preview["confirmation_phrase"].as_str().unwrap()),
+        |_preview| "ja\n".to_string(),
     );
     assert!(status.success(), "{stderr}");
     assert!(events.iter().any(|event| event["event"] == "real_preview"));
@@ -387,7 +397,7 @@ fn provider_sync_cli_nutzt_den_geteilten_realmodusvertrag() {
         &target,
         &audit,
         &["--exclude", "cache"],
-        |preview| format!("{}\n", preview["confirmation_phrase"].as_str().unwrap()),
+        |_preview| "ja\n".to_string(),
     );
     assert!(status.success(), "{stderr}");
     assert_eq!(status.code(), Some(0));
@@ -419,7 +429,7 @@ fn provider_sync_cli_nutzt_den_geteilten_realmodusvertrag() {
 }
 
 #[test]
-fn falsche_phrase_mutiert_nichts() {
+fn abgelehnte_wirkung_mutiert_auch_add_only_nicht() {
     let sandbox = CliSandbox::new();
     let source = sandbox.path().join("quelle");
     let target = sandbox.path().join("ziel");
@@ -433,7 +443,7 @@ fn falsche_phrase_mutiert_nichts() {
         &target,
         &sandbox.path().join("audit.jsonl"),
         &[],
-        |_| "REAL falsch ABC123\n".into(),
+        |_| "nein\n".into(),
     );
     assert!(!status.success());
     assert!(events.iter().any(|event| event["event"] == "error"));
@@ -445,6 +455,49 @@ fn falsche_phrase_mutiert_nichts() {
         "confirmation_mismatch"
     );
     assert!(!target.join("neu.txt").exists());
+}
+
+#[test]
+fn content_sync_prueft_inhaltsvergleich_vor_profil_und_queue() {
+    for (mode, metadata) in [
+        ("update", "portable"),
+        ("mirror", "portable"),
+        ("add-only", "native-best-effort"),
+    ] {
+        let sandbox = CliSandbox::new();
+        let output = sandbox
+            .json_cli()
+            .args([
+                "sync",
+                "--source-provider",
+                "sftp",
+                "--source-profile",
+                "fehlt",
+                "--source-root",
+                "/quelle",
+                "--target-provider",
+                "webdav",
+                "--target-profile",
+                "fehlt-auch",
+                "--target-root",
+                "/ziel",
+                "--mode",
+                mode,
+                "--metadata",
+                metadata,
+                "--compare",
+                "fast",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(event["code"], "invalid_input", "{mode}/{metadata}: {event}");
+        assert!(
+            !sandbox.config_dir().exists(),
+            "ungültige Inhaltsoptionen dürfen keine Profil- oder Queuewirkung auslösen"
+        );
+    }
 }
 
 #[test]
@@ -628,7 +681,7 @@ fn provider_sync_meldet_bestaetigungsfehler_ohne_mutation_oder_audit() {
 }
 
 #[test]
-fn provider_sync_meldet_falsches_backup_gate_ohne_ersetzung() {
+fn provider_sync_erhaelt_bestand_bei_abgelehnter_wirkung() {
     let sandbox = CliSandbox::new();
     let source = sandbox.path().join("quelle");
     let target = sandbox.path().join("ziel");
@@ -646,10 +699,7 @@ fn provider_sync_meldet_falsches_backup_gate_ohne_ersetzung() {
         &["--mode", "update", "--compare", "content"],
         |preview| {
             assert_eq!(preview["backup_confirmation_required"], true);
-            format!(
-                "{}\nNICHT BESTÄTIGT\n",
-                preview["confirmation_phrase"].as_str().unwrap()
-            )
+            "nein\n".to_string()
         },
     );
     assert_eq!(status.code(), Some(2));
@@ -679,11 +729,10 @@ fn provider_sync_meldet_listing_drift_als_neuplanungssignal() {
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(source.join("vorher.txt"), b"vorher").unwrap();
 
-    let (status, events, _) =
-        run_provider_sync(&sandbox, &source, &target, &audit, &[], |preview| {
-            std::fs::write(source.join("spaeter.txt"), b"spaeter").unwrap();
-            format!("{}\n", preview["confirmation_phrase"].as_str().unwrap())
-        });
+    let (status, events, _) = run_provider_sync(&sandbox, &source, &target, &audit, &[], |_| {
+        std::fs::write(source.join("spaeter.txt"), b"spaeter").unwrap();
+        "ja\n".to_string()
+    });
     assert_eq!(status.code(), Some(2));
     assert_eq!(
         events
@@ -702,7 +751,7 @@ fn provider_sync_meldet_listing_drift_als_neuplanungssignal() {
 }
 
 #[test]
-fn update_backup_gate_und_cli_quarantaene_restore_funktionieren() {
+fn update_wirkungsbestaetigung_und_cli_quarantaene_restore_funktionieren() {
     let sandbox = CliSandbox::new();
     let source = sandbox.path().join("quelle");
     let target = sandbox.path().join("ziel");
@@ -729,10 +778,7 @@ fn update_backup_gate_und_cli_quarantaene_restore_funktionieren() {
         &["--mode", "update", "--compare", "content"],
         |preview| {
             assert_eq!(preview["backup_confirmation_required"], true);
-            format!(
-                "{}\nBACKUP UND RESTORE BESTÄTIGT\n",
-                preview["confirmation_phrase"].as_str().unwrap()
-            )
+            "ja\n".to_string()
         },
     );
     assert!(status.success(), "{stderr}");
@@ -853,12 +899,7 @@ fn quarantine_text_macht_version_zwei_als_nur_manuell_rettbar_sichtbar() {
         &target,
         &sandbox.path().join("audit.jsonl"),
         &["--mode", "update", "--compare", "content"],
-        |preview| {
-            format!(
-                "{}\nBACKUP UND RESTORE BESTÄTIGT\n",
-                preview["confirmation_phrase"].as_str().unwrap()
-            )
-        },
+        |_preview| "ja\n".to_string(),
     );
     assert!(status.success(), "{stderr}");
     let listed = sandbox
@@ -950,10 +991,7 @@ fn sigint_nutzt_den_kontrollierten_abbruchpfad() {
             preview = Some(event["preview"].clone());
         }
     }
-    let phrase = format!(
-        "{}\n",
-        preview.unwrap()["confirmation_phrase"].as_str().unwrap()
-    );
+    let phrase = "ja\n";
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(phrase.as_bytes()).unwrap();
     stdin.flush().unwrap();
@@ -1033,7 +1071,7 @@ fn bidirektionaler_plan_verwirft_mutationsloses_laufjournal() {
 }
 
 #[test]
-fn bidirektionaler_cli_lauf_haelt_phrase_und_handles_im_selben_prozess() {
+fn bidirektionaler_cli_lauf_bestaetigt_wirkung_und_haelt_handles_im_selben_prozess() {
     let sandbox = CliSandbox::new();
     let left = sandbox.path().join("links");
     let right = sandbox.path().join("rechts");
@@ -1042,8 +1080,8 @@ fn bidirektionaler_cli_lauf_haelt_phrase_und_handles_im_selben_prozess() {
     std::fs::create_dir(&right).unwrap();
 
     let (status, events, stderr) =
-        run_bidirectional(&sandbox, &left, &right, &baseline, |preview| {
-            format!("{}\n", preview["confirmation_phrase"].as_str().unwrap())
+        run_bidirectional(&sandbox, &left, &right, &baseline, |_preview| {
+            "ja\n".to_string()
         });
 
     assert!(status.success(), "{stderr}");
@@ -1052,6 +1090,26 @@ fn bidirektionaler_cli_lauf_haelt_phrase_und_handles_im_selben_prozess() {
         .any(|event| event["event"] == "bidirectional_result"));
     assert!(baseline.exists());
     assert!(!baseline.with_extension("run.json").exists());
+    let result = events
+        .iter()
+        .find(|event| event["event"] == "bidirectional_result")
+        .unwrap();
+    let queue =
+        doppeldecker_core::OperationQueue::open(sandbox.config_dir().join("operations-queue.json"))
+            .unwrap();
+    let snapshot = queue.snapshot();
+    assert_eq!(snapshot.entries.len(), 1);
+    let entry = &snapshot.entries[0];
+    assert_eq!(result["operation_id"], entry.operation_id);
+    assert_eq!(entry.state, doppeldecker_core::QueueState::Completed);
+    assert!(matches!(
+        entry.operation,
+        doppeldecker_core::QueueOperation::Bidirectional { .. }
+    ));
+    assert_eq!(
+        result["recovery_paths"],
+        serde_json::json!(entry.temp_recovery_paths)
+    );
 }
 
 #[test]
@@ -1060,7 +1118,7 @@ fn bidirektionaler_cli_resume_entfernt_das_abgeschlossene_laufjournal_vor_der_au
     let left = sandbox.path().join("links");
     let right = sandbox.path().join("rechts");
     let baseline = sandbox.path().join("state/resume-paar.json");
-    create_interrupted_bidirectional_run(&left, &right, &baseline, 0x33);
+    create_interrupted_bidirectional_run(&sandbox, &left, &right, &baseline, 0x33, false);
 
     let (status, events, stderr) =
         run_bidirectional_recovery(&sandbox, "resume", &left, &right, &baseline);
@@ -1078,7 +1136,7 @@ fn bidirektionaler_cli_rollback_entfernt_das_abgeschlossene_laufjournal_vor_der_
     let left = sandbox.path().join("links");
     let right = sandbox.path().join("rechts");
     let baseline = sandbox.path().join("state/rollback-paar.json");
-    create_interrupted_bidirectional_run(&left, &right, &baseline, 0x34);
+    create_interrupted_bidirectional_run(&sandbox, &left, &right, &baseline, 0x34, false);
 
     let (status, events, stderr) =
         run_bidirectional_recovery(&sandbox, "rollback", &left, &right, &baseline);
@@ -1088,6 +1146,105 @@ fn bidirektionaler_cli_rollback_entfernt_das_abgeschlossene_laufjournal_vor_der_
         .iter()
         .any(|event| event["event"] == "bidirectional_rollback_result"));
     assert!(!baseline.with_extension("run.json").exists());
+}
+
+#[test]
+fn bidirektionale_cli_recovery_schliesst_den_echten_queueeintrag() {
+    for (command, marker, expected_state) in [
+        ("resume", 0x35, doppeldecker_core::QueueState::Completed),
+        ("rollback", 0x36, doppeldecker_core::QueueState::Cancelled),
+    ] {
+        let sandbox = CliSandbox::new();
+        let left = sandbox.path().join("links");
+        let right = sandbox.path().join("rechts");
+        let baseline = sandbox.path().join("state/queue-paar.json");
+        create_interrupted_bidirectional_run(&sandbox, &left, &right, &baseline, marker, true);
+        let before = {
+            let queue = doppeldecker_core::OperationQueue::open(
+                sandbox.config_dir().join("operations-queue.json"),
+            )
+            .unwrap();
+            let snapshot = queue.snapshot();
+            assert_eq!(snapshot.entries.len(), 1);
+            assert!(snapshot.entries[0].recovery_available);
+            snapshot.entries[0].clone()
+        };
+        let unrelated = sandbox.path().join("anderes-paar");
+        let unrelated_left = unrelated.join("links");
+        let unrelated_right = unrelated.join("rechts");
+        let unrelated_baseline = unrelated.join("state/queue-paar.json");
+        std::fs::create_dir_all(&unrelated_left).unwrap();
+        std::fs::create_dir_all(&unrelated_right).unwrap();
+        std::fs::create_dir_all(unrelated_baseline.parent().unwrap()).unwrap();
+        let unrelated_result = sandbox
+            .json_cli()
+            .args([
+                "bidirectional",
+                command,
+                "--pair-name",
+                "CLI-Recovery-Paar",
+                "--left",
+            ])
+            .arg(&unrelated_left)
+            .arg("--right")
+            .arg(&unrelated_right)
+            .arg("--baseline")
+            .arg(&unrelated_baseline)
+            .output()
+            .unwrap();
+        assert!(!unrelated_result.status.success());
+        let unrelated_events: Vec<serde_json::Value> = String::from_utf8(unrelated_result.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(unrelated_events.len(), 1, "{unrelated_events:?}");
+        assert_eq!(unrelated_events[0]["event"], "error");
+        assert!(!unrelated_baseline.exists());
+        assert!(std::fs::read_dir(&unrelated_left).unwrap().next().is_none());
+        assert!(std::fs::read_dir(&unrelated_right)
+            .unwrap()
+            .next()
+            .is_none());
+        // Der Fixture speichert tempfile-Pfade, die auf macOS über /var laufen;
+        // der Aufruf verwendet für alle drei Pfade deren /private/var-Identität.
+        let canonical_left = std::fs::canonicalize(&left).unwrap();
+        let canonical_right = std::fs::canonicalize(&right).unwrap();
+        let canonical_baseline = std::fs::canonicalize(&baseline).unwrap();
+        let (status, events, stderr) = run_bidirectional_recovery(
+            &sandbox,
+            command,
+            &canonical_left,
+            &canonical_right,
+            &canonical_baseline,
+        );
+        assert!(status.success(), "{command}: {stderr}");
+        let queue = doppeldecker_core::OperationQueue::open(
+            sandbox.config_dir().join("operations-queue.json"),
+        )
+        .unwrap();
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.entries.len(), 1);
+        let after = &snapshot.entries[0];
+        assert_eq!(after.operation_id, before.operation_id);
+        assert_eq!(after.state, expected_state);
+        assert!(!after.recovery_available);
+        assert!(after.bidirectional_completion_recovery.is_none());
+        for path in &before.temp_recovery_paths {
+            assert!(after.temp_recovery_paths.contains(path));
+        }
+        let result = events
+            .iter()
+            .find(|event| event["operation_id"] == after.operation_id)
+            .unwrap();
+        assert_eq!(
+            result["recovery_paths"],
+            serde_json::json!(after.temp_recovery_paths)
+        );
+        assert!(!baseline.with_extension("run.json").exists());
+        assert!(right.join("a-von-links").exists() == (command == "resume"));
+        assert!(left.join("b-von-rechts").exists() == (command == "resume"));
+    }
 }
 
 #[test]
@@ -1232,7 +1389,7 @@ fn mkdir_validiert_endpoint_und_root_vor_dem_queuejournal() {
         (
             vec!["--provider", "sftp", "--profile", "nicht-vorhanden"],
             false,
-            "unsupported",
+            "not_found",
         ),
     ];
 
@@ -1261,10 +1418,12 @@ fn mkdir_validiert_endpoint_und_root_vor_dem_queuejournal() {
         let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(event["code"], expected_code, "{event}");
         assert!(!parent.join("neu").exists());
-        assert!(
-            !sandbox.config_dir().exists(),
-            "reine Endpunktfehler dürfen kein Queuejournal anlegen"
-        );
+        if expected_code != "not_found" {
+            assert!(
+                !sandbox.config_dir().exists(),
+                "reine Endpunktfehler dürfen kein Queuejournal anlegen"
+            );
+        }
     }
 }
 
@@ -1634,14 +1793,13 @@ fn lokaler_cli_move_folgt_dem_finalen_symlink_nicht() {
         .expect("Move-Ergebnis fehlt");
     assert_eq!(result["stats"]["symlinks_skipped"], 1);
 
-    // Die Vorschau nennt die verlangte Phrase maschinenlesbar. Ein Controller im
-    // JSON-Modus musste sie sonst aus dem deutschen stderr-Text lesen oder aus den
-    // eigenen Argumenten rekonstruieren.
+    // Der konkrete Move-Aufruf bestätigt die normale Wirkung bereits;
+    // JSON-Controller müssen keine zusätzliche Routinephrase zurückschreiben.
     let preview = events
         .iter()
         .find(|event| event["event"] == "file_preview")
         .expect("Vorschau fehlt");
-    assert_eq!(preview["move_confirmation"], "VERSCHIEBEN local - 1");
+    assert!(preview["move_confirmation"].is_null());
     assert!(preview["replace_confirmation"].is_null());
     assert!(preview.get("source_profile_id").is_some());
     assert!(preview.get("target_profile_id").is_some());
@@ -1995,7 +2153,7 @@ fn copy_replace_klassifiziert_lokale_wirkung_sichtbar_als_best_effort() {
     std::fs::write(source.join("datei.txt"), b"neu").unwrap();
     std::fs::write(target.join("datei.txt"), b"alt").unwrap();
 
-    let wrong = sandbox
+    let output = sandbox
         .json_cli()
         .args(["copy", "--source-root"])
         .arg(&source)
@@ -2004,30 +2162,9 @@ fn copy_replace_klassifiziert_lokale_wirkung_sichtbar_als_best_effort() {
         .arg("--item")
         .arg(source.join("datei.txt"))
         .arg("--replace")
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .output()
         .unwrap();
-    assert!(!wrong.status.success());
-    assert_eq!(std::fs::read(target.join("datei.txt")).unwrap(), b"alt");
-
-    let mut child = sandbox
-        .json_cli()
-        .args(["copy", "--source-root"])
-        .arg(&source)
-        .arg("--target-root")
-        .arg(&target)
-        .arg("--item")
-        .arg(source.join("datei.txt"))
-        .arg("--replace")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(b"DAUERHAFT ERSETZEN local - 1\n").unwrap();
-    drop(stdin);
-    let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
         "stderr: {}\nstdout: {}",
@@ -2293,9 +2430,35 @@ fn dateibefehle_validieren_pfade_vor_queue_profil_und_netzwerk() {
 }
 
 #[test]
-fn sftp_rename_meldet_die_konkrete_sperre_vor_queue_und_profilzugriff() {
+fn sftp_rename_erreicht_mit_gueltigem_profil_die_prozesssperre_vor_verbindung() {
     let sandbox = CliSandbox::new();
-    std::fs::write(sandbox.config_dir(), b"kein Verzeichnis").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    doppeldecker_core::save_sftp_profile(
+        &sandbox.config_dir().join("sftp-profiles.json"),
+        doppeldecker_core::SftpProfile {
+            id: "testserver".into(),
+            name: "Künstlicher Testserver".into(),
+            connection: doppeldecker_core::SftpConnectionConfig {
+                host: "127.0.0.1".into(),
+                alternate_hosts: Vec::new(),
+                port: listener.local_addr().unwrap().port(),
+                username: "artificial".into(),
+                requested_root: "/".into(),
+                host_key: doppeldecker_core::SftpHostKeyPin {
+                    algorithm: "ssh-ed25519".into(),
+                    sha256: [1; 32],
+                },
+                authentication: doppeldecker_core::SftpAuthenticationReference::SshAgent {
+                    public_key_sha256: [2; 32],
+                },
+            },
+        },
+    )
+    .unwrap();
+    let _owner =
+        doppeldecker_core::OperationQueue::open(sandbox.config_dir().join("operations-queue.json"))
+            .unwrap();
     let output = sandbox
         .json_cli()
         .args([
@@ -2303,7 +2466,7 @@ fn sftp_rename_meldet_die_konkrete_sperre_vor_queue_und_profilzugriff() {
             "--provider",
             "sftp",
             "--profile",
-            "fehlt",
+            "testserver",
             "--root",
             "/pane",
             "--path",
@@ -2313,16 +2476,10 @@ fn sftp_rename_meldet_die_konkrete_sperre_vor_queue_und_profilzugriff() {
         ])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(event["code"], "unsupported");
-    assert!(event["message"]
-        .as_str()
-        .unwrap()
-        .contains("Root-/Elternordner"));
+    assert_processbesitz_blockiert(&output);
     assert_eq!(
-        std::fs::read(sandbox.config_dir()).unwrap(),
-        b"kein Verzeichnis"
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
     );
 }
 
@@ -2636,23 +2793,33 @@ fn run_bidirectional(
 }
 
 fn create_interrupted_bidirectional_run(
+    sandbox: &CliSandbox,
     left: &Path,
     right: &Path,
     baseline: &Path,
     pair_marker: u8,
+    queued: bool,
 ) {
     std::fs::create_dir(left).unwrap();
     std::fs::create_dir(right).unwrap();
     // Die beiden Recovery-Tests laufen parallel. Eine gleiche Paar-ID würde die
     // absichtlich prozessweite Single-Flight-Schranke testen statt ihren jeweils
     // isolierten CLI-Ablauf und kann auf schnellen Linux-Hosts `WouldBlock` liefern.
+    // Vorbereitung und anschließender CLI-Prozess teilen denselben privaten
+    // Queuekontext; der Prozesslock endet vor dem Start der CLI mit diesem Helfer.
+    let queue =
+        doppeldecker_core::OperationQueue::open(sandbox.config_dir().join("operations-queue.json"))
+            .unwrap();
     let pair = doppeldecker_core::PairId([pair_marker; 16]);
-    let initial = doppeldecker_core::prepare_local_bidirectional(
+    let initial = prepare_local_bidirectional_with_decisions_bound_for_queue(
+        &queue,
         pair,
         "CLI-Recovery-Paar",
         left,
         right,
         baseline,
+        &[],
+        None,
     )
     .unwrap();
     let phrase = initial.preview().confirmation_phrase.clone();
@@ -2665,24 +2832,77 @@ fn create_interrupted_bidirectional_run(
 
     std::fs::write(left.join("a-von-links"), b"links").unwrap();
     std::fs::write(right.join("b-von-rechts"), b"rechts").unwrap();
-    let prepared = doppeldecker_core::prepare_local_bidirectional(
+    let prepared = prepare_local_bidirectional_with_decisions_bound_for_queue(
+        &queue,
         pair,
         "CLI-Recovery-Paar",
         left,
         right,
         baseline,
+        &[],
+        None,
     )
     .unwrap();
+    let (prepared, operation_id) = if queued {
+        let operation = doppeldecker_core::QueueOperation::Bidirectional {
+            pair_id: pair,
+            pair_name: "CLI-Recovery-Paar".into(),
+            left: Box::new(doppeldecker_core::BidirectionalQueueEndpoint::Local {
+                root: left.to_str().unwrap().into(),
+            }),
+            right: Box::new(doppeldecker_core::BidirectionalQueueEndpoint::Local {
+                root: right.to_str().unwrap().into(),
+            }),
+            baseline_path: baseline.to_str().unwrap().into(),
+            resolutions: vec![],
+            expected_baseline_digest: prepared.preview().plan.baseline_digest,
+            expected_plan_digest: prepared.preview().plan.plan_digest,
+        };
+        let entry = queue
+            .enqueue_claimed_with_profile_bindings(operation, vec![])
+            .unwrap();
+        let id = entry.operation_id;
+        let prepared = doppeldecker_core::queue::reprepare_direct_bidirectional_queue_run(
+            &queue,
+            &id,
+            std::sync::Arc::new(NoTestSecrets),
+            prepared,
+        )
+        .unwrap();
+        (prepared, Some(id))
+    } else {
+        (prepared, None)
+    };
     let phrase = prepared.preview().confirmation_phrase.clone();
     let run = prepared.confirm(&phrase, true).unwrap();
+    if let Some(id) = &operation_id {
+        queue.mark_running(id).unwrap();
+    }
     // Die Kollision entsteht nach der Permit-Ausgabe auf der zweiten Projektion.
     // Damit bleibt eine echte erste Wirkung im gebundenen Recovery-Journal.
     std::fs::write(left.join("b-von-rechts"), b"fremd").unwrap();
-    assert!(run
+    let error = run
         .execute(&doppeldecker_core::Cancel::new(), &mut |_| {})
-        .is_err());
+        .unwrap_err();
+    if let Some(id) = &operation_id {
+        queue
+            .interrupt_bidirectional_coded(id, doppeldecker_core::Progress::default(), &error)
+            .unwrap();
+    }
     std::fs::remove_file(left.join("b-von-rechts")).unwrap();
     assert!(baseline.with_extension("run.json").exists());
+    drop(queue);
+}
+
+struct NoTestSecrets;
+
+impl doppeldecker_core::SecretResolver for NoTestSecrets {
+    fn resolve(
+        &self,
+        _reference: &doppeldecker_core::KeychainSecretReference,
+    ) -> std::io::Result<doppeldecker_core::SecretString> {
+        panic!("Lokaler Strictlauf darf keine Secrets lesen")
+    }
 }
 
 fn run_bidirectional_recovery(
@@ -2722,9 +2942,19 @@ fn run_bidirectional_recovery(
         "bidirectional_result"
     };
     let mut events = Vec::new();
-    let preview = loop {
+    let _preview = loop {
         let mut line = String::new();
-        assert!(reader.read_line(&mut line).unwrap() > 0);
+        if reader.read_line(&mut line).unwrap() == 0 {
+            let status = child.wait().unwrap();
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("{command_name} endete vor {preview_event}: {status}; Events: {events:?}; stderr: {stderr}");
+        }
         let event: serde_json::Value = serde_json::from_str(&line).unwrap();
         if event["event"] == preview_event {
             let preview = event["preview"].clone();
@@ -2734,15 +2964,7 @@ fn run_bidirectional_recovery(
         events.push(event);
     };
     let mut stdin = child.stdin.take().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        preview["confirmation_phrase"].as_str().unwrap()
-    )
-    .unwrap();
-    if command_name == "resume" && preview["backup_confirmation_required"] == true {
-        writeln!(stdin, "BACKUP UND RESTORE BESTÄTIGT").unwrap();
-    }
+    writeln!(stdin, "ja").unwrap();
     drop(stdin);
 
     loop {
@@ -2774,7 +2996,7 @@ fn run_bidirectional_recovery(
 }
 
 #[test]
-fn sftp_inhaltsklasse_verweigert_move_ersetzung_und_ungebundene_auswahl_vor_profil_oder_queue() {
+fn sftp_dateiaktionen_pruefen_profile_und_ungebundene_auswahl_vor_der_queue() {
     for (command, item, replace) in [
         ("move", "/pane/a.txt", false),
         ("copy", "/pane/a.txt", true),
@@ -2812,7 +3034,7 @@ fn sftp_inhaltsklasse_verweigert_move_ersetzung_und_ungebundene_auswahl_vor_prof
                 == if command == "copy" && !replace {
                     "invalid_input"
                 } else {
-                    "unsupported"
+                    "not_found"
                 }),
             "{events:?}"
         );
@@ -2822,7 +3044,7 @@ fn sftp_inhaltsklasse_verweigert_move_ersetzung_und_ungebundene_auswahl_vor_prof
 }
 
 #[test]
-fn webdav_ersetzen_scheitert_vor_profil_schluesselbund_und_queue() {
+fn webdav_ersetzen_prueft_das_profil_vor_schluesselbund_und_queue() {
     let sandbox = CliSandbox::new();
     let source = sandbox.path().join("quelle");
     std::fs::create_dir(&source).unwrap();
@@ -2851,10 +3073,9 @@ fn webdav_ersetzen_scheitert_vor_profil_schluesselbund_und_queue() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert!(
-        events.iter().any(|event| event["code"] == "unsupported"),
+        events.iter().any(|event| event["code"] == "not_found"),
         "{events:?}"
     );
-    assert!(serde_json::to_string(&events).unwrap().contains("ODER"));
     assert!(!sandbox.config_dir().join("operations-queue.json").exists());
     assert_eq!(std::fs::read(source.join("Datei.txt")).unwrap(), b"neu");
 }
@@ -2987,4 +3208,246 @@ fn cli_delta_zielprofil_scheitert_vor_quellverbindung_und_queuejournal() {
         "Ungültige Zielkonfiguration darf die Quelle nicht kontaktieren"
     );
     assert!(!sandbox.config_dir().join("operations-queue.json").exists());
+}
+
+#[test]
+fn mutierende_cli_befehle_pruefen_profile_vor_dem_queuejournal() {
+    for command in ["mkdir", "rename", "delete"] {
+        let sandbox = CliSandbox::new();
+        let mut process = sandbox.json_cli();
+        process.args([command, "--provider", "ftps", "--profile", "fehlt"]);
+        match command {
+            "mkdir" => {
+                process.args(["--parent", "/pane", "--name", "neu"]);
+            }
+            "rename" => {
+                process.args([
+                    "--root",
+                    "/pane",
+                    "--path",
+                    "/pane/alt",
+                    "--new-name",
+                    "neu",
+                ]);
+            }
+            "delete" => {
+                process.args([
+                    "--root",
+                    "/pane",
+                    "--item",
+                    "/pane/alt",
+                    "--mode",
+                    "permanent",
+                ]);
+            }
+            _ => unreachable!(),
+        }
+        let output = process.output().unwrap();
+        assert!(!output.status.success());
+        let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(event["code"], "not_found", "{command}: {event}");
+        assert!(
+            !sandbox.config_dir().exists(),
+            "{command} darf bei fehlendem Profil keine Queue anlegen"
+        );
+    }
+}
+
+#[test]
+fn bidirektionale_cli_argumentfehler_oeffnen_keine_queue() {
+    for subcommand in ["plan", "run", "resume", "rollback"] {
+        let sandbox = CliSandbox::new();
+        let left = sandbox.path().join("links");
+        let right = sandbox.path().join("rechts");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        let mut command = sandbox.json_cli();
+        command
+            .args(["bidirectional", subcommand, "--pair-name", "Test", "--left"])
+            .arg(&left)
+            .arg("--right")
+            .arg(&right)
+            .arg("--baseline");
+        if matches!(subcommand, "plan" | "run") {
+            command
+                .arg(sandbox.path().join("paar.json"))
+                .args(["--pair-id", "ungueltig"]);
+        } else {
+            command.arg(left.join("paar.json"));
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let expected = if matches!(subcommand, "plan" | "run") {
+            "invalid_input"
+        } else {
+            "permission_denied"
+        };
+        assert_eq!(event["code"], expected, "{subcommand}: {event}");
+        assert!(
+            !sandbox.config_dir().exists(),
+            "{subcommand} darf bei Argumentfehlern keine Queue anlegen"
+        );
+    }
+}
+
+#[test]
+fn bidirektionale_cli_konfliktdateifehler_oeffnen_keine_queue() {
+    for subcommand in ["plan", "run"] {
+        let sandbox = CliSandbox::new();
+        let left = sandbox.path().join("links");
+        let right = sandbox.path().join("rechts");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        let output = sandbox
+            .json_cli()
+            .args([
+                "bidirectional",
+                subcommand,
+                "--pair-name",
+                "Test",
+                "--pair-id",
+                "11111111111111111111111111111111",
+                "--left",
+            ])
+            .arg(&left)
+            .arg("--right")
+            .arg(&right)
+            .arg("--baseline")
+            .arg(sandbox.path().join("paar.json"))
+            .arg("--resolutions")
+            .arg(sandbox.path().join("fehlt.json"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(event["code"], "not_found", "{subcommand}: {event}");
+        assert!(!sandbox.config_dir().exists());
+    }
+}
+
+#[test]
+fn bidirektionaler_textmodus_zeigt_wirkung_und_rekursive_entfernungswarnung_vor_zustimmung() {
+    for empty_source in [false, true] {
+        let sandbox = CliSandbox::new();
+        let left = sandbox.path().join("links");
+        let right = sandbox.path().join("rechts");
+        let baseline = sandbox.path().join("state/paar.json");
+        for root in [&left, &right] {
+            std::fs::create_dir_all(root.join("Baum/Kind")).unwrap();
+            for index in 0..60 {
+                std::fs::write(root.join(format!("Baum/Kind/{index}.txt")), b"alt").unwrap();
+            }
+            std::fs::write(root.join("links-aendern.txt"), b"alt").unwrap();
+            std::fs::write(root.join("rechts-aendern.txt"), b"alt").unwrap();
+        }
+        let queue = doppeldecker_core::OperationQueue::open(
+            sandbox.config_dir().join("operations-queue.json"),
+        )
+        .unwrap();
+        let pair = doppeldecker_core::PairId([0x56; 16]);
+        let initial = prepare_local_bidirectional_with_decisions_bound_for_queue(
+            &queue,
+            pair,
+            "Text-Paar",
+            &left,
+            &right,
+            &baseline,
+            &[],
+            None,
+        )
+        .unwrap();
+        initial
+            .confirm_effects(true)
+            .unwrap()
+            .execute(&doppeldecker_core::Cancel::new(), &mut |_| {})
+            .unwrap();
+        doppeldecker_core::bidirectional::finish_bidirectional_run_completion(&baseline).unwrap();
+        std::fs::remove_dir_all(left.join("Baum")).unwrap();
+        if empty_source {
+            std::fs::remove_file(left.join("links-aendern.txt")).unwrap();
+            std::fs::remove_file(left.join("rechts-aendern.txt")).unwrap();
+        } else {
+            std::fs::write(left.join("links-aendern.txt"), b"neu links").unwrap();
+            std::fs::write(right.join("rechts-aendern.txt"), b"neu rechts").unwrap();
+            std::fs::write(left.join("neu-links.txt"), b"neu").unwrap();
+            std::fs::write(right.join("neu-rechts.txt"), b"neu").unwrap();
+        }
+        drop(queue);
+        let mut child = sandbox
+            .cli()
+            .args([
+                "bidirectional",
+                "run",
+                "--pair-id",
+                "56565656565656565656565656565656",
+                "--pair-name",
+                "Text-Paar",
+                "--left",
+            ])
+            .arg(&left)
+            .arg("--right")
+            .arg(&right)
+            .arg("--baseline")
+            .arg(&baseline)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"nein\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let before_confirmation = stderr
+            .split("Bidirektionale Wirkung der gebundenen Vorschau ausführen?")
+            .next()
+            .unwrap();
+        assert!(before_confirmation.contains("Links → Rechts:"), "{stderr}");
+        assert!(before_confirmation.contains("Rechts → Links:"), "{stderr}");
+        assert!(
+            before_confirmation.contains("Umfangreiche Entfernung:"),
+            "{stderr}"
+        );
+        assert!(
+            before_confirmation.contains(if empty_source {
+                "64 von 64 Zieleinträgen"
+            } else {
+                "62 von 65 Zieleinträgen"
+            }),
+            "{stderr}"
+        );
+        assert!(
+            before_confirmation.contains(if empty_source { "186 Byte" } else { "180 Byte" }),
+            "{stderr}"
+        );
+        if empty_source {
+            assert!(
+                before_confirmation.contains("Die Quelle ist leer"),
+                "{stderr}"
+            );
+        } else {
+            assert!(
+                before_confirmation.contains("Kopieren Links → Rechts: \"neu-links.txt\""),
+                "{stderr}"
+            );
+            assert!(
+                before_confirmation.contains("Kopieren Rechts → Links: \"neu-rechts.txt\""),
+                "{stderr}"
+            );
+            assert!(
+                before_confirmation.contains("Ersetzen Links → Rechts: \"links-aendern.txt\""),
+                "{stderr}"
+            );
+            assert!(
+                before_confirmation.contains("Ersetzen Rechts → Links: \"rechts-aendern.txt\""),
+                "{stderr}"
+            );
+        }
+        assert!(
+            before_confirmation.contains("In Quarantäne entfernen rechts:"),
+            "{stderr}"
+        );
+        assert!(right.join("Baum/Kind/0.txt").exists());
+    }
 }

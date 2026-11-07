@@ -1,6 +1,6 @@
 # Manueller, signierter Updatekanal
 
-Stand: 2026-10-07. „Auto-Update“ bezeichnet die technische Aktualisierung der
+Stand: 2026-11-07. „Auto-Update“ bezeichnet die technische Aktualisierung der
 installierten App. Vor Version 1.0 prüft und installiert Doppeldecker ausschließlich
 auf ausdrücklichen Auftrag über das Menü.
 
@@ -14,6 +14,11 @@ auf ausdrücklichen Auftrag über das Menü.
    die Signaturprüfung lässt sich nicht abschalten.
 4. macOS und Linux verwenden die neue Version beim nächsten Start. Doppeldecker beendet
    oder startet sich nicht ungefragt neu.
+
+Für eine benutzereigene Linux-Installation hält `./install.sh --appimage …` das
+AppImage als reguläre, beschreibbare Datei unter einem stabilen Pfad. Menü- und
+Terminalstarter referenzieren diesen Pfad weiter, wenn der Updater die Nutzlast
+ersetzt. [Installation und Linux-Umfang](linux.md).
 
 Release-Hinweise sind fremder Text aus `latest.json`. Das Frontend maskiert sie deshalb
 vor der Anzeige als Text und übernimmt weder HTML noch Links.

@@ -1,8 +1,9 @@
 //! Bediencommands der persistenten Operations-Queue.
 
+use crate::frontend_payload::FrontendQueueSnapshot;
 use std::sync::Arc;
 
-use doppeldecker_core::{OperationQueue, QueueSnapshot};
+use doppeldecker_core::OperationQueue;
 use tauri::{State, WebviewWindow};
 
 use crate::{
@@ -20,12 +21,12 @@ fn change_queue(
     window: &WebviewWindow,
     state: &State<AppState>,
     change: impl FnOnce(&OperationQueue) -> Result<(), AppError>,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label();
     let queue = operation_queue(app, &state.window(label), label)?;
     change(&queue)?;
     emit_queue_snapshot(app, label, &queue);
-    Ok(queue.snapshot())
+    Ok(queue.snapshot().into())
 }
 
 /// Wie [`change_queue`], aber für Änderungen, die einen wartenden Eintrag wieder
@@ -39,7 +40,7 @@ fn resume_queue(
     window: &WebviewWindow,
     state: &State<AppState>,
     change: impl FnOnce(&Arc<OperationQueue>) -> Result<(), AppError>,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label();
     let window_state = state.window(label);
     let queue = with_queue_extension(state, &window_state, || {
@@ -49,7 +50,7 @@ fn resume_queue(
     })?;
     emit_queue_snapshot(&app, label, &queue);
     start_queue_worker(app, label.to_owned());
-    Ok(queue.snapshot())
+    Ok(queue.snapshot().into())
 }
 
 #[tauri::command]
@@ -69,14 +70,14 @@ pub(crate) fn list_operation_queue(
     app: tauri::AppHandle,
     window: WebviewWindow,
     state: State<AppState>,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label();
     let queue = operation_queue(&app, &state.window(label), label)?;
     let snapshot = queue.snapshot();
     if queue.has_runnable() {
         start_queue_worker(app, label.to_owned());
     }
-    Ok(snapshot)
+    Ok(snapshot.into())
 }
 
 #[tauri::command]
@@ -85,7 +86,7 @@ pub(crate) fn set_queue_paused(
     window: WebviewWindow,
     state: State<AppState>,
     paused: bool,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     let snapshot = change_queue(&app, &window, &state, |queue| {
         queue.set_paused(paused).map_err(AppError::from)
     })?;
@@ -103,7 +104,7 @@ pub(crate) fn set_queue_stop_on_error(
     window: WebviewWindow,
     state: State<AppState>,
     stop: bool,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     change_queue(&app, &window, &state, |queue| {
         queue.set_stop_on_error(stop).map_err(AppError::from)
     })
@@ -116,7 +117,7 @@ pub(crate) fn move_queue_entry(
     state: State<AppState>,
     operation_id: String,
     delta: i32,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     change_queue(&app, &window, &state, |queue| {
         queue
             .move_pending(&operation_id, delta)
@@ -130,11 +131,22 @@ pub(crate) fn remove_queue_entry(
     window: WebviewWindow,
     state: State<AppState>,
     operation_id: String,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     change_queue(&app, &window, &state, |queue| {
+        crate::forward_bidirectional_commands::discard_queue_slot(
+            &state.window(window.label()),
+            queue,
+            &operation_id,
+            false,
+        )?;
         queue
             .remove_pending(&operation_id)
             .map_err(AppError::from)?;
+        state
+            .window(window.label())
+            .content_sync_runs
+            .lock_recover()
+            .remove(&operation_id);
         state
             .window(window.label())
             .local_sync_runs
@@ -150,7 +162,7 @@ pub(crate) fn retry_queue_entry(
     window: WebviewWindow,
     state: State<AppState>,
     operation_id: String,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     resume_queue(app, &window, &state, |queue| {
         queue.retry(&operation_id).map_err(AppError::from)
     })
@@ -162,7 +174,7 @@ pub(crate) fn discard_replan_required_queue_entry(
     window: WebviewWindow,
     state: State<AppState>,
     operation_id: String,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     resume_queue(app, &window, &state, |queue| {
         queue
             .discard_replan_required(&operation_id)
@@ -177,7 +189,7 @@ pub(crate) fn acknowledge_legacy_webdav_delete(
     state: State<AppState>,
     operation_id: String,
     possible_effect_reviewed: bool,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     // Beide zulässigen Abschlüsse beseitigen den vordersten Blocker: Ein sicher
     // ungestarteter Altplan wird entfernt, ein möglicherweise wirksamer Lauf nach
     // manueller Prüfung terminal. Danach darf der nächste Pending-Eintrag dieses
@@ -191,13 +203,34 @@ pub(crate) fn acknowledge_legacy_webdav_delete(
 }
 
 #[tauri::command]
+pub(crate) fn acknowledge_archive_extract_outcome(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    state: State<AppState>,
+    operation_id: String,
+    effects_reviewed: bool,
+) -> Result<FrontendQueueSnapshot, AppError> {
+    if !effects_reviewed {
+        return Err(AppError::new(
+            "confirmation_mismatch",
+            "Entpackbilanz und mögliche Zielwirkung wurden nicht bestätigt",
+        ));
+    }
+    resume_queue(app, &window, &state, |queue| {
+        queue
+            .acknowledge_archive_extract_outcome(&operation_id)
+            .map_err(AppError::from)
+    })
+}
+
+#[tauri::command]
 pub(crate) fn acknowledge_unclear_queue_outcome(
     app: tauri::AppHandle,
     window: WebviewWindow,
     state: State<AppState>,
     operation_id: String,
     possible_effect_reviewed: bool,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     // Die manuelle Prüfung schließt den blockierenden Eintrag. Danach kann der
     // nächste Pending-Eintrag sofort laufen; deshalb gilt derselbe fensterlokale
     // Erweiterungs- und Worker-Vertrag wie bei Retry und Bestätigungsablehnung.
@@ -214,15 +247,42 @@ pub(crate) fn discard_queue_confirmation(
     window: WebviewWindow,
     state: State<AppState>,
     operation_id: String,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     // Ablehnen ist die Gegenrichtung zu `approve_queue_entry`: Der Eintrag wird
     // verworfen, statt die neue Lage zu übernehmen. Es läuft trotzdem über den
     // Wiederaufnahme-Helfer, weil danach der nächste wartende Eintrag anlaufen
     // darf — der Verworfene blockiert die Reihenfolge nicht mehr.
     resume_queue(app, &window, &state, |queue| {
+        if queue.snapshot().entries.iter().any(|entry| {
+            entry.operation_id == operation_id
+                && matches!(
+                    entry.operation,
+                    doppeldecker_core::QueueOperation::BidirectionalForward { .. }
+                )
+        }) {
+            crate::forward_bidirectional_commands::discard_queue_slot(
+                &state.window(window.label()),
+                queue,
+                &operation_id,
+                true,
+            )?;
+            if queue.snapshot().entries.iter().any(|entry| {
+                entry.operation_id == operation_id
+                    && entry.state == doppeldecker_core::QueueState::Interrupted
+            }) {
+                return Err(AppError::new("replan_required","Vorhandene Teilwirkungen bleiben im Journal erhalten; den bidirektionalen Bestand neu abgleichen"));
+            }
+            return Ok(());
+        }
+
         queue
             .discard_attention(&operation_id)
             .map_err(AppError::from)?;
+        state
+            .window(window.label())
+            .content_sync_runs
+            .lock_recover()
+            .remove(&operation_id);
         state
             .window(window.label())
             .local_sync_runs
@@ -238,11 +298,12 @@ pub(crate) fn approve_queue_entry(
     window: WebviewWindow,
     state: State<AppState>,
     operation_id: String,
-    confirmation: String,
-) -> Result<QueueSnapshot, AppError> {
+    expected_attention: doppeldecker_core::QueueAttention,
+    effects_confirmed: bool,
+) -> Result<FrontendQueueSnapshot, AppError> {
     resume_queue(app, &window, &state, |queue| {
         queue
-            .approve_attention(&operation_id, &confirmation)
+            .approve_attention_effects(&operation_id, &expected_attention, effects_confirmed)
             .map_err(AppError::from)
     })
 }

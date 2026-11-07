@@ -4,28 +4,46 @@
 
 mod app_commands;
 mod app_support;
+mod archive_extract_commands;
+mod archive_pack_commands;
+mod archive_read_commands;
+mod archive_upload_commands;
+mod batch_rename_commands;
 mod bidirectional_commands;
 mod browser_commands;
 mod cli_setup;
 mod connection_state_commands;
+mod content_sync_commands;
+mod content_sync_sandbox;
 mod desktop_settings;
 mod directory_size_commands;
+mod duplicate_commands;
 mod favorites_commands;
 mod file_clipboard;
 mod file_commands;
 mod file_intents;
+mod file_property_commands;
+#[cfg(target_os = "macos")]
+mod finder_comments_native;
+mod forward_bidirectional_commands;
+mod frontend_payload;
 mod ftps_commands;
 mod local_sync_commands;
 mod menu;
+mod metadata_admin;
 mod mutex;
+mod name_search_commands;
 mod network_discovery_commands;
 mod normal_sync_commands;
 mod operation_events;
 mod pane_tabs;
+mod preview_commands;
 mod provider_sync_commands;
 mod quarantine_commands;
 mod queue_commands;
 mod queue_runtime;
+mod read_endpoint;
+mod remote_edit_commands;
 mod sftp_commands;
 mod smb_commands;
 mod system_mount_commands;
@@ -80,8 +98,8 @@ fn labeled_queue_error(failure: &app_commands::ExitFailure) -> AppError {
 }
 
 /// Meldet einen appweiten Exit-Blocker an ein tatsächlich sichtbares Fenster. Nur
-/// ein reiner Befund offener Queues bekommt einen bestätigbaren Einmaltoken;
-/// aktive Operationen und Journalfehler bleiben immer fail-closed.
+/// inaktive offene oder unlesbare Queues bekommen einen bestätigbaren Einmaltoken.
+/// Laufende Operationen und Vorbereitungen lassen sich nicht damit übergehen.
 fn report_exit_blockers(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -137,7 +155,7 @@ fn report_exit_blockers(
             ),
         );
     }
-    if assessment.can_confirm_open_queues() {
+    if assessment.can_confirm_exit() {
         let request = app_commands::issue_exit_confirmation(state, assessment.clone());
         if crate::emit_to_window(&target, "queue-exit-requested", &request).is_err() {
             // Ohne zugestellten Dialog existiert auch keine gültige Bestätigung.
@@ -217,6 +235,43 @@ fn main() {
         .menu(menu::build_menu)
         .on_menu_event(menu::handle_menu_event)
         .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                window
+                    .app_handle()
+                    .state::<archive_read_commands::ArchiveReadState>()
+                    .destroy_window(window.label());
+                window
+                    .app_handle()
+                    .state::<AppState>()
+                    .name_searches
+                    .cancel_window(window.label());
+                window
+                    .app_handle()
+                    .state::<batch_rename_commands::BatchRenameState>()
+                    .destroy(window.label());
+                window
+                    .app_handle()
+                    .state::<AppState>()
+                    .window(window.label())
+                    .duplicate_preparation
+                    .lock_recover()
+                    .close();
+                window
+                    .app_handle()
+                    .state::<AppState>()
+                    .window(window.label())
+                    .archive_pack_preparation
+                    .lock_recover()
+                    .close();
+                window
+                    .app_handle()
+                    .state::<AppState>()
+                    .window(window.label())
+                    .archive_extract_preparation
+                    .lock_recover()
+                    .close();
+                return;
+            }
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
@@ -283,6 +338,7 @@ fn main() {
             // RAM zurücklassen. Noch laufende native Dialoge prüfen den Besitzer
             // zusätzlich unmittelbar vor dem Eintragen.
             sftp_commands::discard_connection_secrets_for_owner(&app_state, window.label());
+            app_state.name_searches.cancel_window(window.label());
             let last_window = remaining == 0;
             // Auf macOS lässt das Schließen des letzten Fensters den Prozess
             // weiterlaufen; dieses Fenster soll aus der nächsten Sitzung
@@ -294,6 +350,8 @@ fn main() {
             desktop_settings::schedule_forget_closed_window(app, window.label(), preserve_for_exit);
         })
         .manage(AppState::default())
+        .manage(batch_rename_commands::BatchRenameState::default())
+        .manage(archive_read_commands::ArchiveReadState::default())
         .manage(desktop_settings::DesktopState::default())
         .manage(update_commands::UpdateState::default())
         .setup(|app| {
@@ -347,6 +405,7 @@ fn main() {
             window_commands::take_startup_app_error,
             desktop_settings::desktop_preferences,
             desktop_settings::update_desktop_preferences,
+            desktop_settings::sync_native_theme,
             desktop_settings::remember_window,
             desktop_settings::restored_pane_tabs,
             desktop_settings::restored_active_side,
@@ -355,11 +414,36 @@ fn main() {
             browser_commands::open_path,
             browser_commands::open_project_page,
             browser_commands::open_remote_snapshot,
+            preview_commands::prepare_file_preview,
+            batch_rename_commands::prepare_batch_rename,
+            metadata_admin::get_metadata_admin_status,
+            metadata_admin::set_metadata_admin_service,
+            metadata_admin::open_metadata_admin_settings,
+            file_property_commands::change_file_permissions,
+            file_property_commands::get_file_property_capabilities,
+            file_property_commands::tags::get_file_finder_tags,
+            file_property_commands::tags::change_file_finder_tags,
+            file_property_commands::flags::get_file_flags,
+            file_property_commands::flags::change_file_flag,
+            file_property_commands::visibility::get_file_visibility,
+            file_property_commands::visibility::change_file_visibility,
+            file_property_commands::comments::get_file_finder_comments,
+            file_property_commands::comments::change_file_finder_comments,
+            file_property_commands::change_file_ownership,
+            file_property_commands::cancel_file_property_edit,
+            batch_rename_commands::execute_batch_rename,
+            batch_rename_commands::cancel_batch_rename,
+            batch_rename_commands::discard_batch_rename,
+            remote_edit_commands::list_remote_edits,
+            remote_edit_commands::save_remote_edit,
+            remote_edit_commands::close_remote_edit,
             browser_commands::diff_tool_status,
             browser_commands::compare_files,
             system_mount_commands::list_system_mounts,
             system_mount_commands::eject_system_mount,
             network_discovery_commands::discover_network_services,
+            name_search_commands::start_name_search,
+            name_search_commands::cancel_name_search,
             directory_size_commands::start_directory_sizes,
             directory_size_commands::cancel_directory_sizes,
             local_sync_commands::plan_sync,
@@ -367,6 +451,14 @@ fn main() {
             normal_sync_commands::discard_local_sync,
             normal_sync_commands::enqueue_local_sync,
             normal_sync_commands::local_sync_queue_preview,
+            content_sync_commands::prepare_content_sync,
+            content_sync_commands::discard_content_sync,
+            content_sync_commands::enqueue_content_sync,
+            content_sync_commands::content_sync_queue_preview,
+            content_sync_commands::approve_content_sync_queue_entry,
+            content_sync_commands::acknowledge_directory_dacl_outcome,
+            content_sync_commands::acknowledge_file_dacl_outcome,
+            content_sync_commands::acknowledge_created_directory_dacl_outcome,
             normal_sync_commands::approve_local_sync_queue_entry,
             local_sync_commands::prepare_real_sync,
             local_sync_commands::discard_real_sync,
@@ -382,8 +474,21 @@ fn main() {
             queue_commands::discard_replan_required_queue_entry,
             queue_commands::discard_queue_confirmation,
             queue_commands::acknowledge_legacy_webdav_delete,
+            queue_commands::acknowledge_archive_extract_outcome,
             queue_commands::acknowledge_unclear_queue_outcome,
             queue_commands::approve_queue_entry,
+            forward_bidirectional_commands::register_forward_bidirectional_pair,
+            forward_bidirectional_commands::prepare_forward_bidirectional_sync,
+            forward_bidirectional_commands::discard_forward_bidirectional_sync,
+            forward_bidirectional_commands::enqueue_forward_bidirectional_sync,
+            forward_bidirectional_commands::preview_forward_bidirectional_conflicts,
+            forward_bidirectional_commands::forward_bidirectional_pair_status,
+            forward_bidirectional_commands::finish_forward_bidirectional_pair_completion,
+            forward_bidirectional_commands::forward_bidirectional_queue_preview,
+            forward_bidirectional_commands::prepare_forward_bidirectional_queue_recovery,
+            forward_bidirectional_commands::approve_forward_bidirectional_queue_entry,
+            forward_bidirectional_commands::discard_forward_bidirectional_queue_preparation,
+            forward_bidirectional_commands::finish_forward_bidirectional_queue_completion,
             bidirectional_commands::prepare_bidirectional_sync,
             bidirectional_commands::register_bidirectional_pair,
             bidirectional_commands::prepare_bidirectional_resume,
@@ -420,6 +525,7 @@ fn main() {
             sftp_commands::restore_sftp_quarantine_entry,
             sftp_commands::purge_sftp_quarantine_run,
             ftps_commands::discover_ftps_certificate,
+            ftps_commands::verify_ftps_certificate,
             ftps_commands::list_ftps_profiles,
             ftps_commands::save_ftps_profile,
             ftps_commands::remove_ftps_profile,
@@ -469,6 +575,22 @@ fn main() {
             file_commands::check_local_file_operation,
             file_commands::check_provider_file_operation,
             file_commands::check_provider_delete,
+            archive_extract_commands::prepare_archive_extract,
+            archive_extract_commands::prepare_archive_extract_selection,
+            archive_extract_commands::confirm_archive_extract,
+            archive_extract_commands::discard_archive_extract,
+            archive_pack_commands::prepare_archive_pack,
+            archive_pack_commands::confirm_archive_pack,
+            archive_pack_commands::discard_archive_pack,
+            archive_upload_commands::generated_source_path,
+            archive_read_commands::open_archive_read,
+            archive_read_commands::list_archive_directory,
+            archive_read_commands::preview_archive_entry,
+            archive_read_commands::cancel_archive_read,
+            archive_read_commands::close_archive_read,
+            duplicate_commands::prepare_duplicate,
+            duplicate_commands::confirm_duplicate,
+            duplicate_commands::discard_duplicate,
             file_commands::copy_paths,
             file_commands::move_paths,
             file_commands::enqueue_provider_file_operation,
@@ -784,7 +906,7 @@ mod sandbox_tests {
     }
 
     #[test]
-    fn nativer_exit_bleibt_bei_jedem_queue_oeffnungsfehler_gesperrt() {
+    fn nativer_exit_verlangt_bei_queue_oeffnungsfehler_eine_bestaetigung() {
         let labels = vec!["main".to_string(), "window-1".to_string()];
         let assessment = app_commands::assess_exit(&labels, false, |label| match label {
             "main" => (false, Ok(Vec::new())),
@@ -792,6 +914,7 @@ mod sandbox_tests {
         });
 
         assert!(assessment.must_prevent_exit());
+        assert!(assessment.can_confirm_exit());
         assert_eq!(assessment.open_entries(), 0);
         let failure = assessment.failures().next().unwrap();
         assert_eq!(failure.label, "window-1");

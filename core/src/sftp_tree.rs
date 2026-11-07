@@ -1,15 +1,8 @@
-//! Gemeinsame begrenzte Baumbeobachtung für Inhalte und Metadaten. READDIR-EOF
+//! Gemeinsame iterative Baumbeobachtung für Inhalte und Metadaten. READDIR-EOF
 //! bleibt wirkungsbezogen und erzeugt keinen vollständigen Plannerbeleg.
 
 use super::*;
 use crate::vfs::{InteractiveSourceTree, SourceReadOmission};
-use std::time::Duration;
-
-pub(super) const PREPARATION_LIMIT: Duration = Duration::from_secs(60);
-const MAX_ENTRIES: usize = 1000;
-const MAX_DEPTH: usize = 16;
-const MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-
 #[derive(Clone)]
 pub(super) struct DirectoryProof {
     pub node: FileProof,
@@ -20,6 +13,7 @@ pub(super) struct DirectoryProof {
 type PreparedTree = (
     BTreeMap<PathBuf, FileProof>,
     BTreeMap<PathBuf, DirectoryProof>,
+    BTreeMap<PathBuf, FileProof>,
     Option<TreeSummary>,
 );
 
@@ -52,7 +46,6 @@ async fn read_directory(
     raw: &RawSftpSession,
     remote: &str,
     cancel: &Cancel,
-    purpose: ReadPurpose,
 ) -> io::Result<BTreeMap<String, FileAttributes>> {
     let files = context.record_failure(
         super::super::directory_read::read_records(
@@ -60,9 +53,9 @@ async fn read_directory(
             remote,
             cancel,
             super::super::directory_read::DirectoryReadLimits {
-                entries: MAX_ENTRIES,
-                name_bytes: 1024 * 1024,
-                pages: MAX_ENTRIES + 3,
+                entries: usize::MAX,
+                name_bytes: usize::MAX,
+                pages: usize::MAX,
                 duplicate_error_kind: io::ErrorKind::InvalidInput,
             },
             |result| context.record_failure(result),
@@ -73,13 +66,6 @@ async fn read_directory(
     for (name, attributes) in files {
         check_cancel(cancel)?;
         validate_remote_name(&name)?;
-        if purpose == ReadPurpose::Contents
-            && entries
-                .keys()
-                .any(|existing: &String| crate::remote_rename::names_may_collide(existing, &name))
-        {
-            return Err(invalid("SFTP-Ordner enthält doppelte oder am lokalen Ziel möglicherweise gleichgesetzte Namen"));
-        }
         entries.insert(name, attributes);
     }
     Ok(entries)
@@ -99,23 +85,44 @@ pub(super) async fn prepare(
     let mut files = BTreeMap::new();
     let mut directories = BTreeMap::new();
     let mut omitted = Vec::new();
+    let mut omitted_selections = BTreeMap::new();
+    let mut direct_counts = BTreeMap::<String, usize>::new();
+    if purpose == ReadPurpose::Contents {
+        for path in items {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| invalid("SFTP-Auswahlname ist nicht UTF-8"))?;
+            *direct_counts
+                .entry(crate::remote_rename::folded_name(name))
+                .or_default() += 1;
+        }
+    }
+    let grouped_paths = items
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    direct_counts
+                        .get(&crate::remote_rename::folded_name(name))
+                        .is_some_and(|count| *count > 1)
+                })
+        })
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     let mut pending = items
         .iter()
         .rev()
-        .map(|path| (path.clone(), 0usize, None::<Attributes>))
+        .map(|path| (path.clone(), None::<Attributes>))
         .collect::<Vec<_>>();
     let mut count = 0usize;
     let mut total_bytes = 0u64;
-    while let Some((path, depth, listed)) = pending.pop() {
+    while let Some((path, listed)) = pending.pop() {
         context.check_session()?;
         check_cancel(cancel)?;
         validate_content_path(&path).map_err(|error| at_path(&path, error))?;
         count += 1;
-        if count > MAX_ENTRIES || depth > MAX_DEPTH {
-            return Err(invalid(
-                "SFTP-Auswahl überschreitet 1000 Einträge oder 16 Unterordnerebenen",
-            ));
-        }
         let node = capture_node_for(
             session,
             &identity.canonical_root,
@@ -147,13 +154,21 @@ pub(super) async fn prepare(
                 "SFTP-Kindattribute änderten sich zwischen READDIR und LSTAT",
             ));
         }
+        if grouped_paths.contains(&path) {
+            omitted.push(SourceReadOmission {
+                path: path_to_text(&path)?,
+                reason: "Am lokalen Ziel möglicherweise gleichwertige Case-/Unicode-Namen; gesamte direkte Namensgruppe nicht übertragen".into(),
+            });
+            omitted_selections.insert(path, node);
+            continue;
+        }
         if node.entry.is_file {
             total_bytes = total_bytes
                 .checked_add(node.entry.size)
                 .ok_or_else(|| invalid("SFTP-Gesamtgröße ist nicht darstellbar"))?;
             files.insert(path, node);
         } else {
-            let observed = read_directory(context, raw, &node.remote, cancel, purpose)
+            let observed = read_directory(context, raw, &node.remote, cancel)
                 .await
                 .map_err(|error| at_path(&path, error))?;
             let fresh = capture_node_for(
@@ -168,15 +183,30 @@ pub(super) async fn prepare(
             if fresh.attributes != node.attributes || fresh.chain != node.chain {
                 return Err(drift("SFTP-Ordner änderte sich während READDIR"));
             }
-            for (name, attributes) in observed.iter().rev() {
-                if count.saturating_add(pending.len()) >= MAX_ENTRIES {
-                    return Err(invalid("SFTP-Auswahl überschreitet 1000 Einträge"));
+            let mut name_counts = BTreeMap::<String, usize>::new();
+            if purpose == ReadPurpose::Contents {
+                for name in observed.keys() {
+                    *name_counts
+                        .entry(crate::remote_rename::folded_name(name))
+                        .or_default() += 1;
                 }
-                pending.push((
-                    path.join(name),
-                    depth + 1,
-                    Some(Attributes::from(attributes)),
-                ));
+            }
+            for (name, attributes) in observed.iter().rev() {
+                if purpose == ReadPurpose::Contents
+                    && name_counts
+                        .get(&crate::remote_rename::folded_name(name))
+                        .is_some_and(|count| *count > 1)
+                {
+                    // Keinen willkürlichen Gewinner übertragen. Der vollständige
+                    // READDIR-Bestand bleibt trotzdem im Elternbeleg gebunden.
+                    count += 1;
+                    omitted.push(SourceReadOmission {
+                        path: path_to_text(&path.join(name))?,
+                        reason: "Am lokalen Ziel möglicherweise gleichwertige Case-/Unicode-Namen; gesamte Namensgruppe nicht übertragen".into(),
+                    });
+                } else {
+                    pending.push((path.join(name), Some(Attributes::from(attributes))));
+                }
             }
             directories.insert(
                 path,
@@ -191,21 +221,22 @@ pub(super) async fn prepare(
             );
         }
     }
-    if directories.is_empty() {
-        return Ok((files, directories, None));
+    if directories.is_empty() && omitted.is_empty() {
+        return Ok((files, directories, omitted_selections, None));
     }
-    if purpose == ReadPurpose::Contents && total_bytes > MAX_TOTAL_BYTES {
-        return Err(invalid(
-            "Rekursiver SFTP-Download überschreitet 16 GiB Gesamtinhalt",
-        ));
-    }
-    for (path, directory) in &mut directories {
-        directory.children = directory
-            .observed
-            .keys()
-            .map(|name| path.join(name))
-            .filter(|path| !omitted.iter().any(|item| Path::new(&item.path) == path))
-            .collect();
+    {
+        let omitted_paths = omitted
+            .iter()
+            .map(|item| Path::new(&item.path))
+            .collect::<std::collections::HashSet<_>>();
+        for (path, directory) in &mut directories {
+            directory.children = directory
+                .observed
+                .keys()
+                .map(|name| path.join(name))
+                .filter(|path| !omitted_paths.contains(path.as_path()))
+                .collect();
+        }
     }
     omitted.sort_by(|a, b| a.path.cmp(&b.path));
     // Weder Generation noch flüchtige Handles gelangen in den Neustartbeleg.
@@ -217,6 +248,11 @@ pub(super) async fn prepare(
             directories
                 .iter()
                 .map(|(path, node)| (path, (&node.node.attributes, &node.node.chain))),
+        )
+        .chain(
+            omitted_selections
+                .iter()
+                .map(|(path, node)| (path, (&node.attributes, &node.chain))),
         )
         .collect::<BTreeMap<_, _>>();
     let listings = directories
@@ -249,7 +285,7 @@ pub(super) async fn prepare(
         bytes: total_bytes,
         omitted,
     };
-    Ok((files, directories, Some(summary)))
+    Ok((files, directories, omitted_selections, Some(summary)))
 }
 
 pub(super) async fn verify_directory(
@@ -259,9 +295,7 @@ pub(super) async fn verify_directory(
     raw: &RawSftpSession,
 ) -> io::Result<()> {
     files.check_session()?;
-    let cancel = files
-        .cancel
-        .until(std::time::Instant::now() + PREPARATION_LIMIT);
+    let cancel = files.cancel.clone();
     let result = async {
         let before = capture_node(
             session,
@@ -271,14 +305,7 @@ pub(super) async fn verify_directory(
             true,
         )
         .await?;
-        let listing = read_directory(
-            files,
-            raw,
-            &directory.node.remote,
-            &cancel,
-            ReadPurpose::Contents,
-        )
-        .await?;
+        let listing = read_directory(files, raw, &directory.node.remote, &cancel).await?;
         let after = capture_node(
             session,
             &files.identity.canonical_root,
@@ -304,12 +331,7 @@ pub(super) async fn verify_directory(
         files.check_session()
     }
     .await;
-    limited_result(
-        result,
-        &cancel,
-        &files.cancel,
-        "SFTP-Ordnerprüfung überschritt die Frist von 60 Sekunden",
-    )
+    result
 }
 
 fn at_path(path: &Path, error: io::Error) -> io::Error {

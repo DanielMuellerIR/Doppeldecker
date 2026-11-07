@@ -1,6 +1,6 @@
 # Operations-Queue
 
-Stand: 2026-10-18
+Stand: 2026-11-01
 
 ## Ziel
 
@@ -49,6 +49,50 @@ keine bestätigte Ausführungsklasse. Unklare Probe-/Cleanupausgänge und vorhan
 Recoverypfade dürfen niemals zu diesem sauberen Abbruch abgeschwächt werden.
 Die Vorbereitung vor Enqueue erzeugt bei sauberem Abbruch keinen Queueeintrag.
 Journalformat27 und seine manuelle Recovery bleiben unverändert.
+
+Version 28 ergänzt `ArchivePack` für lokale ZIP-Erzeugung. Persistiert werden die
+backendgebundene Auswahl, Archivname/Kompression und ein bestätigter Versionsdigest
+samt konkreter Wirkung/Auslassungen. Jeder Claim prüft frisch; Drift erzeugt
+`ArchivePackChanged` mit wirkungsbezogener Neubestätigung. Nach Prozessende während
+`Running` bleibt ein unklarer Ausgang ohne Retry erhalten. Der vorhandene
+Dateiabschluss und die Temp-/Staging-Recovery werden wiederverwendet.
+[ZIP-Vertrag](archive-pack.md).
+
+Journalversion 32 bindet für `ArchiveExtract` eine pfadfreie Snapshotquelle:
+begrenzte Aufnahme-ID, Manifest-/Inhaltsbindung, Herkunft und bestätigte
+Eintrags-, Ganzarchiv- oder Unterbaumauswahl. Lokale Quellen aus Version 30 und
+Snapshot-Einzeldateien aus Version 31 bleiben lesbar. Snapshotreferenzen in
+Versionen bis 30 sowie Snapshot-Ganzarchive/Unterbäume in Versionen bis 31 werden
+vor Migration zurückgewiesen, auch in Binding-, Attention- und Reportdaten.
+Nur der bekannte, nicht serialisierte
+Runtime-Snapshotstore darf eine solche Quelle beim Claim erneut öffnen. Der
+vollständige Inhaltscheck und die Lease gelten bis zum Ausführungsabschluss.
+Ohne Store oder bei fehlender/veränderter Aufnahme scheitert der Auftrag ohne
+Zielwirkung und ohne neuen Serverzugriff. Der bisherige lokale Executor bleibt
+für lokale Quellen unverändert; Snapshotabsichten ohne Store werden abgelehnt.
+`Running`-Recovery bleibt unterbrochen/unklar und führt keinen Retry aus.
+[Entpackvertrag](archive-extract.md).
+
+Journalversion 38 ergänzt `RenameCycleRecovery`: ausschließlich lesbare
+Namenszuordnung für entfernte Datei- und Ordnerzyklen, einschließlich Zwischenname und offenem
+Einzelschritt. Vor jeder Wirkung wird die Absicht dauerhaft gespeichert, danach
+der bestätigte Name. Vor der ersten Mutation sicher gestoppte Läufe schließen ihre Prüfintents und
+entfernen den unbegonnenen Recoveryeintrag. Wirklich unfertige Einträge bleiben `Interrupted`/`outcome_unclear`;
+sie besitzen keinen Enqueue-, Executor- oder Retryweg. Manuelles Schließen
+verändert den Server nicht und entfernt einen vorhandenen Zwischennamen nicht aus
+der Sync-Schranke. Versionen bis 37 werden migriert, dürfen den neuen Typ aber
+nicht enthalten. [Stapelumbenennung](batch-rename.md).
+
+Journalversion 39 bindet erzeugte ZIP-/Entpackergebnisse über `generated_source`
+an einen normalen `ProviderFile`-Upload. Referenz, vollständige Auswahl und
+Uploadabsicht werden gemeinsam gespeichert. Nur der bekannte private Queue-Store
+löst sie nach vollständiger Inhaltsprüfung auf; Handles bleiben im RAM. Fehlende
+Marker unter diesem Store, falsche Roots, Move-Absichten und neue Marker in alten
+Journalen werden abgelehnt. [ZIP-Übergabe](remote-pack.md).
+
+Journalversion 40 ergänzt `ArchiveUpload`: lokale Archivphase und Upload laufen
+im selben Eintrag. Die Übergabe speichert die versiegelte Quelle vor Providerkontakt.
+Ein laufender Absturz startet die Erzeugung nicht automatisch neu.
 
 ## Scheduler und Persistenz
 
@@ -109,7 +153,7 @@ Ein Dateipräfix, das Alter oder ein parsebares Journal genügen deshalb nicht f
 automatische Löschung oder Verschiebung. Eigene laufende Writes dürfen nur mit
 dem bei exklusiver Anlage gehaltenen Besitzbeleg bereinigen. Nach einem Crash
 bleiben unbelegte Reste erhalten. Diese bewusste Aufbewahrung hat keine
-zeitgesteuerte Bereinigung; [Prüfung und Grenze](release-validation.md).
+zeitgesteuerte Bereinigung; [Prüfung und Grenze](code-review-2026-10-19-konfigurationsreste.md).
 
 ## Konflikte und Bedienung
 
@@ -124,10 +168,11 @@ Konfliktentscheidungen gehören zum einzelnen Queue-Eintrag. Ein globales „all
 ersetzen“ darf nicht still auf andere Roots oder Provider übergreifen. Fortschritt
 zeigt aktiven Eintrag, Gesamtanzahl, logische und tatsächlich übertragene Bytes sowie
 den letzten recoverbaren Zustand.
-Jede neu entdeckte Plan- oder Ersetzungskonfliktlage besitzt eine aus der zufälligen
-`operation_id` abgeleitete exakte Phrase. Erst deren Eingabe ersetzt den gespeicherten
-Plan beziehungsweise die gespeicherte Konfliktliste; anschließend validiert der
-Scheduler nochmals.
+Eine neu entdeckte Plan-, Quellbaum- oder Ersetzungskonfliktlage benötigt eine
+neue Wirkungsentscheidung. Das Backend vergleicht die exakt angezeigte Attention
+unter derselben Queuesperre, bevor es Plan oder Konfliktliste übernimmt. Eine
+Routinephrase ist dafür nicht erforderlich; anschließend validiert der Scheduler
+nochmals frisch.
 
 Beide behalten bindet seit Journalformat 22 die vom Backend vergebenen Aliasziele
 und Quellbelege. Der Queuekopf prüft sie vor jeder Wirkung frisch; der eigentliche
@@ -145,11 +190,10 @@ kann die Freigabe nicht erben. Der ausführende VFS hält den Rootdeskriptor und
 prüft den sichtbaren Root vor dem Commit erneut. Permits und Handles werden
 weiterhin nicht persistiert. Dies gilt auch für lokale Downloadziele.
 
-Die CLI nennt die exakte Phrase als `local_copy_new_confirmation` im
-`file_preview` und verlangt sie über stdin, bevor der gebundene Eintrag entsteht.
-Eine falsche Phrase lässt das Ziel unverändert. GUI und CLI erklären ausdrücklich,
-dass ein gleichzeitig nach dem letzten Listing angelegtes Ziel im verbleibenden
-kurzen Fenster ersetzt werden kann. Ein unklarer Ausgang erhält keinen Retry.
+Die CLI erklärt die konkrete Klasse im `file_preview`; der ausdrücklich
+angeforderte Datei-/Moveauftrag bestätigt seine Wirkung ohne zusätzliche
+Routinephrase. GUI und CLI erklären den verbleibenden Kollisionswettlauf. Ein
+unklarer Ausgang erhält kein blindes Wiederholungsrecht.
 
 Eine Rückfrage muss auch ablehnbar sein. `discard_attention` schließt den Eintrag
 ausdrücklich als `Cancelled` ab und gibt die Reihenfolge frei; das Popover bietet
@@ -172,6 +216,9 @@ als `Completed` oder `Cancelled` vorliegt. Der Frontend-Hinweis erklärt, dass d
 Journal erhalten bleibt und ein laufender Eintrag beim nächsten Start als
 `Interrupted` neu geprüft werden muss. Nur die ausdrückliche Bestätigung ruft den
 getrennten programmatischen Exit auf.
+Auch unlesbare Journale lassen sich so ausdrücklich bestätigen; der Hinweis nennt
+die betroffenen Fenster und den unbekannten Arbeitsstand. Ihre Dateien bleiben
+unverändert. Laufende Operationen und offene Vorbereitungen bleiben gesperrt.
 
 ## Sicherheitsregeln
 
@@ -259,9 +306,10 @@ credentialed URLs bleiben aus dem Audit heraus.
 
 Journalversion 6 ergänzte bidirektionale Einträge. Persistiert werden nur Paar-ID und
 -name, lokale Roots, Baseline-Pfad, Konfliktentscheidungen sowie bestätigte Baseline-/
-Plan-Digests. Vollständige Pläne, Phrasen, Handles und Permits bleiben im RAM. Ein
-frischer Doppel-Scan fordert zunächst bei Digestdrift eine eigene Planphrase und
-danach immer eine neue zufällige Laufphrase. Resume und Rollback beziehen ihre Roots
+Plan-Digests. Vollständige Pläne, Handles und Permits bleiben im RAM. Ein
+frischer Doppel-Scan verlangt bei Digestdrift eine neue Wirkungsentscheidung;
+normale Starts und Queue-Rückfragen benötigen keine Laufphrase. Die Zustimmung
+bindet atomar den vollständig angezeigten Rückfragezustand. Resume und Rollback beziehen ihre Roots
 ausschließlich aus dem Backend-Queue-Eintrag; erfolgreiche Recovery schließt exakt
 diesen Eintrag als `Completed` beziehungsweise `Cancelled`.
 

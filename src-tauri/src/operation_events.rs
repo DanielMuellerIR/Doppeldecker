@@ -23,6 +23,8 @@ pub(crate) struct ViewEndpoint {
 pub(crate) struct OperationViewContext {
     pub(crate) operation_id: String,
     attempt: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_kind: Option<&'static str>,
     affected_endpoints: Vec<ViewEndpoint>,
 }
 
@@ -57,7 +59,34 @@ impl OperationViewContext {
         };
         let bindings = &entry.profile_bindings;
         match &entry.operation {
-            QueueOperation::FtpsRecovery { .. } => {}
+            QueueOperation::FtpsRecovery { .. } | QueueOperation::RenameCycleRecovery { .. } => {}
+            QueueOperation::ArchiveUpload {
+                generation, target, ..
+            } => {
+                match generation.as_ref() {
+                    doppeldecker_core::archive_upload::ArchiveGeneration::Pack {
+                        request, ..
+                    } => local(&request.source_root.to_string_lossy()),
+                    doppeldecker_core::archive_upload::ArchiveGeneration::Extract {
+                        request,
+                        ..
+                    } if request.snapshot.is_none() => {
+                        local(&request.source_root.to_string_lossy())
+                    }
+                    _ => {}
+                }
+                append_endpoint(&mut endpoints, config, bindings, target);
+            }
+            QueueOperation::ArchiveExtract { request, .. } => {
+                if request.snapshot.is_none() {
+                    local(&request.source_root.to_string_lossy());
+                }
+                local(&request.target_dir.to_string_lossy());
+            }
+            QueueOperation::ArchivePack { request, .. } => {
+                local(&request.source_root.to_string_lossy());
+                local(&request.target_dir.to_string_lossy());
+            }
             QueueOperation::File {
                 items, destination, ..
             } => {
@@ -74,14 +103,16 @@ impl OperationViewContext {
                 local(target);
             }
             QueueOperation::ProviderFile { source, target, .. }
-            | QueueOperation::ProviderSync { source, target, .. } => {
+            | QueueOperation::ProviderSync { source, target, .. }
+            | QueueOperation::ContentSync { source, target, .. } => {
                 append_endpoint(&mut endpoints, config, bindings, source);
                 append_endpoint(&mut endpoints, config, bindings, target);
             }
             QueueOperation::ProviderDelete { endpoint, .. } => {
                 append_endpoint(&mut endpoints, config, bindings, endpoint);
             }
-            QueueOperation::Bidirectional { left, right, .. } => {
+            QueueOperation::Bidirectional { left, right, .. }
+            | QueueOperation::BidirectionalForward { left, right, .. } => {
                 append_endpoint(&mut endpoints, config, bindings, left);
                 append_endpoint(&mut endpoints, config, bindings, right);
             }
@@ -159,6 +190,8 @@ impl OperationViewContext {
         Self {
             operation_id: entry.operation_id.clone(),
             attempt: entry.attempts,
+            operation_kind: matches!(entry.operation, QueueOperation::ArchiveExtract { .. })
+                .then_some("archive_extract"),
             affected_endpoints: endpoints,
         }
     }
@@ -249,10 +282,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn entpackfehler_behaelt_code_details_und_recovery_im_laufkontext() {
+        let context = OperationViewContext {
+            operation_id: "extract-1".into(),
+            attempt: 1,
+            operation_kind: Some("archive_extract"),
+            affected_endpoints: Vec::new(),
+        };
+        let error = crate::AppError {
+            code: "invalid_data".into(),
+            message: "CRC; {\"known_actuals\":{\"files\":0}}".into(),
+            recovery_paths: vec!["/synthetisch/own-temp".into()],
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
+        };
+        let payload = serde_json::to_value(context.wrap(&error)).unwrap();
+        assert_eq!(payload["operationKind"], "archive_extract");
+        assert_eq!(payload["operationId"], "extract-1");
+        assert_eq!(payload["code"], error.code);
+        assert_eq!(payload["message"], error.message);
+        assert_eq!(payload["recovery_paths"][0], error.recovery_paths[0]);
+    }
+
+    #[test]
     fn kontext_ergaenzt_progress_ohne_dessen_payload_zu_veraendern() {
         let context = OperationViewContext {
             operation_id: "lauf-1".into(),
             attempt: 2,
+            operation_kind: None,
             affected_endpoints: vec![ViewEndpoint {
                 provider: "local",
                 profile_id: None,

@@ -4,6 +4,7 @@
 //! Schlüsselbundreferenzen. Entschlüsselte Werte, Sitzungen und Realmodus-Permits
 //! bleiben kurzlebig im Arbeitsspeicher.
 
+use crate::frontend_payload::FrontendQueueSnapshot;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use doppeldecker_core::{
     load_sftp_profiles as core_load_profiles, prepare_sftp_download, prepare_sftp_queue_entry,
     prepare_sftp_upload, purge_quarantine_run_for_target, restore_quarantine_entry_for_target,
     KeychainSecretReference, OperationQueue, Progress, ProviderEndpoint, QuarantineEntry,
-    QuarantineRun, QueueEntry, QueueExecutionResult, QueueOperation, QueueSnapshot, RealRunPreview,
+    QuarantineRun, QueueEntry, QueueExecutionResult, QueueOperation, RealRunPreview,
     RemoteCapabilities, RemoteProfileBinding, RemoteProfileProtocol, SecretResolver, SecretString,
     SftpAuthenticationReference, SftpProfile, SftpPublicKeyIdentity, SftpQueueDirection,
     SftpQueuePreparation, SftpServerIdentity, SftpVfs, SyncOptions, SyncPlan, VersionedProfile,
@@ -1348,8 +1349,7 @@ pub(crate) fn run_sftp_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
     state: State<AppState>,
-    confirmation: String,
-    backup_confirmed: bool,
+    effects_confirmed: bool,
 ) -> Result<(), AppError> {
     let label = window.label().to_owned();
     let window_state = state.window(&label);
@@ -1362,7 +1362,7 @@ pub(crate) fn run_sftp_sync(
         "Keine SFTP-Vorbereitung vorhanden",
         |pending| {
             crate::queue_runtime::ensure_profile_bindings_current(&app, &pending.profile_bindings)?;
-            validate_run_confirmation(pending.prepared.preview(), &confirmation, backup_confirmed)
+            validate_run_confirmation(pending.prepared.preview(), effects_confirmed)
         },
     )?;
     // Wie FTPS, WebDAV, SMB und Providersync läuft auch SFTP über den gemeinsamen
@@ -1377,7 +1377,7 @@ pub(crate) fn run_sftp_sync(
         move |on_progress| {
             prepared
                 .prepared
-                .confirm(&confirmation, backup_confirmed)?
+                .confirm_effects(effects_confirmed)?
                 .execute_with_audit(&audit, &cancel, on_progress)
         },
     );
@@ -1385,20 +1385,13 @@ pub(crate) fn run_sftp_sync(
 }
 
 fn validate_run_confirmation(
-    preview: &RealRunPreview,
-    confirmation: &str,
-    backup_confirmed: bool,
+    _preview: &doppeldecker_core::RealRunPreview,
+    effects_confirmed: bool,
 ) -> Result<(), AppError> {
-    if confirmation != preview.confirmation_phrase {
+    if !effects_confirmed {
         return Err(AppError::new(
             "confirmation_mismatch",
-            "SFTP-Laufphrase stimmt nicht exakt überein",
-        ));
-    }
-    if preview.backup_confirmation_required && !backup_confirmed {
-        return Err(AppError::new(
-            "confirmation_mismatch",
-            "SFTP-Update/Mirror benötigt ein bestätigtes unabhängiges Backup",
+            "Die angezeigte Sync-Wirkung wurde nicht bestätigt",
         ));
     }
     Ok(())
@@ -1410,7 +1403,7 @@ pub(crate) fn enqueue_sftp_sync(
     window: WebviewWindow,
     state: State<AppState>,
     request: EnqueueSftpRequest,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label();
     let window_state = state.window(label);
     let queue = with_queue_extension(&state, &window_state, || {
@@ -1455,7 +1448,7 @@ pub(crate) fn enqueue_sftp_sync(
     })?;
     emit_queue_snapshot(&app, label, &queue);
     start_queue_worker(app, label.to_owned());
-    Ok(queue.snapshot())
+    Ok(queue.snapshot().into())
 }
 
 #[derive(serde::Deserialize)]
@@ -1513,7 +1506,7 @@ pub(crate) fn prepare_remote_queue_entry(
                 "sync-error",
                 AppError::new(
                     "app",
-                    "SFTP-Lauf ist geprüft; Queue öffnen und die einmalige Laufphrase bestätigen",
+                    "SFTP-Lauf ist geprüft; Queue öffnen und die angezeigte Wirkung bestätigen",
                 ),
             )
         }
@@ -1533,9 +1526,8 @@ pub(crate) fn approve_sftp_queue_entry(
     window: WebviewWindow,
     state: State<AppState>,
     operation_id: String,
-    confirmation: String,
-    backup_confirmed: bool,
-) -> Result<QueueSnapshot, AppError> {
+    effects_confirmed: bool,
+) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label().to_owned();
     let window_state = state.window(&label);
     let queue = operation_queue(&app, &window_state, &label)?;
@@ -1565,7 +1557,7 @@ pub(crate) fn approve_sftp_queue_entry(
                     "SFTP-Queue-Vorbereitung gehört zu einem anderen Eintrag",
                 ));
             }
-            validate_run_confirmation(prepared.prepared.preview(), &confirmation, backup_confirmed)
+            validate_run_confirmation(prepared.prepared.preview(), effects_confirmed)
         },
     )?;
     let queue_for_worker = queue.clone();
@@ -1587,11 +1579,10 @@ pub(crate) fn approve_sftp_queue_entry(
         let events = window.clone();
         let mut last = Instant::now() - Duration::from_secs(1);
         let mut terminal_progress = None;
-        let result = doppeldecker_core::execute_prepared_sftp_queue_entry(
+        let result = doppeldecker_core::execute_prepared_sftp_queue_entry_effects(
             &queue_for_worker,
             prepared.prepared,
-            &confirmation,
-            backup_confirmed,
+            effects_confirmed,
             &audit,
             &cancel,
             &mut |progress| {
@@ -1643,7 +1634,7 @@ pub(crate) fn approve_sftp_queue_entry(
             }
         });
     });
-    Ok(queue.snapshot())
+    Ok(queue.snapshot().into())
 }
 
 #[cfg(test)]

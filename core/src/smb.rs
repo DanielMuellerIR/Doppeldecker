@@ -5,6 +5,16 @@
 //! als Symlinks sichtbar gemacht. Reale Schreibfähigkeit entsteht erst nach einer
 //! künstlichen Create-/FLUSH-/Rename-/Readback-Probe.
 
+#[path = "smb_read.rs"]
+mod content_read;
+#[path = "smb_mtime.rs"]
+mod mtime;
+#[path = "smb_named_streams.rs"]
+mod named_streams;
+#[path = "smb_security.rs"]
+mod security;
+pub(crate) use content_read::SMB_CONTENT_READ_LIMITATION;
+
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path};
@@ -120,6 +130,15 @@ pub struct SmbInteractiveDirectoryListing {
 }
 
 impl SmbVfs {
+    pub(crate) fn set_mtime_unchecked(&self, path: &Path, mtime: i64) -> io::Result<()> {
+        self.set_mtime_phased(path, mtime, None)
+            .map_err(mtime::MtimeFailure::into_io)
+    }
+
+    pub(crate) fn connection_config(&self) -> &SmbConnectionConfig {
+        &self.config
+    }
+
     pub fn connect(
         config: SmbConnectionConfig,
         secrets: Arc<dyn SecretResolver>,
@@ -575,6 +594,130 @@ impl SmbVfs {
         })
     }
 
+    pub(crate) fn batch_rename_source(&self, path: &Path) -> io::Result<(Entry, [u8; 32])> {
+        let observed = self.stat_unchecked(path)?;
+        if observed.file_id == 0 {
+            return Err(invalid("SMB-Stapelquelle besitzt keine File-ID"));
+        }
+        let entry = observed.entry();
+        let digest = *blake3::hash(
+            &serde_json::to_vec(&(&entry, observed.provider_token())).map_err(io::Error::other)?,
+        )
+        .as_bytes();
+        Ok((entry, digest))
+    }
+    /// Ausschließlich der Stapel-Schreibweisenpfad ersetzt den Alias-stat durch
+    /// einen vollständigen Rohnamebeleg. Der gewöhnliche Rename behält sein Gate.
+    pub(crate) fn batch_spelling_rename(
+        &self,
+        root: &Path,
+        from: &Path,
+        to: &Path,
+        identity: &crate::RootIdentity,
+        source: [u8; 32],
+    ) -> io::Result<()> {
+        let normalized_root = normalize_virtual_path(root)?;
+        let normalized_from = normalize_virtual_path(from)?;
+        let normalized_to = normalize_virtual_path(to)?;
+        let root = Path::new(&normalized_root);
+        let from = Path::new(&normalized_from);
+        let to = Path::new(&normalized_to);
+        if from.parent() != Some(root)
+            || to.parent() != Some(root)
+            || from == to
+            || crate::remote_rename::folded_name(
+                from.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            ) != crate::remote_rename::folded_name(
+                to.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            )
+        {
+            return Err(invalid(
+                "SMB-Schreibweisenwirkung liegt nicht im gebundenen Pane-Root",
+            ));
+        }
+        if self.root_identity(root)? != *identity || self.batch_rename_source(from)?.1 != source {
+            return Err(crate::real_mode::plan_drift(
+                "SMB-Quelle, Root oder Sitzung änderte sich unmittelbar vor SET_INFO",
+            ));
+        }
+        let remote_from = self.remote_path(from)?;
+        let remote_to = self.remote_path(to)?;
+        let mut state = lock(&self.state);
+        let crate::RootIdentity::Smb(expected) = identity else {
+            return Err(invalid(
+                "SMB-Schreibweisenwirkung benötigt eine SMB-Rootbindung",
+            ));
+        };
+        if state.generation != expected.session_generation
+            || state.session.tree.tree_id.0 != expected.tree_id
+            || state.session.identity != expected.server
+        {
+            return Err(crate::real_mode::plan_drift(
+                "SMB-Sitzung wechselte vor dem Rename-Aufruf",
+            ));
+        }
+        let tree = state.session.tree.clone();
+        self.runtime.block_on(async {
+            let (request, file_id) = open_rename_request(
+                &mut state.session.connection,
+                tree.as_ref(),
+                &remote_from,
+                &remote_to,
+                false,
+            )
+            .await
+            .map_err(|error| {
+                crate::coded_error(
+                    io::ErrorKind::Other,
+                    crate::ErrorCode::OutcomeUnclear,
+                    format!("SMB-Rename-Öffnen fehlgeschlagen: {error}"),
+                )
+            })?;
+            // execute-Fehler können eine verlorene Antwort nach erfolgter Wirkung
+            // sein. Nur eine empfangene negative Serverantwort ist unverändert.
+            let result = match state
+                .session
+                .connection
+                .execute(Command::SetInfo, &request, Some(tree.tree_id))
+                .await
+            {
+                Ok(frame) => require_status(&frame, Command::SetInfo).map_err(|error| {
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotConnected
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) {
+                        crate::coded_error(
+                            io::ErrorKind::Other,
+                            crate::ErrorCode::OutcomeUnclear,
+                            format!("SMB-Sitzung nach SET_INFO unklar: {error}"),
+                        )
+                    } else {
+                        error
+                    }
+                }),
+                Err(error) => Err(crate::coded_error(
+                    io::ErrorKind::Other,
+                    crate::ErrorCode::OutcomeUnclear,
+                    format!("SMB-SET_INFO-Antwort unklar: {}", smb_error(error)),
+                )),
+            };
+            let close = tree
+                .close_handle(&mut state.session.connection, file_id)
+                .await
+                .map_err(|error| {
+                    crate::coded_error(
+                        io::ErrorKind::Other,
+                        crate::ErrorCode::OutcomeUnclear,
+                        format!("SMB-Rename-Handleabschluss unklar: {}", smb_error(error)),
+                    )
+                });
+            close?;
+            result
+        })
+    }
+
     fn stat_unchecked(&self, path: &Path) -> io::Result<SmbListedEntry> {
         let remote = self.remote_path(path)?;
         let name = path
@@ -619,6 +762,7 @@ impl SmbVfs {
             tree.as_ref(),
             &remote,
             FileAccessMask::FILE_WRITE_DATA
+                | FileAccessMask::FILE_READ_ATTRIBUTES
                 | FileAccessMask::FILE_WRITE_ATTRIBUTES
                 | FileAccessMask::SYNCHRONIZE,
             CreateDisposition::FileCreate,
@@ -654,7 +798,7 @@ impl SmbVfs {
             replace,
         ))?;
         drop(state);
-        self.require_rename_readback(from, to)
+        classify_rename_readback(self.require_rename_readback(from, to), from, to)
     }
 
     fn rename_noreplace_unchecked(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -829,6 +973,19 @@ impl SmbVfs {
 }
 
 impl Vfs for SmbVfs {
+    fn created_directory_foreign_root_scope(
+        &self,
+        root: &crate::RootIdentity,
+    ) -> io::Result<Option<crate::created_directory_dacl::CreatedDirectoryRootScope>> {
+        self.observe_created_foreign_root_scope(root)
+    }
+    fn created_directory_root_scope(
+        &self,
+        path: &Path,
+        root: &crate::RootIdentity,
+    ) -> io::Result<Option<crate::created_directory_dacl::CreatedDirectoryRootScope>> {
+        self.observe_created_root_scope(path, root)
+    }
     fn safety_capabilities_digest(&self) -> io::Result<Option<[u8; 32]>> {
         crate::remote::capabilities_digest(self.capabilities()).map(Some)
     }
@@ -907,6 +1064,10 @@ impl Vfs for SmbVfs {
     fn create_dir(&self, path: &Path) -> io::Result<()> {
         self.require_directory_create()?;
         self.create_dir_unchecked(path)
+    }
+
+    fn open_sparse_read(&self, path: &Path) -> io::Result<Box<dyn crate::vfs::SparseRead>> {
+        self.sparse_read(path, None, crate::Cancel::new())
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
@@ -1002,29 +1163,7 @@ impl Vfs for SmbVfs {
 
     fn set_mtime(&self, path: &Path, mtime: i64) -> io::Result<()> {
         self.require_write_capability()?;
-        let remote = self.remote_path(path)?;
-        let system_time = if mtime >= 0 {
-            UNIX_EPOCH + Duration::from_secs(mtime as u64)
-        } else {
-            UNIX_EPOCH
-                .checked_sub(Duration::from_secs(mtime.unsigned_abs()))
-                .ok_or_else(|| invalid("SMB-mtime liegt außerhalb des Zeitbereichs"))?
-        };
-        let raw = FileTime::from_system_time(system_time).0;
-        let mut state = lock(&self.state);
-        let tree = state.session.tree.clone();
-        self.runtime.block_on(set_mtime(
-            &mut state.session.connection,
-            tree.as_ref(),
-            &remote,
-            raw,
-        ))?;
-        drop(state);
-        let observed = self.stat_unchecked(path)?.mtime;
-        if observed != Some(mtime) {
-            return Err(invalid("SMB-mtime-Readback stimmt nicht exakt überein"));
-        }
-        Ok(())
+        self.set_mtime_unchecked(path, mtime)
     }
 
     fn set_mode(&self, _path: &Path, _mode: u32) -> io::Result<()> {
@@ -1034,16 +1173,31 @@ impl Vfs for SmbVfs {
         ))
     }
 
-    fn metadata_capabilities(&self, _root: &Path) -> io::Result<MetadataCapabilities> {
-        Ok(MetadataCapabilities {
-            owner: Capability::Unsupported,
-            special_mode_bits: Capability::Unsupported,
-            acl_model: AclModel::Unsupported,
-            xattrs: Capability::Unsupported,
-            resource_fork: Capability::Unsupported,
-            sparse_extents: Capability::Unsupported,
-            hardlinks: Capability::Unsupported,
-        })
+    fn file_dacl_recovery_observation(
+        &self,
+        path: &Path,
+        expected_root: &crate::RootIdentity,
+    ) -> io::Result<crate::file_dacl::FileDaclRecoveryObservation> {
+        self.read_file_dacl_recovery(path, expected_root)
+    }
+    fn directory_dacl_recovery_observation(
+        &self,
+        path: &Path,
+        expected_root: &crate::RootIdentity,
+    ) -> io::Result<crate::windows_dacl::DirectoryDaclRecoveryObservation> {
+        self.read_directory_dacl_recovery(path, expected_root)
+    }
+
+    fn metadata_manifest(&self, path: &Path) -> io::Result<crate::metadata::MetadataManifest> {
+        self.stream_manifest(path)
+    }
+
+    fn open_named_stream_read(&self, path: &Path, name: &[u8]) -> io::Result<Box<dyn Read + Send>> {
+        self.stream_read(path, name, None)
+    }
+
+    fn metadata_capabilities(&self, root: &Path) -> io::Result<MetadataCapabilities> {
+        self.stream_metadata_capabilities(root, false)
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -1123,6 +1277,7 @@ struct SmbListedEntry {
     created: Option<i64>,
     change_time: u64,
     file_id: u64,
+    hard_links: Option<u64>,
 }
 
 impl SmbListedEntry {
@@ -1142,7 +1297,7 @@ impl SmbListedEntry {
             mode: None,
             device: None,
             inode: (self.file_id != 0).then_some(self.file_id),
-            hard_links: None,
+            hard_links: self.hard_links,
         }
     }
 
@@ -1242,6 +1397,27 @@ struct SmbWrite {
     offset: u64,
     max_write: u32,
     finished: bool,
+}
+
+impl SmbWrite {
+    fn created_file_identity(&mut self) -> io::Result<u64> {
+        // Der Pfad kann nach CREATE bereits ausgetauscht sein. Nur der tatsächlich
+        // erzeugte Handle darf den Besitzbeleg für spätere Streamwrites liefern.
+        let bytes = self.runtime.block_on(query_info(
+            &mut self.connection,
+            &self.tree,
+            self.file_id,
+            FILE_INTERNAL_INFORMATION,
+            8,
+        ))?;
+        let inode = read_u64(&bytes, 0)?;
+        if inode == 0 {
+            return Err(invalid(
+                "SMB-CREATE-Handle lieferte keinen Dateisystem-Identitätsbeleg",
+            ));
+        }
+        Ok(inode)
+    }
 }
 
 impl Write for SmbWrite {
@@ -1550,46 +1726,38 @@ async fn query_entry(
         FILE_OPEN_REPARSE_POINT,
     )
     .await?;
-    let result = async {
-        let basic =
-            query_info(connection, tree, opened.file_id, FILE_BASIC_INFORMATION, 40).await?;
-        let standard = query_info(
-            connection,
-            tree,
-            opened.file_id,
-            FILE_STANDARD_INFORMATION,
-            24,
-        )
-        .await?;
-        let internal = query_info(
-            connection,
-            tree,
-            opened.file_id,
-            FILE_INTERNAL_INFORMATION,
-            8,
-        )
-        .await?;
-        if basic.len() < 36 || standard.len() < 22 || internal.len() < 8 {
-            return Err(invalid("SMB-QUERY_INFO-Antwort ist zu kurz"));
-        }
-        let attributes = read_u32(&basic, 32)?;
-        Ok(SmbListedEntry {
-            name,
-            is_dir: standard[21] != 0 || attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
-            is_symlink: attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
-            size: read_u64(&standard, 8)?,
-            mtime: filetime_to_unix(read_u64(&basic, 16)?),
-            created: filetime_to_unix(read_u64(&basic, 0)?),
-            change_time: read_u64(&basic, 24)?,
-            file_id: read_u64(&internal, 0)?,
-        })
-    }
-    .await;
+    let result = query_handle_entry(connection, tree, opened.file_id, name).await;
     let close = tree
         .close_handle(connection, opened.file_id)
         .await
         .map_err(smb_error);
     result.and_then(|entry| close.map(|()| entry))
+}
+
+async fn query_handle_entry(
+    connection: &mut Connection,
+    tree: &Tree,
+    file_id: FileId,
+    name: String,
+) -> io::Result<SmbListedEntry> {
+    let basic = query_info(connection, tree, file_id, FILE_BASIC_INFORMATION, 40).await?;
+    let standard = query_info(connection, tree, file_id, FILE_STANDARD_INFORMATION, 24).await?;
+    let internal = query_info(connection, tree, file_id, FILE_INTERNAL_INFORMATION, 8).await?;
+    if basic.len() < 36 || standard.len() < 22 || internal.len() < 8 {
+        return Err(invalid("SMB-QUERY_INFO-Antwort ist zu kurz"));
+    }
+    let attributes = read_u32(&basic, 32)?;
+    Ok(SmbListedEntry {
+        name,
+        is_dir: standard[21] != 0 || attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        is_symlink: attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        size: read_u64(&standard, 8)?,
+        mtime: filetime_to_unix(read_u64(&basic, 16)?),
+        created: filetime_to_unix(read_u64(&basic, 0)?),
+        change_time: read_u64(&basic, 24)?,
+        file_id: read_u64(&internal, 0)?,
+        hard_links: Some(u64::from(read_u32(&standard, 16)?)),
+    })
 }
 
 async fn query_info(
@@ -1668,6 +1836,17 @@ async fn rename_path(
     to: &str,
     replace: bool,
 ) -> io::Result<()> {
+    let (request, file_id) = open_rename_request(connection, tree, from, to, replace).await?;
+    set_info_and_close(connection, tree, request, file_id).await
+}
+
+async fn open_rename_request(
+    connection: &mut Connection,
+    tree: &Tree,
+    from: &str,
+    to: &str,
+    replace: bool,
+) -> io::Result<(SetInfoRequest, FileId)> {
     let file_id = open_handle(
         connection,
         tree,
@@ -1684,7 +1863,7 @@ async fn rename_path(
         file_id,
         buffer: rename_buffer(to, replace),
     };
-    set_info_and_close(connection, tree, request, file_id).await
+    Ok((request, file_id))
 }
 
 /// Sendet genau eine `SetInfo`-Anfrage und schließt das Handle in jedem Fall.
@@ -1738,31 +1917,17 @@ async fn delete_path(
         .map_err(smb_error)
 }
 
-async fn set_mtime(
-    connection: &mut Connection,
-    tree: &Tree,
-    path: &str,
-    mtime: u64,
-) -> io::Result<()> {
-    let file_id = open_handle(
-        connection,
-        tree,
-        path,
-        FileAccessMask::FILE_WRITE_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
-        CreateDisposition::FileOpen,
-        FILE_OPEN_REPARSE_POINT,
-    )
-    .await?;
-    let mut buffer = vec![0u8; 40];
-    buffer[16..24].copy_from_slice(&mtime.to_le_bytes());
-    let request = SetInfoRequest {
-        info_type: InfoType::File,
-        file_info_class: FILE_BASIC_INFORMATION,
-        additional_information: 0,
-        file_id,
-        buffer,
-    };
-    set_info_and_close(connection, tree, request, file_id).await
+fn classify_rename_readback(result: io::Result<()>, from: &Path, to: &Path) -> io::Result<()> {
+    result.map_err(|error| {
+        crate::error::with_recovery_paths(
+            crate::coded_error(
+                io::ErrorKind::Other,
+                crate::ErrorCode::OutcomeUnclear,
+                format!("SMB-Rename wurde bestätigt, sein Ergebnis aber nicht vollständig zurückgelesen: {error}"),
+            ),
+            &[from.to_string_lossy().into_owned(), to.to_string_lossy().into_owned()],
+        )
+    })
 }
 
 fn probe_cleanup_recovery(path: &Path, error: impl std::fmt::Display) -> io::Error {
@@ -1901,6 +2066,7 @@ fn parse_file_id_both_directory_info(bytes: &[u8]) -> io::Result<Vec<SmbListedEn
                 created: filetime_to_unix(read_u64(bytes, offset + 8)?),
                 change_time: read_u64(bytes, offset + 32)?,
                 file_id: read_u64(bytes, offset + 96)?,
+                hard_links: None,
             });
         }
         if next == 0 {
@@ -2145,7 +2311,7 @@ mod tests {
     }
 
     #[test]
-    fn dateifaehigkeitsprobe_erhaelt_unklaren_ausgang_und_stoppt_folgeproben() {
+    fn gewoehnliche_dateifaehigkeiten_benoetigen_keine_schreibprobe() {
         use smb2::msg::close::CloseResponse;
         use smb2::msg::create::CreateAction;
         use smb2::msg::header::{ErrorResponse, Header};
@@ -2285,18 +2451,14 @@ mod tests {
         let result = endpoint.probe_file_capabilities();
         timeout.abort();
         mock.close();
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!(
-                "Unklarer Probenrest wurde zu einer gewöhnlichen Fähigkeitsabsage herabgestuft"
-            ),
-        };
-        assert_eq!(crate::error_code(&error), crate::ErrorCode::OutcomeUnclear);
-        assert!(!crate::error::recovery_paths(&error).is_empty());
+        let capabilities = result.unwrap();
+        assert!(capabilities.copy_new);
+        assert!(capabilities.replace_best_effort);
+        assert!(capabilities.remove_source_best_effort);
         assert_eq!(
             mock.sent_count(),
-            5,
-            "Nach unklarem Ausgang darf keine weitere Probe beginnen"
+            0,
+            "Fähigkeitsanzeige darf keine künstlichen SMB-Wirkungen erzeugen"
         );
     }
 
@@ -2409,6 +2571,28 @@ mod tests {
     }
 
     #[test]
+    fn bestaetigter_rename_mit_readbackfehler_bleibt_unklar() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::NotFound,
+        ] {
+            let error = classify_rename_readback(
+                Err(io::Error::new(kind, "Readback fehlt")),
+                Path::new("/pane/a"),
+                Path::new("/pane/new-a"),
+            )
+            .unwrap_err();
+            assert_eq!(crate::error_code(&error), crate::ErrorCode::OutcomeUnclear);
+            assert_eq!(
+                crate::error::recovery_paths(&error),
+                vec!["/pane/a".to_owned(), "/pane/new-a".to_owned()]
+            );
+        }
+        classify_rename_readback(Ok(()), Path::new("/pane/a"), Path::new("/pane/new-a")).unwrap();
+    }
+
+    #[test]
     fn restpruefung_versucht_beide_roots_und_erhaelt_rest_nach_listingfehler() {
         let base = Path::new("/pane/.doppeldecker-probe-owned");
         let mut calls = Vec::new();
@@ -2509,6 +2693,7 @@ mod tests {
             created: None,
             change_time: 0,
             file_id: 1,
+            hard_links: None,
         }
     }
 
@@ -2694,3 +2879,16 @@ mod tests {
         assert_eq!(&replace[16..20], &8u32.to_le_bytes());
     }
 }
+
+#[path = "smb_interactive.rs"]
+mod interactive;
+
+#[cfg(test)]
+#[path = "smb_named_streams_queue_tests.rs"]
+mod named_streams_queue_tests;
+
+pub(crate) use named_streams::lookup_key as named_stream_lookup_key;
+
+#[cfg(test)]
+#[path = "smb_security_probe.rs"]
+mod security_probe;

@@ -21,6 +21,7 @@ export function confirmLocalSync(preview) {
         || (action.type === "CreateHardlink" && action.target_size != null));
       const content = `<p>Dieser Lauf verändert Dateien. Die gebundenen Wurzeln und der Plan werden unmittelbar vor dem Start erneut geprüft.</p>` +
         `<p><strong>${bestEffort ? "Best-Effort-Ausführung" : "Abgesicherte Ausführung"}</strong></p>` +
+        (preview.scope_warnings || []).map(warning => `<p class="real-warning">${escapeHtml(warning)}</p>`).join("") +
         (irreversible ? `<p><strong>${irreversible} vorhandene Dateiversion(en) werden dauerhaft ersetzt. Es gibt keine Doppeldecker-Quarantäne und keine automatische Wiederherstellung. Auch eine gleichzeitige Änderung im kurzen Commitfenster kann verloren gehen.</strong></p>` : "") +
         (execution?.new_file_commit === "best_effort" ? `<p>Dieses Ziel bietet kein atomar kollisionsfreies Rename. Der vollständige Elternbestand wird direkt vor dem Commit geprüft und der Inhalt danach zurückgelesen. Ein gleichzeitig neu angelegtes Ziel kann im kurzen Fenster dazwischen trotzdem ersetzt werden. Bei unklarem Ausgang wird nicht automatisch wiederholt.</p>` : "") +
         (execution && !execution.file_flush ? `<p>Das Ziel garantiert keinen dauerhaften Datei-Flush. Die Datei wird zurückgelesen; bei Stromausfall können bereits bestätigte Inhalte verloren gehen.</p>` : "") +

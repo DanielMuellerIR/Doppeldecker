@@ -238,6 +238,13 @@ MOCK_TAURI = r"""
           { name: "Unvollständig", is_dir: true, is_file: false, is_symlink: false,
             size: 0, mtime: 3, mode: 493 },
         ]
+    : mockParams.has("unicodeFilter")
+      ? [
+          { name: "Cafe\u0301.txt", is_dir: false, is_file: true, is_symlink: false,
+            size: 5, mtime: 1, mode: 420 },
+          { name: "Überblick.txt", is_dir: false, is_file: true, is_symlink: false,
+            size: 7, mtime: 2, mode: 420 },
+        ]
     : mockParams.has("mixedSort")
       ? [
           { name: "A-Ordner", is_dir: true, is_file: false, is_symlink: false,
@@ -346,12 +353,24 @@ MOCK_TAURI = r"""
   });
   const startupState = { reads: 0, wiredAtRead: false, delivered: false };
   window.__MOCK_STARTUP_STATE__ = () => structuredClone(startupState);
+  let pendingForward = null;
+  const forwardPreviews = new Map();
+  const forwardRequests = new Map();
+  const forwardStatuses = new Map();
+  const forwardCalls = [];
+  window.__MOCK_FORWARD_STATE__ = () => structuredClone({ calls: forwardCalls, pending: pendingForward != null });
   let pendingBidirectional = null;
   let pendingBidirectionalRollback = null;
   const bidirectionalPairs = new Map();
   let bidirectionalRecoveryPreparationSequence = 0;
   let bidirectionalRecoveryDiscardAttempts = 0;
   let pendingProvider = null;
+  let contentPreparationFailure = mockParams.get("contentPrepareFails");
+  window.__MOCK_REPAIR_CONTENT_PREPARATION__ = () => { contentPreparationFailure = null; };
+  let pendingContentSync = null;
+  const contentSyncPreviews = new Map();
+  const contentSyncCalls = [];
+  window.__MOCK_CONTENT_SYNC_STATE__ = () => structuredClone({ pending: pendingContentSync != null, calls: contentSyncCalls });
   let pendingLocalSync = null;
   const localSyncPreviews = new Map();
   const localSyncCalls = [];
@@ -611,6 +630,16 @@ MOCK_TAURI = r"""
   };
   if (new URLSearchParams(location.search).has("bidiRecovery")) {
     window.__DOPPELDECKER_MOCK_ADD_BIDI_RECOVERY__();
+  }
+  if (mockParams.has("forwardStartup") || mockParams.has("forwardCompletion")) {
+    const entry = queueEntry({ type: "BidirectionalForward", pair_id: Array(16).fill(17),
+      pair_name: "Forward-Startpaar", left: { provider: "Sftp", root: "/" }, right: { provider: "Local", root: "/mock/ziel" },
+      baseline_path: "/mock/state/forward-start.json", resolutions: [], expected_baseline_digest: Array(32).fill(1),
+      expected_plan_digest: Array(32).fill(2), expected_unresolved_digest: Array(32).fill(3), expected_preview_digest: Array(32).fill(4) });
+    entry.state = "Interrupted"; entry.attempts = 1; entry.recovery_available = !mockParams.has("forwardCompletion");
+    entry.bidirectional_completion_recovery = mockParams.has("forwardCompletion") ? "complete" : null;
+    entry.error = "Vorheriger Forwardlauf besitzt ein dauerhaftes Journal";
+    queue.entries.push(entry);
   }
   if (bidirectionalFastApproveBeforeResponse) {
     const entry = queueEntry({ type: "Bidirectional", pair_id: Array(16).fill(7),
@@ -879,7 +908,46 @@ MOCK_TAURI = r"""
     expires_at_unix_ms: Date.now() + 600000,
     backup_confirmation_required: false, stage_blocker: null,
   });
+  const forwardPreview = request => {
+    const preview = bidirectionalPreview(request);
+    preview.execution_class = "best_effort_forward";
+    preview.unresolved_digest = Array(32).fill(41);
+    preview.digest = Array(32).fill(request.resolutions.length ? 43 : 42);
+    preview.recovery = request.recovery ? { previous_run_id: "forward-unvollständig", changed_left: 1, changed_right: 1,
+      running_projections: 1, warning: "Der vorherige Lauf kann bereits eine Datei geschrieben haben. B0 blieb unverändert." } : null;
+    preview.scope_warnings = []; preview.limitations = ["Kein universelles Rollback; bei unklarem Ausgang kein automatischer Wiederholversuch."];
+    if (!preview.plan.conflicts) preview.plan.actions = [{ type: "copy", path: "eins.txt", expected_target: null }, { type: "copy", path: "zwei.txt", expected_target: null }, { type: "copy", path: "drei.txt", expected_target: null }];
+    const identity = endpoint => endpoint.provider === "local" ? localIdentity(endpoint.root, 10) : providerIdentity(endpoint);
+    preview.plan.left_root_identity = identity(request.left); preview.plan.right_root_identity = identity(request.right);
+    preview.effects = preview.plan.conflicts ? [] : [[request.left, request.right], [request.right, request.left]].map(([source, target]) => ({
+      source_root: source.root, target_root: target.root, source_provider: source.provider, target_provider: target.provider,
+      source_identity: identity(source), target_identity: identity(target), options: { mode: "Update" },
+      plan: { actions: [], copy_count: target === request.right ? 2 : 1, update_count: mockParams.has("forwardReplace") ? 1 : 0, delete_count: 0, bytes_to_transfer: 12, skip_count: 0 },
+      irreversible_replacements: mockParams.has("forwardReplace") && target.provider !== "local" ? 1 : 0, irreversible_removals: 0,
+      quarantined_replacements: mockParams.has("forwardReplace") && target.provider === "local" ? 1 : 0, quarantined_removals: 0,
+      quarantine_run: target.provider === "local" ? "lokal-geprüft" : null, blocked_removals: 0,
+      limitations: ["Best Effort: Bestand vor und nach der Wirkung prüfen."], removal_confirmation: null,
+    }));
+    return preview;
+  };
+  const forwardRequestForEntry = entry => forwardRequests.get(entry.operation_id) || ({ pairId: entry.operation.pair_id,
+    pairName: entry.operation.pair_name, left: { ...entry.operation.left, provider: entry.operation.left.provider.toLowerCase() },
+    right: { ...entry.operation.right, provider: entry.operation.right.provider.toLowerCase() }, resolutions: [] });
+  function finishForwardMock(entry) {
+    entry.state = "Running"; entry.attempts = (entry.attempts || 0) + 1; queueEvent();
+    queueMicrotask(() => {
+      entry.state = "Completed"; entry.recovery_available = false; entry.bidirectional_completion_recovery = null;
+      forwardStatuses.delete(JSON.stringify(entry.operation.pair_id)); queueEvent();
+      window.__MOCK_EMIT__("bidirectional-done", { operationId: entry.operation_id, attempt: entry.attempts, execution_class: "best_effort", runs: [], baseline_generation: 1, baseline_committed: true });
+    });
+  }
   async function invoke(command, args = {}) {
+    if (command === "get_metadata_admin_status") return { available: true, state: "notRegistered", message: "Administratorhelfer noch nicht eingerichtet." };
+    if (command === "get_file_property_capabilities") {
+      const permissions = ["local", "sftp", "ftps"].includes(args.provider);
+      return { permissions, recursivePermissions: permissions, administration: args.provider === "local" && mockParams.has("administrator"), ownership: args.provider === "local", tags: args.provider === "local" && mockParams.has("finderTags"), visibility: args.provider === "local" && mockParams.has("visibility"), nativeFlags: args.provider === "local" && mockParams.has("fileFlags"),
+        limitations: args.provider === "local" ? [] : [permissions ? "Best Effort: Serverpfade werden geprüft; gleichzeitiger Pfadtausch bleibt möglich." : "Dieser Provider bietet keinen Unix-Rechteeditor."] };
+    }
     // Remote-Endpunkte spiegeln den Backendvertrag: Ein fehlender oder veralteter
     // Profilstand scheitert, statt im Mock unbemerkt durchzurutschen.
     for (const endpoint of [
@@ -981,6 +1049,7 @@ MOCK_TAURI = r"""
     if (command === "desktop_preferences") {
       return { preferences: structuredClone(desktopPreferences), revision: desktopRevision, needsMigration: !desktopInitialized, loadError: null };
     }
+    if (command === "sync_native_theme") return null;
     if (command === "update_desktop_preferences") {
       if (args.onlyIfUninitialized && desktopInitialized) {
         return { preferences: structuredClone(desktopPreferences), revision: desktopRevision, needsMigration: false, loadError: null };
@@ -1305,6 +1374,20 @@ MOCK_TAURI = r"""
       actionOrder.push(command);
       return result;
     }
+    if (command === "list_remote_edits") return window.__MOCK_REMOTE_EDITS__ || [];
+    if (command === "save_remote_edit") {
+      const entry = (window.__MOCK_REMOTE_EDITS__ || []).find(entry => entry.id === args.request.id);
+      if (!entry) throw { code: "not_found", message: "Bearbeitung nicht gefunden" };
+      if (mockParams.has("remoteEditDrift")) throw { code: "plan_drift", message: "Serverdatei wurde inzwischen verändert. Bearbeitung neu öffnen." };
+      entry.lastOperationId = "mock-remote-edit-save";
+      entry.dirty = false;
+      window.__REMOTE_EDIT_SAVE_REQUEST__ = structuredClone(args.request);
+      return entry.lastOperationId;
+    }
+    if (command === "close_remote_edit") {
+      window.__MOCK_REMOTE_EDITS__ = (window.__MOCK_REMOTE_EDITS__ || []).filter(entry => entry.id !== args.request.id);
+      return null;
+    }
     if (command === "open_remote_snapshot") {
       const cancelsBefore = cancelSyncCalls;
       const limitations = args.request.endpoint.provider === "sftp" && mockParams.has("sftpContents")
@@ -1318,7 +1401,11 @@ MOCK_TAURI = r"""
       } else {
         window.__DOPPELDECKER_LAST_REMOTE_OPENED__ = args.request.path;
         document.documentElement.dataset.lastRemoteOpened = args.request.path;
-        window.__MOCK_EMIT__("remote-snapshot-done", { name: args.request.path.split("/").pop(), bytes: 8, limitations });
+        const name = args.request.path.split("/").pop();
+        const editId = args.request.mode === "edit" ? "mock-remote-edit" : null;
+        window.__LAST_REMOTE_OPEN_MODE__ = args.request.mode;
+        if (editId) window.__MOCK_REMOTE_EDITS__ = [{ id: editId, name, endpointLabel: `${args.request.endpoint.provider.toUpperCase()} · ${args.request.path}`, dirty: true, lastOperationId: null, limitations: ["Pfadbindung als Best Effort"], replaceBestEffort: true, saveAvailable: true, saveBlocker: null }];
+        window.__MOCK_EMIT__("remote-snapshot-done", { name, bytes: 8, limitations, editId });
       }
       if (mockParams.has("snapshotFollowup")) {
         window.__MOCK_EMIT__("fileop-progress", { phase: "copy", files_done: 0, files_total: 1, bytes_done: 0, bytes_total: 50, current: "Nachfolgelauf" });
@@ -1375,7 +1462,7 @@ MOCK_TAURI = r"""
       };
     }
     if (command === "plan_sync") return structuredClone(plan);
-    if (command === "register_bidirectional_pair") {
+    if (["register_bidirectional_pair", "register_forward_bidirectional_pair"].includes(command)) {
       const endpointKey = endpoint =>
         `${endpoint.provider}\u0000${endpoint.profileId || ""}\u0000${endpoint.root}`;
       const ordered = [structuredClone(args.left), structuredClone(args.right)]
@@ -1394,6 +1481,80 @@ MOCK_TAURI = r"""
         right: ordered[1],
         visibleLeftRole: endpointKey(args.left) === endpointKey(ordered[0]) ? "left" : "right",
       };
+    }
+    if (command === "forward_bidirectional_pair_status") {
+      forwardCalls.push({ command, args: structuredClone(args) });
+      if (mockParams.has("forwardPairRecovery") && !forwardStatuses.has(JSON.stringify(args.pairId))) {
+        forwardStatuses.set(JSON.stringify(args.pairId), { run_id: "vorheriger-lauf", baseline_matches_previous: true, baseline_completion_available: false });
+      }
+      return structuredClone(forwardStatuses.get(JSON.stringify(args.pairId)) || null);
+    }
+    if (command === "prepare_forward_bidirectional_sync") {
+      forwardCalls.push({ command, args: structuredClone(args) });
+      const before = cancelSyncCalls;
+      window.__MOCK_EMIT__("sync-preparation-started", "Beide Seiten frisch prüfen");
+      if (mockParams.has("forwardPrepareDelay")) await wait(200);
+      window.__MOCK_EMIT__("sync-preparation-done", null);
+      if (before !== cancelSyncCalls) throw { code: "interrupted", message: "Bidirektionale Vorbereitung abgebrochen" };
+      if (pendingForward) throw { code: "busy", message: "Forwardvorbereitung noch belegt" };
+      pendingForward = { request: structuredClone(args.request), preview: forwardPreview(args.request) };
+      return structuredClone(pendingForward.preview);
+    }
+    if (command === "discard_forward_bidirectional_sync") {
+      forwardCalls.push({ command }); pendingForward = null; return null;
+    }
+    if (command === "preview_forward_bidirectional_conflicts") {
+      forwardCalls.push({ command, args: structuredClone(args) });
+      const preview = args.operationId ? forwardPreviews.get(args.operationId) : pendingForward.preview;
+      const decided = new Set(args.resolutions.map(r => JSON.stringify(r.path)));
+      return structuredClone(preview.conflict_details.filter(c => !decided.has(JSON.stringify(c.path))));
+    }
+    if (command === "enqueue_forward_bidirectional_sync") {
+      forwardCalls.push({ command, args: structuredClone(args) });
+      if (!pendingForward || !args.effectsConfirmed || JSON.stringify(args.preparationDigest) !== JSON.stringify(pendingForward.preview.digest)) throw { code: "plan_drift", message: "Frische Forwardwirkung fehlt" };
+      if (mockParams.has("forwardEnqueueFailsOnce") && forwardCalls.filter(c => c.command === command).length === 1) throw { code: "busy", message: "Forward-Einreihen vor Commit belegt" };
+      const { request, preview } = pendingForward;
+      const entry = queueEntry({ type: "BidirectionalForward", pair_id: request.pairId, pair_name: request.pairName,
+        left: queueEndpoint(request.left), right: queueEndpoint(request.right), baseline_path: "/mock/state/forward-pair.json",
+        resolutions: structuredClone(request.resolutions), expected_baseline_digest: preview.plan.baseline_digest,
+        expected_plan_digest: preview.plan.plan_digest, expected_unresolved_digest: preview.unresolved_digest,
+        expected_preview_digest: preview.digest });
+      forwardRequests.set(entry.operation_id, structuredClone(request)); forwardPreviews.set(entry.operation_id, structuredClone(preview));
+      queue.entries.push(entry); pendingForward = null;
+      if (mockParams.has("forwardReopen")) {
+        entry.state = "AwaitingConfirmation"; entry.attention = { type: "RemoteRun", reason: "Nach Neustart frisch geprüft" };
+        const fresh = forwardPreviews.get(entry.operation_id); fresh.digest = Array(32).fill(44);
+        fresh.limitations.push("Neue Wirkung nach Neustart: frischer Digest."); queueEvent();
+      } else if (mockParams.has("forwardPartial")) {
+        entry.state = "Interrupted"; entry.attempts = 1; entry.recovery_available = true; entry.error_code = "outcome_unclear";
+        entry.error = "Erste von drei Dateien committed; gemeinsamer Stand B0 bleibt erhalten.";
+        forwardStatuses.set(JSON.stringify(request.pairId), { run_id: "forward-unvollständig", baseline_matches_previous: true, baseline_completion_available: false }); queueEvent();
+        window.__MOCK_EMIT__("bidirectional-error", { operationId: entry.operation_id, attempt: 1, code: "outcome_unclear", message: entry.error });
+      } else finishForwardMock(entry);
+      return entry.operation_id;
+    }
+    if (command === "forward_bidirectional_queue_preview") { forwardCalls.push({ command, args: structuredClone(args) }); return structuredClone(forwardPreviews.get(args.operationId)); }
+    if (command === "prepare_forward_bidirectional_queue_recovery") {
+      forwardCalls.push({ command, args: structuredClone(args) });
+      const entry = queue.entries.find(e => e.operation_id === args.operationId);
+      const request = { ...forwardRequestForEntry(entry), resolutions: args.resolutions, recovery: true };
+      const preview = forwardPreview(request); preview.digest = Array(32).fill(args.resolutions.length ? 46 : 45);
+      forwardPreviews.set(entry.operation_id, preview); entry.state = "AwaitingConfirmation"; entry.attention = { type: "RemoteRun", reason: "Neu gegen B0 abgeglichen" }; queueEvent(); return structuredClone(preview);
+    }
+    if (command === "discard_forward_bidirectional_queue_preparation") {
+      forwardCalls.push({ command, args: structuredClone(args) }); forwardPreviews.delete(args.operationId);
+      const entry = queue.entries.find(e => e.operation_id === args.operationId); entry.state = "Interrupted"; entry.attention = null; entry.recovery_available = true; queueEvent(); return null;
+    }
+    if (command === "approve_forward_bidirectional_queue_entry") {
+      forwardCalls.push({ command, args: structuredClone(args) });
+      const entry = queue.entries.find(e => e.operation_id === args.operationId); const preview = forwardPreviews.get(args.operationId);
+      if (!args.effectsConfirmed || JSON.stringify(args.preparationDigest) !== JSON.stringify(preview.digest)) throw { code: "plan_drift", message: "Neuer Forwarddigest muss bestätigt werden" };
+      finishForwardMock(entry); return structuredClone(queue);
+    }
+    if (["finish_forward_bidirectional_pair_completion", "finish_forward_bidirectional_queue_completion"].includes(command)) {
+      forwardCalls.push({ command, args: structuredClone(args) });
+      if (args.operationId) { const entry = queue.entries.find(e => e.operation_id === args.operationId); entry.state = "Completed"; entry.bidirectional_completion_recovery = null; queueEvent(); }
+      else forwardStatuses.delete(JSON.stringify(args.pairId)); return structuredClone(queue);
     }
     if (command === "prepare_bidirectional_sync") {
       preparationActions.push({ command, args: structuredClone(args) });
@@ -1481,7 +1642,8 @@ MOCK_TAURI = r"""
       if (bidirectionalRunFailsOnce && attempts === 1) {
         throw { code: "busy", message: "Bidirektionaler Mock-Start ist vor der Entnahme belegt" };
       }
-      document.documentElement.dataset.bidirectionalConfirmation = args.confirmation;
+      if (args.effectsConfirmed !== true) throw { code: "confirmation_mismatch", message: "Wirkung nicht bestätigt" };
+      document.documentElement.dataset.bidirectionalConfirmation = String(args.effectsConfirmed);
       if (bidirectionalRunDelayMs) await wait(bidirectionalRunDelayMs);
       const recoveryId = pendingBidirectional?.recoveryId;
       const directRequest = pendingBidirectional?.request;
@@ -1569,7 +1731,7 @@ MOCK_TAURI = r"""
         plan: structuredClone(plan), options: structuredClone(args.options),
         impact: { new_files: 1, new_bytes: 12, replacements: 0,
           replacement_new_bytes: 0, replacement_old_bytes: 0, metadata_changes: 0,
-          quarantine_entries: 0, quarantine_bytes: 0, required_available_bytes: 4108,
+          quarantine_entries: plan.delete_count, quarantine_bytes: plan.delete_bytes, required_available_bytes: 4108,
           available_bytes: 1000000, available_bytes_known: true },
         plan_digest: Array(32).fill(5), confirmation_phrase: "REAL ziel K7M4Q2",
         prepared_at_unix_ms: now, expires_at_unix_ms: now + 600000,
@@ -1619,6 +1781,76 @@ MOCK_TAURI = r"""
       entry.state = "Pending"; entry.attention = null; entry.error = null;
       queueEvent(); return structuredClone(queue);
     }
+    if (command === "prepare_content_sync") {
+      contentSyncCalls.push({ command, args: structuredClone(args) });
+      const request = args.request;
+      const cancelsBefore = cancelSyncCalls;
+      window.__MOCK_EMIT__("sync-preparation-started", "Dateisync: Inhalte und Bestand prüfen");
+      if (mockParams.has("contentPrepareDelay")) await new Promise(resolve => setTimeout(resolve, 300));
+      window.__MOCK_EMIT__("sync-preparation-done", null);
+      if (cancelSyncCalls !== cancelsBefore) throw { code: "interrupted", message: "Dateisync-Vorbereitung abgebrochen" };
+      if (contentPreparationFailure) throw { code: contentPreparationFailure, message: "Dateisync-Vorbereitung: vorübergehende Testursache" };
+      const currentPlan = structuredClone(plan);
+      const replacing = request.options.mode === "Update";
+      const removing = request.options.mode === "Mirror";
+      if (removing) { currentPlan.delete_count = mockParams.has("contentLargeRemove") ? 1001 : 2; currentPlan.delete_bytes = 24; currentPlan.actions.push({ type: "DeleteFile", path: "nur-im-ziel.txt", size: 24 }); }
+      if (replacing) { currentPlan.update_count = 1; currentPlan.actions.push({ type: "UpdateFile", path: "alte-Version.txt", size: 12 }); }
+      const preview = { source_root: request.source.root, target_root: request.target.root,
+        source_provider: request.source.provider, target_provider: request.target.provider,
+        source_identity: request.source.provider === "local" ? localIdentity(request.source.root, 10) : providerIdentity(request.source),
+        target_identity: request.target.provider === "local" ? localIdentity(request.target.root, 11) : providerIdentity(request.target),
+        options: structuredClone(request.options), plan: currentPlan, digest: Array(32).fill(8),
+        expires_unix_ms: Date.now() + 600000,
+        limitations: ["Best Effort: Der Zielbestand wird vor dem Commit geprüft und der Inhalt danach zurückgelesen. Kein automatischer Wiederholversuch bei unklarem Ausgang."],
+        irreversible_replacements: replacing ? 1 : 0, irreversible_removals: removing ? currentPlan.delete_count : 0,
+        irreversible_removal_bytes: removing ? 24 : 0, blocked_removals: 0,
+        removal_confirmation: removing && mockParams.has("contentLargeRemove") ? "ENTFERNEN 1001 MOCK" : null };
+      if (mockParams.has("contentQuarantine") && request.target.provider === "local") {
+        preview.quarantined_replacements = preview.irreversible_replacements;
+        preview.quarantined_removals = preview.irreversible_removals;
+        preview.irreversible_replacements = 0; preview.irreversible_removals = 0;
+        preview.irreversible_removal_bytes = 0; preview.removal_confirmation = null;
+        preview.quarantine_run = "run-mock-geprüft";
+        preview.local_execution = { new_file_commit: "assured", file_flush: true, directory_flush: true, irreversible_replacements: 0 };
+        preview.limitations = ["Die alte Zielversion wird vor dem Ersetzen in der geprüften lokalen Quarantäne gesichert."];
+      }
+      pendingContentSync = { request: structuredClone(request), preview };
+      return structuredClone(preview);
+    }
+    if (command === "discard_content_sync") {
+      contentSyncCalls.push({ command }); pendingContentSync = null; return null;
+    }
+    if (command === "enqueue_content_sync") {
+      contentSyncCalls.push({ command, args: structuredClone(args) });
+      if (!pendingContentSync || JSON.stringify(args.preparationDigest) !== JSON.stringify(pendingContentSync.preview.digest) || !args.effectsConfirmed) {
+        throw { code: "plan_drift", message: "Dateisync-Vorbereitung fehlt oder ist nicht bestätigt" };
+      }
+      const attempts = contentSyncCalls.filter(call => call.command === command).length;
+      if (providerRunFailsOnce && attempts === 1) throw { code: "busy", message: "Provider-Mock-Start ist vor der Entnahme belegt" };
+      const { request, preview } = pendingContentSync;
+      if (preview.removal_confirmation && args.removalPhrase !== preview.removal_confirmation) throw { code: "confirmation_mismatch", message: "Entfernungstext stimmt nicht überein" };
+      const entry = queueEntry({ type: "ContentSync", source: queueEndpoint(request.source), target: queueEndpoint(request.target),
+        options: structuredClone(request.options), expected_plan: structuredClone(preview.plan), binding_digest: [...preview.digest] });
+      contentSyncPreviews.set(entry.operation_id, structuredClone(preview));
+      if (mockParams.has("contentReopen")) {
+        entry.state = "AwaitingConfirmation"; entry.attention = { type: "RemoteRun", reason: "Nach Neustart frisch vorbereitet" };
+        const fresh = contentSyncPreviews.get(entry.operation_id); fresh.digest = Array(32).fill(9);
+        fresh.irreversible_replacements = 2; fresh.plan.update_count = 2;
+        fresh.plan.actions.push({ type: "UpdateFile", path: "frisch-geändert.txt", size: 8 });
+      }
+      queue.entries.push(entry); pendingContentSync = null; queueEvent(); return entry.operation_id;
+    }
+    if (command === "content_sync_queue_preview") {
+      contentSyncCalls.push({ command, args: structuredClone(args) });
+      return structuredClone(contentSyncPreviews.get(args.operationId));
+    }
+    if (command === "approve_content_sync_queue_entry") {
+      contentSyncCalls.push({ command, args: structuredClone(args) });
+      const preview = contentSyncPreviews.get(args.operationId);
+      if (JSON.stringify(args.preparationDigest) !== JSON.stringify(preview.digest) || !args.effectsConfirmed) throw { code: "plan_drift", message: "Frische Vorschau nicht bestätigt" };
+      const entry = queue.entries.find(item => item.operation_id === args.operationId);
+      entry.state = "Pending"; entry.attention = null; queueEvent(); return structuredClone(queue);
+    }
     if (command === "discard_real_sync") return null;
     if (command === "discard_sftp_sync") return null;
     if (command === "discard_ftps_sync") return null;
@@ -1649,8 +1881,8 @@ MOCK_TAURI = r"""
         }
         pendingProvider = null;
       }
-      document.documentElement.dataset[`${protocol}Confirmation`] = args.confirmation;
-      document.documentElement.dataset[`${protocol}Backup`] = String(args.backupConfirmed);
+      if (args.effectsConfirmed !== true) throw { code: "confirmation_mismatch", message: "Wirkung nicht bestätigt" };
+      document.documentElement.dataset[`${protocol}Confirmation`] = String(args.effectsConfirmed);
       queueMicrotask(() => listeners.get("sync-done")?.({ payload: {
         files_copied: 1, files_deleted: 0, metadata_updated: 0, bytes_copied: 12,
         cancelled: false, dry_run: false, quarantine: null,
@@ -1658,8 +1890,8 @@ MOCK_TAURI = r"""
       return null;
     }
     if (command === "run_real_sync") {
-      document.documentElement.dataset.realConfirmation = args.confirmation;
-      document.documentElement.dataset.realBackup = String(args.backupConfirmed);
+      if (args.effectsConfirmed !== true) throw { code: "confirmation_mismatch", message: "Wirkung nicht bestätigt" };
+      document.documentElement.dataset.realConfirmation = String(args.effectsConfirmed);
       queueMicrotask(() => listeners.get("sync-done")?.({ payload: {
         files_copied: 1, files_deleted: 0, metadata_updated: 0, bytes_copied: 12,
         cancelled: false, dry_run: false, quarantine: null,
@@ -1812,7 +2044,9 @@ MOCK_TAURI = r"""
       if (sftpProfileChangesDuringAgent === "change" && sftpProfiles[0]) {
         sftpProfiles[0] = { ...sftpProfiles[0], name: "Extern geändert" };
       }
-      return [];
+      return mockParams.has("sftpAgentKeys")
+        ? [{ comment: "Asynchroner Testschlüssel", algorithm: "ssh-ed25519", sha256: Array(32).fill(23) }]
+        : [];
     }
     if (["list_sftp_profiles", "list_ftps_profiles", "list_webdav_profiles", "list_smb_profiles"].includes(command)) {
       const protocol = command.slice(5, -9);
@@ -1916,11 +2150,15 @@ MOCK_TAURI = r"""
       if (protocol === "smb") smbProfiles = smbProfiles.filter(profile => profile.id !== args.profileId);
       return structuredClone(profilesFor(protocol));
     }
-    if (["discover_sftp_host_key", "discover_ftps_certificate", "discover_webdav_certificate", "discover_smb_server"].includes(command)) {
+    if (["discover_sftp_host_key", "discover_ftps_certificate", "verify_ftps_certificate", "discover_webdav_certificate", "discover_smb_server"].includes(command)) {
       connectionActions.push({ command, args: structuredClone(args) });
       if (editorDiscoveryDelayMs) await wait(editorDiscoveryDelayMs);
       if (command === "discover_sftp_host_key") return { algorithm: "ssh-ed25519", sha256: Array(32).fill(11) };
-      if (command === "discover_ftps_certificate") return { sha256: Array(32).fill(7) };
+      if (command === "verify_ftps_certificate") {
+        if (mockParams.has("ftpsPublicVerifyError")) throw { code: "tls_identity_unverified", message: "Öffentliche Zertifikatsprüfung fehlgeschlagen" };
+        return { sha256: Array(32).fill(9) };
+      }
+      if (command === "discover_ftps_certificate") return { sha256: Array(32).fill(mockParams.has("ftpsRenewedCertificate") ? 9 : 7) };
       if (command === "discover_webdav_certificate") return { sha256: Array(32).fill(5) };
       return { server_guid: Array(16).fill(6), dialect: 785,
         encryption_capable: true, signing_required: true };
@@ -1995,6 +2233,48 @@ MOCK_TAURI = r"""
       }
       queueEvent(); return structuredClone(queue);
     }
+    if (command === "acknowledge_directory_dacl_outcome") {
+      (window.__MOCK_DACL_ACKS__ ||= []).push(structuredClone(args));
+      if (window.__MOCK_DACL_ACK_FAIL__) throw { code: "plan_drift", message: "Rechtezustand hat sich geändert" };
+      const entry = queue.entries.find(item => item.operation_id === args.operationId);
+      if (entry && args.possibleEffectReviewed && entry.directory_dacl_recovery) {
+        entry.state = "Cancelled"; entry.directory_dacl_recovery = false;
+        entry.progress.phase = "recovery_acknowledged";
+        const report = entry.directory_dacl_report || { completed: [], uncertain: [] };
+        report.completed.push(...report.uncertain); report.uncertain = [];
+        entry.directory_dacl_report = report; entry.progress.directory_dacl_report = structuredClone(report);
+        entry.temp_recovery_paths = [];
+      }
+      queueEvent(); return structuredClone(queue);
+    }
+    if (command === "acknowledge_file_dacl_outcome") {
+      (window.__MOCK_FILE_DACL_ACKS__ ||= []).push(structuredClone(args));
+      if (window.__MOCK_FILE_DACL_ACK_FAIL__) throw { code: "plan_drift", message: "Rechtezustand hat sich geändert" };
+      const entry = queue.entries.find(item => item.operation_id === args.operationId);
+      if (entry && args.possibleEffectReviewed && entry.file_dacl_recovery) {
+        entry.state = "Cancelled"; entry.file_dacl_recovery = false;
+        entry.progress.phase = "recovery_acknowledged";
+        const report = entry.file_dacl_report || { completed: [], uncertain: [] };
+        report.completed.push(...report.uncertain); report.uncertain = [];
+        entry.file_dacl_report = report; entry.progress.file_dacl_report = structuredClone(report);
+        entry.temp_recovery_paths = [];
+      }
+      queueEvent(); return structuredClone(queue);
+    }
+    if (command === "acknowledge_created_directory_dacl_outcome") {
+      (window.__MOCK_CREATED_DIRECTORY_DACL_ACKS__ ||= []).push(structuredClone(args));
+      if (window.__MOCK_CREATED_DIRECTORY_DACL_ACK_FAIL__) throw { code: "plan_drift", message: "Rechtezustand hat sich geändert" };
+      const entry = queue.entries.find(item => item.operation_id === args.operationId);
+      if (entry && args.possibleEffectReviewed && entry.created_directory_dacl_recovery) {
+        entry.state = "Cancelled"; entry.created_directory_dacl_recovery = false;
+        entry.progress.phase = "recovery_acknowledged";
+        const report = entry.created_directory_dacl_report || { completed: [], uncertain: [] };
+        report.completed.push(...report.uncertain); report.uncertain = [];
+        entry.created_directory_dacl_report = report; entry.progress.created_directory_dacl_report = structuredClone(report);
+        entry.temp_recovery_paths = [];
+      }
+      queueEvent(); return structuredClone(queue);
+    }
     if (command === "acknowledge_unclear_queue_outcome") {
       const entry = queue.entries.find(item => item.operation_id === args.operationId);
       if (entry && args.possibleEffectReviewed && entry.error_code === "outcome_unclear") {
@@ -2017,6 +2297,13 @@ MOCK_TAURI = r"""
     }
     if (command === "discard_queue_confirmation") {
       const entry = queue.entries.find(item => item.operation_id === args.operationId);
+      if (entry?.operation.type === "BidirectionalForward" && entry.state === "AwaitingConfirmation") {
+        forwardPreviews.delete(entry.operation_id);
+        const active = forwardStatuses.has(JSON.stringify(entry.operation.pair_id));
+        entry.state = active ? "Interrupted" : "Cancelled"; entry.attention = null; entry.recovery_available = active; queueEvent();
+        if (active) throw { code: "replan_required", message: "Vorhandene Teilwirkungen bleiben erhalten; neu abgleichen" };
+        return structuredClone(queue);
+      }
       if (entry && entry.state === "AwaitingConfirmation" && entry.attention?.type !== "RemoteRun") {
         entry.state = "Cancelled"; entry.attention = null;
         entry.error = "Die neu entdeckte Lage wurde nicht übernommen; die Operation wurde verworfen";
@@ -2025,8 +2312,33 @@ MOCK_TAURI = r"""
     }
     if (command === "approve_queue_entry") {
       const entry = queue.entries.find(item => item.operation_id === args.operationId);
-      if (entry && entry.attention?.confirmation === args.confirmation) {
-        if (entry.attention.type === "SourceTreeChanged") entry.operation.source_tree_expected = structuredClone(entry.attention.current_tree);
+      if (!entry || entry.state !== "AwaitingConfirmation" || args.effectsConfirmed !== true
+          || entry.attention?.type === "RemoteRun" || entry.error_code === "outcome_unclear"
+          || entry.recovery_available || entry.bidirectional_completion_recovery
+          || JSON.stringify(entry.attention) !== JSON.stringify(args.expectedAttention)) {
+        throw { code: "plan_drift", message: "Die Queue-Rückfrage hat sich seit der Anzeige geändert" };
+      }
+      if (entry) {
+        const attention = entry.attention;
+        if (attention.type === "SourceTreeChanged") entry.operation.source_tree_expected = structuredClone(attention.current_tree);
+        if (attention.type === "PlanChanged") entry.operation.expected_plan = structuredClone(attention.current_plan);
+        if (attention.type === "ConflictsChanged") {
+          entry.operation.expected_conflicts = structuredClone(attention.current_conflicts);
+          entry.operation.expected_conflict_proofs = structuredClone(attention.current_conflict_proofs || []);
+        }
+        if (attention.type === "LocalFileCommit") {
+          entry.operation.local_copy_new_best_effort_expected = structuredClone(attention.target_identity);
+          if (entry.operation.type === "ProviderFile") entry.operation.copy_new_best_effort_expected = true;
+        }
+        if (attention.type === "BestEffortCommitDowngrade") {
+          if (attention.copy_new_best_effort) entry.operation.copy_new_best_effort_expected = true;
+          if (attention.replace_best_effort) entry.operation[entry.operation.type === "File" ? "local_replace_best_effort_expected" : "replace_best_effort_expected"] = true;
+          if (attention.remove_source_best_effort) entry.operation.remove_source_best_effort_expected = true;
+        }
+        if (attention.type === "BidirectionalPlanChanged") {
+          entry.operation.expected_baseline_digest = structuredClone(attention.current_baseline_digest);
+          entry.operation.expected_plan_digest = structuredClone(attention.current_plan_digest);
+        }
         entry.state = "Pending"; entry.error = null; entry.attention = null;
       }
       queueEvent(); return structuredClone(queue);
@@ -2120,8 +2432,8 @@ MOCK_TAURI = r"""
         window.__AP21_CHOICE_ID__ = id;
         const skip = policy === "skip";
         const partialMerge = skip && mockParams.has("ftpsPartialMerge");
-        const both = policy === "both";
-        const replacementDenied = policy === "overwrite" && mockParams.has("ftpsReplaceDenied");
+        const both = policy === "both" || policy === "inspect";
+        const replacementDenied = ["overwrite", "inspect"].includes(policy) && mockParams.has("ftpsReplaceDenied");
         return {
           requiresConflictChoice: policy === null, skipOnly: skip && !partialMerge,
           sourceRemovalRequired: !skip,
@@ -2129,8 +2441,8 @@ MOCK_TAURI = r"""
           conflictPreparationId: id, keepBothPreparationId: both ? id : null,
           keepBothNames: both ? ["remote (Kopie).txt"] : [], keepBothBlocker: "Kollisionsfreier Commit wird erst nach der Wahl geprüft.",
           sourceReadLimitations: [], sourceTree: null,
-          targetCapabilities: { provider: "ftps", copyNew: both, copyNewBestEffort: partialMerge || policy !== null && !skip && !both,
-            replace: false, replaceBestEffort: policy === "overwrite" && !replacementDenied, removeSource: false, removeSourceBestEffort: false, renameNoreplace: both, limitations: [], blockers: replacementDenied ? ["Ersetzen ist für diese Ordnerauswahl nicht gebunden"] : [] },
+          targetCapabilities: { provider: "ftps", copyNew: policy === "both", copyNewBestEffort: partialMerge || policy !== null && !skip && policy !== "both",
+            replace: false, replaceBestEffort: ["overwrite", "inspect"].includes(policy) && !replacementDenied, removeSource: false, removeSourceBestEffort: false, renameNoreplace: both, limitations: [], blockers: replacementDenied ? ["Ersetzen ist für diese Ordnerauswahl nicht gebunden"] : [] },
           sourceCapabilities: !skip && !replacementDenied && policy !== null && request.kind === "move" ? { provider: "ftps", removeSource: false, removeSourceBestEffort: true, limitations: [], blockers: [] } : null,
         };
       }
@@ -2186,6 +2498,7 @@ MOCK_TAURI = r"""
     }
     if (command === "enqueue_provider_file_operation" || command === "enqueue_provider_file_intent") {
       const request = args.request;
+      window.__LAST_PROVIDER_FILE_REQUEST__ = structuredClone(request);
       if (command === "enqueue_provider_file_operation" && mockParams.has("ftpsEnqueuePreparationGate")) {
         const before = cancelSyncCalls;
         window.__MOCK_EMIT__("fileop-preparation-started", "FTP-/FTPS-Dateioperation wird erneut vor Einreihung geprüft.");
@@ -2235,7 +2548,7 @@ MOCK_TAURI = r"""
         bytes: request.items.length * 8,
         digest: Array(32).fill(4),
       };
-      const confirmation = mode === "permanent"
+      const confirmation = mode === "permanent" && mockParams.has("largeRemoteDelete")
         ? `DAUERHAFT LÖSCHEN ${request.endpoint.provider.toUpperCase()} ${request.endpoint.profileId} ${plan.root} ${plan.items.length} ${plan.entries}`
         : null;
       return {
@@ -2243,6 +2556,7 @@ MOCK_TAURI = r"""
           provider: request.endpoint.provider,
           quarantine: mode === "quarantine",
           permanent: mode === "permanent",
+          limitations: mode === "permanent" ? ["Collection-DELETE bleibt Best Effort; <fremder> Bestand kann hinzukommen."] : [],
           blockers: [],
         },
         mode, plan, confirmation,

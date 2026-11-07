@@ -1,47 +1,60 @@
-# Roadmap
+# Roadmap bis Version 1.0
 
-Stand: 2026-10-19 · erste öffentliche Preview 0.1.124.
+Stand: 2026-11-02. Ziel ist ein komfortabler, umfassender und effizienter
+Two-Pane-Dateimanager für macOS und Linux. Offene Einzelaufgaben stehen nur im
+[Backlog](../backlog.md); die [Funktionsmatrix](function-audit.md) beschreibt das
+aktuell implementierte Verhalten.
 
-## Vorhandene Grundlage
+## Beauftragter Ausbau der Alltagstauglichkeit
 
-Doppeldecker bietet mehrere unabhängige Dual-Pane-Fenster, Tabs, lokale
-Dateioperationen und eine persistente Queue je Fenster. Quelle und Ziel werden
-im Core gebunden. Kopien, Sync, Quarantäne und Papierkorb verwenden getrennte,
-wirkungsbezogene Bestätigungs- und Wiederherstellungsverträge.
+1. **Metadatenumfang umgesetzt:** Die belegten Alltagsfunktionen einschließlich
+   macOS-Administratorfreigabe sind implementiert. Über die belegte ForkLift-Parität
+   hinausgehende Spezialfähigkeiten sind keine Releasepflicht. Verbleibende
+   Kandidatenprüfungen stehen beim [Vergleich und Prüfstand](forklift-parity.md).
+2. **Komfort umgesetzt:** Entfernte Namenzyklen sowie ZIP-Erzeugung und Entpacken
+   zu Remotezielen sind implementiert und gegen reale Provider geprüft.
+   Nativ auf macOS geprüft sind SFTP-Namenzyklen und SFTP-/WebDAV-Archive.
+   Weitere Anbieterläufe folgen beim Kandidaten. [Prüfstand](remote-pack.md).
+3. **Kandidaten stabilisieren:** Neue Funktionen gezielt prüfen, anschließend den
+   aktuellen Kandidaten auf beiden unterstützten Plattformen als echte App und
+   Paket abnehmen. [Release- und Plattformplan](release-plan.md).
+4. **Auslieferung vorbereiten:** Funktionsmatrix, READMEs, Release Notes und Website
+   auf denselben abgenommenen Kandidaten beziehen. Die
+   [Entwicklungshinweise](release-notes-next.md) beschreiben den Umfang nach
+   0.1.124; die Website beschreibt weiterhin den verfügbaren Previewdownload.
+   Eine Veröffentlichung braucht einen eigenen konkreten Auftrag.
 
-Hintergrundübertragungen lassen Navigation und weitere Aufträge zu. Lokale
-Dateien können über die native Datei-Zwischenablage übergeben werden. Sync besitzt
-Vorschau, Simulation und einen getrennten bestätigten Start. GUI und CLI teilen
-denselben Kern. Remote-Funktionen richten sich nach der aktuellen
-[Funktionsmatrix](function-audit.md), nicht nach einer pauschalen Protokollzusage.
+## Was „fertig“ bedeutet
 
-## Nächste Produktziele
+Version 1.0 benötigt:
 
-1. SFTP-Ordneranlage, Umbenennung und additive Uploads anhand eigener begrenzter
-   Ausführungsklassen ergänzen. Der vorhandene Lesepfad erteilt keine Schreibfreigabe.
-2. Problematische Namen und Metadaten pfadgenau bilanzieren; unabhängige Dateien
-   sollen trotz benannter Auslassungen bedienbar bleiben.
-3. Schnellfilter und abbrechbare rekursive Namenssuche mit sichtbaren Teilbilanzen.
-4. Integrierte lokale und Remote-Vorschau für Grundformate; danach Remote-Bearbeitung
-   mit geprüftem Rückupload und Versionskonflikten.
-5. Duplizieren, Stapelumbenennung mit Vorschau sowie Archivnavigation und
-   Packen/Entpacken mit klaren Zielen, Konflikten und Fortschritt.
+- direkt bedienbare gewöhnliche lokale und entfernte Dateiaktionen mit klaren
+  Konflikt-, Abbruch- und Fehlerzuständen, auch bei großen Beständen;
+- die oben genannten Komfortabläufe und den begrenzten
+  [Metadaten-Paritätsumfang](forklift-parity.md);
+- zuverlässige fenstereigene Queues, nachvollziehbare Wiederherstellung sowie
+  einseitigen und bidirektionalen Sync mit passendem Providervertrag;
+- reproduzierbare macOS-/Linux-Pakete mit belegter Installation, Upgrade,
+  Recovery und konsistenten öffentlichen Funktionszusagen.
 
-Weitere Ideen und ihre Sicherheitsgrenzen stehen unter
-[Produkt- und Performancechancen](product-opportunities.md).
+Fehlende lokale Atomaritätsgarantien auf entfernten Protokollen verlangen passende
+Best-Effort-Wege, keine pauschale Schreibsperre. Gewöhnliche Dateiaktionen brauchen
+keine allgemeine Vorschau. Remote-Quarantäne, plattformübergreifende ACL-Übersetzung,
+Dateisystem-Snapshots und vollständige Backupgarantien sind kein 1.0-Ziel.
 
-## Voraussetzungen für Version 1.0
+## Aktueller Stand
 
-- Lokale Dateioperationen, Synchronisation, Installation, Upgrade und Recovery
-  bleiben auf macOS und Linux reproduzierbar geprüft.
-- Native Metadaten einschließlich Hardlinks werden entsprechend dem gewählten
-  Profil vollständig übertragen oder sichtbar bilanziert.
-- Alle Provider erfüllen für die freigegebenen Wirkungen denselben Plan-, Abbruch-
-  und Recoveryvertrag; verbleibende Protokollgrenzen sind konkret dokumentiert.
-- Bidirektionaler Sync behandelt Konflikte und Löschungen anhand persistenter
-  Baselines, ohne unbemerkte Konfliktauflösung.
-- Oberfläche und Dokumentation versprechen nur die tatsächlich verfügbaren
-  Fähigkeiten. Ein erfolgreicher Cross-Build ersetzt keinen nativen Plattformtest.
+Lokale/entfernte Dateiaktionen, mehrere Fenster und Pane-Tabs, Zwischenablage,
+Hintergrundarbeit, Suche, passive Vorschau, Stapelumbenennung, lokale ZIP-Erzeugung,
+Archivnavigation und Entpacken in lokale oder entfernte Ziele sind implementiert. Einseitiger
+und bidirektionaler gewöhnlicher Inhaltssync unterstützen die angebotenen Provider.
+Der konkrete Prüf- und Einschränkungsstand steht in der Funktionsmatrix und den
+verlinkten Verträgen; daraus folgt keine neue Releasefreigabe.
 
-Dateisystem-Snapshots, APFS-Klonerhalt und die automatische Übersetzung
-inkompatibler ACL-Modelle sind keine Voraussetzung für 1.0.
+## Dokumentation pflegen
+
+Roadmap: Ziele und Fertigkriterien. Backlog: offene Aufgaben. Changelog: Änderungen.
+Vertragsdokumente: notwendige technische Grenzen und gebündelte Prüfbelege.
+Historische Abläufe und wiederholte Testzahlen gehören nicht in die aktiven Listen.
+Der frühere Gesamtstand bleibt als [Historie bis 2026-10](roadmap-history-2026-10.md)
+erhalten; seine Aufwandszahlen sind keine Schätzung für den heutigen Restumfang.

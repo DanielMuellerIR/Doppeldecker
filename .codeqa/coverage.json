@@ -1,0 +1,2652 @@
+{
+  "schema_version": 2,
+  "project": "Doppeldecker",
+  "campaign": {
+    "id": "20260910T111321948617+0200",
+    "token_budget": 6000000,
+    "status": "complete",
+    "started_at": "2026-09-10T11:13:21+02:00",
+    "tokens_spent": 2050878,
+    "completion_reopen_history": [
+      {
+        "prior_completion": {
+          "id": "20260910T111321948617+0200",
+          "token_budget": 6000000,
+          "status": "complete",
+          "started_at": "2026-09-10T11:13:21+02:00",
+          "tokens_spent": 2050878,
+          "finished_at": "2026-10-19T16:51:15+02:00",
+          "finish_reason": "all-current"
+        },
+        "reopened_at": "2026-10-19T15:16:33.982607+00:00",
+        "reason": "Der unmittelbar anschließende beauftragte Linux-Kandidatenlauf reproduziert einen zusätzlichen Paketprüferfehler auf dem echten AppImage: gültiger interner Desktoplink wird abgelehnt. Nur der betroffene Releasebereich wird mit Delta und Paketgegenlauf erneut fällig. Verbrauch und frühere Abschlussbelege bleiben erhalten.",
+        "evidence": "docs/code-review-2026-10-19-linux-paket.md",
+        "observed_head": "45e21af"
+      },
+      {
+        "prior_completion": {
+          "id": "20260910T111321948617+0200",
+          "token_budget": 6000000,
+          "status": "complete",
+          "started_at": "2026-09-10T11:13:21+02:00",
+          "tokens_spent": 2050878,
+          "finished_at": "2026-10-19T18:21:14+02:00",
+          "finish_reason": "all-current"
+        },
+        "reopened_at": "2026-10-19T17:06:09.453372+00:00",
+        "reason": "Daniel meldet nach bestandener funktionaler Linux-Geräteabnahme ein fehlendes Dockicon. Die echte X11-Probe bestätigt fehlendes _NET_WM_ICON an beiden Fenstern; unabhängiger GTK-Gegenlauf verwirft512/1024undakzeptiert256. Nur Fenster-/Icon-Delta samt Laufzeitgrenzen erneut prüfen; bisherige Abdeckung und Verbrauch erhalten.",
+        "evidence": "docs/linux-kandidat-2026-10-19.md",
+        "observed_head": "2884457"
+      }
+    ],
+    "finished_at": "2026-10-19T19:17:26+02:00",
+    "finish_reason": "all-current"
+  },
+  "campaign_history": [
+    {
+      "id": "20260815T115557607402+0200",
+      "token_budget": 3000000,
+      "status": "paused",
+      "started_at": "2026-08-15T11:55:57+02:00",
+      "finished_at": "2026-08-15T16:15:25+02:00",
+      "finish_reason": "budget-reached"
+    },
+    {
+      "id": "20260819T180452594815+0200",
+      "token_budget": 5000000,
+      "status": "complete",
+      "started_at": "2026-08-19T18:04:52+02:00",
+      "tokens_spent": 533072,
+      "finished_at": "2026-08-19T21:59:59+02:00",
+      "finish_reason": "all-current"
+    },
+    {
+      "id": "20260825T162859427161+0200",
+      "token_budget": 6000000,
+      "status": "complete",
+      "started_at": "2026-08-25T16:28:59+02:00",
+      "tokens_spent": 3676302,
+      "finished_at": "2026-08-25T22:31:29+02:00",
+      "finish_reason": "all-current"
+    },
+    {
+      "id": "20260829T203917212283+0200",
+      "token_budget": 8000000,
+      "status": "complete",
+      "started_at": "2026-08-29T20:39:17+02:00",
+      "tokens_spent": 1363064,
+      "finished_at": "2026-08-29T21:54:10+02:00",
+      "finish_reason": "all-current"
+    },
+    {
+      "id": "20260830T102930403483+0200",
+      "token_budget": 3000000,
+      "status": "complete",
+      "started_at": "2026-08-30T10:29:30+02:00",
+      "finished_at": "2026-08-30T10:31:14+02:00",
+      "finish_reason": "all-current"
+    },
+    {
+      "id": "20260903T104519936010+0200",
+      "token_budget": 6000000,
+      "status": "blocked",
+      "started_at": "2026-09-03T10:45:19+02:00",
+      "tokens_spent": 395468,
+      "finished_at": "2026-09-03T17:49:21+02:00",
+      "finish_reason": "blocked"
+    }
+  ],
+  "scope": {
+    "paths": [
+      "core",
+      "src-tauri",
+      "cli",
+      "frontend",
+      "tools",
+      "fuzz",
+      ".github",
+      ".cargo",
+      "build-app",
+      "install",
+      "release",
+      "Cargo.toml",
+      "package.json",
+      ".gitignore",
+      "Cargo.lock",
+      "pnpm-lock.yaml",
+      "vendor/smb2/src/client/connection.rs",
+      "vendor/smb2/src/testing/fixtures/consumer/smb-consumer-windows/Dockerfile",
+      "vendor/smb2/DOPPELDECKER-PATCH.md"
+    ],
+    "exclusions": [
+      {
+        "path": "frontend/icons",
+        "reason": "Binaere App-/Theme-Icons; visueller Assetbestand statt Laufzeitcode"
+      },
+      {
+        "path": "fuzz/Cargo.lock",
+        "reason": "Generierte Abhängigkeitsauflösung des separaten Fuzz-Workspaces"
+      },
+      {
+        "path": "fuzz/README.md",
+        "reason": "Nutzerdokumentation statt Quellcode"
+      },
+      {
+        "path": "src-tauri/icons/README.md",
+        "reason": "Dokumentierter oder binärer Iconbestand; Renderer und aktive Buildlogik sind gesondert im Review."
+      },
+      {
+        "path": "src-tauri/icons/icon-source.png",
+        "reason": "Dokumentierter oder binärer Iconbestand; Renderer und aktive Buildlogik sind gesondert im Review."
+      },
+      {
+        "path": "src-tauri/icons/icon.icns",
+        "reason": "Dokumentierter oder binärer Iconbestand; Renderer und aktive Buildlogik sind gesondert im Review."
+      },
+      {
+        "path": "src-tauri/icons/icon.png",
+        "reason": "Dokumentierter oder binärer Iconbestand; Renderer und aktive Buildlogik sind gesondert im Review."
+      },
+      {
+        "path": "src-tauri/icons/variants/aurora.png",
+        "reason": "Dokumentierter oder binärer Iconbestand; Renderer und aktive Buildlogik sind gesondert im Review."
+      },
+      {
+        "path": "src-tauri/icons/variants/blue.png",
+        "reason": "Dokumentierter oder binärer Iconbestand; Renderer und aktive Buildlogik sind gesondert im Review."
+      },
+      {
+        "path": "src-tauri/icons/variants/rose.png",
+        "reason": "Dokumentierter oder binärer Iconbestand; Renderer und aktive Buildlogik sind gesondert im Review."
+      },
+      {
+        "path": "src-tauri/icons/variants/storm.png",
+        "reason": "Dokumentierter oder binärer Iconbestand; Renderer und aktive Buildlogik sind gesondert im Review."
+      },
+      {
+        "path": "src-tauri/icons/variants/sunset.png",
+        "reason": "Dokumentierter oder binärer Iconbestand; Renderer und aktive Buildlogik sind gesondert im Review."
+      },
+      {
+        "path": "src-tauri/icons/variants/turquoise.png",
+        "reason": "Dokumentierter oder binärer Iconbestand; Renderer und aktive Buildlogik sind gesondert im Review."
+      },
+      {
+        "path": "Cargo.lock",
+        "reason": "Generierte Cargo-Auflösung; --locked und Build-/Abhängigkeitsgates prüfen Konsistenz."
+      },
+      {
+        "path": "pnpm-lock.yaml",
+        "reason": "Generierte pnpm-Auflösung; --frozen-lockfile prüft Konsistenz."
+      }
+    ]
+  },
+  "areas": [
+    {
+      "id": "core-bidirectional",
+      "paths": [
+        "core/src/bidirectional.rs",
+        "fuzz/fuzz_targets/bidirectional_baseline.rs",
+        "fuzz/fuzz_targets/bidirectional_run_journal.rs",
+        "fuzz/seeds/bidirectional_baseline",
+        "fuzz/seeds/bidirectional_run_journal"
+      ],
+      "risk": "critical",
+      "priority": 1,
+      "reason": "Bidirektionale Teilcommits, Resume, Rollback und Konflikte sind unmittelbar datenintegritätskritisch; größte eigene Kerndatei",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:51+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "f2a7f234b67affc9a665071a60f9eaa94e277ef61f6b716f795ac8c243f1f72e",
+            "file_count": 3,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Seit dem unveränderten bisherigen Bereichsnachweis nur heutiges Abbruchdelta: beide Syncprojektionen erhalten ihre Recoverypfade beim Übergang zu Interrupted. Queue-Interrupted-Commit und Reopen sichern den Pfad. Vollständige Core-Suite auf beiden Plattformen grün; unabhängige unveränderte Bidi-Funktionen nicht neu vollgelesen, späte Folgeschrittbilanz separat offen.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T00:40:55+02:00",
+        "observed_head": "f6feead88286c8bc480c768d10a5409b817fab4c",
+        "content_sha256": "d83d0a8d4ccca74de15ffd677c0731f983ecd97e6b8108d4184a18dfb53431b3",
+        "file_count": 5,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Delta seit 53f53e0 und heutige Ein-/Ausgangsgrenzen geprüft. Kumulierte Typwechsel und Namensalias zwischen neuen Konfliktkopien einschließlich Teilentscheidungen korrigiert; vorheriger Vollreview und vier unveränderte Fuzzdateien bleiben hashgebunden. Siehe docs/code-review-2026-10-19.md.",
+        "tests": [
+          "Drei rote Gegenläufe; final Core macOS1110/Linux1129 je21 ignoriert, CLI je69, App macOS vollständig204/Linux194+2GTK-Ausnahmen; Workspace-Clippy, Fuzz locked all-targets, fmt, 383 Quellhashes und gezielter Browser/CSP grün. Natives macOS-Testbundle: beide Themes, vier gesperrte Varianten, Tab auf Skip, Escape ohne Queue/Journal/Dateiwirkung; Cleanup0. Menschliche Linux-Abnahme separat offen."
+        ]
+      }
+    },
+    {
+      "id": "core-queue-recovery",
+      "paths": [
+        "core/src/queue.rs",
+        "core/src/quarantine.rs",
+        "core/src/trash.rs",
+        "core/proptest-regressions/queue.txt",
+        "core/src/trash/journal_v2.rs",
+        "core/src/trash/journal_v2/claim.rs",
+        "core/src/trash/journal_v2/claim",
+        "core/src/trash/legacy.rs",
+        "core/src/trash/native.rs",
+        "core/src/trash/native"
+      ],
+      "risk": "critical",
+      "priority": 2,
+      "reason": "Persistente Queue-, Recovery-, Papierkorb- und Quarantänezustände entscheiden über Wiederholung und Datenverlust",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:50+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "cf4a34a83480c092b37d4ec99d665f92baa47ca7ab510930a95da2b9f7be94b1",
+            "file_count": 4,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Anschlussdelta seit 9ebc05d vollständig samt echten Executor-Callern geprüft: Fehlerhüllen, öffentlicher ioError, fail_coded, Bidi-Interrupted und sekundärer Journalfehler erhalten belegte Recoverypfade. Reopen und Retry-Sperren geprüft. Erfolgreiche SFTP-Terminalbilanz sowie späte Batch-/Bidi-Folgefehler bleiben ausdrücklich eigener Restbefund.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T16:49:36+02:00",
+        "observed_head": "d1067c004a33ed5c8004ecfa8debc9a3c2d1c84d",
+        "content_sha256": "a2d7ee91cda2a5144402abd919d9a5406c28068d9496049f55cddc85abe6e223",
+        "file_count": 14,
+        "review": "delta-plus-boundaries",
+        "outcome": "reviewed-clean",
+        "summary": "Begrenztev1/v2Erzeuger-/Recovery-/Abschlussprüfung;kein erneuter Vollreview undkeineProduktkorrektur. Wachstumskandidat überholt: v1Erzeuger ausschließlich cfg(test),produktive macOS/LinuxWege ausschließlich privater v2ClaimRun. Neue echte Dateifälle fehlender/ersetzter Quelle belegen einmaligen UntouchedAbschluss,erhalten Original undfremdeInode,entfernen eigenesJournal/Bereich undmelden im zweitenRecovery nichts. Vorhandene v1Driftbelege absichtlich weiter erhalten undgemeldet;keine Autoalterslöschung,Nutzerquittierung oder neueLöschautorität aus is_clean. Quelle d1067c004a33ed5c8004ecfa8debc9a3c2d1c84d;docs/code-review-2026-10-19-papierkorb-drift.md.",
+        "tests": [
+          "VierexaktemacOSFällegrün;vollständigeCoreSuiteMac1143/Linux1165,je22umgebungsgebundeneignoriert;WorkspaceClippyalltargetsDwarningsundFmtbeidseitiggrün;385Dateienstabil. Nur cfg(test)Regressionsdatei ergänzt,Produktcodebytegleich;frühereCLI/App/Fuzz/Browserbelegeexplizitreferenziert,kein neuer nativerLaufbeansprucht."
+        ]
+      }
+    },
+    {
+      "id": "core-one-way-sync",
+      "paths": [
+        "core/src/sync.rs",
+        "core/src/sync",
+        "core/tests/sync_tests.rs",
+        "core/tests/property_tests.rs"
+      ],
+      "risk": "critical",
+      "priority": 3,
+      "reason": "Plan-Ausführung, Driftgates, atomarer Commit und Mirror-Entfernung sind zentrale Datenintegritätsverträge",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:46+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "c0168ea9c07cfa61f43b19ee2dec99ad55570284205bb2872c18162cbb74f8dd",
+            "file_count": 9,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit 80c7e76877acc2a8245b81e912f375bbbbe14dec plus Plan/Transfer/Commit/Hardlink/Entfernung/Metadaten geprüft. Mirror finalisiert Ordner nach Kindwirkungen; Stagingabschluss umfasst alle Besitzer-Ausgänge. Neue Abschlussdeltas unabhängig gegengeprüft. Frühere erfolgreiche Restpfade bei späterem Actionfehler bleiben als eigener Befund offen.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T01:12:29+02:00",
+        "observed_head": "11ba317893e6632a12426bfe5b37ed3c46465aaa",
+        "content_sha256": "f39e8c5270f9a78e6340459c47fe6a87e2eec85a98dcd88d1a4ac68e5c29f674",
+        "file_count": 9,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Deltas seit74d7c04 und heutige Plan-/Commit-/Permit-/Mirror-/Metadaten-/Abbruchgrenzen geprüft; vier frühere Vollbereichsdateien unverändert hashgebunden. Tatsächlich vollzogene dauerhafte Hardlink-Ersetzungen erhöhen jetzt die Abschlussbilanz. Roter Dateigegenlauf mit öffentlicher Vorbereitung, bestätigter Ausführung, Inhalt und Inode-Verbindung; ausschließlich testthread-/zielgebundener schwacher Fähigkeitshook.",
+        "tests": [
+          "Finaler unveränderter383-Dateien-Stand: vollständige Core-Suiten macOS1112/Linux1131 je21 ignoriert, CLI69 und App204/194+2GTK; Clippy workspace all-targets -D warnings, Fuzz locked all-targets und fmt beidseitig grün. Neue Regression prüft Addition0 und Ersetzung1. Kein realer schwacher Hardlinkmount, Stromausfall oder neue native GUI-Abnahme behauptet."
+        ]
+      }
+    },
+    {
+      "id": "core-fileops-vfs",
+      "paths": [
+        "core/src/fileops.rs",
+        "core/src/local_fs.rs",
+        "core/src/vfs.rs",
+        "core/src/path.rs",
+        "core/src/atomic_file.rs",
+        "core/src/atomic_write.rs",
+        "core/tests/fileops_tests.rs",
+        "core/src/local_staging.rs",
+        "core/tests/local_file_commit_mounts.rs",
+        "core/src/fileops_recovery_tests.rs",
+        "core/src/conflict_view.rs",
+        "core/tests/conflict_choices.rs",
+        "core/src/local_read.rs"
+      ],
+      "risk": "critical",
+      "priority": 4,
+      "reason": "Interaktive Kopie, Move, Rename und lokale descriptor-relative VFS-Grenzen wirken direkt auf Nutzerdaten",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:46+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "0cafab728646ec13dbfca2726d4a7ce5525e0f597bbe067634135e0b4d76f427",
+            "file_count": 8,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit e9946a365f29f6c4ef99c93c1894463ecdfb5af2 sowie Copy/Move-, FD-/ACL-, Commit-, Backup- und Recoverygrenzen geprüft; neues local_staging.rs vollständig gelesen. Gemeinsamer Besitzerabschluss deckt frühe Fehler/Cancel ab; unklare Journale und Kindreste bleiben erhalten. Späte Batchbilanz separat offen.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T15:26:26+02:00",
+        "observed_head": "0a893b7f141672638cd3525d48a14886b13f2b8f",
+        "content_sha256": "c611c179d566ab09c7b6b129cc19f968037f87d720a714d39b01d5b4ebbdbe28",
+        "file_count": 13,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Begrenztes Quellnamens-/Bilanzdelta samt direkten Quellen-/Ziel-/Queue-/CLI-/Anzeigengrenzen; kein neuer Vollreview. Normale additive Copy mit Skip bilanziert nicht dekodierbare rohe Quellnamen und überträgt unabhängige sichere Kinder. Vollständige Listings, eindeutige rohe Komponenten und sichere genutzte Pfade bleiben Pflicht. Quellversion bindet ausgelassenen Rohbestand ohne Öffnen; alte vollständige Hashformate erhalten. Queue ergänzt statt überschreibt Quellhinweise; CLI-Text zeigt konkrete Namen wie JSON. Move, Ersetzen, Konfliktkopie, Zielbelege und Planner bleiben strikt. Quelle 0a893b7f141672638cd3525d48a14886b13f2b8f; docs/code-review-2026-10-19-quellnamen.md.",
+        "tests": [
+          "Vier rote Caller-Gegenläufe: Providerbaum auf macOS, echte additive Linux-Dateikopie und Quellversionsbindung, zusätzlicher CLI-Textfehler nach erfolgreicher Kopie. Vier Linux-Teilläufe grün; abschließend Mac Core1142/CLI76/App219, Linux1164/77/209. Core je22 ignoriert, CLI je1, App2/4. Beide sechs Rustgates inklusive Clippy, Fuzz locked, fmt grün;385Quellen unverändert. Vollständige Browser-Suite mit CSP/Pane-Tabs/Quellbilanz grün. APFS-EILSEQ separat;kein neuer nativer Linux-GUI-Lauf."
+        ]
+      }
+    },
+    {
+      "id": "core-real-mode",
+      "paths": [
+        "core/src/real_mode.rs",
+        "core/src/remote_real_mode.rs",
+        "core/src/remote_snapshot.rs",
+        "core/src/tree_measure.rs",
+        "core/tests/local_sync_mounts.rs"
+      ],
+      "risk": "critical",
+      "priority": 5,
+      "reason": "Permits, Rootidentität, Capability-Proben und Realmodusvorbereitung binden bestätigte Wirkung",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:46+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "16aef39db4e14393d1454c060316dc363c0ae637ae2f196d922ef61044399ea0",
+            "file_count": 4,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit adb39558b13f576339e16579ab960f9ed5c6d159 plus Vorbereitung, Permitverbrauch, Roots, Restore-Probe und Zweitscan geprüft. Nur zuvor gebundene ausstehende Ordner-Metadaten dürfen den Mirror-Zwischenscan passieren; fremde Änderungen bleiben gesperrt.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T14:15:37+02:00",
+        "observed_head": "03ce910d9aa3d2ad181c22300f1d7de1cf624b88",
+        "content_sha256": "a38a76223f47afcf91c34d26f7dfba9314264c1ffb24f6c775d6ab3b7017034f",
+        "file_count": 5,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Fehlerkontext-/Payloaddelta mit direkten Caller-/Queue-/App-/CLI-Grenzen geprüft; kein neuer Vollreview der großen Bereichsdateien. Kontext erhält Fehlerart, Code und alle Prüfpfade. Core-Helper gemeinsam für Remote-Löschplan, Snapshot und Restore-Cleanup; gezielte Claimklassifizierung erhält Transport statt falscher Drift. Quarantäne-/DELETE-Readbacks führen Ursachen-/Laufpfade weiter. AppError und echtes Tauri InvokeError übertragen optionale recovery_paths; Textfehler bleiben kompatibel. Queue-Reset erhält beide Pfadmengen und führendes OutcomeUnclear. Quellen6205671 und 03ce910d9aa3d2ad181c22300f1d7de1cf624b88; docs/code-review-2026-10-19-fehlerkontext.md.",
+        "tests": [
+          "Neun tatsächliche rote/grüne Caller-/Tauri-Gegenläufe in zwei belegten Stufen. Abschließend Mac Core1136/CLI76/App219 und Linux1155/76/209 bestanden; Core je22 ignoriert, CLI je1 Kind, App2/4; beide Workspace-Clippy, Fuzz locked und fmt grün.385 Hashes in finaler Runde unverändert, inklusive zuvor präzisierter Kommentare. Keine neuen Frontend-/nativen GUI-Läufe."
+        ]
+      }
+    },
+    {
+      "id": "tauri-window-queue",
+      "paths": [
+        "src-tauri/src/main.rs",
+        "src-tauri/src/app_support.rs",
+        "src-tauri/src/mutex.rs",
+        "src-tauri/src/queue_runtime.rs",
+        "src-tauri/src/queue_commands.rs",
+        "src-tauri/src/window_commands.rs",
+        "src-tauri/src/menu.rs",
+        "src-tauri/src/desktop_settings.rs",
+        "src-tauri/src/pane_tabs.rs",
+        "src-tauri/src/operation_events.rs"
+      ],
+      "risk": "critical",
+      "priority": 6,
+      "reason": "Mehrfenster-Isolation, Single-Flight, Journale und gezielte Ereignisse sind verbindlicher Prozessvertrag",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:50+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "279eb1002e7420031d1a21191326ddc6b3db2b24e3796eecef8216849228210e",
+            "file_count": 8,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Anschlussdelta seit 9ebc05d vollständig geprüft: geteilter direkter Kindordner-Helfer, atomare einmalige Altwertmigration unter Store-Mutex, Journal-Reopen-Test mit gehaltener gemeinsamer Prozesssperre. Vorherige Claim-/Remote-Reset-Korrekturen bleiben durch vollständige Mac/Linux-Tauri-Suite belegt; Fensterqueues bleiben getrennt.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T19:17:22+02:00",
+        "observed_head": "6293e294ec025862160882be184a2a9e54647262",
+        "content_sha256": "67b468af668d6002919613211a855d5f030eb5bf1e496d8e73438b124b99aa77",
+        "file_count": 10,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Linux-Fenstericons auf GTK-verträgliche 256 Pixel begrenzt; Hauptfenster übernimmt ebenfalls die gespeicherte Variante. Beide Icon-Caller, initialisierte DesktopState-Bindung, kosmetische Fehlerbehandlung und unveränderte Fenster-/Exitgrenzen geprüft. Historischer Vollreview bleibt erhalten.",
+        "tests": [
+          "Unabhängiger GTK-Gegenlauf:1024/512 verworfen,256 akzeptiert. Linux-App211+4ignoriert,Mac-App220+2ignoriert seriell; Clippy/fmt beidseitig.385Quellhashes stabil. Regulärer signierter Paketbau,3Signaturen,Prüfsummen,vertauschteSignatur abgelehnt. Echte AppImage- und DEB-GUI:Main/Nebenfensterpixel exakt; AppImage-Iconwahl Blau/Türkis/Blau aktualisiert beide. Private Apps regulär exit0; menschliche F2/F5/F6/Fensterabnahme bestanden, Dock-Sichtkontrolle separat ausstehend."
+        ]
+      }
+    },
+    {
+      "id": "core-remote-common",
+      "paths": [
+        "core/src/remote.rs",
+        "core/src/connections.rs",
+        "core/src/remote_delete.rs",
+        "core/src/remote_rename.rs",
+        "core/src/error.rs",
+        "core/src/progress.rs",
+        "core/src/lib.rs",
+        "core/src/directory_create.rs",
+        "core/src/rename_interaction.rs"
+      ],
+      "risk": "critical",
+      "priority": 7,
+      "reason": "Gemeinsame Providerfähigkeiten, Profilrevisionen und maschinenlesbare Fehler wirken auf alle Remotewege",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:51+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "c836358c74d201d6a4399701592fbf6543206f9820d6260c6d657e07ccd3eace",
+            "file_count": 7,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Anschlussdelta seit 9ebc05d vollständig geprüft: with_recovery_paths vereinigt belegte Pfade ohne Code-/Kindverlust und hält sie im Anzeigetext sowie im typisierten Errorpayload. Tatsächliche Queue-/Staging-/Bidi-Aufrufer plus öffentliche Fehlergrenze geprüft; keine neue Providerfähigkeit eingeführt.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T14:15:37+02:00",
+        "observed_head": "03ce910d9aa3d2ad181c22300f1d7de1cf624b88",
+        "content_sha256": "2339545e255c8b681c9f3973d601efdf35a5d7a0e04d23825e6c53cb690d2b2f",
+        "file_count": 9,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Fehlerkontext-/Payloaddelta mit direkten Caller-/Queue-/App-/CLI-Grenzen geprüft; kein neuer Vollreview der großen Bereichsdateien. Kontext erhält Fehlerart, Code und alle Prüfpfade. Core-Helper gemeinsam für Remote-Löschplan, Snapshot und Restore-Cleanup; gezielte Claimklassifizierung erhält Transport statt falscher Drift. Quarantäne-/DELETE-Readbacks führen Ursachen-/Laufpfade weiter. AppError und echtes Tauri InvokeError übertragen optionale recovery_paths; Textfehler bleiben kompatibel. Queue-Reset erhält beide Pfadmengen und führendes OutcomeUnclear. Quellen6205671 und 03ce910d9aa3d2ad181c22300f1d7de1cf624b88; docs/code-review-2026-10-19-fehlerkontext.md.",
+        "tests": [
+          "Neun tatsächliche rote/grüne Caller-/Tauri-Gegenläufe in zwei belegten Stufen. Abschließend Mac Core1136/CLI76/App219 und Linux1155/76/209 bestanden; Core je22 ignoriert, CLI je1 Kind, App2/4; beide Workspace-Clippy, Fuzz locked und fmt grün.385 Hashes in finaler Runde unverändert, inklusive zuvor präzisierter Kommentare. Keine neuen Frontend-/nativen GUI-Läufe."
+        ]
+      }
+    },
+    {
+      "id": "core-webdav",
+      "paths": [
+        "core/src/webdav.rs",
+        "core/tests/webdav_e2e.rs",
+        "core/src/webdav_folder.rs",
+        "core/tests/webdav_folder.rs",
+        "core/src/webdav_namespace.rs",
+        "core/src/webdav_rename.rs",
+        "core/tests/support/webdav_namespace.rs",
+        "core/tests/webdav_rename.rs",
+        "core/src/webdav_upload.rs",
+        "core/tests/webdav_upload.rs",
+        "core/tests/webdav_upload_tree.rs",
+        "core/tests/webdav_replace_boundary.rs"
+      ],
+      "risk": "critical",
+      "priority": 8,
+      "reason": "ETag-, Listing-, Upload-, Quarantäne- und Reconnect-Verträge des WebDAV-Providers",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T15:17:16+02:00",
+            "observed_head": "9ebc05d1529a7ccc8e99f5a03a6276b955cf7228",
+            "content_sha256": "bb967a292b3aa38107e7b90d7539accd401e8949a7ad58e23d5d4c0e011cb931",
+            "file_count": 2,
+            "review": "delta-plus-boundaries",
+            "outcome": "reviewed-clean",
+            "summary": "Gesamtes Delta seit f9262d69: Fehlercode bei HTTP412, gemeinsamer Root-Readback und getrennte Bilanz eines unklaren Probeausgangs. Probeabschluss ruft nur bei Err den Readback-Kombinator auf; Listings und Restprüfung bleiben vollständig.",
+            "tests": [
+              "2026-10-02: macOS vollständige 9/9 Headless-Gates grün; Linux Core/CLI/Tauri, Workspace-Clippy und Fuzz-Build grün; letzte Trash-/Queue-Deltas erneut geprüft; echter Samba-E2E grün."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T08:11:22+02:00",
+        "observed_head": "dd6ea4c9376915b40035010d0da6362e74c0cefa",
+        "content_sha256": "771a8c4782a97e00749c875779a2c768d405c6017000ac74a29c400813799b82",
+        "file_count": 12,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "WebDAV-Delta seit fb14df1 und heutige Namespace-/Uploadgrenzen geprüft; zehn neue Dateien vollständig gelesen. Belegte Fristerneuerung bei delegierter Ordneranlage korrigiert, einschließlich Upload-Callback und Prüfung unmittelbar vor MKCOL. Echter HTTPS-Gegenlauf vor Korrektur nach 100,03s noch Mutation, danach nach 75,03s ohne Mutation. Bestätigte Best-Effort-Klassen erhalten. docs/code-review-2026-10-19-webdav.md.",
+        "tests": [
+          "macOS Core 1128/CLI69/App207; Linux Core 1147/CLI69/App197+2GTK ignoriert. Je21 Core-Spezialfälle ignoriert; Workspace-Clippy mit allen Targets und -D warnings, Fuzz --locked --all-targets, Fmt beidseitig grün. 383 Quell-/Werkzeughashes vor und nach den Gates identisch. Echter HTTPS-Fristgegenlauf rot/grün: 100,03s mit MKCOL gegenüber75,03s ohne Mutation. Erster Mac-Gesamtlauf durch Werkzeugsandbox eingeschränkt; danach mit bestehender Nutzerfreigabe vollständig grün."
+        ]
+      }
+    },
+    {
+      "id": "core-sftp",
+      "paths": [
+        "core/src/sftp.rs",
+        "core/tests/sftp_e2e.rs",
+        "tools/run-sftp-e2e.sh",
+        "tools/tests/test_run_sftp_e2e.py",
+        "core/src/sftp_read.rs",
+        "core/tests/sftp_contents.rs",
+        "core/src/sftp_tree.rs",
+        "core/src/sftp_size.rs",
+        "core/src/sftp_directory.rs"
+      ],
+      "risk": "critical",
+      "priority": 9,
+      "reason": "Hostkey-, SFTP-Listing-, Mutations- und E2E-Isolationsverträge",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260903T104519936010+0200",
+            "completed_at": "2026-09-03T17:47:43+02:00",
+            "observed_head": "cb1374ed534ee2ed73737131dfbac16a29aecf63",
+            "content_sha256": "e30f883a50ab5e2bd9c7b58abfc1302edc7cb5f8a5c2ba2a7135560a0fa988da",
+            "file_count": 4,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Der Verbindungsaufbau traegt jetzt dieselbe harte Frist von 15 Sekunden wie FTPS, WebDAV und SMB (connect_once_bounded, umfasst TCP, Schluesseltausch, Anmeldung und SFTP-Init); die Hostkey-Ermittlung ebenso. Der Guard fuer pfadbasierte Lesewege schneidet root_identity wieder eng, nachdem sein Endmarker sich nur im eigenen Testliteral fand. Die test-only mkdir-Maschinerie bleibt offen (Querschnitts-Fund sftp-mkdir-machinery-is-test-only).",
+            "tests": [
+              "tools/check-gates.py --json: 9/9 pass"
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T13:09:10+02:00",
+        "observed_head": "270d7a16e4d08b7f505ef3891b38d7d77fff2cab",
+        "content_sha256": "cc6349ec43a6813b377fc739deeb271527ed8565eba30b254140354da47d6d84",
+        "file_count": 9,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Ausschließlich das seit dem SFTP-Abschluss hinzugekommene Signalfixture-Delta geprüft: gemeinsame immutableProgramme mit begrenzter Startvorprüfung und eigenen Fall-Symlinks; Handshake-,Root-/Gruppenbesitz- und Cleanupgrenzen abgeglichen. 270d7a1. Historischer Vollbeleg sämtlicher Providerdateien bleibt erhalten; kein neuer vollständiger Providerreview oder Produktfix behauptet.",
+        "tests": [
+          "MacFullTools146/146 inklusive26Signaltests, LinuxgesamteSignaltestklasse26/26ohneSkips, roteXProtect-/ReadyGegenproben undgrüneAfter-/Parallelproben;385Hashesunverändert. SeitvorherigemFreeze nurtools/tests/test_run_sftp_e2e.pygeändert. Core-/App-/CLI-/UI-/Lockquellenbytegleich, frühereProvider-/Rust-/NativeGateswiederverwendet. docs/code-review-2026-10-19-sftp-signale.md."
+        ]
+      }
+    },
+    {
+      "id": "core-ftps",
+      "paths": [
+        "core/src/ftps.rs",
+        "core/tests/ftps_e2e.rs",
+        "core/src/ftps_transport_tests.rs"
+      ],
+      "risk": "critical",
+      "priority": 10,
+      "reason": "FTP/FTPS-Transportidentität, MLSD, Reconnect und mutierende Capability-Proben",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:47+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "244d23876787ce373d1d2d9d1e4e35283120abe82de371953ab3410956d84e35",
+            "file_count": 2,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit 8d84be645f3780a01b7bbed251d94f238cc622d4 plus Aufrufer, Registry, Scoped-Probe, Erfolgs-/Teilfehlerrückwege, Reconnect und Capability-Grenzen geprüft. Cleanup bindet bekannte Namen und Hashes; fremder Bestand wird nicht gelöscht. Keine neue Regression im zweiten Durchgang.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T15:08:48+02:00",
+        "observed_head": "fcbd6d42847a4dc069fb72d44278f992445e0d47",
+        "content_sha256": "36f9cf38e7d56582fae6749991b835c0b32c66546567a9a909e68086c78fa907",
+        "file_count": 3,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Namens-/Tempreadback-Delta samt direkten Fileops-/FTP-/Syncgrenzen geprüft; kein neuer Vollreview. Wirkungsbezogene, abbrechbare Nachbarbelege erlauben den exakten Ersetzungsreadback bei unveränderten äquivalenten regulären Namen; globale Providerfähigkeit bleibt unverändert. Normalisierte mögliche Tempnamen bleiben unklar und erhalten strukturierte Prüfpfade ohne Cleanuprecht. Ungeklärte Providerintents und verlorene Antworten bleiben fail-closed. Quelle fcbd6d42847a4dc069fb72d44278f992445e0d47; docs/code-review-2026-10-19-namensbelege.md.",
+        "tests": [
+          "Zwei tatsächliche rote FTP-Protokollgegenläufe; fünf finale Protokolltests grün, einschließlich Abbruch, veränderter/neuer Nachbarn und verlorenem RNTO-ACK mit erhaltenem Intent. Mac Core1141/CLI76/App219 und Linux1160/76/209 bestanden; Core je22 ignoriert, CLI je1 Kind, App2/4. Je sechs Gates inklusive Clippy, Fuzz locked und fmt grün;385 Quellen unverändert. Kein neuer nativer GUI-/TLS-Namenslauf."
+        ]
+      }
+    },
+    {
+      "id": "core-smb",
+      "paths": [
+        "core/src/smb.rs",
+        "core/tests/smb_e2e.rs",
+        "tools/run-smb-e2e.sh",
+        "tools/tests/test_run_smb_e2e.py",
+        "vendor/smb2/src/client/connection.rs",
+        "vendor/smb2/src/testing/fixtures/consumer/smb-consumer-windows/Dockerfile",
+        "vendor/smb2/DOPPELDECKER-PATCH.md"
+      ],
+      "risk": "critical",
+      "priority": 11,
+      "reason": "SMB-Identität, Verschlüsselung, Paging, Durability und isolierter E2E-Weg",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:47+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "46651750aca12a485289bd0e6db6d0bee564ae5956dd3d536c35f6335a9bb7c1",
+            "file_count": 4,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit fbf56388b036276c177f62b34a6b6d6bc842c6da über alle vier Scopepfade geprüft. Probe-Cleanup nur für bekannte Namen/Typen und nichtrekursive Verzeichnisse; signed FILETIME. E2E prüft tatsächlich verfügbare Wirkungsrichtungen; Runner-Count/Exact-Grenzen wieder vollständig abgesichert.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T07:41:37+02:00",
+        "observed_head": "7e5e501959b70fd2cbf02b950798ad3d4245aed1",
+        "content_sha256": "d6096065b2b96abcbe2cda82d54334b6910c772603169fae1ceec21154ecb0e1",
+        "file_count": 7,
+        "review": "delta-plus-boundaries",
+        "outcome": "reviewed-clean",
+        "summary": "Delta seit37d769f: ausschließlich bestehender reiner map_virtual_path innerhalb der Crate sichtbar. Body und übrige6Bereichsdateien unverändert; neuer Caller in gemeinsamem Rename-Preflight vor Profil/Queue/Proben. Vollgatesbeidseitig und frischer SambaE2Egrün.",
+        "tests": [
+          "MacCore1127/CLI69/App207;LinuxCore1146/CLI69/App197+2GTK,je21Coreignoriert. WorkspaceClippy-Dwarnings,Fuzz--locked--all-targets,Fmtbeidegrün;Samba1/1verschlüsselt,Launcher4/4beide,Vendorfmtgrün,383Quellhashesidentisch. GemeinsameRemote20/20,Renamevorprüfung2/2,RenameKoordinator18/18;echteCLIinvalidInputvorProfilundQueue. ErsterMacIconfallfailed,isoliert1/1unddanachvolleApp207grünohneSourceänderung;Ursacheunbelegt."
+        ]
+      }
+    },
+    {
+      "id": "core-metadata-acl",
+      "paths": [
+        "core/src/metadata.rs",
+        "core/src/acl.rs",
+        "fuzz/fuzz_targets/metadata_manifest.rs",
+        "core/src/local_fs/metadata_capabilities.rs",
+        "core/tests/local_metadata_mounts.rs",
+        "fuzz/seeds/metadata_manifest"
+      ],
+      "risk": "high",
+      "priority": 12,
+      "reason": "Manifestgebundene Metadaten und ACL-Readback beeinflussen portable und native Profile",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T15:17:17+02:00",
+            "observed_head": "9ebc05d1529a7ccc8e99f5a03a6276b955cf7228",
+            "content_sha256": "cda05e194f6caca1faf75489a02892e93449187c42791dd925101360d42a2ade",
+            "file_count": 3,
+            "review": "delta-plus-boundaries",
+            "outcome": "reviewed-clean",
+            "summary": "Gesamtes Delta seit ea91de98: LocalParentInheritance bindet Rootidentität, Owner, Modus und ACL. Erzeugung unter RootHandle sowie Verwendung in File-Proof und Sync-Plan/Execute geprüft. ACL- und Fuzz-Dateien seit Basis unverändert.",
+            "tests": [
+              "2026-10-02: macOS vollständige 9/9 Headless-Gates grün; Linux Core/CLI/Tauri, Workspace-Clippy und Fuzz-Build grün; letzte Trash-/Queue-Deltas erneut geprüft; echter Samba-E2E grün."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-07T14:50:40+02:00",
+        "observed_head": "8c2ffa599cf85ec172359319f06288486e2f4590",
+        "content_sha256": "4bb177d97b083eb13e7a5770f17ba67b3d475d8085bc58877b60cdc362e907d5",
+        "file_count": 6,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "AP-050: vollständiger bisheriger Review erhalten; volumenbezogene Klasse, Zielrootbindung, Queue/CLI/GUI und Metadaten-/Staginggrenzen samt neuem Mounttest geprüft. Siehe docs/code-review-2026-10-07.md.",
+        "tests": [
+          "Core macOS885/Linux904; je fünf echte Mounttests; CLI63/Tauri173/Tools128/UI6+237; Clippy/Fuzz/fmt/Diff und 16 Quellhashes grün. Echte macOS-GUI/CLI-exFAT grün."
+        ]
+      }
+    },
+    {
+      "id": "core-platform-services",
+      "paths": [
+        "core/src/directory_size.rs",
+        "core/src/favorites.rs",
+        "core/src/finder_favorites.rs",
+        "core/src/network_discovery.rs",
+        "core/src/system_mounts.rs",
+        "core/tests/directory_size_tests.rs",
+        "fuzz/fuzz_targets/finder_favorites.rs",
+        "core/src/system_mounts"
+      ],
+      "risk": "high",
+      "priority": 13,
+      "reason": "Mount-, Geräte-, Favoriten- und Größenabfragen bilden Plattformgrenzen und dürfen UI oder Pfadsicherheit nicht verletzen",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260903T104519936010+0200",
+            "completed_at": "2026-09-03T14:45:00+02:00",
+            "observed_head": "ea91de9866e11978061b961c4fbd3369c39a546d",
+            "content_sha256": "c6ccc60db74e96041e0868b158b4cf77e15702c2f789deebf2cefb1011348c4f",
+            "file_count": 7,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Der bisher von keinem Test erreichte Zweig, der ein Listing ohne bestaetigte Vollstaendigkeit zu DirectorySizeStatus::Partial macht und das Caching verhindert, hat jetzt einen Test: InstrumentedVfs kann die Vollstaendigkeit gezielt zuruecknehmen. Der fristlose statvfs-Aufruf im Linux-Zweig von system_mounts bleibt offen und ist als Querschnitts-Fund linux-mount-listing-deadline festgehalten; er braucht den Linux-Testhost.",
+            "tests": [
+              "cargo test -p doppeldecker-core --test directory_size_tests: 9 passed (einer neu)",
+              "tools/check-gates.py --json: 9/9 pass"
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T08:59:30+02:00",
+        "observed_head": "e84dfce71261d713bb555bec6d7b05f009cfac7a",
+        "content_sha256": "108e976a549ce7a5a163496949df2c12ceddf112ffb01bc1013c8a7bd8b23f8c",
+        "file_count": 8,
+        "review": "full",
+        "outcome": "improved",
+        "summary": "Alle8 heutigen Bereichsdateien mit3932 Ausgangszeilen und direkte Appgrenzen vollständig gelesen. Vier rot/grün belegte Fehler korrigiert: fehlende Mountpunktbindung, auswerfbarer extern gestarteter Systemroot, FIFO-Blockade beim Favoritenlesen, alter Größenwert nach gescheiterter Neuberechnung. Linux-Probenfristen, Finderparsergrenzen, Entdeckungsbudgets und Größen-Generationsschutz geprüft. Separates noch ungeprüftes FIFO-Muster im Finder-Appimport als Querschnitt erfasst. docs/code-review-2026-10-19-plattformdienste.md.",
+        "tests": [
+          "MacCore1134/CLI69/App207;LinuxCore1153/CLI69/App197+2GTK,je22Coreignoriert (FIFO-Kind wird vom aktiven Haupttest separat gestartet). WorkspaceClippy-Dwarnings,Fuzz--locked--all-targets,Fmtbeidegrün;383Quellhashesvor/nachidentisch. Vier echte rote/grüne Gegenläufe (2Parser, FIFO-Kind, realeVerzeichnisgrößen); keineechteUnmount-/Favoritenwirkung."
+        ]
+      }
+    },
+    {
+      "id": "tauri-provider-commands",
+      "paths": [
+        "src-tauri/src/bidirectional_commands.rs",
+        "src-tauri/src/connection_state_commands.rs",
+        "src-tauri/src/ftps_commands.rs",
+        "src-tauri/src/provider_sync_commands.rs",
+        "src-tauri/src/quarantine_commands.rs",
+        "src-tauri/src/sftp_commands.rs",
+        "src-tauri/src/smb_commands.rs",
+        "src-tauri/src/webdav_commands.rs"
+      ],
+      "risk": "critical",
+      "priority": 14,
+      "reason": "Dünne, aber sicherheitsrelevante Bindung von Providerplänen, Revisionen, Permits und Fenstern",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T15:17:18+02:00",
+            "observed_head": "9ebc05d1529a7ccc8e99f5a03a6276b955cf7228",
+            "content_sha256": "3c8a4b3a9ff6ac7572960fad778b32d070717c009a32ef893d339d05c7bd112f",
+            "file_count": 8,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vorher unveränderter Bereich; alle 17 neuen Remote-Reset-Zweige für SFTP, FTPS, WebDAV, SMB, ProviderSync und bidirektionale Läufe samt Vorbereitungs-/Bestätigungs-/Fehlergrenzen geprüft. Keine automatische Permit-Erneuerung.",
+            "tests": [
+              "2026-10-02: macOS vollständige 9/9 Headless-Gates grün; Linux Core/CLI/Tauri, Workspace-Clippy und Fuzz-Build grün; letzte Trash-/Queue-Deltas erneut geprüft; echter Samba-E2E grün."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T16:00:02+02:00",
+        "observed_head": "4df183b1799d614f7d900ae5e10caf9baa5d0d59",
+        "content_sha256": "478b72c702af3b8679e76108a828a215db78ced54a9e3575e1e83ce478229361",
+        "file_count": 8,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Drei Dispatchgrenzen samt bestehenden Reservierungs-/Recovery-/Profile-/Quellguardgrenzen;kein neuer Vollreview. Drei Bidi-Vorbereitungscommands async+spawn_blocking; State erst im Worker. Bestehende fenstereigene cancellable/panicsichere Reservierung vor Vorbereitung,Profil-/Paar-/Root-/Pending-/Permitbindung erhalten. Cancel an Grenzen geprüft; frische Vorbereitung verwirft nur eigenes mutationsloses Journal,Resume/Rollback behalten Recovery. Vier vorhandene Quellguardmarker an tatsächliche asyncSignaturen angepasst;Reservierung vor Wirkung bleibt geprüft. Quelle 4df183b1799d614f7d900ae5e10caf9baa5d0d59;docs/code-review-2026-10-19-bidi-hintergrund.md.",
+        "tests": [
+          "Tatsächlicher nativer Vorher-/Nachherlauf mit gehaltenem künstlichem Source-Read: vorher Mainthread in prepare+Read, Resizeexit3 und1180x850 unverändert; danach Worker im Read, Mainthread frei, Resizeexit0 in22ms und1160x820 noch während Halt. Quelleunverändert/Zielabsent, beide FIFOjobs/Cleanup0, Screens angesehen. Finale MacApp219+2ignoriert/Linux209+4,Clippyalltargets-Dwarnings undfmtbeidseitiggrün,385Quellenstabil. Core/CLI/Fuzz/Browser bytegleich vom vollständigen Vorpaketübernommen;kein neuer nativer Resume-/Rollbacklauf behauptet."
+        ]
+      }
+    },
+    {
+      "id": "tauri-local-commands",
+      "paths": [
+        "src-tauri/src/app_commands.rs",
+        "src-tauri/src/browser_commands.rs",
+        "src-tauri/src/directory_size_commands.rs",
+        "src-tauri/src/favorites_commands.rs",
+        "src-tauri/src/file_commands.rs",
+        "src-tauri/src/local_sync_commands.rs",
+        "src-tauri/src/network_discovery_commands.rs",
+        "src-tauri/src/system_mount_commands.rs",
+        "src-tauri/src/file_clipboard.rs",
+        "src-tauri/src/file_intents.rs",
+        "src-tauri/src/normal_sync_commands.rs"
+      ],
+      "risk": "high",
+      "priority": 15,
+      "reason": "Lokale Tauri-Kommandos müssen Sandbox-, Fehler- und Fensterverträge ohne Frontend-Sicherheitsduplikation durchreichen",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:47+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "81fce6fab2ee50bdc8400d711327eac66bdd8f54b47e949a539f3e33af4282f1",
+            "file_count": 8,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit cb1374ed534ee2ed73737131dfbac16a29aecf63 (Browser und Mounts) plus Endpunkt-/Profilbindung, Singleflight, Snapshotreadback, externe argv/Fristen und Mountreadback geprüft. Sandboxcache validiert jede neue Ebene; Symlink-Repro behoben. Fastra-Testfixtures serialisiert, normale parallele Suite auf beiden Plattformen grün.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T10:10:03+02:00",
+        "observed_head": "90e8339b014d1da1f3b6f637c7acaa1239462c9a",
+        "content_sha256": "ef38fa59440a87b8cc0821b4790d08dfa81e6c76904fe0fc45d03de78a40eabb",
+        "file_count": 11,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Vollständiges einziges Bereichsdelta seit4ad75e6 in browser_commands.rs sowie CoreSnapshot-/Fensterreservierungs-/Profil-/Frontendgrenzen geprüft. Tatsächliche native SFTP-Vorherabsage unsupported vor jedem Inhaltsread korrigiert. Vergleich verwendet vorhandene interaktive Snapshotklasse und beide Profilvalidierungen vor Providerkontakt; Verbindung/Downloads sind fenstereigen abbrechbar. Sichtbare Best-Effort-Bilanz und eigene nicht rücknehmbare Werkzeugübergabephase, strukturiertes Terminalevent vor nächstem Queueworker. Echter Fastra-Vergleich, identische Snapshotbytes/unveränderte Eingaben, Abbruch nach erstem Datenpaket ohne Zusatzfenster/Teilcache und nullRemote-Mutationen samt eigenem Cleanup0 belegt. docs/code-review-2026-10-19-dateivergleich.md.",
+        "tests": [
+          "MacApp214+1 isolierter FIFO-Kindtest; LinuxApp204+3 ignoriert (Kind+2GTK). App/Workspace-Clippy --all-targets -D warnings/Fmt beidseitig, Mac-Build und Browser387+6 grün. 383Hashes beidseitig unverändert. Echte native SFTP-Vorherabsage unsupported ohne Inhaltsread; Nachher schreibgeschützter Fastra-Vergleich mit identischen Snapshotbytes und unveränderten Eingaben, Abbruch nach erstem Datenpaket, kein Zusatzfenster, eigene Teilkopie entfernt, null Remote-Mutationen, eigener Fenster-/App-/Server-/Proxy-Cleanup0. Visuelle Prüfung beider Themes760x480 und tatsächlicher Diffansicht. Core/CLI/Fuzz bytegleich; vorherige Vollgates wiederverwendet, nicht erneut ausgeführt."
+        ]
+      }
+    },
+    {
+      "id": "cli-headless",
+      "paths": [
+        "cli/src",
+        "cli/tests"
+      ],
+      "risk": "critical",
+      "priority": 16,
+      "reason": "Unterstützter Headless-Einstieg teilt Realmodus-, Queue-, Secret- und JSONL-Verträge mit der GUI",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T15:17:18+02:00",
+            "observed_head": "9ebc05d1529a7ccc8e99f5a03a6276b955cf7228",
+            "content_sha256": "4853ea1c29c1285aed853e2ae0f91ccf41ab83870f56ed5af0de7f36a0063dde",
+            "file_count": 3,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Gesamtes Delta seit e9a92d86 und Queue-/JSONL-/Auditgrenzen gelesen. Zweiter Fehlercommit erhält vollständige FileActuals einschließlich retained_backup_paths; gespeicherte Bilanz wird nach Reopen geprüft.",
+            "tests": [
+              "2026-10-02: macOS vollständige 9/9 Headless-Gates grün; Linux Core/CLI/Tauri, Workspace-Clippy und Fuzz-Build grün; letzte Trash-/Queue-Deltas erneut geprüft; echter Samba-E2E grün."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T15:26:26+02:00",
+        "observed_head": "0a893b7f141672638cd3525d48a14886b13f2b8f",
+        "content_sha256": "90e163577f74ae1d3131812eebb298854c6f0d659ab8b9d340c898466e7d303d",
+        "file_count": 3,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Begrenztes Quellnamens-/Bilanzdelta samt direkten Quellen-/Ziel-/Queue-/CLI-/Anzeigengrenzen; kein neuer Vollreview. Normale additive Copy mit Skip bilanziert nicht dekodierbare rohe Quellnamen und überträgt unabhängige sichere Kinder. Vollständige Listings, eindeutige rohe Komponenten und sichere genutzte Pfade bleiben Pflicht. Quellversion bindet ausgelassenen Rohbestand ohne Öffnen; alte vollständige Hashformate erhalten. Queue ergänzt statt überschreibt Quellhinweise; CLI-Text zeigt konkrete Namen wie JSON. Move, Ersetzen, Konfliktkopie, Zielbelege und Planner bleiben strikt. Quelle 0a893b7f141672638cd3525d48a14886b13f2b8f; docs/code-review-2026-10-19-quellnamen.md.",
+        "tests": [
+          "Vier rote Caller-Gegenläufe: Providerbaum auf macOS, echte additive Linux-Dateikopie und Quellversionsbindung, zusätzlicher CLI-Textfehler nach erfolgreicher Kopie. Vier Linux-Teilläufe grün; abschließend Mac Core1142/CLI76/App219, Linux1164/77/209. Core je22 ignoriert, CLI je1, App2/4. Beide sechs Rustgates inklusive Clippy, Fuzz locked, fmt grün;385Quellen unverändert. Vollständige Browser-Suite mit CSP/Pane-Tabs/Quellbilanz grün. APFS-EILSEQ separat;kein neuer nativer Linux-GUI-Lauf."
+        ]
+      }
+    },
+    {
+      "id": "frontend-file-queue",
+      "paths": [
+        "frontend/file-actions.js",
+        "frontend/operation-ui.js",
+        "frontend/queue-ui.js",
+        "frontend/quarantine-ui.js",
+        "frontend/modal.js",
+        "frontend/file-drops.js",
+        "frontend/file-clipboard.js",
+        "frontend/conflict-dialog.js"
+      ],
+      "risk": "high",
+      "priority": 17,
+      "reason": "Interaktive Mutationen, Konflikte, Abschlussbilanz und Queuezustand müssen sichtbar und fensterlokal bleiben",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:48+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "f0aa094dbc06219ca523e515236fff5afd751ac6d1f45c1ec9f4351b5629bf31",
+            "file_count": 6,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit 82cc6ee50ea6910d4214d61b50d6e0a17e7aa9c7 plus F5/F6, Dropgruppen, Modal-Leases, Queue/Actuals und Quarantäne geprüft. Erfolgreiches Enqueue zählt auch nach Navigation; Modalhülle und onchange werden je Besitzer isoliert und restauriert. Browser-Rot/Grün-Belege und vollständige Suite.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T11:49:27+02:00",
+        "observed_head": "ca4acabbd6ed956059eda3a749c302e04e76d84b",
+        "content_sha256": "ddf7d80f5179f6b813b82389cd3263b567d857bbaa27ea82d7fe12d4d1062811",
+        "file_count": 8,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Gezieltes vollständiges Delta seit 1540973: genau zwei passive Abschlussaufrufer in file-actions.js markieren; aktuelle Scope-/Endpunktgrenzen abgeglichen. Drei Navigation-Gegenproben rot/grün, zwei positive Fehlerfreigaben. Der vorausgehende Bereichsreview bleibt erhalten. docs/code-review-2026-10-19-pane-navigation.md.",
+        "tests": [
+          "UI402 einschließlich CSP, sechs Tabtests und Mac-App-Build grün; 383 Quellhashes unverändert. Native normale Queue-/Navigations-/Tababnahme mit künstlichen Quellen und Zielen, exakter Kopie, erhaltenen Quellen und Cleanup0. Visuelle Zustände in beiden Themes geprüft. Gehaltene IPC-Reihenfolge ausschließlich im Browser; kein nativer Race-Gegenbeleg behauptet. Backend und Lockfiles unverändert; frühere beidseitige Gates wiederverwendet."
+        ]
+      }
+    },
+    {
+      "id": "frontend-sync",
+      "paths": [
+        "frontend/bidirectional-ui.js",
+        "frontend/one-way-sync-ui.js",
+        "frontend/plan-view.js",
+        "frontend/real-mode-ui.js",
+        "frontend/sync-comparison.js",
+        "frontend/sync-view.js",
+        "frontend/local-sync-ui.js"
+      ],
+      "risk": "high",
+      "priority": 18,
+      "reason": "Sync-Anzeige und Bestätigung müssen exakt Backendpläne erklären, ohne Sicherheitswerte zu erfinden",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260903T104519936010+0200",
+            "completed_at": "2026-09-03T17:08:53+02:00",
+            "observed_head": "82cc6ee50ea6910d4214d61b50d6e0a17e7aa9c7",
+            "content_sha256": "f448f7679293aa3242c6bfe2878f25fe12ec65107077f9a6e2b9ef7854ce81ae",
+            "file_count": 6,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Die Sync-Ansicht haelt ihre beiden Kerninvarianten in beide Richtungen: Mirror plus NativeBestEffort und ein natives Profil ohne Inhaltsvergleich lassen sich nicht mehr einstellen. Zuvor korrigierte nur der Metadaten-Handler, und jede folgende Vorschau endete im Fehler, waehrend die Ansicht die Optionen als gueltig anbot.",
+            "tests": [
+              "pnpm test:ui: vollstaendig gruen",
+              "tools/check-gates.py --json: 9/9 pass"
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T11:35:14+02:00",
+        "observed_head": "508d2b56f1746c3a85ab06a55a4b9aacf2dc694f",
+        "content_sha256": "739adcaa39f5a90676f2b54de78d14c751c2f70c59500e48ddfb958d66446400",
+        "file_count": 7,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Vollständiges Sync-Frontend-Delta seit fb14df1 geprüft; aktuelle Bidi-/Einweg-/Ansichtscontroller und neues Local-Sync-Modul vollständig gelesen. Zwei P2 mit vier roten/grünen UI-Gegenproben korrigiert: späte Einreihantwort erhält aktuelle Rückfrage, Terminalstand und Sync-Scope; wirkungslose Einwegoptionen verborgen, BLAKE3/Portable erklärt, Einwegwahl und Backuphinweis erhalten. Unveränderte Plan-, Realmodus- und Vergleichsansicht behalten ihren früheren Vollbeleg. docs/code-review-2026-10-19-frontend-sync.md.",
+        "tests": [
+          "Vollständige UI397 einschließlich CSP, sechs Tabtests und Mac-App-Build grün; 383 Hashes unverändert. Finaler nativer Lauf R4: Optionsanzeige mit BLAKE3/Portable und Backuphinweis; Erstbaseline-Konfliktentscheidung, AwaitingConfirmation/RemoteRun, sichtbare Rückfrage und aktivierte Planbestätigung. Quelle unverändert, Ziel abwesend, Cleanup0. Native Dark- und Browser-Light/Dark-Ansichten visuell geprüft. Gehaltene IPC-Reihenfolge ausschließlich im Browser. Frühe Radio-/Ready-Helferfehler getrennt, ihre Gesamtblöcke nicht als Pass gezählt. Rust/Core/CLI/Provider/Lockfiles unverändert; frühere beidseitige Gates wiederverwendet."
+        ]
+      }
+    },
+    {
+      "id": "frontend-pane-shell",
+      "paths": [
+        "frontend/main.js",
+        "frontend/pane-controller.js",
+        "frontend/event-controller.js",
+        "frontend/input-controller.js",
+        "frontend/context-menu.js",
+        "frontend/index.html",
+        "frontend/styles.css",
+        "frontend/file-information.js",
+        "frontend/pane-tabs.js",
+        "frontend/pane-tabs-ui.js"
+      ],
+      "risk": "high",
+      "priority": 19,
+      "reason": "Komposition, Pane-Navigation, A11y, Virtualisierung und Fensterereignisse haben breite UI-Wirkung",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:48+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "10ebd9ae83667d6b5d40abd2614ea3c3bec54c027aec955e8bde30a5111c6cc7",
+            "file_count": 8,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit 82cc6ee50ea6910d4214d61b50d6e0a17e7aa9c7 samt Navigation/loadSeq, Drag-Auswahl, Dockdelegation, Sitzungsstart/-speicherung, Compare-Payload und Modal-/Menügrenzen geprüft. Auswurf entwertet betroffene Panes synchron; verspätete Rückfälle überschreiben neuere Navigation nicht.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T11:49:27+02:00",
+        "observed_head": "ca4acabbd6ed956059eda3a749c302e04e76d84b",
+        "content_sha256": "6f0355cca9638a14b0f695061dbab45506e57c4988023580ae06e41bb22b9fdb",
+        "file_count": 10,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Vollständiges Pane-Shell-Delta seit fb14df1 sowie relevante aktuelle Navigations-, Tab-, Ereignis-, Auswahl- und Fokusgrenzen geprüft. Ein P2 mit drei roten/grünen Controller-Gegenproben: Queue-/Rename-Abschluss startet bei laufendem Listing oder Home keinen alten Read. Navigation vor erstem Await gebunden; nur aktuelle Anfrage räumt auf. Zwei positive Listing-/Homefehlerfälle geben passiven Refresh frei. Unveränderte Tabmodule behalten früheren Vollbeleg. docs/code-review-2026-10-19-pane-navigation.md.",
+        "tests": [
+          "UI402 einschließlich CSP, sechs Tabtests und Mac-App-Build grün; 383 Quellhashes unverändert. Native normale Queue-/Navigations-/Tababnahme mit künstlichen Quellen und Zielen, exakter Kopie, erhaltenen Quellen und Cleanup0. Visuelle Zustände in beiden Themes geprüft. Gehaltene IPC-Reihenfolge ausschließlich im Browser; kein nativer Race-Gegenbeleg behauptet. Backend und Lockfiles unverändert; frühere beidseitige Gates wiederverwendet."
+        ]
+      }
+    },
+    {
+      "id": "frontend-connections-sidebar",
+      "paths": [
+        "frontend/connection-editors.js",
+        "frontend/connections-ui.js",
+        "frontend/devices-ui.js",
+        "frontend/favorites-ui.js",
+        "frontend/network-discovery-ui.js",
+        "frontend/sidebar-sections.js"
+      ],
+      "risk": "medium",
+      "priority": 20,
+      "reason": "Providerprofile, Geräte und Favoriten teilen revisionsgebundene Pane-Endpunkte",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:48+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "620313ca52d8819380c927e4a7e37255c3cfab00fb7814e12c9955249a6e39e0",
+            "file_count": 6,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit 82cc6ee50ea6910d4214d61b50d6e0a17e7aa9c7 plus Profilrevision/-invalidierung, Editor, Favoriten-/Sidebar-Drag und Discovery geprüft. Auswurffehler lassen keine alte Auswahl bedienbar; generationengebundener Rückfall bleibt erhalten. Native Mountbedienung nicht erneut ausgeführt.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T12:10:37+02:00",
+        "observed_head": "143568f16296c8642a010c67d0a3bad13742c7a5",
+        "content_sha256": "58c050c4bed18d20231cd7f5ac94d93569e6089e38ecdd66c20d4aae6b9b6314",
+        "file_count": 6,
+        "review": "full",
+        "outcome": "improved",
+        "summary": "Alle sechs aktuellen Verbindungs-/Seitenleistenmodule mit 2250 Ausgangszeilen vollständig gelesen. Profil-, Dialog-, Pin-/Secret-, Pane-, Mount- und Favoritenstoregrenzen abgeglichen. Drei P2 mit fünf gültigen roten UI-Gegenbelegen korrigiert: alte Geräteantwort und alter Lesefehler nach Auswurf; veraltete Favoritenantwort/Startliste; verschwiegener erster Favoriten-Lesefehler. Frischer autoritativer Read nach Änderungen und Generationensperre, klarer Fehler bei erfolgreicher Änderung mit fehlgeschlagenem Readback. docs/code-review-2026-10-19-verbindungen-seitenleiste.md.",
+        "tests": [
+          "Finale UI408 einschließlich CSP, sechs Tabtests und Mac-App-Build grün; 383 Quellhashes unverändert. Sechs gezielte Fälle grün. Native eigene Favoriten hinzugefügt/entfernt mit tatsächlicher Storeprüfung und unveränderten künstlichen Daten, lesende Geräteanzeige nach Fokusrefresh sowie sichtbarer tatsächlicher Fehlerstart bei künstlich beschädigter Konfiguration; eigener Cleanup0. Native Ansichten visuell geprüft. Gehaltene Antwortfolgen nur im Browser, kein nativer physischer Auswurfbeleg. Erster Image-Hilfslauf vor Bedienung fehlgeschlagen: eigener /tmp-Mount laut Produktvertrag unsichtbar, vollständiger Cleanup0 samt exaktem eigenem Image-Detach. Alter Folge-Read-Hilfsfall nicht erreichbar; tatsächliche Startabfrage separat rot belegt. Backend/Lockfiles unverändert, frühere beidseitige Gates wiederverwendet."
+        ]
+      }
+    },
+    {
+      "id": "frontend-layout-platform",
+      "paths": [
+        "frontend/byte-units.js",
+        "frontend/column-layout.js",
+        "frontend/splitter.js",
+        "frontend/tauri-api.js",
+        "frontend/theme-boot.js",
+        "frontend/theme.js",
+        "frontend/ui-utils.js",
+        "frontend/update-ui.js",
+        "frontend/view-options.js",
+        "frontend/settings-ui.js",
+        "frontend/view-options-state.js"
+      ],
+      "risk": "medium",
+      "priority": 21,
+      "reason": "Gemeinsame Layout-, Theme-, IPC- und Update-Helfer wirken als breite UI-Grenzfläche",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:49+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "18d11495ae6c0d358f7610c818ec806c38d527250ca2137a3db9a035e5286592",
+            "file_count": 10,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit 6ea792e8433ace05b7e54fb3f28e7ac3880a78a4 plus Themeboot, Einheiten, Preference/localStorage, Listener, Modal- und Restorevertrag geprüft. Öffnungsphase ist gegen doppelte Einstellungsabrufe gesperrt; Altwertmigration nutzt atomare Backend-Bedingung und verwirft keine neue Nutzerwahl.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T12:13:04+02:00",
+        "observed_head": "11ee08225d720252e3bbebb7454f6837e7f7ad79",
+        "content_sha256": "4109a3625ca722c3ddcaf3da4e27343e0dad4ebb4c55389086fc9aced4662641",
+        "file_count": 11,
+        "review": "delta-plus-boundaries",
+        "outcome": "reviewed-clean",
+        "summary": "Vollständiges Delta seit fb14df1: zehn neue Zeilen in sourceReadReport vollständig gelesen, aktuelle HTML-/Escaping-Grenze, Dateiaktions-/Terminalaufrufer und typisierten Core-Baum-/Limitationsvertrag abgeglichen. Zehn unveränderte Module behalten früheren Vollbeleg. Alle Auslassungspfade bleiben in tree.limitations erhalten; Texte werden vor HTML und Textarea escaped. Kein neuer belegter Fehler und keine Produktquellenänderung.",
+        "tests": [
+          "Alle 383 erfassten Produkt-/Werkzeugquellen bytegleich mit 143568f. Dessen finale vollständige UI408 einschließlich CSP und sechs Tabtests sowie Mac-App-Build grün, einschließlich vorhandener Langtext-/Auslassungs-/HTML-Injektionsfälle in beiden Themes. Ergebnisse unverändert wiederverwendet, nicht erneut ausgeführt. Native Ansichten nicht neu geprüft; keine UI-Änderung in diesem Schnitt."
+        ]
+      }
+    },
+    {
+      "id": "tauri-build-update-config",
+      "paths": [
+        "src-tauri/build.rs",
+        "src-tauri/Info.plist",
+        "src-tauri/capabilities/default.json",
+        "src-tauri/tauri.conf.json",
+        "src-tauri/src/cli_setup.rs",
+        "src-tauri/src/update_commands.rs"
+      ],
+      "risk": "high",
+      "priority": 22,
+      "reason": "Bundle-, Capability-, Updater- und CLI-Installationskonfiguration entscheidet über startfähige und sichere Auslieferung",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260903T104519936010+0200",
+            "completed_at": "2026-09-03T11:35:24+02:00",
+            "observed_head": "98b1550976824b8ea5c171c4961821b476262aa2",
+            "content_sha256": "19ddd89f77e6b74752802fd4c862651cf235e3c482883791b15f744d98fd8519",
+            "file_count": 6,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Delta ist genau der verifizierte Theme-Diff: update_commands.rs sendet Fortschritt, Abschluss und Fehler der Installation nur noch an das ausloesende Fenster. Der prozessweite Installationslock bleibt unveraendert, es kann also weiterhin nur ein Fenster installieren.",
+            "tests": [
+              "tools/check-gates.py --json: 9/9 pass"
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-07T07:49:42+02:00",
+        "observed_head": "0c689356c974eab11360973fe6031153df2fcc53",
+        "content_sha256": "eefd1a6c5a06e2569dd98882890f021f7c3d7c6428a1f0c13484b4e06c86f790",
+        "file_count": 6,
+        "review": "full",
+        "outcome": "improved",
+        "summary": "Alle sechs Dateien und unveränderte Tests vollständig frisch geprüft: Build/CSP/Capabilities/Info.plist/Updaterhandles, Generationen, Schranken und CLI-Einrichtung. Zwei echte späte Ordnerkollisionen rot→grün; native exklusive Symlinkanlage statt ln-Verzeichnisfallback. Update-/CLI-Doku korrigiert.",
+        "tests": [
+          "Tauri173, fünf tatsächliche exklusive Symlinkfälle mit ungewöhnlichem Bundlepfad; Workspace-Clippy --all-targets -D warnings, fmt/Diff/Release-Check grün. Keine echten Installations-/Updatewirkungen."
+        ]
+      }
+    },
+    {
+      "id": "release-pipeline",
+      "paths": [
+        "build-app",
+        "install",
+        "release",
+        ".github/workflows/ci.yml",
+        "tools/build-release.py",
+        "tools/check-release.py",
+        "tools/make-icons.sh",
+        "tools/verify-linux-release.py",
+        "tools/verify-macos-release.sh",
+        "tools/verify-release-privacy.py",
+        "tools/write-release-checksums.py",
+        "tools/write-update-manifest.py",
+        "tools/tests/test_build_release_prerequisites.py",
+        "tools/tests/test_ci_yaml_structure.py",
+        "tools/tests/test_fleet_rules.py",
+        "tools/tests/test_linux_release_attestation.py",
+        "tools/tests/test_release_dmg_detach.py",
+        "tools/tests/test_update_release_contract.py",
+        "tools/tests/test_release_gate_enforcement.py",
+        "tools/tests/test_install_transaction.py",
+        "src-tauri/icons/icon-render.svg",
+        "src-tauri/icons/icon.svg"
+      ],
+      "risk": "high",
+      "priority": 23,
+      "reason": "Release-Vertrauenskette und öffentliche Artefaktverträge; enthält den bestätigten offenen Backlogbereich",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:49+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "e335df233e154ae3bc125764966acf2e6aad903b23c5bec1e1827a0d0b65a464",
+            "file_count": 20,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit c40981bab08db32e3fa6077f8519adf5dbeeb2f4 plus Release-Vertrauenskette geprüft. Installer prüft vor Wirkung, hält Altstand, nutzt descriptor-relative Transaktion und rollt Fehler/Signale zurück. Zwölf echte Swift-Dateisystemproben nur unter /tmp. make-icons- und Gate-Deltas vollständig geprüft; release:check grün, kein Release/Install ausgelöst.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T17:49:59+02:00",
+        "observed_head": "0cff338ebadfaa64b22d9119d9df0a9c13af1474",
+        "content_sha256": "c557027025f13b657cf29b3caa198e4db1d13f2030749594be0fa96e6d7ff323",
+        "file_count": 22,
+        "review": "delta-plus-boundaries",
+        "outcome": "improved",
+        "summary": "Eng begrenztes Linux-Paketdelta: Der reguläre AppImage-Bau reproduziert einen fälschlich abgelehnten spezifikationskonformen internen Desktoplink. Genau dieses relative Linkziel wird mit lstat jeder Zielkomponente erlaubt; allgemeine Paketdateiregeln bleiben unverändert. Source 0cff338; frühere Vollbelege bleiben erhalten. Bericht docs/code-review-2026-10-19-linux-paket.md.",
+        "tests": [
+          "Mac:149 Werkzeugtests bestanden; Linux:130 bestanden und19 plattformbedingt übersprungen.385 Dateihashes unverändert. Echter Standard-Paketbau reproduziert Fehler; mit Korrektur Release-,Privacy-,Layout-,ELF-,CLI-Version-,Signatur-undChecksumgates grün.3 echte Signaturen unabhängig verifiziert,vertauschte Signatur abgelehnt. Tatsächliches AppImage:F2/F5/F6 byteidentisch,2 Fenster mit getrennten Journalen;Screenshot des zweiten noch während Ladens. DEB isoliert installiert,gleichversionig ersetzt und entfernt;GUI/CLI-Payloadhashes passend,Konfiguration erhalten,Container entfernt. Menschliche Abnahme und echter Versionswechsel offen;native Menübefunde gesondertes Produktdelta. Keine Veröffentlichung."
+        ]
+      }
+    },
+    {
+      "id": "test-gate-harness",
+      "paths": [
+        "tools/check-gates.py",
+        "tools/mock-ui-server.py",
+        "tools/run-test-sandbox.sh",
+        "tools/screenshots.mjs",
+        "tools/test-mock-ui.mjs",
+        "tools/tests/test_check_gates.py",
+        "tools/tests/module_loader.py",
+        "tools/tests/test_run_test_sandbox.py",
+        "tools/tests/test_rust_testmodule.py",
+        "tools/tests/test-pane-tabs.mjs",
+        "tools/tests/test_cargo_safety.py",
+        "tools/browser-cleanup.mjs",
+        "tools/tests/test_browser_cleanup.py"
+      ],
+      "risk": "high",
+      "priority": 24,
+      "reason": "Zentrale Headless- und UI-Gates müssen echte Fehlschläge zuverlässig erkennen und isoliert bleiben",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T16:04:50+02:00",
+            "observed_head": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+            "content_sha256": "e00c574b2cf4403eff7af71e23e5a19f79f93bb51dc6afff8c780eb68c3543cf",
+            "file_count": 9,
+            "review": "delta-plus-boundaries",
+            "outcome": "improved",
+            "summary": "Vollständiges Delta seit cb1374ed534ee2ed73737131dfbac16a29aecf63 plus Runner/CSP/Fixture-/Prozessgrenzen geprüft. Sandboxlauncher kodiert XML und verwendet frisches exklusives Bundle. Plattform-Modulwächter erkennt überlappende Negationen. Sämtliche neuen Browserfälle prüfen beobachtbare Zustände; 127 Werkzeugtests und komplette UI-Suite grün.",
+            "tests": [
+              "2026-10-02: erste vollständige macOS-Runde 9/9 Gates grün; nach weiteren Deltas betroffene Gates erneut grün: Core 817, CLI 62, Tauri 164, Werkzeugtests 127, Browser-Suite, Workspace-Clippy, Fuzz --locked --all-targets. Linux Core 828, CLI 62, Tauri 162, Queue-Gegenlauf, Clippy, Fuzz und fmt grün; echter Samba-E2E grün. Native GUI nicht erneut geprüft."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T12:51:33+02:00",
+        "observed_head": "6e6c0a378ac755ab9238353c692a45f079bc2db0",
+        "content_sha256": "71f44aa5c75bd00b6f5d7777a72d5ba3a22cc8ce2a70fa86a9d2d63dd1d85692",
+        "file_count": 13,
+        "review": "delta-plus-boundaries",
+        "outcome": "reviewed-clean",
+        "summary": "Ergänzungsabschluss für die erst während des Vollreviews zugeordneten Dateien browser-cleanup.mjs und test_browser_cleanup.py: beide vollständig gelesen, Runnerverdrahtung und Playwright-Exitgrenze geprüft. Vollbeleg aller13Dateien und11999Zeilen bleibt in docs/code-review-2026-10-19-test-harness.md und full-review-2026-10-07.json erhalten. Keine weiteren Änderungen seit6e6c0a3.",
+        "tests": [
+          "Identische385Hash-Freeze wie im unmittelbar vorangegangenen Vollabschluss: Mac16+4gezielt grün, FullTools145/146mitbenanntemSFTP-Altfehler; Browser408inklCSP+6Tabsgrün; echterChromiumSIGTERMbeendetbeideProzesse. Linux19bestanden8explizitSkips. Keine Tests erneut ausgeführt oder neue Tokenzahlen geschätzt."
+        ]
+      }
+    },
+    {
+      "id": "workspace-build-config",
+      "paths": [
+        "Cargo.toml",
+        "core/Cargo.toml",
+        "src-tauri/Cargo.toml",
+        "cli/Cargo.toml",
+        "fuzz/Cargo.toml",
+        "package.json",
+        ".cargo/config.toml",
+        ".gitignore"
+      ],
+      "risk": "medium",
+      "priority": 25,
+      "reason": "Workspace-, Abhängigkeits- und Testschutzkonfiguration bildet die gemeinsame Buildgrenze",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260910T111321948617+0200",
+            "completed_at": "2026-10-02T15:17:18+02:00",
+            "observed_head": "9ebc05d1529a7ccc8e99f5a03a6276b955cf7228",
+            "content_sha256": "b71e65e152cd0602ffaed135f7594bdfa7b3ee18d8fe7535677927e7ea958fbd",
+            "file_count": 7,
+            "review": "delta-plus-boundaries",
+            "outcome": "reviewed-clean",
+            "summary": "Gesamtes Delta seit ca04230d: PNG-Feature für Tauri nur unter Linux. Icon-Aufrufer und macOS-AppKit-Grenze geprüft; Core/CLI/Tauri und Clippy auf beiden unterstützten Plattformen übersetzt.",
+            "tests": [
+              "2026-10-02: macOS vollständige 9/9 Headless-Gates grün; Linux Core/CLI/Tauri, Workspace-Clippy und Fuzz-Build grün; letzte Trash-/Queue-Deltas erneut geprüft; echter Samba-E2E grün."
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T13:13:41+02:00",
+        "observed_head": "7429812d4fc067de05039d873bb1d0cc00ff5aac",
+        "content_sha256": "4e9256047e9ded07c7cc6c65a0f8046bff869ff5473dd60c44d4599761e112d3",
+        "file_count": 8,
+        "review": "delta-plus-boundaries",
+        "outcome": "reviewed-clean",
+        "summary": "Gesamtes7ZeilenDelta seitfb14df1 in zwei vollständig gelesenen Cargo-Manifeste samt heutigen Imports, Target-/Feature-/Lock- und CLI-Testschutzgrenzen geprüft. libc produktiv fürgehaltenes CLI-Dateilesen; url plattformübergreifend imDateiURIcodec, neue AppKit/FoundationFeatures nurmacOS beiabgeschaltetenDefaults. KeinweitererFehler, keineProduktänderung. docs/code-review-2026-10-19-workspace.md; historischeVollbelegederübrigenKonfigurationerhalten.",
+        "tests": [
+          "cargo metadata --locked --offline --no-deps --format-version1 grün; tatsächlicheDependencyarten/Targets/FeaturesundLockversionen geprüft,385Quellhashesunverändert. CLI/Core/Cargo/Lock/Schutzkonfigurationbytegleichzuf279685, App/Core/Cargo/Lock/Schutzkonfigurationbytegleichzu90e8339; damaligegrüneTests/Clippy/Kompilierungenwiederverwendet. KeinweitererRust-/Browser-/GUI-Lauf;Diffprüfunggrün.KeineTokenzahlen geschätzt."
+        ]
+      }
+    },
+    {
+      "id": "fuzz-harness",
+      "paths": [
+        "fuzz/examples",
+        "fuzz/tests"
+      ],
+      "risk": "medium",
+      "priority": 26,
+      "reason": "Seed-Generator und Fuzz-Selbsttest sichern persistierte und externe Eingaben",
+      "state": "completed",
+      "review_history": [
+        {
+          "archived_at": "2026-10-07T04:49:47+02:00",
+          "reason": "Ausdrücklich beauftragter frischer vollständiger Review einschließlich unveränderter eigener Bereiche.",
+          "run": {
+            "campaign_id": "20260819T180452594815+0200",
+            "completed_at": "2026-08-19T21:38:32+02:00",
+            "observed_head": "6c4b58668e3db17f58b9484c3f22fcf230c98bc5",
+            "content_sha256": "01a99cd2cb3538d888f9fda7ebda517b890348aaaab7b355d68b65e8551f2b2f",
+            "file_count": 2,
+            "review": "full",
+            "outcome": "improved",
+            "summary": "Vollreview: Die vier Fuzz-Targets, der Seed-Generator und der Seed-Corpus-Test übersetzen weiterhin gegen den heutigen Kern. Gefundene Lücke: Kein Gate baute sie, weshalb fuzz/Cargo.lock unbemerkt von den Kern-Abhängigkeiten abgewichen war (time, unicode-normalization, tinyvec fehlten). Behoben durch das neue Gate fuzz-check mit --locked plus aktualisierte Lockdatei.",
+            "tests": [
+              "tools/check-gates.py --json: 9/9 pass (neues Gate fuzz-check); Gegenprobe: mit der alten Lockdatei meldet fuzz-check rc=101"
+            ]
+          }
+        }
+      ],
+      "last_run": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-07T07:43:09+02:00",
+        "observed_head": "3ef3ab88e3f12694a7b6bb9c9d8a0017ad55d972",
+        "content_sha256": "bb6c5c2425f0fa33eac1f7c904d81ccb9438957355d693320099c5cbe262b9b2",
+        "file_count": 2,
+        "review": "full",
+        "outcome": "reviewed-clean",
+        "summary": "Generator und Seedtest vollständig frisch gelesen; künstliche Roots und lokale Seed-Ausgaben, JSON-Validatoren sowie Finder-Plist-Target als direkte Grenzen geprüft. Kein Produktfehler im Harness; veraltete Fuzz-README berichtigt.",
+        "tests": [
+          "Ein tatsächlicher Schema-/Digesttest je Plattform; Fuzz --locked --all-targets grün, Generator mitübersetzt; kein Seedgenerator gegen versionierte Dateien ausgeführt."
+        ]
+      }
+    }
+  ],
+  "architecture": {
+    "campaign_id": "20260910T111321948617+0200",
+    "recorded_at": "2026-10-19T19:17:23+02:00",
+    "observed_head": "6293e294ec025862160882be184a2a9e54647262",
+    "summary": "Core hält Wirkungs- und Persistenzverträge; Tauri adaptiert native Fenster und Icons. Der begrenzte Icon-Fix teilt die Skalierung zwischen Fensterstart und Einstellungsänderung. Fensterqueues und Ereignisse bleiben getrennt. Historische Vollreviews und heutige begrenzte Deltas bleiben getrennt belegt.",
+    "paradigm": null,
+    "fit": "passt",
+    "recommendation": "Schichtung beibehalten. Alle 26 Bereiche sind aktuell; 75 Funde behoben. Menschliche Linux-Funktionsabnahme und Dock-Sichtkontrolle sind am 2026-10-19 bestanden. Weitere Produktziele folgen dem beauftragten Roadmapumfang; Veröffentlichung braucht einen konkreten Auftrag.",
+    "external_acceptance_recorded_at": "2026-10-19T17:20:05.667090+00:00"
+  },
+  "themes": [
+    {
+      "id": "rename-phase-awareness",
+      "summary": "Zwei Implementierungen derselben Idee 'Rename und Verzeichnis-Sync sind getrennte Fehlerphasen': fileops.rs trennt sauber über SyncedRenameFailure/TempCommitFailure inklusive OutcomeUnclear, sync/atomic.rs nur über ein bool temp_released. Die reichere Fassung ist modulprivat in fileops.rs und für den Sync-Weg nicht erreichbar.",
+      "evidence": [
+        "core/src/fileops.rs",
+        "core/src/sync/atomic.rs",
+        "core/src/atomic_file.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-08-19T18:35:55+02:00",
+      "campaign_id": "20260819T180452594815+0200",
+      "started_at": "2026-08-19T21:38:44+02:00",
+      "completed": {
+        "campaign_id": "20260819T180452594815+0200",
+        "completed_at": "2026-08-19T21:46:09+02:00",
+        "observed_head": "91917f86cfe96eb4c23f8abf237ed91b7f202708",
+        "summary": "SyncedRenameFailure und rename_noreplace_with_phase sind von fileops.rs nach atomic_file.rs gewandert und werden jetzt von beiden Commitwegen benutzt. Der Sync-Weg leitet sein temp_released aus den drei benannten Phasen ab, statt MutationFailure selbst auszuwerten. TempCommitFailure bleibt modulprivat in fileops.rs, weil es dessen eigenen Rückweg beschreibt und nicht die Rename-Phase.",
+        "tests": [
+          "tools/check-gates.py --json: 9/9 pass; cargo test -p doppeldecker-core: 532+8+34+4+2+3+68+1 passed"
+        ]
+      }
+    },
+    {
+      "id": "webdav-probe-frame",
+      "summary": "Die drei WebDAV-Capability-Proben (Rename, Dauerlöschen, AddOnly-MKCOL) wiederholen denselben sicherheitskritischen Rahmen: Probenverzeichnis unter genau dem gewählten Root anlegen, den nicht-rekursiven Collection-Delete zuerst beweisen, expected-Bestand und depth_zero_verified mitführen, den Probenkörper in einer Closure ausführen, auf Erfolgs- wie Fehlerpfad über finish_probe aufräumen und erst nach unveränderter Sitzung eine Fähigkeit setzen. Genau diese Rahmenlogik ist 2026-07-28 schon einmal am falschen Root gelaufen. Ein gemeinsamer run_capability_probe-Rahmen würde das an einer Stelle festhalten; die Änderung ist umfangreich genug für eine eigene Arbeitseinheit und braucht den WebDAV-E2E als Netz.",
+      "evidence": [
+        "core/src/webdav.rs",
+        "core/tests/webdav_e2e.rs"
+      ],
+      "priority": 3,
+      "state": "completed",
+      "noted_at": "2026-08-19T19:13:47+02:00",
+      "campaign_id": "20260819T180452594815+0200",
+      "started_at": "2026-08-19T21:46:24+02:00",
+      "completed": {
+        "campaign_id": "20260819T180452594815+0200",
+        "completed_at": "2026-08-19T21:55:07+02:00",
+        "observed_head": "2a6b5a67c205ed6a3d5cf69c5a9d2aa7fe20c0cd",
+        "summary": "run_capability_probe hält den Rahmen aller vier WebDAV-Capability-Proben einmal: Sitzungsbindung, Probenverzeichnis unter dem gewählten Root, Bestands- und Depth-0-Führung, finish_probe auf beiden Wegen und die Sitzungsprüfung vor dem Freischalten. CapabilityProbe beschreibt die Probe, ProbeScope reicht das Arbeitsumfeld hinein. Verhalten, Namen und Fehlertexte unverändert.",
+        "tests": [
+          "tools/check-gates.py --json: 9/9 pass, darunter der WebDAV-E2E gegen einen lokal gestarteten TLS-Server mit allen vier Proben und ihren Fehlerpfaden"
+        ]
+      }
+    },
+    {
+      "id": "localstorage-fallback",
+      "summary": "Sieben Frontend-Module lesen und schreiben localStorage je mit eigenem try/catch und eigener Begründung, dass der Zugriff in restriktiven WebViews gesperrt sein kann: theme.js, byte-units.js, column-layout.js, splitter.js, view-options.js, sidebar-sections.js, network-discovery-ui.js. Ein gemeinsamer Lese-/Schreibhelfer in ui-utils.js würde die Regel einmal festhalten. theme-boot.js bleibt bewusst außen vor: Es läuft vor allen Modulen und darf nichts importieren.",
+      "evidence": [
+        "frontend/theme.js",
+        "frontend/byte-units.js",
+        "frontend/column-layout.js",
+        "frontend/splitter.js",
+        "frontend/view-options.js",
+        "frontend/sidebar-sections.js",
+        "frontend/network-discovery-ui.js",
+        "frontend/ui-utils.js"
+      ],
+      "priority": 3,
+      "state": "completed",
+      "noted_at": "2026-08-19T21:04:58+02:00",
+      "campaign_id": "20260819T180452594815+0200",
+      "started_at": "2026-08-19T21:05:07+02:00",
+      "completed": {
+        "campaign_id": "20260819T180452594815+0200",
+        "completed_at": "2026-08-19T21:18:43+02:00",
+        "observed_head": "e772b3ecbceb94e909f02da43f4f19af1b0c3b82",
+        "summary": "readStoredValue/writeStoredValue in ui-utils.js ersetzen sieben eigene try/catch-Fassungen in theme.js, byte-units.js, column-layout.js, splitter.js, view-options.js, sidebar-sections.js und network-discovery-ui.js. theme-boot.js bleibt bewusst eigenständig, weil es vor allen Modulen läuft. Die Validierung der gelesenen Werte bleibt jeweils beim Aufrufer.",
+        "tests": [
+          "tools/check-gates.py --json: 8/8 pass, darunter pnpm test:ui"
+        ]
+      }
+    },
+    {
+      "id": "queue-error-code-preservation",
+      "summary": "Maschinenlesbare OutcomeUnclear-Codes gehen an drei Executorgrenzen verloren: doppelter Realmodus-Auditfehler, Remote-Fortschrittspersistenz und CLI-Abschluss. Dadurch kann retry() eine bereits gesendete Mutation erneut freigeben.",
+      "evidence": [
+        "core/src/real_mode.rs",
+        "core/src/queue.rs",
+        "cli/src/main.rs"
+      ],
+      "priority": 1,
+      "state": "completed",
+      "noted_at": "2026-08-25T16:55:30+02:00",
+      "campaign_id": "20260825T162859427161+0200",
+      "started_at": "2026-08-25T17:02:52+02:00",
+      "completed": {
+        "campaign_id": "20260825T162859427161+0200",
+        "completed_at": "2026-08-25T17:08:03+02:00",
+        "observed_head": "8c5611db02c5b0c146a27e9d8381b2d13133d8ed",
+        "summary": "Realmodus kombiniert einen zweiten Auditfehler unter Erhalt des primären maschinenlesbaren Codes; Remote-Fortschrittspersistenz markiert den nach möglicher Mutation nicht sicher journalisierten Lauf als OutcomeUnclear und sperrt Retry; CLI nutzt fail_coded/fail_file_coded für dieselbe persistente Sperre wie die GUI.",
+        "tests": [
+          "cargo fmt --all -- --check",
+          "cargo test -p doppeldecker-core (555 bestanden, 1 LAN-Test ignoriert; Integrationssuiten 8+34+4+2+3+68+1 bestanden, 3 umgebungsabhängige Provider-E2Es ignoriert)",
+          "cargo test -p doppeldecker-cli (18 Unit- und 38 Integrationstests bestanden)",
+          "cargo clippy --workspace --all-targets -- -D warnings"
+        ]
+      }
+    },
+    {
+      "id": "sync-quarantine-identity-binding",
+      "summary": "Nach Stat- und Hash-Prüfung verschiebt der Einweg-Sync das Ziel weiterhin nur pfadbasiert in die Quarantäne. Ein anderes Fenster oder externer Writer kann den Namen vor dem Rename durch einen Nachfolger ersetzen; dann würde die bestätigte Operation das falsche Objekt verschieben. Die Korrektur braucht einen VFS-weiten bedingten Rename- beziehungsweise Exchange-Vertrag und gehört nicht als lokaler Beifang in atomic.rs.",
+      "evidence": [
+        "core/src/sync/atomic.rs",
+        "core/src/sync/execute.rs",
+        "core/src/vfs.rs"
+      ],
+      "priority": 1,
+      "state": "completed",
+      "noted_at": "2026-08-25T17:21:01+02:00",
+      "campaign_id": "20260825T162859427161+0200",
+      "started_at": "2026-08-25T17:27:54+02:00",
+      "completed": {
+        "campaign_id": "20260825T162859427161+0200",
+        "completed_at": "2026-08-25T18:15:01+02:00",
+        "observed_head": "5b0bb2e17e2bf256cc7f8c6ee79fdce82f901104",
+        "summary": "Sync-Pläne binden bestehende Zielobjekte nun an Provider-Token beziehungsweise lokale Geräte-/Inode-Identität. Der Claim in die Laufquarantäne verwendet bei fähigen VFS-Providern einen bedingten Rename mit gebundenem Elternordner; lokale Best-Effort-Pfade prüfen Ziel-, Lauf- und Parkordneridentität nach der Wirkung und melden unklaren Ausgang statt einen Nachfolger als Erfolg. Der zufällige Laufordner bleibt während Erzeugung, Claims und Abschluss an seinen atomaren Erzeugungsbeleg gebunden. Deterministische Swap-Regressionstests decken Ziel-, Lauf-, Eltern- und Erzeugungsfenster ab.",
+        "tests": [
+          "cargo test -p doppeldecker-core: grün (565 Unit-Tests, 8 directory_size, 34 fileops, 4 FTPS, 2 Property-, 68 Sync-, 1 WebDAV-Test; vorgesehene E2E-Ignores); cargo fmt --all -- --check: grün; cargo clippy --workspace --all-targets -- -D warnings: grün; cargo check --manifest-path fuzz/Cargo.toml --locked: grün; git diff --check: grün; unabhängiger P1-Nachreview: keine neue Regression."
+        ]
+      }
+    },
+    {
+      "id": "mirror-skip-removal-gate",
+      "summary": "real_mode.rs sperrt jeden echten Mirror-Lauf mit ausgelassenen Einträgen, obwohl der Core-Vertrag nur Entfernungen sperrt. Bei delete_count == 0 sollten unabhängige Ergänzungen und Aktualisierungen weiterlaufen; der Permit-Pfad braucht einen gezielten Regressionstest, ohne Mirror-Entfernungen zu lockern.",
+      "evidence": [
+        "core/src/real_mode.rs",
+        "core/src/sync/safety.rs",
+        "core/tests/sync_tests.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-08-25T17:21:01+02:00",
+      "campaign_id": "20260825T162859427161+0200",
+      "started_at": "2026-08-25T21:55:52+02:00",
+      "completed": {
+        "campaign_id": "20260825T162859427161+0200",
+        "completed_at": "2026-08-25T22:05:07+02:00",
+        "observed_head": "45a569dfc3cd1ba24177dead674c30abf61bb30b",
+        "summary": "Der Realmodus sperrt ausgelassene Einträge jetzt nur noch bei tatsächlich geplanten Mirror-Entfernungen; unabhängige Ergänzungen und Aktualisierungen laufen weiter, während Vorbereitung und Zweitscan jede Entfernung unverändert fail-closed behandeln.",
+        "tests": [
+          "Zwei exakte Realmodus-Regressionstests; cargo test -p doppeldecker-core vollständig grün; python3 tools/check-gates.py --json: 9/9 grün; unabhängiger Subagent-Review ohne P1/P2-Fund"
+        ]
+      }
+    },
+    {
+      "id": "remote-delete-quarantine-identity-binding",
+      "summary": "RemoteDeletePlan speichert Provider-Token und Inhaltsdigest, doch execute_quarantine verschiebt den ausgewählten Pfad nach frischem Replan weiterhin nur mit rename_noreplace. Ein anderer Writer kann den Namen unmittelbar davor austauschen; die permanente Variante verwendet dagegen bereits remove_if_matches. Der Quarantänepfad muss denselben bedingten Rename-/gebundenen Elternvertrag und einen deterministischen Swap-Test erhalten.",
+      "evidence": [
+        "core/src/remote_delete.rs",
+        "core/src/vfs.rs"
+      ],
+      "priority": 1,
+      "state": "completed",
+      "noted_at": "2026-08-25T17:56:12+02:00",
+      "campaign_id": "20260825T162859427161+0200",
+      "started_at": "2026-08-25T18:15:50+02:00",
+      "completed": {
+        "campaign_id": "20260825T162859427161+0200",
+        "completed_at": "2026-08-25T18:56:15+02:00",
+        "observed_head": "8d24682b2a736d3a90eebc9e87d74807d4ef45ed",
+        "summary": "Remote-Löschquarantäne bindet nun Quellobjekt, frische Quellroot-Identität, Quarantänebasis, Laufordner und den kumulativen Manifestdigest atomar bis zum Claim. Intent- und Abschlussmanifeste wechseln per dauerhaftem Inhalts-CAS; Teilclaims, Sessionwechsel, Parent-/Manifest-Swaps und Durabilityfehler werden als PlanDrift oder OutcomeUnclear mit Recoverypfad erhalten. Die Restore-Probe belegt richtigen und falschen Manifest-CAS. Unabhängiger Nachreview reviewed-clean.",
+        "tests": [
+          "cargo test -p doppeldecker-core remote_delete::tests:: (26/26); cargo test -p doppeldecker-core restore_probe (4/4); cargo test -p doppeldecker-core (575 bestanden, 1 bewusst ignoriert); cargo clippy --workspace --all-targets -- -D warnings; cargo check --manifest-path fuzz/Cargo.toml --locked; cargo fmt --all -- --check; git diff --check; unabhängiger Subagent-Nachreview reviewed-clean"
+        ]
+      }
+    },
+    {
+      "id": "quarantine-manifest-run-identity",
+      "summary": "Quarantänemanifeste binden Provider- und Zielroot, persistieren aber keine Identität des zufälligen Laufordners. Der Einweg-Sync hält den Beleg nun nur während des laufenden Prozesses und prüft ihn vor/nach Abschluss; nach Abschluss kann ein externer Writer den gleich benannten Laufordner austauschen, sodass Restore/List/Purge den Manifestpfad nicht dauerhaft an dasselbe Objekt binden. Das Manifest braucht eine migrationsfähige Laufidentität und fail-closed Validierung bei jedem Recoveryzugriff.",
+      "evidence": [
+        "core/src/quarantine.rs",
+        "core/src/sync/atomic.rs",
+        "core/src/queue.rs"
+      ],
+      "priority": 1,
+      "state": "completed",
+      "noted_at": "2026-08-25T18:08:55+02:00",
+      "campaign_id": "20260825T162859427161+0200",
+      "started_at": "2026-08-25T18:56:40+02:00",
+      "completed": {
+        "campaign_id": "20260825T162859427161+0200",
+        "completed_at": "2026-08-25T19:31:17+02:00",
+        "observed_head": "2a319a822bfa8943dbe061efcf790ecb0153e5a5",
+        "summary": "Quarantänemanifest v2 bindet lokale Laufordner an Gerät/Inode und SMB-Läufe an stabile File-ID; v1, Pending-Records, Identitätswechsel und manifestlose Fremdordner bleiben fail-closed. Pending- und Bound-Start sind getrennt, Listen greifen nach bestätigter Abwesenheit nicht auf Kinder zu, und ein mutationsloser Typwechsel verwirft sein leeres Sidecar unter gehaltener Lease. Die atomare Restore-/Purge-Wirkungsbindung bleibt als eigenes P1-Thema erfasst.",
+        "tests": [
+          "tools/check-gates.py --json: 9/9 grün; 585 Core-Unit-/Property-Tests plus Integrationstests grün, 4 umgebungsabhängig ignored; gezielte Quarantäne-, Queue-, RemoteDelete- und Typwechseltests grün; unabhängiger finaler Nachreview ohne neue P1/P2-Funde"
+        ]
+      }
+    },
+    {
+      "id": "provider-conflict-source-parent-binding",
+      "summary": "Die Provider-Dateikonfliktquarantäne bindet Quellobjekt und Park-Elternordner, aber nicht den Quell-Elternordner in derselben Rename-Wirkung. Der neue Zwei-Eltern-Vertrag sperrt die allgemeine Restore-Capability zwar bis zu einer echten Implementierung; quarantine_provider_file_conflicts verwendet anschließend jedoch weiterhin die ältere Ein-Eltern-Primitive. Vor einer Providerfreigabe muss dieser Claim auf den vollständigen Vertrag wechseln und Quellroot-/Mehrfachclaim-Swaps deterministisch testen.",
+      "evidence": [
+        "core/src/queue.rs",
+        "core/src/vfs.rs"
+      ],
+      "priority": 1,
+      "state": "completed",
+      "noted_at": "2026-08-25T18:34:57+02:00",
+      "campaign_id": "20260825T162859427161+0200",
+      "started_at": "2026-08-25T20:44:07+02:00",
+      "completed": {
+        "campaign_id": "20260825T162859427161+0200",
+        "completed_at": "2026-08-25T20:56:38+02:00",
+        "observed_head": "0378d48878e487191d01ed7f3986637b369d2e6e",
+        "summary": "Provider-Konfliktclaims verlangen jetzt den vollständigen Zwei-Eltern-Vertrag, binden Quell- und Park-Elternidentität sowie den exakten kumulativen Manifest-Intentdigest in derselben Rename-Wirkung und schließen das Manifest per CAS ab.",
+        "tests": [
+          "tools/check-gates.py --json: 9/9 grün; fünf gezielte Provider-Quarantänetests einschließlich Source-/Base-/Run-/Park-Swap, Capability- und Manifest-Swap; finaler Subagent-Review ohne P1/P2"
+        ]
+      }
+    },
+    {
+      "id": "quarantine-recovery-atomic-run-claim",
+      "summary": "Persistierte Laufidentität wird beim Recoveryzugriff geprüft, Restore und Purge mutieren danach aber weiterhin pfadbasiert. Ein externer Swap zwischen Validierung und rename_noreplace beziehungsweise remove_dir_all kann einen fremden Eintrag restaurieren oder einen fremden Laufbaum löschen. Dafür braucht es einen lokal descriptor-gebundenen beziehungsweise provideratomaren Run-Claim mit deterministischen Swap- und Rollbacktests; ein bloßer zweiter Readback reicht nicht.",
+      "evidence": [
+        "core/src/quarantine.rs",
+        "core/src/local_fs.rs",
+        "core/src/vfs.rs"
+      ],
+      "priority": 1,
+      "state": "completed",
+      "noted_at": "2026-08-25T19:08:39+02:00",
+      "campaign_id": "20260825T162859427161+0200",
+      "started_at": "2026-08-25T19:32:07+02:00",
+      "completed": {
+        "campaign_id": "20260825T162859427161+0200",
+        "completed_at": "2026-08-25T20:43:03+02:00",
+        "observed_head": "b5f18654ee7bac8e4308157486793b279656bb49",
+        "summary": "Lokales Restore bindet Lauf-, Quell- und Zielroot bis in den No-Replace-Rename; Purge hält Run, Intent-Proof und exakten Intentdigest über descriptor-relative Leerung und abschließenden Leerheitsbeleg. Missing-/Swap-/späte-Inhalt-Zustände sind fail-closed, PurgeRecovery ist getrennt sichtbar, Remote-Fähigkeiten bleiben ohne atomaren Providervertrag gesperrt.",
+        "tests": [
+          "tools/check-gates.py --json: 9/9 grün; 35 gezielte Quarantänetests; exakter Local-Purge-Test; exakter bidirektionaler Pending-Tombstone-Test; vollständiger UI-Test; zwei abschließende Subagent-Reviews ohne P1/P2"
+        ]
+      }
+    },
+    {
+      "id": "quarantine-restore-intent-recovery",
+      "summary": "Restore persistiert vor dem descriptor-gebundenen Rename keinen Operation-Intent. Ein Prozessabbruch nach erfolgreichem Rename, aber vor restored=true im Manifest lässt die Quelle fehlen und das Ziel vorhanden; der nächste Versuch kann den exakten Abschluss weder idempotent erkennen noch sicher fortsetzen.",
+      "evidence": [
+        "core/src/quarantine.rs",
+        "core/src/local_fs.rs"
+      ],
+      "priority": 1,
+      "state": "completed",
+      "noted_at": "2026-08-25T20:43:09+02:00",
+      "campaign_id": "20260825T162859427161+0200",
+      "started_at": "2026-08-25T20:56:50+02:00",
+      "completed": {
+        "campaign_id": "20260825T162859427161+0200",
+        "completed_at": "2026-08-25T21:54:16+02:00",
+        "observed_head": "33dd9813cd4022c0493b6b5844df075822ecad09",
+        "summary": "Restore persistiert Ziel und stabile Quellidentität vor dem Rename, bindet Manifest, Zielroot und Zieleintrag bis zur Wirkung und reconciliert einen unterbrochenen Abschluss ohne zweiten Rename; Purge, Remote-CAS, UI, CLI und Missing-Run-Recovery bleiben fail-closed und typisiert.",
+        "tests": [
+          "python3 tools/check-gates.py --json: 9/9 grün"
+        ]
+      }
+    },
+    {
+      "id": "product-opportunity-map",
+      "summary": "Die Kampagne hat konkrete Funktions- und Performance-Chancen über Core, Tauri und Frontend belegt; eine dauerhaft verlinkte, messbare Chancenübersicht soll Nutzen, vorhandenen Anknüpfungspunkt, Sicherheitsgrenze und Nachweisplan trennen.",
+      "evidence": [
+        "core/src/sync.rs",
+        "core/src/queue.rs",
+        "core/src/remote_snapshot.rs",
+        "frontend/pane-controller.js",
+        "docs/INDEX.md"
+      ],
+      "priority": 3,
+      "state": "completed",
+      "noted_at": "2026-08-25T22:06:41+02:00",
+      "campaign_id": "20260825T162859427161+0200",
+      "started_at": "2026-08-25T22:06:42+02:00",
+      "completed": {
+        "campaign_id": "20260825T162859427161+0200",
+        "completed_at": "2026-08-25T22:30:49+02:00",
+        "observed_head": "8d722404ff29870ee05b4e2c78dfbd34b44c4b67",
+        "summary": "Dauerhaft verlinkte Chancenübersicht ergänzt: fünf nahe Funktionen, vier größere Erweiterungen und sieben messbare Performanceansätze sind jeweils an vorhandenen Code, Sicherheitsgrenzen und Nachweispläne gebunden. Der notwendige Linux-Gegenlauf fand zusätzlich eine plattformspezifische Clippy-Abweichung in der Quarantänebeleg-ID; 94cc802 behebt sie, und README, Roadmap sowie Backlog unterscheiden nun die bestandene historische Abnahme vom noch offenen Releasekandidaten-Gegenlauf.",
+        "tests": [
+          "python3 tools/check-gates.py --json: 9/9 passed on macOS",
+          "Linux rust:1.96 at 94cc802: core 731 passed/4 ignored, CLI 56 passed, core clippy -D warnings passed"
+        ]
+      }
+    },
+    {
+      "id": "window-scoped-events",
+      "summary": "Tauri v2 macht aus window.emit einen Rundruf: Menuebefehle, Fortschritt, Abschluss und Fehler direkter Laeufe erreichen jedes Fenster. Nur queue_runtime.rs benutzt emit_to (15 Stellen), die uebrigen 71 .emit-Aufrufe der App-Schicht nicht. Verletzt die verbindliche Mehrfenster-Anforderung; die Kommentare an main.rs:207 und queue_runtime.rs:141 beschreiben bereits die richtige Absicht.",
+      "evidence": [
+        "src-tauri/src/main.rs",
+        "src-tauri/src/queue_runtime.rs",
+        "src-tauri/src/local_sync_commands.rs",
+        "src-tauri/src/bidirectional_commands.rs",
+        "src-tauri/src/provider_sync_commands.rs",
+        "src-tauri/src/directory_size_commands.rs",
+        "frontend/event-controller.js"
+      ],
+      "priority": 1,
+      "state": "completed",
+      "noted_at": "2026-09-03T10:46:03+02:00",
+      "campaign_id": "20260903T104519936010+0200",
+      "started_at": "2026-09-03T11:13:40+02:00",
+      "completed": {
+        "campaign_id": "20260903T104519936010+0200",
+        "completed_at": "2026-09-03T11:34:40+02:00",
+        "observed_head": "98b1550976824b8ea5c171c4961821b476262aa2",
+        "summary": "Alle 73 fensterbezogenen Sendungen der App-Schicht laufen jetzt ueber emit_to_window bzw. emit_to_window_label statt ueber Emitter::emit, das in Tauri v2 auch auf einem Fenster jeden Webview erreicht. Einziger bewusster Rundruf bleibt emit_connection_update, weil Profile und Verbindungen prozessweit sichtbar sind; die Begruendung steht an der Funktion. QueueTerminalEvent::emit heisst jetzt emit_to_window, damit der Name die vorhandene Fensterbindung ausspricht. Der neue Quelltext-Guard fensterereignisse_gehen_nie_als_rundruf_hinaus scannt alle Dateien unter src-tauri/src.",
+        "tests": [
+          "tools/check-gates.py --json: 9/9 pass",
+          "cargo test -p doppeldecker: 133 passed; Guard schlaegt mit eingefuegter Probe nachweislich fehl"
+        ]
+      }
+    },
+    {
+      "id": "listing-generation-binding",
+      "summary": "SMB, FTPS und WebDAV lesen Listing und Sitzungsgeneration aus zwei getrennten State-Snapshots: connection.list() gibt die Sperre frei, danach holt der Command connection.session_generation() erneut. Ein Reconnect aus einem anderen Fenster etikettiert Eintraege der alten Sitzung mit der neuen Generation, an der die Driftbindung haengt. Fuer SFTP ist das bereits ueber SftpInteractiveDirectoryListing geloest und mit einem Quelltext-Guard festgenagelt (sftp_commands.rs:1619).",
+      "evidence": [
+        "core/src/smb.rs",
+        "core/src/ftps.rs",
+        "core/src/webdav.rs",
+        "src-tauri/src/smb_commands.rs",
+        "src-tauri/src/ftps_commands.rs",
+        "src-tauri/src/webdav_commands.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-09-03T10:46:11+02:00",
+      "campaign_id": "20260903T104519936010+0200",
+      "started_at": "2026-09-03T12:36:12+02:00",
+      "completed": {
+        "campaign_id": "20260903T104519936010+0200",
+        "completed_at": "2026-09-03T12:55:42+02:00",
+        "observed_head": "9441e3918c84b8a6cb39dda170cd4a6c329f6bfa",
+        "summary": "SMB, FTPS und WebDAV liefern Listing und Sitzungsgeneration jetzt aus demselben gehaltenen Zustand (list_interactive, analog zu SftpInteractiveDirectoryListing). Nebenbei entfallen zwei weitere Doppelzugriffe: SMB und FTPS bauten ihren Listing-Token ebenfalls aus einer zweiten Sperruebernahme. Der Guard scan_commands_binden_listing_und_generation_atomar prueft jetzt alle vier Scan-Commands statt nur SFTP.",
+        "tests": [
+          "tools/check-gates.py --json: 9/9 pass",
+          "Negativprobe: mit zurueckgedrehtem SMB-Command schlaegt der Guard nachweislich fehl"
+        ]
+      }
+    },
+    {
+      "id": "provider-probe-cleanup-balance",
+      "summary": "FTPS (alle vier Proben) und SMB (zwei von vier) verwerfen auf dem Fehlerpfad das Ergebnis ihres Cleanups: let cleanup = ...; result?; cleanup?; erreicht cleanup nie, wenn result ein Err ist. Zurueckgebliebene Probenordner unter dem gewaehlten Pane-Root bleiben unerwaehnt. WebDAV hat dafuer bereits finish_probe mit combine_probe_result und verify_probe_absence.",
+      "evidence": [
+        "core/src/ftps.rs",
+        "core/src/smb.rs",
+        "core/src/webdav.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-09-03T10:46:11+02:00",
+      "campaign_id": "20260903T104519936010+0200",
+      "started_at": "2026-09-03T12:55:53+02:00",
+      "completed": {
+        "campaign_id": "20260903T104519936010+0200",
+        "completed_at": "2026-09-03T13:13:21+02:00",
+        "observed_head": "0f715df48eabdacad561926e7290f01659177d41",
+        "summary": "Alle sechs unsymmetrischen Probenabschluesse in FTPS und SMB laufen jetzt ueber den gemeinsamen Helfer remote::combine_probe_outcome: Beide Fehler bleiben sichtbar, der Recoverypfad steht im Text, und ein unklarer Ausgang hat Vorrang. WebDAV hatte diese Form ueber combine_probe_result bereits. Ein Quelltext-Guard verbietet das Muster 'result?; cleanup?;' in allen drei Providerdateien.",
+        "tests": [
+          "cargo test -p doppeldecker-core --lib remote::tests: 13 passed (drei neu)",
+          "tools/check-gates.py --json: 9/9 pass"
+        ]
+      }
+    },
+    {
+      "id": "blocking-ui-thread-commands",
+      "summary": "Mehrere synchrone Tauri-Commands erledigen lange blockierende Arbeit auf dem UI-Thread: eject_system_mount (zweimal load_mounts mit je 1s diskutil pro Volume, dann diskutil unmount ganz ohne Frist), die drei SFTP-Commands discover_sftp_host_key/connect_sftp_profile/scan_sftp_dir (SFTP ist das einzige Protokoll ohne CONNECT_TIMEOUT; FTPS, WebDAV und SMB haben je 15s) und open_remote_snapshot (laedt die vollstaendige Remote-Datei, ohne Abbruchweg). Das richtige Muster steht im selben Modul: list_system_mounts wurde genau deshalb auf async fn plus spawn_blocking umgestellt.",
+      "evidence": [
+        "src-tauri/src/system_mount_commands.rs",
+        "src-tauri/src/sftp_commands.rs",
+        "src-tauri/src/browser_commands.rs",
+        "core/src/sftp.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-09-03T11:35:09+02:00",
+      "campaign_id": "20260903T104519936010+0200",
+      "started_at": "2026-09-03T17:09:08+02:00",
+      "completed": {
+        "campaign_id": "20260903T104519936010+0200",
+        "completed_at": "2026-09-03T17:31:08+02:00",
+        "observed_head": "2ae0b68b06a0fb638c21212c45e272f6286d5e58",
+        "summary": "eject_system_mount laeuft jetzt wie list_system_mounts ueber spawn_blocking, und der externe Aushaengebefehl bekommt 20 Sekunden Frist statt keiner. Der SFTP-Verbindungsaufbau hat dieselbe harte Frist von 15 Sekunden wie FTPS, WebDAV und SMB und umfasst TCP, Schluesseltausch, Anmeldung und SFTP-Init; discover_sftp_host_key laeuft zusaetzlich ausserhalb des Fenster-Threads. Offen bleiben connect_sftp_profile, scan_sftp_dir und open_remote_snapshot: Sie halten ein State<AppState> und brauchen eine gemeinsame Umstellung auf das AppHandle-Muster; als eigener Querschnitts-Fund state-holding-commands-off-ui-thread festgehalten.",
+        "tests": [
+          "tools/check-gates.py --json: 9/9 pass",
+          "Quelltext-Guard jeder_verbindungsaufbau_traegt_die_frist haelt die 15 Sekunden und den einzigen gebundenen Aufruf fest"
+        ]
+      }
+    },
+    {
+      "id": "sftp-signal-test-timing",
+      "summary": "tools/tests/test_run_sftp_e2e.py SftpE2eSignalTests laeuft mit einer harten Frist von 8 Sekunden je Signalfall. Unter Last (voller Gate-Lauf parallel zu anderer Arbeit) ist der Fall phase=cargo-listing, signal=SIGINT einmal in eine TimeoutExpired gelaufen; drei gezielte Wiederholungen der Klasse waren danach gruen (je 25 Tests). Vorbestehend, nicht durch die Kampagne verursacht. Zu klaeren ist, ob die Frist steigt oder der Fall auf ein Bereitschaftssignal statt einer Zeitspanne wartet.",
+      "evidence": [
+        "tools/tests/test_run_sftp_e2e.py"
+      ],
+      "priority": 3,
+      "state": "completed",
+      "noted_at": "2026-09-03T12:36:05+02:00",
+      "campaign_id": "20260903T104519936010+0200",
+      "investigation_note": "2026-10-06, freigegebener Folgeauftrag AP-012: zehn vollständige Klassenläufe, fünf ohne und fünf mit vier CPU-Lastprozessen, 250 Tests bestanden. Acht-Sekunden-Frist unverändert; seltene Ursache nicht reproduziert. Weitere Untersuchung erst bei neuem konkreten Befund; docs/test-stability-2026-10-06.md. Keine nachträgliche Kampagnenfreigabe behauptet. 2026-10-19: neuer konkreter Auslöser im vollständigen Mac-Werkzeuglauf(146Tests,170.511s): cargo-ready-before-ack/SIGHUP erreicht15sBereitschaftsmarkernicht. Test/Launcherbytegleichzu e85c4b5. LogimHarnessbeleggesichert; Ursacheungeklärt. Nächstesbegründetes8hPaketpriorisiertdiesenFall. 2026-10-19: Thema mit270d7a1 abgeschlossen. NeueGegenfälleundGrenzeimBericht docs/code-review-2026-10-19-sftp-signale.md. Mac146/146undLinux26/26grün;KeineFristvergrößerungderSignalfälle.",
+      "started_at": "2026-10-19T12:53:14+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T13:09:10+02:00",
+        "observed_head": "270d7a16e4d08b7f505ef3891b38d7d77fff2cab",
+        "summary": "Der neue rote Gatefall wurde bis vor den geplanten Signalversand eingegrenzt. Zwei instrumentierte Gegenfälle verfehlen15sReady; erster Python-Code erst18,8/19,5s, Sample _dyld_start und exakt zugehöriger XProtect-Abschluss. Unveränderliche Attrappen jetzt einmal je Klasse mit begrenztem Setup vorbereiten; pro Fall eigene Symlinks/Zustände/Ports/Roots. Ready15s und Cleanup8s, Signalphasen und Besitz-/Fremdprozessschutz unverändert. 270d7a1; docs/code-review-2026-10-19-sftp-signale.md. Der ursprüngliche unsampelte Gate-PID wird nicht nachträglich als XProtect-Beweis ausgegeben.",
+        "tests": [
+          "Zwei natürliche rote instrumentierte Gegenfälle vor Korrektur; danach gleicher Fall grün, Marker0,6s, zusätzlich zwei gleichzeitige Fälle0,88/0,92s grün bei geteilten Programmen und getrenntem Zustand. Vollständiger Mac-Werkzeuglauf146/146 grün, darin26Signaltests; Linux26/26 ohneSkips grün.385Quellhashes währendbeiderLäufeunverändert; nurTestquelldateigeändert. Produktionslauncher/Core/CLI/App/Frontend/Locksbytegleich; deren frühereGateswerdenwiederverwendet. Diff-/Syntaxprüfunggrün. KeineTokenmessungvorhanden,keineSchätzunggebucht."
+        ]
+      }
+    },
+    {
+      "id": "provider-probe-root-readback",
+      "summary": "WebDAV liest nach Erfolgs- UND Fehlerpfad beide Wurzeln zurueck (verify_probe_absence: gewaehlter Root und Profilroot, vollstaendiges Listing, erwarteter Bestand). FTPS und SMB pruefen heute nur den Probenpfad selbst beziehungsweise den gewaehlten Root; das Profilroot bleibt ungeprueft. Die CLAUDE.md verlangt ausdruecklich beide Wurzeln, und genau dort lief 2026-07-28 eine Probe am falschen Root. Der Port braucht einen echten FTPS-/Samba-Server als Netz und ist deshalb eine eigene Arbeitseinheit.",
+      "evidence": [
+        "core/src/ftps.rs",
+        "core/src/smb.rs",
+        "core/src/webdav.rs"
+      ],
+      "priority": 2,
+      "state": "dismissed",
+      "noted_at": "2026-09-03T13:13:22+02:00",
+      "campaign_id": "20260903T104519936010+0200",
+      "dismissal_reason": "Im freigegebenen Folgeauftrag AP-006/AP-007 am 2026-10-06 umgesetzt und extern verifiziert; keine nachträgliche Kampagnenprüfung behauptet. FTPS macOS/Linux: je 19 Schutztests und 5 Netzfälle; SMB je 10 Schutztests und verschlüsselter Samba-E2E mit Profilroot-/Create-Fehlern. Vertrag docs/remote-providers-design.md."
+    },
+    {
+      "id": "local-parked-backup-outcome",
+      "summary": "Ein lokales Overwrite mit Typkonflikt (Ordner ueber Datei oder umgekehrt) endet IMMER mit outcome_unclear, obwohl der Zielbaum vollstaendig und zurueckgelesen geschrieben ist: remove_bound_backup verlangt einen beim Parken atomar gebundenen Entfernungsbeleg, und LocalVfs bietet weder rename_noreplace_with_removal_proof noch remove_if_matches an. Der Pfad der geparkten Sicherung erscheint zudem nur im deutschen Fehlertext, nicht in FileOperationActuals::temp_recovery_paths und damit nicht im Audit. Die saubere Loesung haengt an derselben offenen Entscheidung wie backlog.md Punkt 2: entweder eine lokale deskriptorgebundene Entfernung mit Inode-Vergleich (beruehrt die Capability-Flagge und andere Loeschpfade) oder die bewusste Entscheidung fuer stehenbleibende Reste samt Recovery-Anzeige. Kein Beifang fuer eine Bereichsrunde.",
+      "evidence": [
+        "core/src/fileops.rs",
+        "core/src/vfs.rs",
+        "backlog.md"
+      ],
+      "priority": 1,
+      "state": "dismissed",
+      "noted_at": "2026-09-03T14:21:14+02:00",
+      "campaign_id": "20260903T104519936010+0200",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-16T02:21:46+02:00",
+        "reason": "Als offener Kandidat überholt: privater C2-Kontext bilanziert bestätigte Kopie und erhaltene Sicherung korrekt. docs/decision-lokale-restbereinigung.md und backlog.md dokumentieren den bestehenden Fix; aktuelle Recoverytests/Deltas vollständig gelesen."
+      }
+    },
+    {
+      "id": "local-metadata-capabilities-probe",
+      "summary": "MetadataCapabilities::local() meldet owner, special_mode_bits, sparse_extents und hardlinks unbesehen als Exact und behauptet ein ACL-Modell allein aus cfg!(target_os) — ohne den konkreten Ziel-Mount zu pruefen. require_complete_native_capabilities lehnt nur Unknown ab, und local() liefert nie Unknown: Ein NativeStrict-Sync auf einen exFAT-Stick geht deshalb durch das Gate, die Vorschau sagt Owner-, ACL- und Sonderbituebertragung zu, build_metadata_report zaehlt jede Klasse als transferred und setzt strict_verified. Die Ausfuehrung faellt danach fail-closed, es entsteht also kein stiller Datenverlust — falsch sind Vorschau, Klassenbilanz und das Strict-Versprechen. Der Fix braucht eine echte Faehigkeitsprobe am gewaehlten Root und einen Testbed mit exFAT/msdos; er ist ohne den nicht belegbar.",
+      "evidence": [
+        "core/src/metadata.rs",
+        "core/src/vfs.rs",
+        "core/src/acl.rs"
+      ],
+      "priority": 2,
+      "state": "dismissed",
+      "noted_at": "2026-09-03T14:44:29+02:00",
+      "campaign_id": "20260903T104519936010+0200",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-06T19:03:12+02:00",
+        "reason": "Im freigegebenen Folgeauftrag AP-008 am 2026-10-06 umgesetzt und extern verifiziert; keine nachträgliche Kampagnenprüfung behauptet. Rootgebundene, rein lesende Mountabfrage ersetzt die plattformweite Zusage. Eigene APFS-/ext4-/exFAT-Images belegen Inhalt, Owner/Rechte/Sonderbits, ACL, Sparse und Hardlinks sowie Fork bzw. xattrs; nur lesbare Mounts erhalten ReadOnly. Unbekannte Treiber bleiben Unknown. Vertrag und Grenzen: docs/local-metadata-mounts.md."
+      }
+    },
+    {
+      "id": "linux-mount-listing-deadline",
+      "summary": "Der Linux-Zweig von system_mounts ruft fuer jeden sichtbaren Mount ein blockierendes statvfs() ohne Frist. Ein hart gemounteter NFS-/CIFS-Share, dessen Server nicht antwortet, kommt durch alle Filter und blockiert dort unbegrenzt im D-State: list_system_mounts kehrt nie zurueck, auch nicht fuer die bis zu vier Bestaetigungsdurchlaeufe von eject_system_mount. Zweiter Punkt: Err(_) => continue laesst einen Mount bei ESTALE oder EACCES spurlos aus der Liste verschwinden, ohne dass irgendwo 'ausgelassen' bilanziert wird. Der macOS-Zweig holt seine Zahlen mit getfsstat(MNT_NOWAIT) und hat fuer die teure diskutil-Anreicherung eine harte Sekundenfrist. Der Fix ist Linux-Code und braucht den Linux-Testhost.",
+      "evidence": [
+        "core/src/system_mounts.rs"
+      ],
+      "priority": 2,
+      "state": "dismissed",
+      "noted_at": "2026-09-03T14:44:29+02:00",
+      "campaign_id": "20260903T104519936010+0200",
+      "dismissed": {
+        "dismissed_at": "2026-10-06T17:35:25+02:00",
+        "reason": "Als offener Umsetzungsauftrag überholt: Linux-Speicherabfrage über begrenzte GNU-stat-Prozesse, gemeinsame Frist, maximal vier offene Kinder und kein blockierendes Wait nach Abbruch umgesetzt. Mountfehler bleiben mit space_error sichtbar; unabhängige Volumes bleiben erhalten. 17 Linux-/8 macOS-Mounttests, Core-Clippy auf beiden Plattformen, 164 macOS-Tauri-Tests und 222 Browserfälle bestanden. Kurze Fehlerzeile visuell geprüft; keine echten hängenden Netz-Mounts erzeugt."
+      }
+    },
+    {
+      "id": "state-holding-commands-off-ui-thread",
+      "summary": "connect_sftp_profile, scan_sftp_dir und open_remote_snapshot laufen weiterhin synchron auf dem UI-Thread. Anders als list_system_mounts und eject_system_mount halten sie ein State<AppState>, das sich nicht in eine spawn_blocking-Closure verschieben laesst; der Umbau braucht das Muster 'AppHandle mitnehmen und app.state::<AppState>() erst in der Closure holen' und damit eine gleichmaessige Umstellung aller drei Commands samt ihrer Hilfsfunktionen. Die SFTP-Frist von 15 Sekunden begrenzt den Schaden jetzt (vorher TCP-Default, auf macOS rund 75 Sekunden), open_remote_snapshot bleibt aber an die Dateigroesse gebunden und hat weiterhin keinen Abbruchweg.",
+      "evidence": [
+        "src-tauri/src/sftp_commands.rs",
+        "src-tauri/src/browser_commands.rs"
+      ],
+      "priority": 2,
+      "state": "dismissed",
+      "noted_at": "2026-09-03T17:30:31+02:00",
+      "campaign_id": "20260903T104519936010+0200",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-06T23:40:58+02:00",
+        "reason": "Durch beauftragten Produktfix erledigt: drei Commands mit AppHandle/State im Blocking-Worker; fenstereigener Cancel und Terminalevent vor Queuefortsetzung. App macOS172/Linux170, Clippy beide Plattformen und 225 Browserfälle grün. Native macOS-Tauri-IPC am 2026-10-06 mit künstlicher SSH-Wartezeit: 122/120/119 Frames, größte Lücken28/18/50ms, echter Abbruchknopf/interrupted und UI-Freigabe grün; Fenster visuell geprüft. Vertrag docs/gui-background-commands.md. Keine vollständige Bereichsreview-Abdeckung behauptet."
+      }
+    },
+    {
+      "id": "sftp-mkdir-machinery-is-test-only",
+      "summary": "Rund 800 Zeilen SFTP-mkdir-Proben- und create_dir_all-Maschinerie mit etwa zwanzig Tests stehen unter #[cfg(test)] und werden nicht ausgeliefert: MkdirProbeBackend, cleanup_mkdir_probe, unowned_mkdir_probe_error, run_mkdir_probe, CreateDirAllBackend, create_dir_all_bound, map_virtual_path und unclear_sftp_mkdir. Produktiv sind alle SFTP-Mutationen gesperrt (create_dir liefert unsupported_sftp_directory_create), und die vier probe_*_at-Methoden rufen nur passive_capabilities_at. Wer Tests wie mkdir_cleanup_prueft_beide_roots_nach_jedem_restfehler als Beleg fuer die Profilroot-Restpruefung liest, irrt: im gebauten Binary existiert sie nicht. Zu entscheiden ist, ob die Maschinerie scharf geschaltet oder entfernt wird — beides ist ein Auftrag, keine Bereichskorrektur.",
+      "evidence": [
+        "core/src/sftp.rs"
+      ],
+      "priority": 3,
+      "state": "dismissed",
+      "noted_at": "2026-09-03T17:39:05+02:00",
+      "campaign_id": "20260903T104519936010+0200",
+      "dismissed": {
+        "dismissed_at": "2026-10-06T17:04:34+02:00",
+        "reason": "Als offener Entscheidungs-/Umsetzungspunkt überholt: bestätigter Auftrag zur Entfernung umgesetzt. 1.441 Zeilen und 18 ausschließlich abhängige Mocktests entfernt; produktive VFS-Implementierung und 26 freie Funktionen bytegleich. Verbliebene 16 SFTP-Tests auf macOS und Linux bestanden; fmt und Core-Clippy mit allen Targets und Warnungen als Fehler bestanden. Keine produktive Aktivierung von Mutationen."
+      }
+    },
+    {
+      "id": "quarantine-park-parent-case-binding",
+      "summary": "ensure_bound_park_parent bildet den Quarantaene-Unterordner ueber listed_bound_directory, dessen Suche Gross-/Kleinschreibung zusammenfasst. Auf einem case-sensitiven Ziel (lokal ext4, SFTP, SMB) meldet die Suche nach run/Docs den vorhandenen run/docs als Treffer, legt run/Docs also nicht an; der Aufrufer arbeitet danach mit run/Docs weiter, root_identity scheitert mit NotFound und der Lauf endet als OutcomeUnclear, nachdem die erste Datei bereits geparkt ist. Der naheliegende Fix ueber Vfs::has_exact_names ist nachweislich falsch: Auf einem case-insensitiven APFS-Mount (hier geprueft, mkdir Docs neben docs liefert EEXIST) scheitert dann das folgende create_dir. Korrekt waere die Anlage selbst als Probe: exakten Treffer binden, sonst anlegen, und erst ein AlreadyExists als Beleg fuer die zusammenfassende Schreibweise werten und dann case-insensitiv binden. Der Parkpfad und das Manifest verwenden weiterhin den relativen Originalpfad, ein abweichender Ordnername ist also keine Loesung. Braucht den Linux-Testhost fuer den case-sensitiven Gegenbeweis.",
+      "evidence": [
+        "core/src/queue.rs",
+        "core/src/vfs.rs"
+      ],
+      "priority": 2,
+      "state": "dismissed",
+      "noted_at": "2026-09-10T11:32:35+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-07T05:37:55+02:00",
+        "reason": "Durch den vollständigen Bereichsreview in bb60668 korrigiert, bevor eine getrennte Themenarbeit begonnen wurde. Tatsächliche Anlageprobe statt has_exact_names; Regression vorher auf Linux rot, danach beidseitig grün. Core vollständig macOS873/Linux892, Clippy grün. Kein nachträglich vorgetäuschter Themencommit."
+      }
+    },
+    {
+      "id": "trash-journal-drifted-abschluss",
+      "summary": "Ein Papierkorb-Journal mit mindestens einem Drifted-Eintrag wird nie entfernt und hat keinen Abschlussweg: recover_journal setzt preserve_terminal_journal, die Loeschbedingung greift damit nie, und jeder spaetere trash_paths-Lauf liest dasselbe Journal erneut und haengt dieselbe Warnung an. RecoveryStats::is_clean prueft nur recovery_paths und errors, es blockiert also nichts, aber die Dateien unter <config>/trash-journals wachsen unbegrenzt. Zu entscheiden ist, ob ein Drifted-Eintrag quittierbar wird (Nutzeraktion) oder nach bestaetigter Anzeige automatisch verfaellt; beides ist eine Produktentscheidung, keine Bereichskorrektur.",
+      "evidence": [
+        "core/src/trash.rs"
+      ],
+      "priority": 3,
+      "state": "dismissed",
+      "noted_at": "2026-09-10T11:36:22+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-19T16:40:39+02:00",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-19T16:49:09+02:00",
+        "reason": "Wachstumskandidat überholt: v1Erzeuger ausschließlich cfg(test),produktive macOS/LinuxWege ausschließlich privater v2ClaimRun. Neue echte Dateifälle fehlender/ersetzter Quelle belegen einmaligen UntouchedAbschluss,erhalten Original undfremdeInode,entfernen eigenesJournal/Bereich undmelden im zweitenRecovery nichts. Vorhandene v1Driftbelege absichtlich weiter erhalten undgemeldet;keine Autoalterslöschung,Nutzerquittierung oder neueLöschautorität aus is_clean. Quelle d1067c004a33ed5c8004ecfa8debc9a3c2d1c84d;docs/code-review-2026-10-19-papierkorb-drift.md. VierexaktemacOSFällegrün;vollständigeCoreSuiteMac1143/Linux1165,je22umgebungsgebundeneignoriert;WorkspaceClippyalltargetsDwarningsundFmtbeidseitiggrün;385Dateienstabil. Nur cfg(test)Regressionsdatei ergänzt,Produktcodebytegleich;frühereCLI/App/Fuzz/Browserbelegeexplizitreferenziert,kein neuer nativerLaufbeansprucht."
+      }
+    },
+    {
+      "id": "queue-executor-scaffolding-duplication",
+      "summary": "Teilweise im vollständigen Queue-Review bb60668 konsolidiert: vier protokollspezifische Vorbereitungen teilen connect/Attention/Planvergleich/Bestätigung; Regression unterscheidet Credential- von Namespacefehlern. Noch offen: sechsfache Fortschrittsrahmen sowie zweimaliger terminaler PendingFileCompletion-/Auditrahmen. Diese Restkonsolidierung bleibt eine eigene Arbeitseinheit mit vollständiger Queue-Suite und Linux-Gegenlauf.",
+      "evidence": [
+        "core/src/queue.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-09-10T11:36:22+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-19T15:26:59+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T15:40:07+02:00",
+        "observed_head": "ee8aea0d52c91a2feb5416b92e1d2e7fa25fb2d5",
+        "summary": "Sieben Executorrahmen teilen privaten QueueProgress für Momentaufnahme,250msThrottle,ersten Journalfehler,Cancel und Callback. Zwei Dateiabschlüsse teilen private Funktion mit Pendingbeleg vor terminalem Commit,Clear vor Audit und unverändertem reinen Abschlussretry. Protokollspezifische Flush-/Intent-/Recoverylogik bleibt am Aufrufer; keine neue Fensterkopplung oder öffentliche API/Schemaänderung. Quelle ee8aea0d52c91a2feb5416b92e1d2e7fa25fb2d5;docs/code-review-2026-10-19-queue-rahmen.md.",
+        "tests": [
+          "146 operative Queue-Tests grün; sieben aktuelle Fortschrittsaufrufer und zwei terminale Dateiabschlüsse geprüft. Vier Sicherheitshelfer bytegleich. Abschließend Mac Core1142/CLI76/App219, Linux1164/77/209;Coreje22 ignoriert,CLIje1,App2/4. Je sechs Rustgates inklusive Clippy,Fuzz locked,fmt grün;385Quellenstabil. Browser408inklCSP+6PaneTabs vom unmittelbar vorherigen bytegleichen Anzeigestand übernommen;kein neuer nativer GUI-Lauf. Frühe zwei Socket-Bind-EPERM-Fixtures separat,kein Produktgegenbeleg."
+        ]
+      }
+    },
+    {
+      "id": "replace-readback-name-exactness",
+      "summary": "Vor- und Nachpruefung des Ersetzens behandeln Namensexaktheit unterschiedlich: unique_named_proof gibt dem byte-exakten Treffer bedingungslos Vorrang, readback_target nur bei Vfs::has_exact_names. Auf jedem Remote-Provider (has_exact_names ist dort hart false) meldet deshalb ein korrekt vollzogenes Best-Effort-Ersetzen outcome_unclear, sobald im Zielordner ein Name mit anderer Schreibweise oder Unicode-Normalform liegt: Die Vorpruefung bindet Bericht.txt exakt, der Readback findet ueber names_may_collide zusaetzlich bericht.txt und meldet nicht eindeutig. Fail-closed, aber der Nutzer muss grundlos manuell nachsehen. Dieselbe Asymmetrie in classify_replace_readback: die Tempdatei wird byte-exakt gesucht, das Ziel ueber die Aequivalenz, sodass eine noch vorhandene Tempdatei auf einem normalisierenden Server als verschwunden zaehlt (heute nur vom Hash aufgefangen). Zwei Loesungswege: has_exact_names als echte Providerprobe statt harter Voreinstellung, oder im Readback unterscheiden, ob der zweite Aequivalenztreffer schon im Vorlisting stand. Beides braucht einen echten WebDAV-/FTPS-Testbed.",
+      "evidence": [
+        "core/src/fileops.rs",
+        "core/src/vfs.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-09-10T13:14:25+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-19T14:16:21+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T15:08:48+02:00",
+        "observed_head": "fcbd6d42847a4dc069fb72d44278f992445e0d47",
+        "summary": "Wirkungsbezogene, abbrechbare Nachbarbelege erlauben den exakten Ersetzungsreadback bei unveränderten äquivalenten regulären Namen; globale Providerfähigkeit bleibt unverändert. Normalisierte mögliche Tempnamen bleiben unklar und erhalten strukturierte Prüfpfade ohne Cleanuprecht. Ungeklärte Providerintents und verlorene Antworten bleiben fail-closed. Quelle fcbd6d42847a4dc069fb72d44278f992445e0d47; docs/code-review-2026-10-19-namensbelege.md.",
+        "tests": [
+          "Zwei tatsächliche rote FTP-Protokollgegenläufe; fünf finale Protokolltests grün, einschließlich Abbruch, veränderter/neuer Nachbarn und verlorenem RNTO-ACK mit erhaltenem Intent. Mac Core1141/CLI76/App219 und Linux1160/76/209 bestanden; Core je22 ignoriert, CLI je1 Kind, App2/4. Je sechs Gates inklusive Clippy, Fuzz locked und fmt grün;385 Quellen unverändert. Kein neuer nativer GUI-/TLS-Namenslauf."
+        ]
+      }
+    },
+    {
+      "id": "incomplete-listing-blocks-whole-folder",
+      "summary": "require_complete_safe_listing sperrt die gesamte Ordner- oder Ersetzungsoperation, sobald ein einziger Nachbarname nicht sicher dekodierbar ist. Ein Quellordner mit 200 normalen Dateien und einer Latin-1-Datei laesst copy_tree abbrechen, bevor irgendetwas geschrieben ist; dasselbe blockiert jedes Ersetzen in diesem Ordner. OpStats hat keinen Zaehler fuer ausgelassene undekodierbare Namen, es gibt also auch keine Bilanz. Der CLAUDE.md-Vertrag verlangt dagegen, nur die konkret davon abhaengige Wirkung zu sperren und den Rest sichtbar zu bilanzieren. Ein Test haelt das heutige Verhalten ausdruecklich fest, es ist also eine Produktentscheidung: entweder der Vertrag wird hier praezisiert oder die Operation laeuft mit Skip-Bilanz weiter. Beruehrt copy_tree, collect_conflicts, best_effort_replace und OpStats.",
+      "evidence": [
+        "core/src/fileops.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-09-10T13:14:26+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-19T15:09:47+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T15:26:25+02:00",
+        "observed_head": "0a893b7f141672638cd3525d48a14886b13f2b8f",
+        "summary": "Normale additive Copy mit Skip bilanziert nicht dekodierbare rohe Quellnamen und überträgt unabhängige sichere Kinder. Vollständige Listings, eindeutige rohe Komponenten und sichere genutzte Pfade bleiben Pflicht. Quellversion bindet ausgelassenen Rohbestand ohne Öffnen; alte vollständige Hashformate erhalten. Queue ergänzt statt überschreibt Quellhinweise; CLI-Text zeigt konkrete Namen wie JSON. Move, Ersetzen, Konfliktkopie, Zielbelege und Planner bleiben strikt. Quelle 0a893b7f141672638cd3525d48a14886b13f2b8f; docs/code-review-2026-10-19-quellnamen.md.",
+        "tests": [
+          "Vier rote Caller-Gegenläufe: Providerbaum auf macOS, echte additive Linux-Dateikopie und Quellversionsbindung, zusätzlicher CLI-Textfehler nach erfolgreicher Kopie. Vier Linux-Teilläufe grün; abschließend Mac Core1142/CLI76/App219, Linux1164/77/209. Core je22 ignoriert, CLI je1, App2/4. Beide sechs Rustgates inklusive Clippy, Fuzz locked, fmt grün;385Quellen unverändert. Vollständige Browser-Suite mit CSP/Pane-Tabs/Quellbilanz grün. APFS-EILSEQ separat;kein neuer nativer Linux-GUI-Lauf."
+        ]
+      }
+    },
+    {
+      "id": "settings-load-error-overwrites-legacy",
+      "summary": "Bei beschaedigter oder unlesbarer desktop-settings.json setzt initialize load_error, und snapshot liefert daneben die Standardwerte im selben Feld wie echte gelesene Werte. settings-ui.js ueberspringt zwar die Migration, ruft danach aber accept auf den Defaults auf und persistiert sie ueber applyTheme, applyByteUnits, applyLocalFolderSizes und applyNetworkDiscovery in den localStorage-Altbestand. Damit ist die letzte noch vorhandene Kopie der Nutzerwahl weg: Wird die Datei spaeter repariert oder geloescht, findet die Migration nur noch die eben ueberschriebenen Vorgaben. Der Snapshot traegt load_error bereits, das Frontend muesste daraus nur den Schluss ziehen, nichts anzuwenden und nichts zu schreiben. Gehoert zum Bereich frontend-layout-platform.",
+      "evidence": [
+        "frontend/settings-ui.js",
+        "src-tauri/src/desktop_settings.rs"
+      ],
+      "priority": 2,
+      "state": "dismissed",
+      "noted_at": "2026-09-10T14:50:32+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-16T02:21:25+02:00",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-16T02:21:46+02:00",
+        "reason": "Als offener Kandidat überholt: accept() wendet bei loadError bereits keine Defaults an. Vollständiger Frontendreview und aktuelle Browser-Suite bestätigen den vorhandenen Schutz; neuer Migrationsretryfix separat in fb14df1."
+      }
+    },
+    {
+      "id": "settings-write-on-ui-thread",
+      "summary": "Der Einstellungs-Mutex wird ueber den vollstaendigen Schreibvorgang gehalten (Temp anlegen, sync_all, Rename, Verzeichnis-sync_all — zwei fsyncs), und mehrere Einstiege liegen auf dem Fenster-Thread: update_desktop_preferences ist ein synchroner tauri::command ohne async, forget_closed_window laeuft aus dem CloseRequested-Handler. Umgekehrt haelt remember denselben Mutex ueber seinen Hintergrundschreibvorgang, sodass ein gleichzeitiges desktop_preferences aus einem anderen Fenster auf dem UI-Thread wartet. Auf einem traegen oder eingehaengten Home-Verzeichnis ist das ein sichtbarer Haenger beim Fensterschliessen. Das Muster steht im selben Modul: list_system_mounts wurde genau deshalb auf async fn plus spawn_blocking umgestellt. Dazu gehoert der zweite Punkt: Zwei gleichzeitige remember_window-Aufrufe desselben Fensters haben keine Reihenfolgegarantie, weil die Geometrie auf der Runtime gelesen und erst im spawn_blocking-Task geschrieben wird — ein Zeitstempel oder Sequenzzaehler fehlt. Verwandt mit state-holding-commands-off-ui-thread.",
+      "evidence": [
+        "src-tauri/src/desktop_settings.rs",
+        "src-tauri/src/main.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-09-10T14:50:32+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "partial_resolution_2026_10_16": {
+        "commits": [
+          "fb14df1",
+          "c84a7bb"
+        ],
+        "resolved": "update_desktop_preferences, remember-Sequenz, Closewrite und drei lesende Commands laufen im Hintergrund; Close/Exit warten geordnet.",
+        "remaining": "Interne synchrone DesktopStore-Zugriffe außerhalb dieser Commands im vollständigen Tauri-Fensterreview prüfen; der Ganzbereich bleibt offen. Keine erneute Dock-Cache-Untersuchung.",
+        "evidence": "docs/code-review-2026-10-16.md; App179/175, Clippy beidseitig; native Close/Exit/Restart."
+      },
+      "started_at": "2026-10-19T16:01:14+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T16:27:41+02:00",
+        "observed_head": "bd12ea3c70a59ed0ce0c1632b1401558aefab8d5",
+        "summary": "Historische Settingscommands/Closewrites/Remember-Sequenz bereits korrigiert. Aktueller nativer Geometrierest gelöst: vor Fensterbau validierte Startgeometrien separat im RAM binden und einmalig entnehmen,ohne schreibenden Store-Mutex. Live-/Dateistand,Monitor-/Formatprüfung,Schreibserialisierung,Sequenz undExitbarriere erhalten;kein neues Dateiformat. Quelle bd12ea3c70a59ed0ce0c1632b1401558aefab8d5;docs/code-review-2026-10-19-startgeometrie.md.",
+        "tests": [
+          "Tatsächlicher nativer Restfehler: Mainthread in restored_window/apply_restored_geometry wartet hinter gehaltenem künstlichem Settings-Rename; native Abfrage ohne Fenster und Resizeexit3. Nachher beide Fenster während Halt erreichbar,Resize15ms und1160x820; tatsächlicher Appneustart stellt beide Größen1160x820/1180x850 undTheme wieder her. Vorher/R2FIFO+Cleanup0,Screensgesehen.17SettingsfälleinklDatei+gehaltenemStore grün; finale MacApp220+2ignoriert/Linux210+4,Clippy/Fmtbeidseitiggrün,385Quellenstabil. CoreCLI/Fuzz/Browser bytegleich belegtreferenziert. R1-Livenesspositiv,zusätzliche synthetische Shortcutannahme getrennt korrigiert;C-fsync-Ausschluss kein Produktgegenlauf."
+        ]
+      }
+    },
+    {
+      "id": "config-dir-leftovers",
+      "summary": "Zwei Dateiarten sammeln sich im Konfigurationsordner an, ohne dass etwas sie aufraeumt. Erstens: promote_session_main gibt einem gespeicherten Nebenfenster das Label main; sein bisheriges operations-queue-window-<alt>.json bleibt liegen, und next_window_label meidet das Label danach dauerhaft — jeder Start mit Befoerderung legt ein weiteres Journal ab. Zweitens: Stirbt der Prozess zwischen create_new und rename, bleibt .desktop-settings-<32 hex>.tmp stehen; ein repoweiter Grep findet ausser Schreiben und Lesen keinen Aufraeumer. Eine einmalige Bereinigung waere hier vertragskonform, weil der prozessweite Queue-Lock zu diesem Zeitpunkt schon gehalten wird — der CLAUDE.md-Vertrag verbietet nur die Bereinigung je Fensterqueue.",
+      "evidence": [
+        "src-tauri/src/window_commands.rs",
+        "src-tauri/src/desktop_settings.rs"
+      ],
+      "priority": 3,
+      "state": "dismissed",
+      "noted_at": "2026-09-10T14:50:32+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-19T16:28:44+02:00",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-19T16:39:47+02:00",
+        "reason": "Die angenommene Bereinigungserlaubnis durch einmaligen Prozesslock ist durch den aktuellen Besitzvertrag widerlegt: Core hält alte unbelegte Temps ausdrücklich unverändert; terminale Queueeinträge tragen weiterhin Recovery- und Sicherungspfade. Beförderung verändert nur die Sitzung und erhält Historie unter dem alten Label. Vier vorhandene exakte Regressionstests grün,385 ausführbare Quellen unverändert;keine neue Produktlogik. Aufbewahrung einschließlich fehlender Altersgrenze explizit dokumentiert in docs/code-review-2026-10-19-konfigurationsreste.md,gesichert als6177952. Keine Lösch- oder Archivierungsautorität aus Präfix/Alter/Status abgeleitet."
+      }
+    },
+    {
+      "id": "probe-cleanup-helper-duplicate",
+      "summary": "combine_probe_and_cleanup in remote_real_mode.rs ist ein zweiter Abdruck von combine_probe_outcome aus remote.rs. Er erzwingt im Doppelfehlerfall korrekt OutcomeUnclear — dieser Code wird danach aber von allen vier Providerzweigen in probe_delete_capabilities in einen Text-blocker umgewandelt und an der Tauri-/Queue-Grenze zu unsupported. Wirkung: Scheitern Quarantaeneprobe und Cleanup gemeinsam, kann unter dem gewaehlten Root ein .doppeldecker-quarantine-Rest mit ungeklaertem Zustand liegen, waehrend prepare_provider_delete_request dem Nutzer unsupported meldet — also dauerhaft nicht moeglich, es ist nichts passiert. Derselbe Verlust noch einmal im Queue-Worker. Zwei Schritte: den Helfer durch combine_probe_outcome ersetzen (beruehrt core-real-mode) und die Providerzweige den Code weiterreichen lassen, statt ihn zu Blockertext zu machen.",
+      "evidence": [
+        "core/src/remote_real_mode.rs",
+        "src-tauri/src/file_commands.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-09-10T15:00:59+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-19T13:30:41+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T13:42:55+02:00",
+        "observed_head": "d67621ad712bffa18cd39e22eff5131f470656fd",
+        "summary": "Doppelten combine_probe_and_cleanup entfernt, sechs Aufrufe nutzen vorhandenen combine_probe_outcome. Tatsächlicher VFS-Austausch und Anlage-Syncfehler plus Cleanup rot→grün für strukturierte Prüfpfade; fremder und eigener Bestand erhalten. Delete-/Ersetzungs-Capabilityzweige reichen kritische Fehler über vorhandenen Helfer weiter. Heutige Provider lehnen starke Restoreprobe bereits vorher passiv ab; kein tatsächlicher heutiger Remote-Rest behauptet. App-Payloadfelder bleiben gesondertes io-context-Thema. d67621a; docs/code-review-2026-10-19-probe-cleanup.md.",
+        "tests": [
+          "Zwei tatsächliche VFS-Dateigegenläufe rot→grün; finale vollständige Gates auf Mac und Linux: Core1134/1153 (je22 ignoriert), CLI76/76 (je1 Kind ignoriert), App218/208 (2/4 ignoriert); Workspace-Clippy, Fuzz locked und fmt beidseitig grün;385 unveränderte Hashes. Capabilityweitergabe zusätzlich statisch geprüft, heutige passive Gates unverändert."
+        ]
+      }
+    },
+    {
+      "id": "webdav-depth0-propfind-duplicate",
+      "summary": "probe_resource_absent und resource_present bauen denselben Depth-0-PROPFIND mit identischem Body und derselben Statusauswertung; sie unterscheiden sich nur in der Polaritaet des Rueckgabewerts und im Fehlertext. Die Statusliste steht damit doppelt: Wird kuenftig ein weiterer Status als nicht vorhanden zugelassen (etwa 410 Gone), erfasst eine Korrektur an einer Stelle die andere nicht, und die Absenzpruefung der Proben weicht von der 412-Klaerung in move_noreplace ab. Zusammenfuehrbar ueber einen label-Parameter fuer den Fehlertext plus eine Negation am einzigen Aufrufer.",
+      "evidence": [
+        "core/src/webdav.rs"
+      ],
+      "priority": 3,
+      "state": "dismissed",
+      "noted_at": "2026-09-10T15:11:07+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-19T08:11:22+02:00",
+        "reason": "Überholt: Beide beschriebenen Helfer probe_resource_absent und resource_present wurden im bereits vorliegenden WebDAV-Delta mit den allgemeinen Mutationspfaden entfernt. Repo-Suche in core/src und core/tests liefert keinen Treffer. Heutige passive Absage und spezialisierte HTTPS-Gegenläufe vollständig nachgeprüft; keine neue künstliche Mutation zum Konsolidieren eingeführt. docs/code-review-2026-10-19-webdav.md."
+      }
+    },
+    {
+      "id": "modal-shell-class-leak",
+      "summary": "resetModalShell in modal.js nimmt nur quarantine-modal und real-mode-modal zurueck. settings-modal und file-information-modal bleiben nach dem Schliessen am Rahmen haengen, und capturePresentation friert sie ein: Ein danach geoeffneter Konfliktdialog erscheint mit 760 statt 420 Pixel Breite und mit scrollendem Body. Dieselbe Luecke betrifft den in renderBody gesetzten body.onchange — restorePresentation sichert nur body.onclick, sodass der Handler am gemeinsamen Body haengenbleibt; heute folgenlos, weil kein anderer Dialog data-setting, name=icon oder name=diff-tool verwendet. Der richtige Eingriff ist ein Zuruecksetzen auf className=modal statt einer wachsenden Ausnahmeliste, plus das Aufraeumen von onchange. Beruehrt modal.js und alle Dialogrenderer.",
+      "evidence": [
+        "frontend/modal.js",
+        "frontend/settings-ui.js"
+      ],
+      "priority": 3,
+      "state": "dismissed",
+      "noted_at": "2026-09-10T15:30:02+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-02T16:04:51+02:00",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-02T16:06:27+02:00",
+        "reason": "Als offener Punkt überholt: bereits in 89c9114 korrigiert und vor der nachträglichen Themenbuchung verifiziert. Neutrale Modalhülle und onchange-Capture/Restore; zwei neue Browserregressionen rot/grün, vollständige Browser-Suite grün. begin-theme wurde erst nach dem Fixcommit gebucht, deshalb kein nachträglich vorgetäuschter Konsolidierungscommit."
+      }
+    },
+    {
+      "id": "settings-migration-runs-per-window",
+      "summary": "Die einmalige Migration des localStorage-Altbestands laeuft nicht genau einmal, sondern einmal je Fenster, das desktop_preferences liest, bevor irgendein Fenster initialized=true geschrieben hat. Mit eingeschalteter Sitzungswiederherstellung baut prepare_session_windows mehrere Fenster gleichzeitig; alle sehen needsMigration=true und schreiben denselben Inhalt. Kein Wertverlust, weil sich alle Fenster denselben localStorage teilen, aber je Fenster eine zusaetzliche Schreibrunde, eine Revision und ein Rundruf beim Start. Ein Wertverlust entstuende nur, wenn zwischen zwei Migrationen eine Nutzeraenderung laege — ein Zeitfenster zwischen zwei unmittelbar aufeinanderfolgenden Awaits. Die Loesung gehoert ins Backend: Die Migration einmal prozessweit unter der bestehenden Mutex entscheiden, statt sie jedem Fenster zu ueberlassen.",
+      "evidence": [
+        "frontend/settings-ui.js",
+        "src-tauri/src/desktop_settings.rs"
+      ],
+      "priority": 3,
+      "state": "dismissed",
+      "noted_at": "2026-09-10T15:30:02+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-02T16:06:27+02:00",
+        "reason": "Als offener Punkt überholt: bereits in 89c9114 unter gemeinsamem Backend-Mutex korrigiert. Zwei Leserthreads, verspäteter Migrationsworker, neue Nutzerwahl und Persistenzreadback grün; Original ohne Guard rot; vollständige Tauri-Suite macOS164/Linux162 und Browser-Suite grün. Fix entstand im separaten Zweistundenreview vor der Themenbuchung."
+      }
+    },
+    {
+      "id": "trash-private-claim-namespace",
+      "summary": "Der Claim im beschreibbaren Quell-Elternordner kann nach erster Identitätsprüfung vor dem finalen Rename ausgetauscht werden. Finaler Readback und persistierter Transferhinweis erkennen und blockieren Recovery, verhindern die fremde Verschiebung selbst aber nicht. Privaten Claim-Namensraum mit macOS-/XDG-Lifecycle festlegen; Details im Review 2026-10-02.",
+      "evidence": [
+        "core/src/trash.rs",
+        "docs/trash-toctou-design.md"
+      ],
+      "priority": 1,
+      "state": "dismissed",
+      "noted_at": "2026-10-02T15:11:51+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-16T02:21:46+02:00",
+        "reason": "Als offener Kandidat überholt: privater Claim-Kern/Plattformadapter implementiert und mit vorhandener Ganzbereichs-, Mount- und nativer GUI-Abnahme abgeschlossen. Belege: docs/trash-private-claim.md, docs/code-review-2026-10-07.md; aktuelle Core-Suiten grün."
+      }
+    },
+    {
+      "id": "batch-recovery-path-propagation",
+      "summary": "Spätere Sync-/Bidi-Fehler können bereits gesammelte Recoverypfade früher erfolgreicher Teilaktionen verlieren; erfolgreicher SFTP-Queueabschluss übernimmt sie nicht vollständig ins Queuejournal. Daten und Journale bleiben erhalten. Gesamtlauf-Fault-Reproduktion und ein gemeinsamer Abschlussvertrag stehen aus.",
+      "evidence": [
+        "core/src/sync/execute.rs",
+        "core/src/bidirectional.rs",
+        "core/src/queue.rs",
+        "docs/code-review-2026-10-02.md"
+      ],
+      "priority": 2,
+      "state": "dismissed",
+      "noted_at": "2026-10-02T15:55:45+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-16T02:21:46+02:00",
+        "reason": "Als offener Kandidat überholt: Originalbefund bereits in vorhandenen Folgefixes abgeschlossen. docs/recovery-aggregation.md und backlog.md halten macOS-/Linux-Mehraktionen, Queueabschluss und Journal-Reopen fest; unveränderte aktuelle Vollbereiche/Suiten abgeglichen."
+      }
+    },
+    {
+      "id": "bidirectional-journal-reconcile-durability",
+      "summary": "update_run_journal_using akzeptiert nach Schreibfehler allein den sichtbaren next-Readback als Commit. Wie beim korrigierten Queue-Writer fehlt die nachgeholte Datei-/Parent-Durability. Im bidirektionalen Teil mit persistiertem Zwischenstand und verweigertem Sync reproduzieren und korrigieren; derzeit kein Abschlussbeleg.",
+      "evidence": [
+        "core/src/bidirectional.rs"
+      ],
+      "priority": 1,
+      "state": "completed",
+      "noted_at": "2026-10-07T05:33:23+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-07T05:38:35+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-07T05:46:03+02:00",
+        "observed_head": "a06337dc6122317f3708b2e08283a5cb9f93d1dd",
+        "summary": "a06337d ersetzt sichtbaren Readback durch nachgeholten gebundenen Datei-/Parent-fsync und frischen Standvergleich. Fehlende Durability liefert OutcomeUnclear und stoppt vor der Folgeprojektion; bestehende positive Abschluss-Recovery bleibt grün.",
+        "tests": [
+          "Reales Journal-Rename ohne Sync plus verweigerter Retry: vorher falsches Ok, nachher OutcomeUnclear, unverändertes Ziel/Baseline, Normalplansperre/Reopen. Core macOS874/Linux893 je zehn ignoriert; CLI je63, Tauri172, Clippy beidseitig/Fuzz locked/fmt/Diff/SHA grün. Initialer Linux-Queue-Lockfehler separat AP042."
+        ]
+      }
+    },
+    {
+      "id": "queue-process-lock-inherited-fd",
+      "summary": "OperationQueueProcessLock besitzt im Gegensatz zum korrigierten BaselineStore keinen expliziten ownergebundenen Unlock. Ein beim Drop noch geerbter Fork-FD kann den beendeten Queuebesitz verlängern. Linux-Vollsuite AP041 scheiterte in alle_sync_queueklassen_validieren_optionen_vor_persistenz_und_verbindung an WouldBlock beim nächsten eigenen Open; exakter Einzelgegenlauf grün. Deterministischen Fork-Gegenbeleg erstellen und passenden Unlock korrigieren, ohne Lock-Retry oder Testfristen auszuweiten.",
+      "evidence": [
+        "core/src/queue.rs",
+        "core/src/bidirectional.rs"
+      ],
+      "priority": 1,
+      "state": "completed",
+      "noted_at": "2026-10-07T05:43:13+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-07T05:46:04+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-07T05:51:38+02:00",
+        "observed_head": "3af7529db0770a2118734f8a9b65d523530a339b",
+        "summary": "3af7529 gibt flock beim Ende des letzten Arc-Fensterbesitzers ausdrücklich frei; erworbene PID verhindert Unlock durch ein geerbtes Kindobjekt. Weitergehaltener FD verlängert beendeten Besitz nicht. Kein Lock-Retry/Fristausweitung.",
+        "tests": [
+          "Deterministisch gleicher offener Dateideskriptor vor Fix rot/nachher grün; zwei Fenster und fremde Besitzer-PID geschützt. Queue132/macOS, vollständiger Core876/895 je zehn ignoriert, CLI je63, Tauri172, Clippy/fmt/Diff/Quellhash beidseitig grün."
+        ]
+      }
+    },
+    {
+      "id": "hardlink-source-discovery-target-gate",
+      "summary": "MetadataPlanPolicy.hardlinks verbindet Quellbeobachtung und Zieltransfer. diff_dir ruft group_for nur bei transferfähigem Ziel auf; bei bekanntem Unsupported-Ziel fehlen Hardlinkgruppen im Quellmanifest und damit in der Auslassungsbilanz. NativeStrict kann diese Beziehung verlieren, ohne sie abzulehnen. Direkter Metadaten-Review korrigiert Planner-/Verifygrenze mit rotem Gegenbeleg; vollständiger Einweg-Sync bleibt separat pending.",
+      "evidence": [
+        "core/src/sync/plan.rs",
+        "core/src/sync/metadata.rs"
+      ],
+      "priority": 1,
+      "state": "dismissed",
+      "noted_at": "2026-10-07T05:57:38+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-07T06:10:58+02:00",
+        "reason": "Im aktiven vollständigen Metadatenbereich AP043 an dessen direkter Sync-Grenze behoben und beidseitig geprüft, Commit5fdf7a9; keine separate Themenarbeit benötigt. Verlustbilanz und Strict-Gate sowie externe/ausgeschlossene Partner rot→grün belegt."
+      }
+    },
+    {
+      "id": "native-best-effort-no-writable-class",
+      "summary": "for_roots lehnt NativeBestEffort pauschal ab, sobald kein natives Merkmal exakt am Ziel schreibbar ist; damit wird selbst reiner Contenttransfer blockiert. Ein einfaches Entfernen des Gates reicht nicht: plan_metadata_transfer/Readback benötigen bilanzierte Manifeste auch bei null aktivierten Klassen, und lokale Unsupported-ACL/xattr/Sparse-Leser dürfen nicht als Abwesenheit erfunden werden. Gegenbeleg und wirkungsspezifischer Fix im Einweg-Sync; derzeit statischer Befund ohne Abschlussbeleg.",
+      "evidence": [
+        "core/src/sync/plan.rs",
+        "core/src/local_fs.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-10-07T05:57:38+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-07T06:11:35+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-07T06:26:20+02:00",
+        "observed_head": "66e7ec18911217ab13c190076c46664642b4cc95",
+        "summary": "Pauschales Nullklassen-Gate rot reproduziert und behoben; Manifest und Verlustbilanz bleiben gebunden, portable Rechtefallbacks respektieren native Auslassungen. Lokale Manifeste beachten ausdrücklich unsupported Klassen am gehaltenen Mount. Unabhängige macOS-exFAT-Rename-Lücke separat pending.",
+        "tests": [
+          "Core879/898 je zehn ignoriert, CLI63/Tauri172, Clippy beidseitig/Fuzz --locked/fmt/Diff/SHA grün. Echte APFS/ext4-Übertragung und beide Read-only-Mounts bestanden; Linux-exFAT Copy/Update bestanden, macOS-exFAT Manifest/Vorschau bestanden, Inhaltslauf explizit offen wegen ENOTSUP."
+        ]
+      }
+    },
+    {
+      "id": "local-exfat-exclusive-rename-unsupported",
+      "summary": "Echter macOS-exFAT-Lauf: rename_noreplace liefert ENOTSUP, LocalVfs meldet trotzdem Assured. Inhaltscommit und private Tempbereinigung scheitern; Linux-exFAT exklusiver Rename und Inhaltstransfer funktionieren. Zielbezogene Ausführungsklasse/Best-Effort-Vertrag nötig.",
+      "evidence": [
+        "core/src/vfs.rs",
+        "core/src/local_fs.rs",
+        "core/src/sync/atomic.rs"
+      ],
+      "priority": 1,
+      "state": "dismissed",
+      "noted_at": "2026-10-07T06:20:10+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "dismissed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "dismissed_at": "2026-10-16T02:21:46+02:00",
+        "reason": "Als offener Kandidat überholt: AP-050 bietet volumenbezogenen, rootgebundenen Best Effort. Vorhandene echte Mount-/GUI-Belege: docs/local-metadata-mounts.md. Aktuelle komplette Dateioperations-Deltas und Core-Suiten geprüft; kein neuer exFAT-Mountlauf behauptet."
+      }
+    },
+    {
+      "id": "mixed-trash-terminal-source-rebind",
+      "summary": "Gemischte private Claim-Recovery bindet Quell-Eltern terminaler Einträge und blockiert dadurch unabhängige offene Claims; bestätigte Nacht-Triage, AP-051.",
+      "evidence": [
+        "core/src/trash/journal_v2/claim/recovery.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-10-07T07:18:15+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-07T07:18:15+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-07T07:26:17+02:00",
+        "observed_head": "6ffccfe56dc0a48b48a17175e98b6388523020be",
+        "summary": "Phasengenau optionale Quellhandles erhalten Journalindizes; verschwundene terminale Quellen blockieren keine unabhängigen offenen Claims. Fehlende benötigte Handles bleiben fail-closed.",
+        "tests": [
+          "Zwölf gemischte echte Journale, sechs Fehlerfälle beidseitig rot→grün; drei offene Eltern-Driftfälle unverändert. Trash84/86, Core885/904, CLI63/Tauri172, Clippy/Fuzz/fmt/Diff/SHA4 grün."
+        ]
+      }
+    },
+    {
+      "id": "pane-tab-state-retention",
+      "summary": "Tabgebundene Darstellungsoptionen bei Refresh und letzter bewiesener Navigationsstand nach Listingfehler erhalten.",
+      "evidence": [
+        "frontend/pane-controller.js"
+      ],
+      "priority": 1,
+      "state": "completed",
+      "noted_at": "2026-10-07T07:32:17+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-07T07:32:17+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-07T07:37:54+02:00",
+        "observed_head": "caf777f85320716a6a1595c32b55485311e636a8",
+        "summary": "Zwei rote Browsergegenbelege korrigiert; tabgebundener Refresh und letzter bewiesener Auswahl/Cursor/Anker/Scrollstand über echten Listingfehler samt direktem Retry erhalten.",
+        "tests": [
+          "pnpm test:ui: 6 Modelltests, 236 Browserfälle und CSP grün; echtes macOS-Testbundle mit 1200px Scrollzustand und tatsächlichem Sitzungsstore, visuell geprüft; normaler Debug-Build wiederhergestellt."
+        ]
+      }
+    },
+    {
+      "id": "bidirectional-preparation-ui-thread",
+      "summary": "prepare_bidirectional_sync/resume/rollback sind synchrone Tauri-Commands ohne async-Dispatch; sie halten den Fensterthread während vollständiger Baum-/Inhaltsscans und Projektionsvorbereitung. Die neue Konfliktanzeige verstärkt denselben langen Aufruf. Im Tauri-Bereich mit gehaltenem Scan und weiterlaufenden Fensterframes reproduzieren; fenstereigene Reservierung, Cancel, Profilbindung und Recovery erhalten.",
+      "evidence": [
+        "src-tauri/src/bidirectional_commands.rs",
+        "core/src/bidirectional.rs"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-10-19T00:01:10+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-19T15:40:35+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T16:00:01+02:00",
+        "observed_head": "4df183b1799d614f7d900ae5e10caf9baa5d0d59",
+        "summary": "Drei Bidi-Vorbereitungscommands async+spawn_blocking; State erst im Worker. Bestehende fenstereigene cancellable/panicsichere Reservierung vor Vorbereitung,Profil-/Paar-/Root-/Pending-/Permitbindung erhalten. Cancel an Grenzen geprüft; frische Vorbereitung verwirft nur eigenes mutationsloses Journal,Resume/Rollback behalten Recovery. Vier vorhandene Quellguardmarker an tatsächliche asyncSignaturen angepasst;Reservierung vor Wirkung bleibt geprüft. Quelle 4df183b1799d614f7d900ae5e10caf9baa5d0d59;docs/code-review-2026-10-19-bidi-hintergrund.md.",
+        "tests": [
+          "Tatsächlicher nativer Vorher-/Nachherlauf mit gehaltenem künstlichem Source-Read: vorher Mainthread in prepare+Read, Resizeexit3 und1180x850 unverändert; danach Worker im Read, Mainthread frei, Resizeexit0 in22ms und1160x820 noch während Halt. Quelleunverändert/Zielabsent, beide FIFOjobs/Cleanup0, Screens angesehen. Finale MacApp219+2ignoriert/Linux209+4,Clippyalltargets-Dwarnings undfmtbeidseitiggrün,385Quellenstabil. Core/CLI/Fuzz/Browser bytegleich vom vollständigen Vorpaketübernommen;kein neuer nativer Resume-/Rollbacklauf behauptet."
+        ]
+      }
+    },
+    {
+      "id": "io-context-error-metadata",
+      "summary": "Weitere manuelle Kontextfehler können ErrorCodes und Recoverypfade verlieren. Core-Kandidaten remote_delete/real_mode/remote_snapshot zuerst mit echtem Caller-Fault reproduzieren. CLI-JSONL-Anteil am2026-10-19 nach zwei roten Payload-Gegenproben korrigiert (f279685; docs/code-review-2026-10-19-cli.md), einschließlich getrennter Ausführungs-/Journalpfade. AppError::from(io::Error) besitzt weiterhin kein Feld für strukturierte Recoverypfade; tatsächlichen Corefehler bis GUI/JSON-Payload nachweisen. Querschnitt bleibt offen. Probe-/Cleanup-Konsolidierung mit strukturierten Core-Prüfpfaden inzwischen abgeschlossen (d67621a; docs/code-review-2026-10-19-probe-cleanup.md). Aktuelle Quellprüfung: snapshot_context und Realmodus-Auditabschluss erhalten Metadaten bereits; Remote-Löschplan-Kontexte und AppError-Payload bleiben konkret zu prüfen.",
+      "evidence": [
+        "core/src/remote_delete.rs",
+        "core/src/real_mode.rs",
+        "core/src/remote_snapshot.rs",
+        "src-tauri/src/app_support.rs",
+        "cli/src/main.rs",
+        "docs/code-review-2026-10-19-cli.md",
+        "docs/code-review-2026-10-19-probe-cleanup.md"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-10-19T07:34:08+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-19T13:43:31+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T14:15:37+02:00",
+        "observed_head": "03ce910d9aa3d2ad181c22300f1d7de1cf624b88",
+        "summary": "Kontext erhält Fehlerart, Code und alle Prüfpfade. Core-Helper gemeinsam für Remote-Löschplan, Snapshot und Restore-Cleanup; gezielte Claimklassifizierung erhält Transport statt falscher Drift. Quarantäne-/DELETE-Readbacks führen Ursachen-/Laufpfade weiter. AppError und echtes Tauri InvokeError übertragen optionale recovery_paths; Textfehler bleiben kompatibel. Queue-Reset erhält beide Pfadmengen und führendes OutcomeUnclear. Quellen6205671 und 03ce910d9aa3d2ad181c22300f1d7de1cf624b88; docs/code-review-2026-10-19-fehlerkontext.md.",
+        "tests": [
+          "Neun tatsächliche rote/grüne Caller-/Tauri-Gegenläufe in zwei belegten Stufen. Abschließend Mac Core1136/CLI76/App219 und Linux1155/76/209 bestanden; Core je22 ignoriert, CLI je1 Kind, App2/4; beide Workspace-Clippy, Fuzz locked und fmt grün.385 Hashes in finaler Runde unverändert, inklusive zuvor präzisierter Kommentare. Keine neuen Frontend-/nativen GUI-Läufe."
+        ]
+      }
+    },
+    {
+      "id": "regular-file-open-fifo",
+      "summary": "Regulärdatei-Leser können vor der Handle-Typprüfung an FIFOs blockieren. Core-Favoritenleser und Finder-Import inzwischen mit echten eigenen FIFO-Kindgegenläufen korrigiert; CLI-Entscheidungsleser ebenfalls tatsächliche I/O-Grenze rot→grün, NOFOLLOW/NONBLOCK+Handleprüfung+16MiB-Leselimit (f279685; docs/code-review-2026-10-19-cli.md). Die bidirektionale Paarregistry liest weiterhin per std::fs::read ohne Typ-/Größengrenze; vor Korrektur isoliert reproduzieren und andere relevante Leser gezielt abgleichen. Querschnitt bleibt offen.",
+      "evidence": [
+        "core/src/favorites.rs",
+        "src-tauri/src/favorites_commands.rs",
+        "src-tauri/src/bidirectional_commands.rs",
+        "cli/src/main.rs",
+        "docs/code-review-2026-10-19-cli.md"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-10-19T08:50:28+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-19T13:16:15+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T13:30:03+02:00",
+        "observed_head": "26e98eb9764057ac981ac7e2c278fdb0f68315fb",
+        "summary": "Paarregistry mit tatsächlichem FIFO-/Symlink-/Größen-/Schreibgegenlauf rot→grün korrigiert: NOFOLLOW/NONBLOCK, Handletyp, 16 MiB und nachträgliche Lesebegrenzung; Writer begrenzt vor Tempöffnung und erhält alten Bestand. Gemeinsamer Core-Öffner und relevante benachbarte Leser gezielt abgeglichen; frühere Favoriten-/Finder-/CLI-Korrekturen bleiben belegt. 26e98eb; docs/code-review-2026-10-19-paarregistry.md.",
+        "tests": [
+          "Vier tatsächliche rote/grüne Gegenläufe; Mac App 218+2 Kindtests ignoriert, Linux App 208+4 (2 Kinder und 2 GTK) ignoriert; beide Workspace-Clippy und fmt grün; 385 unveränderte Quellhashes. Keine neuen Core-/CLI-/Frontend-/GUI-Läufe behauptet."
+        ]
+      }
+    },
+    {
+      "id": "diff-interactive-read-contract",
+      "summary": "P2: Dateivergleich bietet reguläre SFTP-Dateien an, nutzt aber die gesperrte strikte Lesesicht. Providerauflösung vor Reservierung, eigener Cancel und sichtbare Best-Effort-Bilanz gemeinsam an der Vergleichsgrenze prüfen; tatsächlicher SFTP-App-Gegenlauf steht aus.",
+      "evidence": [
+        "src-tauri/src/browser_commands.rs",
+        "frontend/main.js",
+        "core/src/remote_real_mode.rs",
+        "docs/settings-session-diff.md"
+      ],
+      "priority": 2,
+      "state": "completed",
+      "noted_at": "2026-10-19T09:43:53+02:00",
+      "campaign_id": "20260910T111321948617+0200",
+      "started_at": "2026-10-19T09:45:03+02:00",
+      "completed": {
+        "campaign_id": "20260910T111321948617+0200",
+        "completed_at": "2026-10-19T10:10:02+02:00",
+        "observed_head": "90e8339b014d1da1f3b6f637c7acaa1239462c9a",
+        "summary": "Tatsächliche native SFTP-Vorherabsage unsupported vor jedem Inhaltsread korrigiert. Vergleich verwendet vorhandene interaktive Snapshotklasse und beide Profilvalidierungen vor Providerkontakt; Verbindung/Downloads sind fenstereigen abbrechbar. Sichtbare Best-Effort-Bilanz und eigene nicht rücknehmbare Werkzeugübergabephase, strukturiertes Terminalevent vor nächstem Queueworker. Echter Fastra-Vergleich, identische Snapshotbytes/unveränderte Eingaben, Abbruch nach erstem Datenpaket ohne Zusatzfenster/Teilcache und nullRemote-Mutationen samt eigenem Cleanup0 belegt. docs/code-review-2026-10-19-dateivergleich.md.",
+        "tests": [
+          "MacApp214+1 isolierter FIFO-Kindtest; LinuxApp204+3 ignoriert (Kind+2GTK). App/Workspace-Clippy --all-targets -D warnings/Fmt beidseitig, Mac-Build und Browser387+6 grün. 383Hashes beidseitig unverändert. Echte native SFTP-Vorherabsage unsupported ohne Inhaltsread; Nachher schreibgeschützter Fastra-Vergleich mit identischen Snapshotbytes und unveränderten Eingaben, Abbruch nach erstem Datenpaket, kein Zusatzfenster, eigene Teilkopie entfernt, null Remote-Mutationen, eigener Fenster-/App-/Server-/Proxy-Cleanup0. Visuelle Prüfung beider Themes760x480 und tatsächlicher Diffansicht. Core/CLI/Fuzz bytegleich; vorherige Vollgates wiederverwendet, nicht erneut ausgeführt."
+        ]
+      }
+    }
+  ],
+  "timeboxed_reviews": [
+    {
+      "date": "2026-10-02",
+      "time_limit_minutes": 120,
+      "completed_at": "2026-10-02T16:07:25+02:00",
+      "status": "completed",
+      "base_commit": "f84116f44c271362a987d5014461825bb6b1a9a8",
+      "code_commit": "89c9114eed0102b20b9faec767fd78964e2e7ba1",
+      "report": "docs/code-review-2026-10-02.md",
+      "review": "delta-plus-boundaries",
+      "reviewed_areas": [
+        "core-bidirectional",
+        "core-queue-recovery",
+        "core-one-way-sync",
+        "core-fileops-vfs",
+        "core-real-mode",
+        "tauri-window-queue",
+        "core-remote-common",
+        "core-webdav",
+        "core-ftps",
+        "core-smb",
+        "core-metadata-acl",
+        "tauri-provider-commands",
+        "tauri-local-commands",
+        "cli-headless",
+        "frontend-file-queue",
+        "frontend-pane-shell",
+        "frontend-connections-sidebar",
+        "frontend-layout-platform",
+        "release-pipeline",
+        "test-gate-harness",
+        "workspace-build-config"
+      ],
+      "unchanged_prior_area_count": 5,
+      "current_area_count": 26,
+      "unowned_file_count": 0,
+      "new_open_findings": [
+        "trash-private-claim-namespace",
+        "batch-recovery-path-propagation"
+      ],
+      "resolved_existing_findings": [
+        "modal-shell-class-leak",
+        "settings-migration-runs-per-window"
+      ],
+      "note": "Eigenständiger Zweistundenauftrag. Das historische Tokenbudget und seine Verbrauchsbuchung bleiben unverändert; dieser Lauf hatte kein Tokenbudget."
+    },
+    {
+      "date": "2026-10-16",
+      "started_at": "2026-10-15T22:36:47+00:00",
+      "completed_at": "2026-10-16T00:37:08+00:00",
+      "minimum_minutes": 120,
+      "maximum_minutes": 360,
+      "elapsed_minutes": 120.35,
+      "status": "completed",
+      "base_commit": "74d7c04",
+      "code_commits": [
+        "fb14df1",
+        "c84a7bb",
+        "fac7de8"
+      ],
+      "report": "docs/code-review-2026-10-16.md",
+      "review": "full-and-targeted-deltas",
+      "full_area_rounds": [
+        "core-remote-common",
+        "core-webdav",
+        "core-sftp",
+        "core-ftps",
+        "cli-headless",
+        "frontend-file-queue",
+        "frontend-sync",
+        "frontend-pane-shell",
+        "frontend-layout-platform",
+        "release-pipeline",
+        "workspace-build-config"
+      ],
+      "closed_previous_area": "core-one-way-sync",
+      "verified_delta_areas": [
+        "core-fileops-vfs",
+        "tauri-window-queue",
+        "tauri-provider-commands",
+        "tauri-local-commands"
+      ],
+      "current_area_count": 18,
+      "total_area_count": 26,
+      "remaining_full_area_count": 8,
+      "unowned_file_count": 0,
+      "note": "Zeitbudgetierter Auftrag erfüllt. Acht Ganzbereiche und Querschnitt bleiben dauerhafte Backlogarbeit. Kein Tokenverbrauch geschätzt oder zum historischen Budget gebucht."
+    },
+    {
+      "date": "2026-10-19",
+      "started_at": "2026-10-19T10:30:05.930970+00:00",
+      "completed_at": "2026-10-19T10:52:07.071700+00:00",
+      "maximum_minutes": 480,
+      "elapsed_minutes": 22.02,
+      "status": "completed-with-independent-test-failure",
+      "base_commit": "e85c4b5475eea5293a1206fbf48693fe6e2808b9",
+      "code_commits": [
+        "6e6c0a378ac755ab9238353c692a45f079bc2db0"
+      ],
+      "report": "docs/code-review-2026-10-19-test-harness.md",
+      "review": "full",
+      "full_area_rounds": [
+        "test-gate-harness"
+      ],
+      "remaining_full_area_count": 0,
+      "remaining_delta_area": "workspace-build-config",
+      "pending_theme_count": 11,
+      "note": "docs/code-review-2026-10-19-test-harness.md; Mac16Gate+4Browsercleanup grün; echterheadlessChromiumSIGTERM beendetServerundBrowser. FullBrowser408inklCSP+6Tabsgrün. FullMacTools145/146, unveränderterSFTPReadyTest cargo-ready-before-ack/SIGHUP erreicht15sMarkernicht: Laufrot, Timingthemeoffen. Linux19bestanden+8explizitSkips(4Darwin,4Nodefehlt);385Hashesunverändert. KeineNativeGUIoderInstallation. Tokenuntergrenze2050878unverändert; keineSchätzung."
+    },
+    {
+      "date": "2026-10-19",
+      "started_at": "2026-10-19T10:53:14.840257+00:00",
+      "completed_at": "2026-10-19T11:09:41.291333+00:00",
+      "maximum_minutes": 480,
+      "elapsed_minutes": 16.44,
+      "status": "completed",
+      "base_commit": "884829ae5ac9c48d3aae87cea2b502fb03b09240",
+      "code_commits": [
+        "270d7a16e4d08b7f505ef3891b38d7d77fff2cab"
+      ],
+      "report": "docs/code-review-2026-10-19-sftp-signale.md",
+      "review": "theme-and-area-delta",
+      "completed_themes": [
+        "sftp-signal-test-timing"
+      ],
+      "verified_delta_areas": [
+        "core-sftp"
+      ],
+      "remaining_delta_area": "workspace-build-config",
+      "pending_theme_count": 10,
+      "note": "Mac146/146Werkzeugtests grün, einschließlich26Signaltests; Linux26/26Signaltests ohneSkips. Instrumentierter Einzelgegenlauf nachher Marker0,6s, zwei paralleleFälle0,88/0,92sgrün;Setup1,53s.385Quellhashes unverändert; ausschließlich eineTestquelldatei geändert. Ursprünglicher unsampelter Gate-PID kein nachträglicherXProtectBeweis; langsameStartprüfung iminstrumentiertenNachlaufbelegt. docs/code-review-2026-10-19-sftp-signale.md GemeldeteTokenuntergrenze2050878unverändert; keineSchätzung."
+    },
+    {
+      "date": "2026-10-19",
+      "started_at": "2026-10-19T11:11:24.921810+00:00",
+      "completed_at": "2026-10-19T11:13:41.551220+00:00",
+      "maximum_minutes": 480,
+      "elapsed_minutes": 2.28,
+      "status": "completed-clean",
+      "base_commit": "7429812d4fc067de05039d873bb1d0cc00ff5aac",
+      "code_commits": [],
+      "report": "docs/code-review-2026-10-19-workspace.md",
+      "review": "delta-plus-boundaries",
+      "verified_delta_areas": [
+        "workspace-build-config"
+      ],
+      "remaining_delta_area": null,
+      "pending_theme_count": 10,
+      "note": "GelockteOfflineCargo-Metadatenprobegrün; tatsächlicheDependencyarten,Targets,FeaturemengenundgesperrteVersionengeprüft.385HasheszumzuletztgrünenQuellstandgleich. CLI/Core/Manifeste/Locks/Schutzcfgbytegleichzuf279685, App/Core/Manifeste/Locks/Schutzcfgbytegleichzu90e8339: vorangegangeneTests/Clippy/Buildswiederverwendet, keineerneutenLäufebehauptet. docs/code-review-2026-10-19-workspace.md GemeldeteTokenuntergrenze2050878unverändert; keineSchätzung."
+    }
+  ]
+}

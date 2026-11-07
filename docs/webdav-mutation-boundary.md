@@ -1,4 +1,36 @@
-# WebDAV-Mutationsbedingungen und strikte Grenze
+# WebDAV: gewöhnliche und strikte Mutationsklassen
+
+Stand: 2026-10-20. Gewöhnliche Uploads, bestätigte reguläre Ersetzungen, mkdir,
+Rename und ausdrücklich dauerhaftes Löschen besitzen private Best-Effort-Wege.
+Keine dieser Wirkungen verlangt künstliche Schreib- oder Quarantäneproben.
+Der öffentliche strikte VFS-/Syncvertrag bleibt davon getrennt.
+
+Mehrere getaggte WebDAV-If-Listen gelten alternativ. Additionen, mkdir, Rename und
+einzelne DELETEs verwenden deshalb höchstens eine unmittelbare Elternliste
+zusätzlich zur Requestbedingung. Reguläres Ersetzen verwendet stattdessen genau
+eine Altziel-Liste und `If-Match` für die Tempversion; sämtliche Eltern werden
+frisch vor und nach MOVE geprüft. Eine gemeinsame atomare Bindung aller Ressourcen
+wird ausdrücklich nicht versprochen. [Upload und Ersetzen](webdav-upload.md).
+
+Dauerhaftes Löschen plant zunächst den vollständigen Umfang. Der Executor entfernt
+nur die bestätigten Blattdateien und anschließend leer beobachtete Collections.
+Jede Wirkung verwendet frische ETags, eine vollständige Einzelprüfung und einen
+Abwesenheitsreadback. Standard-WebDAV löscht Collections rekursiv: Ein nach dem
+Leercheck neu entstandenes Kind kann deshalb von genau diesem DELETE mitbetroffen
+sein. Der Name-/Elternwettlauf und fehlende Wiederherstellung stehen in der
+Wirkungsanzeige. Quarantäne wird weder erzeugt noch behauptet.
+
+Abbruch erhält bereits abgeschlossene Wirkungen in der Teilbilanz. Nach verlorener
+Mutationsantwort gibt es keinen Blind-Retry. Die echte HTTPS-Suite
+`webdav_ordinary_actions` prüft Rekursion, Umfang, Sentinel, Drift, Abbruch,
+Antwortverlust und Ersetzungskollision. Die folgenden Abschnitte sind die
+historische Begründung des stärkeren Vertrags und seiner damaligen Absagen.
+
+## Historischer Stand bis 2026-10-18
+
+Die früheren pauschalen Absagen für gewöhnliches Ersetzen und Dauerlöschen gelten
+seit dem getrennten Best-Effort-Vertrag nicht mehr. Strikte Sync-, Restore- und
+Purgegrenzen bleiben eigenständige Verträge.
 
 Stand: 2026-10-18. AP13R korrigiert die übrigen Aufrufer des bisherigen getaggten
 `If`-Helfers. Gewöhnliche Additionen, mkdir und Rename bleiben ausdrücklich
@@ -76,9 +108,35 @@ Sentinels. Strikte Abfragen und direkte VFS-Wirkungen müssen ohne Providerreque
 enden. Recovery-, Crash-, Queue-, Inhalts- und Baumtests bleiben eigenständige
 Regressionen.
 
-Die strikte VFS-Schreibgrenze und der verbleibende Vorfahrenwettlauf gelten
-unabhängig von den übrigen freigegebenen Dateioperationen. Zusätzliche allgemeine
-Datei-/Löschklassen benötigen einen eigenen begrenzten Ausführungsvertrag.
+Der Implementierungsdelta ist kein vollständiger Provider- oder Gesamtcode-Review.
+Acht offene CodeQA-Ganzbereiche, der Querschnitt und die menschliche interaktive
+Linux-Kandidatenabnahme bleiben eigenständige Hürden. Neue schwächere allgemeine
+Datei-/Löschklassen oder zusätzliche Serververträge benötigen einen eigenen
+begründeten Schnitt; dieses Paket schafft dafür keine Schnittstelle.
+
+## Unabhängige Prüfbefunde
+
+Die erneute Gesamtprüfung zeigte zusätzlich instabile, hier nicht korrigierte
+Prüfwege außerhalb des WebDAV-Deltas:
+
+- `ftps_pin_mlsd_stream_und_reconnect_bleiben_gebunden` scheiterte unter Linux
+  zweimal beim Bestätigen der leeren bidirektionalen Erstbaseline mit einer
+  Vorschaudrift. Der isolierte exakte Lauf bestand; eine pauschal grüne vollständige
+  Linux-Suite wird daraus nicht abgeleitet.
+- Die Browserfälle „SFTP-Agentantwort darf ein inzwischen entferntes Profil nicht
+  neu anlegen“ und „Veraltetes SFTP-Listing startet keinen nachgelagerten Connect“
+  scheiterten im Gesamtlauf, bestanden jedoch jeweils isoliert.
+- Der macOS-Fastra-Exitcodetest lieferte einmal `app` statt `unavailable`.
+  Der exakte Gegenlauf und anschließend alle 203 App-Tests seriell bestanden.
+
+Diese Befunde bleiben eine eigene Prüfstabilitäts- und gegebenenfalls
+Produktkorrekturaufgabe. Sie werden weder übersprungen, ohne dies zu benennen,
+noch als durch AP13R behoben geführt. Die vollständige Release-Gateabnahme bleibt
+von ihren deterministischen Gegenbelegen abhängig. Der
+[AP14-Stabilitätsbericht](test-stability-2026-10-06.md#ap14-sftp-browser-ftps-erstbaseline-und-fastra)
+führt die späteren Gegenläufe getrennt: Browser-Zeitannahmen sind ersetzt,
+unnötige FTPS-Schreibproben für leere Pläne und reine Quellen sind korrigiert.
+Ein STOU-Probenrest und die historische Fastra-Ursache bleiben offen.
 
 ## Abnahme des AP13R-Deltas
 

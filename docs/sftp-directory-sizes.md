@@ -1,16 +1,17 @@
 # Beobachtete SFTP-Ordnergrößen
 
-Stand: 2026-10-18. Größenspalte und Informationsdialog verwenden für SFTP eine
+Stand: 2026-10-20. Größenspalte und Informationsdialog verwenden für SFTP eine
 eigene begrenzte Metadatenbeobachtung. Sie öffnen keine Dateiinhalte und geben
 weder ein vollständiges Sync-VFS noch Schreibfähigkeiten frei.
 
 ## Umfang und Ergebnis
 
-Pro Anfrage sind 1 bis 100 eindeutige direkte Ordner unter dem sichtbaren Pane-Root
-zulässig. Alle Pfade und Namen werden vor Providerzugriff geprüft. Je Ordner gelten
-1000 Baumeinträge, 16 Unterordnerebenen und 1 MiB Namen pro Listing. Der gesamte
-Lauf hat 60 Sekunden zuzüglich laufendem Request und Handle-Cleanup. Größen werden
-mit geprüftem `u64`-Addieren summiert; ein Überlauf erzeugt keinen Größenwert.
+Anfragen enthalten eindeutige direkte Ordner unter dem sichtbaren Pane-Root.
+Alle Pfade und Namen werden vor Providerzugriff geprüft. Feste Auswahl-, Baum-
+und Tiefenlimits sowie die pauschale 60-Sekunden-Lauffrist sind entfallen.
+Einzelne Requests und Parser-/Speicherressourcen bleiben begrenzt; Abbruch wird
+zwischen Requests und Einträgen geprüft. Größen werden mit geprüftem
+`u64`-Addieren summiert; ein Überlauf erzeugt keinen Größenwert.
 
 Der gemeinsame SFTP-Baumscanner bindet Hostkey, Sitzung, REALPATH/LSTAT-Elternbelege
 und beobachtet READDIR bis zum tatsächlichen EOF. Leere NAME-Seiten sind kein EOF;
@@ -40,8 +41,9 @@ Metadaten benötigen keine 8-GiB-Datei- oder 16-GiB-Baumgrenze: Es werden keine
 Inhalte übertragen. Der gemeinsame Scanner unterscheidet deshalb intern Inhalt
 und Metadaten. Der Metadatenkontext und seine Zusammenfassung bleiben privat und
 werden niemals als VFS-Kopierquelle oder Queue-Baumbeleg herausgegeben. Nur der
-Inhaltszweck erzeugt den validierten `InteractiveSourceTree`; dessen ursprüngliche
-Bytegrenzen und Änderungszeitbelege gelten unverändert. Eine fehlende Änderungszeit
+Inhaltszweck erzeugt den validierten `InteractiveSourceTree`; dessen
+Änderungszeit- und Inhaltsbelege für den Transfer gelten. Feste Bytegrenzen
+besitzt auch diese Inhaltsklasse nicht mehr. Eine fehlende Änderungszeit
 allein sperrt die reine Größenbeobachtung nicht, eine fehlende Dateigröße schon.
 
 Die Tauri-Laufzeit behält die ursprüngliche Provider-Arc, Profilrevision, Generation,
@@ -54,7 +56,8 @@ für eine andere Pane an. Die Mutations-Queue wird nicht belegt.
 Die künstlichen SSH-/SFTP-Paketgegenläufe prüfen leere Ordner, große Größen ohne
 OPEN, fehlende Zeiten, Auslassungen, Case-/Unicode-Varianten, frisches Nachmessen,
 Einzelordnerfehler, Eingabegrenzen, Tiefe, Überlauf, Abbruch und Sitzungswechsel.
-Dieselben Gegenläufe erhalten Inhaltsbytegrenzen und strikte VFS-Sperren. Browserfälle
+Die Gegenläufe erhalten die strikten VFS-Sperren; große Bestände und tiefe
+Bäume werden ohne die früheren Produktlimits geprüft. Browserfälle
 prüfen Größenspalte, zugängliche Beschriftung, Informationsdialog und verspätete
 Ereignisse nach Navigation.
 

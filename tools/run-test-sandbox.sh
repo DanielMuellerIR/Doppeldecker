@@ -40,12 +40,12 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --help|-h)
-      printf 'Verwendung: %s [--release|--installed|--binary <Programm>] [--reuse <Testbereich>]\n' "$0"
+      printf 'Verwendung: %s [--release|--installed|--binary <Programm>] [--open] [--reuse <Testbereich>]\n' "$0"
       printf '  --release  gebündeltes macOS-.app beziehungsweise Linux-AppImage starten\n'
       printf '  --installed unter Linux das installierte DEB-Programm starten\n'
-      printf '  --binary   fertig gebautes Programm starten, statt hier zu übersetzen\n'
-      printf '  --open     Debug-App über LaunchServices in der angemeldeten GUI-Sitzung starten\n'
-      printf '             (nötig beim Start über SSH; nur macOS, nicht mit --release)\n'
+      printf '  --binary   fertiges Programm; vorhandenes signiertes .app unverändert starten\n'
+      printf '  --open     neue App-Instanz über LaunchServices mit Test-Sandbox starten\n'
+      printf '             (nötig beim Start über SSH; nur macOS, auch mit --release)\n'
       printf '  --reuse    vorhandenen markierten Testbereich für Recovery erneut öffnen\n'
       exit 0
       ;;
@@ -89,10 +89,6 @@ if [ "$start_via_launchservices" = true ] && [ "$platform" != "Darwin" ]; then
   printf '%s\n' '--open wird nur unter macOS unterstützt.' >&2
   exit 2
 fi
-if [ "$start_via_launchservices" = true ] && [ "$release_bundle" = true ]; then
-  printf '%s\n' '--release --open ist gesperrt: Das signierte Release-Bundle enthält keine Test-Sandbox.' >&2
-  exit 2
-fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(dirname "$script_dir")
@@ -123,7 +119,36 @@ trap finish EXIT
 printf 'Doppeldecker-Testbereich:\n%s\n\n' "$sandbox"
 cd "$project_dir"
 if [ "$platform" = "Darwin" ]; then
-  if [ "$release_bundle" = true ]; then
+  existing_bundle=
+  if [ -n "$prebuilt_binary" ]; then
+    executable_dir=$(dirname -- "$prebuilt_binary")
+    contents_dir=$(dirname -- "$executable_dir")
+    candidate=$(dirname -- "$contents_dir")
+    case "$candidate" in
+      *.app)
+        if [ "$(basename -- "$executable_dir")" = MacOS ] &&
+           [ "$(basename -- "$contents_dir")" = Contents ]; then
+          # Ein signiertes Bundle darf weder neu verpackt noch über seine Plist
+          # verändert werden. Auch ein unpassender Executable-Eintrag ist ein Fehler,
+          # kein Anlass, die Signatur durch einen Debugwrapper zu umgehen.
+          python3 - "$candidate/Contents/Info.plist" "$(basename -- "$prebuilt_binary")" <<'PYEXEC'
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as source:
+    document = plistlib.load(source)
+if document.get("CFBundleExecutable") != sys.argv[2]:
+    sys.exit("CFBundleExecutable stimmt nicht mit --binary überein.")
+PYEXEC
+          codesign --verify --deep --strict "$candidate"
+          existing_bundle=$candidate
+        fi
+        ;;
+    esac
+  fi
+  if [ -n "$existing_bundle" ]; then
+    bundle=$existing_bundle
+  elif [ "$release_bundle" = true ]; then
     # Der Release-Smoke-Test verwendet exakt das von Tauri erzeugte und signierte
     # Bundle. Der Aufrufer baut es vorher über `pnpm bundle:macos`.
     bundle="$project_dir/target/release/bundle/macos/Doppeldecker.app"
@@ -150,17 +175,19 @@ if [ "$platform" = "Darwin" ]; then
     bundle="$bundle_parent/Doppeldecker-Test.app"
     mkdir -p "$bundle/Contents/MacOS"
     cp "$program" "$bundle/Contents/MacOS/doppeldecker"
-    # `LSEnvironment` trägt Sandbox und Testbremse in das Bundle selbst. Nur so
-    # erreichen sie die App auch dann, wenn LaunchServices sie startet (`--open`):
-    # `open` reicht keine Umgebungsvariablen weiter, und das Backend nimmt die Bremse
-    # ausschließlich zusammen mit einer gültigen markierten Sandbox an.
-    python3 - "$bundle/Contents/Info.plist" "$sandbox" <<'PYPLIST'
+    # Nur der rohe Debugbuild erhält einen eigenen Wegwerfwrapper. Die Umgebung
+    # bleibt auch beim direkten Start darin nachvollziehbar; LaunchServices erhält
+    # dieselben eng benannten Werte ausdrücklich über --env.
+    python3 - "$bundle/Contents/Info.plist" "$sandbox" "$project_dir/src-tauri/Info.plist" <<'PYPLIST'
 import plistlib
 import sys
 
-plist_path, sandbox_path = sys.argv[1:]
+# Gleiche Datenschutzdeklarationen; fehlende Usage-Texte lassen TCC-Zugriffe abbrechen.
+plist_path, sandbox_path, app_plist_path = sys.argv[1:]
+with open(app_plist_path, "rb") as source:
+    document = plistlib.load(source)
 with open(plist_path, "wb") as target:
-    plistlib.dump({
+    document.update({
         "CFBundleExecutable": "doppeldecker",
         "CFBundleIdentifier": "com.doppeldecker.test",
         "CFBundleName": "Doppeldecker Test",
@@ -169,8 +196,13 @@ with open(plist_path, "wb") as target:
             "DOPPELDECKER_SANDBOX": sandbox_path,
             "DOPPELDECKER_TEST_COPY_DELAY_MS": "5",
         },
-    }, target)
+    })
+    plistlib.dump(document, target)
 PYPLIST
+  fi
+  launch_program="$bundle/Contents/MacOS/doppeldecker"
+  if [ -n "$existing_bundle" ]; then
+    launch_program=$prebuilt_binary
   fi
   # Fünf Millisekunden pro Fortschrittsblock machen den Abbruch einer großen
   # Testkopie zuverlässig bedienbar. Das Backend akzeptiert die Bremse nur zusammen
@@ -180,10 +212,15 @@ PYPLIST
     # Fenster erscheint aber auf keinem Bildschirm. LaunchServices startet die App
     # dagegen in der angemeldeten Sitzung des Benutzers. `-W` wartet auf ihr Ende,
     # damit der Testbereich wie sonst erst danach gemeldet wird.
-    open -W "$bundle"
+    set -- -n -W "$bundle" --env "DOPPELDECKER_SANDBOX=$sandbox" \
+      --env DOPPELDECKER_TEST_COPY_DELAY_MS=5
+    if [ "${SSH_AUTH_SOCK+x}" = x ]; then
+      set -- "$@" --env "SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
+    fi
+    open "$@"
   else
     DOPPELDECKER_SANDBOX="$sandbox" DOPPELDECKER_TEST_COPY_DELAY_MS=5 \
-      "$bundle/Contents/MacOS/doppeldecker"
+      "$launch_program"
   fi
 else
   if [ "$installed_bundle" = true ]; then

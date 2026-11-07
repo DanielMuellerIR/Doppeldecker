@@ -1,30 +1,24 @@
-# Offene Produktarbeit
+# Aktiver Backlog
 
-Stand: 2026-10-19 · Preview 0.1.124.
+Stand: 2026-11-02. Nur offene Arbeit; Reihenfolge und Releaseumfang stehen in der
+[Roadmap](docs/roadmap.md). Verfügbares Verhalten: [Funktionsmatrix](docs/function-audit.md).
 
-Die erste öffentliche Preview bietet lokale Dateioperationen, mehrere Fenster,
-Sync-Vorschau, Quarantäne, Papierkorb und die in der
-[Funktionsmatrix](docs/function-audit.md) beschriebenen Remote-Funktionen.
-Sie ist keine Freigabe für vollständige Providerparität oder Version 1.0.
+| Priorität | Aufgabe | Fertigkriterium / Vertrag |
+| --- | --- | --- |
+| 2 | Aktuellen Releasekandidaten abnehmen | macOS/Linux: relevante Gates, echte GUI-/Providerläufe, Paketinstallation, Upgrade und Recovery. [Releaseplan](docs/release-plan.md). |
+| 2 | Öffentlichen Kandidatenstand abschließen | Nach Paketabnahme Kandidatenversion, Downloadlinks, Releasehinweise und Website auf dieselben Artefakte beziehen. Veröffentlichung bleibt gesondert beauftragt. [Entwicklungsstand](docs/release-notes-next.md). |
 
-Die nächsten Produktziele stehen in der [Roadmap](docs/roadmap.md):
+## Später, ohne Releasepflicht
 
-- SFTP-Mutationen mit konkreten Pfad-, Identitäts- und Recoveryverträgen.
-- Problematische Namen und Metadaten konsistent pfadgenau bilanzieren.
-- Schnellfilter und begrenzte, abbrechbare rekursive Namenssuche.
-- Integrierte Vorschau und später Remote-Bearbeitung mit geprüftem Rückupload.
-- Duplizieren, Stapelumbenennung und Archivarbeit mit Vorschau und Konfliktprüfung.
+- Weitergehende SMB-ACE-/Vererbungsmodelle, SID-/Domänenmigration, vollständiger
+  SMB-Hardlink-Schreibvertrag und DAV-ACL-Editor, sofern kein konkreter
+  ForkLift-Gegenbeleg sie zur Paritätslücke macht.
+- Gespeicherte Sync-Aufträge, zentrale Recovery-Ansicht, fortsetzbare Transfers
+  und weitere Archivformate. [Ideensammlung](docs/product-opportunities.md).
 
-Bekannte Grenzen bleiben sichtbar: SFTP unterstützt nur seine begrenzte
-Leseklasse; gewöhnliches WebDAV-Ersetzen besitzt derzeit keine ausreichende
-gemeinsame Bindung von Altziel und Eltern. Alte Journale und unbelegte Arbeitsreste
-werden nicht nach Alter automatisch gelöscht.
+## Pflege
 
-Ein FTP-/FTPS-Endpunkt mit mehreren Serverknoten benötigt eine je Knoten gebundene
-Capability-Probe oder Probe und Mutation in derselben Sitzung. Die derzeitige
-Freigabe setzt den geprüften Einzelserververtrag voraus.
-
-Fehler und nachvollziehbare Reproduktionen können über
-[GitHub Issues](https://github.com/DanielMuellerIR/Doppeldecker/issues) gemeldet
-werden. Bitte nur künstliche Daten verwenden und private Pfade oder Zugangsdaten
-vor dem Teilen entfernen.
+Neue Punkte nennen Wirkung, Fertigkriterium und höchstens einen Detailverweis.
+Erledigtes aus dieser Liste entfernen; Änderungen ins Changelog, Prüfbelege ins
+zuständige Vertrags-/Prüfdokument. Keine Commitchronik oder wiederholten
+Testzahlen im Backlog. Historie: [Stand bis 2026-10](docs/backlog-history-2026-10.md).

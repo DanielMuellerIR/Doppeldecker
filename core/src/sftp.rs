@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,6 +31,9 @@ use crate::remote::{
 };
 use crate::vfs::{entry_extension, CompleteDirectoryListing, Entry, Vfs};
 
+#[path = "sftp_principals.rs"]
+mod display_principals;
+
 #[path = "sftp_directory.rs"]
 mod directory_read;
 
@@ -38,11 +41,13 @@ mod directory_read;
 mod interactive_read;
 #[path = "sftp_size.rs"]
 mod interactive_size;
-pub use interactive_read::{
-    validate_interactive_content_selection, SFTP_CONTENT_READ_LIMITATION,
-    SFTP_MAX_INTERACTIVE_FILE_BYTES,
-};
+#[path = "sftp_write.rs"]
+mod interactive_write;
+pub use interactive_read::{validate_interactive_content_selection, SFTP_CONTENT_READ_LIMITATION};
 pub use interactive_size::SFTP_DIRECTORY_SIZE_LIMITATION;
+pub use interactive_write::{
+    validate_interactive_write_selection, SFTP_DELETE_LIMITATION, SFTP_WRITE_LIMITATION,
+};
 
 /// Kurzlebiger Klartextwert. Debug-Ausgaben und Fehlermeldungen geben nur eine
 /// Maskierung aus; der Speicher wird beim Drop durch `zeroize` überschrieben.
@@ -232,6 +237,9 @@ struct Connection {
     sftp: Arc<SftpSession>,
     read_session: Arc<RawSftpSession>,
     identity: SftpServerIdentity,
+    fsync: bool,
+    posix_rename: bool,
+    display_principal_names: Arc<AtomicBool>,
 }
 
 struct ProviderState {
@@ -278,6 +286,10 @@ pub struct SftpInteractiveDirectoryListing {
 }
 
 impl SftpVfs {
+    pub(crate) fn connection_config(&self) -> &SftpConnectionConfig {
+        &self.config
+    }
+
     pub fn connect(
         config: SftpConnectionConfig,
         secrets: Arc<dyn SecretResolver>,
@@ -351,6 +363,7 @@ impl SftpVfs {
         let identity = state.connection.identity.clone();
         let generation = state.generation;
         let raw = state.connection.read_session.clone();
+        let principal_names = state.connection.display_principal_names.clone();
         drop(state);
         let read = self.runtime.block_on(async {
             let remote = verify_sftp_directory_chain(
@@ -360,9 +373,22 @@ impl SftpVfs {
                 Some(&bounded),
             )
             .await?;
-            collect_interactive_entries(
-                read_sftp_display_entries(self, generation, &raw, &remote, &bounded).await?,
+            let mut records =
+                read_sftp_display_entries(self, generation, &raw, &remote, &bounded).await?;
+            // Die optionale Namensanzeige darf ein belegtes Pane-Listing nicht
+            // verwerfen. Ein verlorener Kanal wird für den nächsten Leser markiert.
+            if let Err(error) = display_principals::resolve_display_names(
+                &raw,
+                &mut records,
+                &principal_names,
+                &bounded,
             )
+            .await
+            {
+                check_sftp_cancel(Some(&bounded))?;
+                let _ = self.record_interactive_read_failure(generation, Err::<(), _>(error));
+            }
+            collect_interactive_entries(records)
         });
         let read = self.record_interactive_read_failure(generation, read);
         let (entries, omitted) = read.map_err(|error| {
@@ -812,8 +838,10 @@ impl Vfs for SftpVfs {
             owner: Capability::Unsupported,
             special_mode_bits: Capability::Unsupported,
             acl_model: AclModel::Unsupported,
+            acl: crate::metadata::Capability::Unknown,
             xattrs: Capability::Unsupported,
             resource_fork: Capability::Unsupported,
+            named_streams: Capability::Unsupported,
             sparse_extents: Capability::Unsupported,
             hardlinks: Capability::Unsupported,
         })
@@ -942,10 +970,24 @@ async fn connect_once(
         ));
     }
     Ok(Connection {
+        display_principal_names: Arc::new(AtomicBool::new(
+            version
+                .extensions
+                .get("users-groups-by-id@openssh.com")
+                .is_some_and(|version| version == "1"),
+        )),
         _ssh: ssh,
         sftp,
         read_session: raw,
         identity,
+        fsync: version
+            .extensions
+            .get("fsync@openssh.com")
+            .is_some_and(|version| version == "1"),
+        posix_rename: version
+            .extensions
+            .get("posix-rename@openssh.com")
+            .is_some_and(|version| version == "1"),
     })
 }
 

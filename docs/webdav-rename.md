@@ -1,9 +1,10 @@
 # Gewöhnliche WebDAV-Umbenennung
 
-Stand: 2026-10-18. F2 und CLI `rename` verwenden für WebDAV eine eigene bedingte
+Stand: 2026-10-24. F2 und CLI `rename` verwenden für WebDAV eine eigene bedingte
 Best-Effort-Wirkung. Sie benötigen weder eine künstliche Collection noch eine
-Schreib-/Löschprobe. Strikter Ziel-Sync und allgemeine VFS-Mutationen bleiben
-ohne gemeinsame Root-/Elternbindung passiv gesperrt;
+Schreib-/Löschprobe. Gewöhnliches Ersetzen und dauerhaftes Löschen besitzen
+inzwischen eigene Best-Effort-Wege. Strikter Ziel-Sync und allgemeine strikte
+VFS-Mutationen bleiben getrennt;
 [Mutationsvertrag](webdav-mutation-boundary.md).
 
 ## Anzeige und Vorbereitung
@@ -28,14 +29,22 @@ haben 60 Sekunden zuzüglich eines bereits begonnenen Requests mit höchstens
 Eine private VFS-Sicht verwendet den gemeinsamen Rename-Koordinator. Sie bindet
 Sitzung, Generation, den starken Quelltoken und alle Collection-ETags vom
 kanonischen Profilroot bis zum gewählten Elternordner. Ein vollständiges Listing
-prüft auch mögliche Groß-/Kleinschreibungs- und Unicode-Kollisionen. Nach frischen
+prüft auch mögliche Groß-/Kleinschreibungs- und Unicode-Kollisionen. Vor MOVE
+müssen alle unmittelbaren Kindbelege einschließlich starker ETags verfügbar sein;
+auch eine unabhängige Collection ohne solchen Beleg verhindert diesen Lauf vor
+der Wirkung, weil der nachfolgende vollständige Namensvergleich sonst nicht
+belegbar wäre. Nach frischen
 Quell- und Elternprüfungen folgt genau ein `MOVE` mit `If-Match` für die Quelle,
 genau einer getaggten `If`-Bedingung für den gemeinsamen unmittelbaren Elternordner und `Overwrite: F`.
 
 HTTP 201 oder 204 genügt nicht allein. Erfolg verlangt einen frischen vollständigen
 Elternbestand: alter Name fehlt, neuer Name ist exakt vorhanden, Typ, Größe und
-starker Versionstoken stimmen mit dem Quellbeleg überein. Sitzung und gesamte
-Elternkette müssen unverändert sein. Die Wirkung liest keine Datei-Inhalte und
+starker Versionstoken stimmen mit dem Quellbeleg überein. Der vollständige
+Kindbestand muss exakt dem Vorbestand mit dieser einen Namensänderung entsprechen.
+Sitzung und alle übrigen Vorfahren bleiben unverändert. Nur nach bestätigtem
+HTTP 201/204 und diesem exakten Nachbeleg darf die ETag des unmittelbaren
+Elternordners auf dessen eigene Änderung folgen. Erneute Elternprüfungen vor und
+nach dem Listing begrenzen weitere beobachtete Änderungen. Die Wirkung liest keine Datei-Inhalte und
 behauptet keinen eigenen Contenthash. Nichtleere Ordner werden als Ganzes
 umbenannt, ohne Zusammenführen oder rekursives Löschen.
 
@@ -52,17 +61,30 @@ ein Server `Overwrite: F`, könnte ein spät entstandenes Ziel unwiederbringlich
 ersetzt werden. Diese Grenze und die fehlende Durability sind vor der Wirkung
 sichtbar. ETags sind Serverbelege; sie ersetzen keine lokale Deskriptorbindung.
 
-Server ohne starke Quell-/Eltern-ETags bleiben konkret gesperrt. Ändert der Server
-ETags allein durch die Umbenennung, kann der Readback keinen Erfolg belegen und
-meldet einen unklaren Ausgang. HTTP 405, 409 und 412 werden ausschließlich lesend
+Fehlende oder schwache Quell-, Eltern- oder unmittelbare Kind-ETags verhindern
+diese Vorbereitung vor MOVE. Ändert der Server die ETag des umbenannten Objekts
+selbst, kann der Readback keinen Erfolg belegen und meldet einen unklaren Ausgang.
+Ein hinzugefügter, entfernter oder geänderter Nachbareintrag verhindert ebenso die
+Übernahme eines neuen Elternbelegs. Ein gleichzeitiger Pfadtausch, der alle
+beobachteten Kindbelege exakt reproduziert, ist dagegen nicht atomar ausschließbar. HTTP 405, 409 und 412 werden ausschließlich lesend
 in Kollision, Drift oder Ablehnung eingeordnet. Antwortverlust, unerwartete Antwort
 und fehlender oder widersprüchlicher Readback nach möglicher Wirkung liefern
 `outcome_unclear` mit altem Namen, neuem Namen und Elternpfad. Es gibt keinen
 automatischen zweiten MOVE, Reconnect oder Cleanup-DELETE.
 
-Andere Provider behalten ihre bestehenden Rename-Verträge. SFTP v3 bleibt wegen
-fehlender atomarer Root-/Elternbindung konkret gesperrt; die GUI zeigt dies vor
-der Namenseingabe. Fensterreservierung und Profilrevision gelten unverändert.
+Die [WebDAV-Stapelumbenennung](batch-rename.md) verwendet dieselbe Einzelwirkung
+und übernimmt nur deren erfolgreich geprüfte Elternbelege für die nächste Zeile.
+Antwortverlust, Ablehnungen oder ein unklarer Nachbeleg erteilen diese Übernahme
+nicht; der Stapel stoppt bei Bindungsverlust oder unklarem Ausgang.
+Reine Case-/Unicode-Schreibweisen werden bei genau einer exakten alten
+Rohgruppe über denselben Weg zugelassen. Starke Quell-ETag, vollständiger
+Namespacebeleg und `Overwrite: F` bleiben erhalten; eine Serverablehnung des
+eigenen Zielalias wird nicht umgangen. Entfernte Namenstausche bleiben gesperrt.
+
+SFTP und FTP/FTPS besitzen gewöhnliche pfadbasierte Best-Effort-Wege; SMB nutzt
+sein serverseitiges No-Replace-Rename ohne künstliche Vorprobe. Diese Freigaben
+behaupten keine atomare Elternbindung. Fensterreservierung und Profilrevision
+bleiben eigenständig gebunden.
 
 ## Standard und Prüfung
 

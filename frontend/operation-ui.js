@@ -98,7 +98,7 @@ export function createOperationUi({ planSummaryHtml, setRunning, captureEndpoint
 
   function startSync(plan, context) {
     const execution = context?.localExecution;
-    const bestEffort = execution && (execution.new_file_commit === "best_effort" || !execution.file_flush || !execution.directory_flush);
+    const bestEffort = context?.bestEffort || execution && (execution.new_file_commit === "best_effort" || !execution.file_flush || !execution.directory_flush);
     startRun(context?.simulated ? "Simulierter Testlauf startet …" : "Sync-Ausführung startet …", context);
     showDock(`<span class="pill ${context?.simulated ? "none" : "copy"}">${context?.simulated ? "Simulation · keine Dateiänderungen" : bestEffort ? "Best-Effort-Sync-Ausführung" : execution ? "Abgesicherte Sync-Ausführung" : "Echte Sync-Ausführung"}</span>` + planSummaryHtml(plan), { keepList: true });
   }
@@ -113,13 +113,22 @@ export function createOperationUi({ planSummaryHtml, setRunning, captureEndpoint
       copy: "Kopiere",
       move: "Verschiebe",
       metadata: "Übertrage Metadaten",
+      archive_pack: "Erstelle ZIP-Archiv",
+      archive_extract_extracting: "Entpacke ZIP-Archiv",
+      archive_extract_verifying: "Prüfe entpackten Inhalt",
+      archive_extract_committing: "Übernehme entpackte Datei",
+      archive_upload_ready: "Bereite Archivupload vor",
+      archive_finalize: "Schließe ZIP-Archiv ab",
+      archive_verify: "Prüfe ZIP-Archiv",
+      archive_commit: "Übernehme ZIP-Zielnamen",
       quarantine: "Sichere",
       delete: "Lösche",
       done: "Fertig",
       cancelled: "Abgebrochen",
     }[progress.phase] || progress.phase;
     const current = progress.current ? ` · ${progress.current}` : "";
-    $("#prog-text").textContent = `${phase} ${progress.files_done}/${progress.files_total}${current}`;
+    const count = progress.phase === "archive_upload_ready" ? "" : ` ${progress.files_done}/${progress.files_total}`;
+    $("#prog-text").textContent = `${phase}${count}${current}`;
   }
 
   function end() {

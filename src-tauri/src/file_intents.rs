@@ -120,15 +120,7 @@ fn prepare(
     validate_endpoint_request_root(&request.target)?;
     let items = request.items.iter().map(PathBuf::from).collect::<Vec<_>>();
     if request.source.provider_kind() == doppeldecker_core::ProviderKind::Sftp {
-        if request.target.provider_kind() != doppeldecker_core::ProviderKind::Local
-            || kind != FileQueueKind::Copy
-        {
-            return Err(AppError::new(
-                "unsupported",
-                "SFTP-Inhalte erlauben nur additive lokale Downloads",
-            ));
-        }
-        doppeldecker_core::sftp::validate_interactive_content_selection(
+        doppeldecker_core::sftp::validate_interactive_write_selection(
             Path::new(request.source.root()),
             &items,
         )

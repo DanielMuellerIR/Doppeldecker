@@ -1,6 +1,6 @@
 # Normaler lokaler Sync
 
-Stand: 2026-10-18. Der normale lokale Start unterstützt AddOnly und Update über
+Stand: 2026-10-20. Der normale lokale Start unterstützt AddOnly und Update über
 eine backendgebundene Vorbereitung und die eigene Fensterqueue.
 
 ## Bedienung und Wirkung
@@ -88,8 +88,8 @@ Bei einer schwachen Update-Ausführung nennt der Dialog Zahl und Ziele der
 dauerhaften Ersetzungen zuerst. Die Zustimmung erklärt ausdrücklich, dass für
 diese alten Versionen keine Quarantäne oder Wiederherstellung bereitsteht.
 Vorschau und Ergebnis unterscheiden geplante und tatsächlich abgeschlossene
-dauerhafte Ersetzungen. ContentHash und die Grenze von 100 Ersetzungen bleiben
-verbindlich. Additionen benötigen auch hier keine Zufallsphrase.
+dauerhafte Ersetzungen. ContentHash bleibt verbindlich; eine feste Grenze von
+100 Ersetzungen besteht nicht. Additionen benötigen auch hier keine Zufallsphrase.
 
 `Portable` bilanziert nicht darstellbare POSIX-Rechte pfadgenau. Die Profilzeile
 nennt die fehlende Rechteübertragung; Vorschau und Abschluss zeigen auch unter
@@ -104,19 +104,26 @@ Additionen bleiben ausführbar.
 
 ## Grenzen
 
-Mirror verwendet weiterhin den getrennten Realmodus-Assistenten mit Laufphrase,
-Backupbestätigung, vollständigem Zweitscan und unveränderten Mengengrenzen.
-Dieser normale Einstieg kann keinen Mirror-Permit erzeugen. Eine Umgebungsvariable
-allein erteilt auch AddOnly/Update keine Freigabe.
+Mirror verwendet seinen eigenen vorbereiteten Plan mit vollständigem Zweitscan,
+Quarantäne und einer konkreten Wirkungsbestätigung. Hohe Entfernungszahlen und
+-anteile sowie eine leere Quelle erzeugen sichtbare Warnungen, keine festen
+50-/100-Eintrags- oder 5-/25-Prozent-Sperren. Unvollständige Scans und ausgelassene
+problematische Einträge erteilen weiterhin keine Entfernungsfreigabe.
+Eine Umgebungsvariable allein erteilt keinem Modus Schreibrechte.
 
-Abgesicherte Ersetzungen behalten den vorhandenen sicheren Geschwisterbereich
-für Quarantäne und Restore-Probe. Dateisystemwurzel,
-Benutzerordner selbst und Git-Repositoryziele bleiben für diese Ersetzungsklasse
-gesperrt. Reine Additionen und ausdrücklich dauerhafte schwache Ersetzungen
-benötigen diesen Geschwisterbereich nicht. Die separate strikte lokale Vorbereitung,
-Remote-Sync, Mirror und bidirektionale Ausführung übernehmen die neue Freigabe
-nicht. Andere Dateisystemtreiber und ein Stromausfall sind durch die realen
-Image-Gegenläufe nicht belegt.
+Git-Unterbäume und HOME sind mit konkreten Bereichswarnungen nutzbar. Für HOME
+liegt die Quarantäne im reservierten direkten Unterordner
+`.doppeldecker-quarantine`; dieser wird bei Sync auf beiden Seiten ausdrücklich
+ausgeschlossen. Andere Ziele behalten die Geschwisterquarantäne. Der reservierte
+Bereich bleibt in der normalen Dateiansicht sichtbar und ist nicht global
+versteckt. Die Dateisystemwurzel `/` bleibt als Ganzbaumziel gesperrt.
+
+Auch strikte lokale, Remote- und bidirektionale Starts bestätigen die konkrete
+Wirkung ohne Laufphrase oder eine behauptete externe Backupprobe. Quarantäne und
+Restore-Probe der abgesicherten Ersetzungsklasse bleiben erforderlich. Die
+Backendvorbereitung hält weiterhin Roots, vollständige Bestandsbelege, Digest und
+einmaliges Permit; Wiederaufnahme nach Neustart bereitet frisch vor und zeigt
+einen einzigen neuen Wirkungsdialog.
 
 GUI-Schreibtests verwenden weiterhin ausschließlich den markierten Sandbox-Launcher.
 Auch die Vorbereitung mit eigener Restore-Probe bleibt dort an denselben gehaltenen

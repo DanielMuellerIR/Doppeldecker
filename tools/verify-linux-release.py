@@ -102,19 +102,28 @@ def elf_architecture(path: Path) -> str:
     return "x86_64"
 
 
+def verify_appimage_host_libraries(root: Path) -> None:
+    if any(root.rglob("libwayland-client.so*")):
+        fail("AppImage enthält einen Wayland-Client statt der Host-Grafikbibliothek")
+
+
 def verify_layout(root: Path, label: str) -> None:
     binary = require_file(root, "usr/bin/doppeldecker", executable=True)
     cli = require_file(root, "usr/bin/doppeldecker-cli", executable=True)
+    helper = require_file(root, "usr/bin/doppeldecker-metadata-helper", executable=True)
     require_file(root, "usr/share/applications/Doppeldecker.desktop")
     require_file(root, "usr/share/icons/hicolor/1024x1024/apps/doppeldecker.png")
     elf_architecture(binary)
     elf_architecture(cli)
+    elf_architecture(helper)
     linked = output("ldd", binary)
     if "not found" in linked:
         fail(f"{label}-Binary besitzt nicht auflösbare Bibliotheken")
     cli_linked = output("ldd", cli)
     if "not found" in cli_linked:
         fail(f"{label}-CLI besitzt nicht auflösbare Bibliotheken")
+    if "not found" in output("ldd", helper):
+        fail(f"{label}-Metadatenhelfer besitzt nicht auflösbare Bibliotheken")
 
 
 def verify_cli_payload_version(cli: Path, version: str, label: str) -> None:
@@ -311,6 +320,7 @@ def verify_release(environment: dict[str, str]) -> tuple[str, Path, Path]:
         )
         appimage_root = temporary_root / "squashfs-root"
         require_appimage_desktop(appimage_root)
+        verify_appimage_host_libraries(appimage_root)
         require_file(appimage_root, "Doppeldecker.png")
         verify_layout(appimage_root, "AppImage")
         appimage_cli = appimage_root / "usr/bin/doppeldecker-cli"

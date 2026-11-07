@@ -68,14 +68,16 @@ pub fn ordinary_rename_contract(provider: ProviderKind) -> RenameInteractionCont
         ProviderKind::WebDav => RenameInteractionContract::Confirmed {
             execution_class: RenameExecutionClass::BestEffort,
             limitations: vec![
-                "Genau ein bedingtes MOVE verwendet Overwrite: F für den Zielnamen und If-Match für die Quelle. Die Elternkette wird frisch geprüft und das Ergebnis unabhängig zurückgelesen, ohne künstliche Schreib- oder Löschprobe.".into(),
+                "Genau ein MOVE verwendet Overwrite: F für den Zielnamen. Bei Dateien bindet If-Match die Quellversion; bei Collections werden der vollständige Quellbestand und die Eltern frisch geprüft. Das Ergebnis wird unabhängig zurückgelesen, ohne künstliche Schreib- oder Löschprobe.".into(),
                 "Die Serverbedingungen sind nicht verhaltensgeprüft: Missachtet der Server Overwrite: F, könnte ein gerade entstandenes Ziel unwiederbringlich ersetzt werden. Dauerhafte Speicherung ist nicht bewiesen. Bei unklarem Ausgang beide Namen prüfen; kein automatisches Wiederholen oder Entfernen.".into(),
                 crate::SOURCE_PATH_BINDING_LIMITATION.into(),
                 crate::webdav::NAMESPACE_BINDING_LIMITATION.into(),
+                "Ein gleichzeitiger Austausch desselben Serverpfads mit identischen beobachtbaren Belegen ist nicht ausschließbar. Collection-ETags sind Versionsbelege und keine stabilen Ordneridentitäten; nur die vollständig belegte eigene Namensänderung erlaubt eine neue unmittelbare Elternversion.".into(),
             ],
         },
-        ProviderKind::Sftp => RenameInteractionContract::Blocked {
-            blockers: vec!["SFTP v3 bindet Rename nicht an die Root-/Elternordner. Ein Pfadtausch könnte außerhalb des gewählten Bereichs verändern; diese Wirkung bleibt gesperrt.".into()],
+        ProviderKind::Sftp => RenameInteractionContract::Confirmed {
+            execution_class: RenameExecutionClass::BestEffort,
+            limitations: vec![crate::sftp::SFTP_WRITE_LIMITATION.into()],
         },
         _ => RenameInteractionContract::Existing,
     }

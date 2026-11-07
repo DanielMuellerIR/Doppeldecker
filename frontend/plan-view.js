@@ -32,18 +32,18 @@ export function createPlanView({ metadataClassLabels, metadataReportHtml, update
     return parts.join("") + `<span class="dim">${transfer}</span>`;
   }
 
-  function renderActionList(actions, report = null, list = $("#actions-list")) {
+  function renderActionList(actions, report = null, list = $("#actions-list"), { permanentRemovals = false } = {}) {
     const label = {
       CopyFile: "kopieren", UpdateFile: "aktual.", CreateHardlink: "Hardlink",
-      DeleteFile: "Quarantäne", DeleteDir: "Quarantäne", CreateDir: "Ordner+",
-      SetMode: "Rechte", SetDirectoryMetadata: "Metadaten",
+      DeleteFile: permanentRemovals === null ? "entfernen" : permanentRemovals ? "dauerhaft entfernen" : "Quarantäne", DeleteDir: permanentRemovals === null ? "entfernen" : permanentRemovals ? "dauerhaft entfernen" : "Quarantäne", CreateDir: "Ordner+",
+      SetMode: "Rechte", SetDirectoryMetadata: "Metadaten", SetFileDacl: "Objektweite Dateirechte",
       SkipSymlink: "Symlink ausgelassen", SkipConflict: "Konflikt ausgelassen",
       SkipUnsupported: "Spezialdatei ausgelassen",
     };
     const cssClass = {
       CopyFile: "copy", UpdateFile: "update", CreateHardlink: "link",
       DeleteFile: "delete", DeleteDir: "delete", CreateDir: "copy",
-      SetMode: "update", SetDirectoryMetadata: "update", SkipSymlink: "skip",
+      SetMode: "update", SetDirectoryMetadata: "update", SetFileDacl: "update", SkipSymlink: "skip",
       SkipConflict: "skip", SkipUnsupported: "skip",
     };
     const actionHtml = actions.slice(0, 500).map((action) => {
@@ -53,6 +53,7 @@ export function createPlanView({ metadataClassLabels, metadataReportHtml, update
         transfer.normal_mode && "NormalMode",
         transfer.special_mode_bits && "SpecialModeBits",
         transfer.xattrs && "Xattrs", transfer.resource_fork && "ResourceFork",
+        transfer.named_streams && "NamedStreams",
         transfer.sparse_extents && "SparseExtents", transfer.hardlinks && "Hardlinks",
       ].filter(Boolean).map((name) => metadataClassLabels[name]).join(", ") : "";
       const suffix = classes
@@ -70,7 +71,7 @@ export function createPlanView({ metadataClassLabels, metadataReportHtml, update
     list.innerHTML = actionHtml + issueHtml;
   }
 
-  function showPlan(plan) {
+  function showPlan(plan, presentation = {}) {
     updateMetadataNote(plan.metadata_report);
     // Im offenen Sync-Modus ist die Vorschau die Hauptansicht; sonst fällt die
     // Anzeige wie bisher ins Dock (z. B. Realmodus-Vorbereitung aus der Queue).
@@ -81,15 +82,15 @@ export function createPlanView({ metadataClassLabels, metadataReportHtml, update
       const hasComparison = Array.isArray(plan.comparison?.rows) && plan.comparison.rows.length > 0;
       $("#sync-actions").hidden = hasComparison;
       if (hasComparison) {
-        comparisonView.render(plan.comparison, plan.metadata_report);
+        comparisonView.render(plan.comparison, plan.metadata_report, presentation);
       } else {
         comparisonView.render(null);
-        renderActionList(plan.actions, plan.metadata_report, $("#sync-actions"));
+        renderActionList(plan.actions, plan.metadata_report, $("#sync-actions"), presentation);
       }
       return;
     }
     showDock(planSummaryHtml(plan), { showList: plan.actions.length > 0 });
-    renderActionList(plan.actions, plan.metadata_report);
+    renderActionList(plan.actions, plan.metadata_report, $("#actions-list"), presentation);
   }
 
   return { planSummaryHtml, showPlan };

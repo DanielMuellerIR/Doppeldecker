@@ -75,11 +75,12 @@ impl ExitSnapshot {
             || self.has_failures()
     }
 
-    pub(crate) fn can_confirm_open_queues(&self) -> bool {
-        self.open_entries() > 0
+    pub(crate) fn can_confirm_exit(&self) -> bool {
+        // Ein nicht lesbares Journal bleibt unverändert auf Platte. Es darf das
+        // Beenden nicht dauerhaft verhindern; tatsächliche Arbeit bleibt gesperrt.
+        (self.open_entries() > 0 || self.has_failures())
             && !self.has_active_operations()
             && !self.has_pending_preparations()
-            && !self.has_failures()
     }
 }
 
@@ -94,6 +95,7 @@ pub(crate) struct PendingExitConfirmation {
 pub(crate) struct QueueExitRequest {
     pub(crate) token: String,
     pub(crate) open_entries: usize,
+    pub(crate) unreadable_queues: Vec<String>,
 }
 
 /// Testbare Erfassung: Ein Journalfehler bleibt Bestandteil des Snapshots, statt
@@ -205,6 +207,10 @@ pub(crate) fn issue_exit_confirmation(
     QueueExitRequest {
         token,
         open_entries: snapshot.open_entries(),
+        unreadable_queues: snapshot
+            .failures()
+            .map(|failure| failure.label.clone())
+            .collect(),
     }
 }
 
@@ -240,7 +246,7 @@ fn authorize_confirmed_exit(
     }
     let pending = slot.take().expect("unmittelbar zuvor geprüft");
     drop(slot);
-    if pending.snapshot != current || !current.can_confirm_open_queues() {
+    if pending.snapshot != current || !current.can_confirm_exit() {
         return Err(AppError::new(
             "state_changed",
             "Queue- oder Operationszustand hat sich seit dem Beenden-Hinweis geändert",
@@ -255,7 +261,7 @@ pub(crate) fn take_matching_exit_authorization(state: &AppState, current: &ExitS
         .authorized_exit
         .lock_recover()
         .take()
-        .is_some_and(|authorized| authorized == *current && current.can_confirm_open_queues())
+        .is_some_and(|authorized| authorized == *current && current.can_confirm_exit())
 }
 
 /// Produktversion (aus `Cargo.toml`), damit die Oberfläche sie anzeigen kann, ohne
@@ -336,7 +342,73 @@ mod tests {
         assert!(result.has_active_operations());
         assert!(result.has_failures());
         assert_eq!(result.failures().next().unwrap().label, "window-z");
-        assert!(!result.can_confirm_open_queues());
+        assert!(!result.can_confirm_exit());
+    }
+
+    #[test]
+    fn journalfehler_ohne_laufende_arbeit_erlaubt_bestaetigtes_beenden() {
+        let state = AppState::default();
+        let snapshot = assess_exit(&["main".into()], false, |_| {
+            (
+                false,
+                Err(AppError::new("invalid_data", "Unbekannte Journalversion")),
+            )
+        });
+
+        assert!(snapshot.must_prevent_exit());
+        assert!(snapshot.can_confirm_exit());
+        let request = issue_exit_confirmation(&state, snapshot.clone());
+        assert_eq!(request.open_entries, 0);
+        assert_eq!(request.unreadable_queues, ["main"]);
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["unreadableQueues"],
+            serde_json::json!(["main"])
+        );
+        authorize_confirmed_exit(&state, &request.token, snapshot.clone()).unwrap();
+        assert!(take_matching_exit_authorization(&state, &snapshot));
+        assert!(!take_matching_exit_authorization(&state, &snapshot));
+    }
+
+    #[test]
+    fn gemischte_queues_nennen_lesefehler_und_binden_deren_zustand() {
+        let state = AppState::default();
+        let snapshot = assess_exit(&["main".into(), "window-defekt".into()], false, |label| {
+            (
+                false,
+                if label == "main" {
+                    Ok(vec![("op-1".into(), "Pending".into())])
+                } else {
+                    Err(AppError::new("invalid_data", "Unbekannte Journalversion"))
+                },
+            )
+        });
+        let request = issue_exit_confirmation(&state, snapshot.clone());
+        assert_eq!(request.open_entries, 1);
+        assert_eq!(request.unreadable_queues, ["window-defekt"]);
+        assert!(snapshot.can_confirm_exit());
+        let mut changed = snapshot.clone();
+        changed.windows[1].failure.as_mut().unwrap().code = "permission_denied".into();
+        assert_eq!(
+            authorize_confirmed_exit(&state, &request.token, changed)
+                .unwrap_err()
+                .code,
+            "state_changed"
+        );
+
+        let request = issue_exit_confirmation(&state, snapshot.clone());
+        authorize_confirmed_exit(&state, &request.token, snapshot).unwrap();
+    }
+
+    #[test]
+    fn journalfehler_uebergeht_keine_offene_vorbereitung() {
+        let snapshot = assess_exit_with_pending(&["main".into()], false, |_| {
+            (
+                false,
+                vec!["local-real".into()],
+                Err(AppError::new("io", "Journal nicht lesbar")),
+            )
+        });
+        assert!(!snapshot.can_confirm_exit());
     }
 
     #[test]
@@ -347,7 +419,7 @@ mod tests {
 
         assert!(snapshot.must_prevent_exit());
         assert!(snapshot.has_pending_preparations());
-        assert!(!snapshot.can_confirm_open_queues());
+        assert!(!snapshot.can_confirm_exit());
         assert_eq!(
             snapshot.windows[0].pending_preparations,
             ["bidirectional-real"]
@@ -398,12 +470,12 @@ mod tests {
     }
 
     #[test]
-    fn aktive_operation_oder_journalfehler_kann_nicht_bestaetigt_werden() {
+    fn aktive_operation_auch_mit_journalfehler_kann_nicht_bestaetigt_werden() {
         let state = AppState::default();
         for current in [
             snapshot(&["op-1"], true),
             assess_exit(&["window-defekt".into()], false, |_| {
-                (false, Err(AppError::new("io", "Journal beschädigt")))
+                (true, Err(AppError::new("io", "Journal beschädigt")))
             }),
         ] {
             let request = issue_exit_confirmation(&state, current.clone());
@@ -454,7 +526,7 @@ mod tests {
 
         assert!(current.must_prevent_exit());
         assert!(current.has_active_operations());
-        assert!(!current.can_confirm_open_queues());
+        assert!(!current.can_confirm_exit());
         assert_eq!(
             authorize_confirmed_exit(&state, &request.token, current)
                 .unwrap_err()

@@ -23,6 +23,9 @@ pub(super) enum CopyResult {
     Complete {
         quarantined: bool,
         recovery_paths: Vec<String>,
+        omitted_mtime: Option<crate::content_sync::KnownMtimeOmission>,
+        omitted_normal_mode: Option<String>,
+        omitted_windows_dacl: Option<crate::windows_dacl::WindowsDaclTargetIssue>,
     },
     Cancelled {
         recovery_paths: Vec<String>,
@@ -296,6 +299,9 @@ pub(super) fn copy_one(
 
     let staging_scope = dst.staging_scope(dst_path, safety.sandbox())?;
     let dst = staging_scope.as_deref().unwrap_or(dst);
+    if safety.content_sync_permit().is_some() {
+        dst.hint_content_sync_mtime(expected_source_mtime)?;
+    }
     let result = (|| -> io::Result<CopyResult> {
         let sparse_extents = expected_metadata
             .filter(|metadata| metadata.sparse_extents)
@@ -322,6 +328,9 @@ pub(super) fn copy_one(
         // Rename gehört er ausschließlich uns, danach nicht mehr.
         let mut temp_released = false;
         let mut temp_proof = None;
+        let mut omitted_mtime = None;
+        let mut omitted_normal_mode = None;
+        let mut omitted_windows_dacl = None;
         let verify_and_commit = (|| -> io::Result<Option<bool>> {
             if bytes_written != expected_size {
                 return Err(plan_changed(
@@ -355,6 +364,7 @@ pub(super) fn copy_one(
             }
 
             let transferred_hash = source_hash;
+            src.verify_transferred_source(src_path, &transferred_hash)?;
             if let Some(expected_hash) = expected_source_hash {
                 if transferred_hash.to_hex().as_str() != expected_hash {
                     return Err(plan_changed(
@@ -383,6 +393,8 @@ pub(super) fn copy_one(
                     dst,
                     temp_path: &temp_path,
                     expected: expected_metadata,
+                    allow_windows_dacl_omission: safety.allows_windows_dacl_omission(),
+                    windows_dacl_omission: &mut omitted_windows_dacl,
                 },
                 cancel,
                 prog,
@@ -394,7 +406,15 @@ pub(super) fn copy_one(
             // bisheriges Ziel müssen deshalb unmittelbar danach erneut plan-gebunden sein.
             verify_planned_metadata(src, src_path, dst, dst_path, expected_metadata)?;
             if let Some(metadata) = expected_metadata.filter(|metadata| metadata.normal_mode) {
-                dst.set_metadata_normal_mode(&temp_path, metadata.source.mode & 0o777)?;
+                if let Err(error) =
+                    dst.set_metadata_normal_mode(&temp_path, metadata.source.mode & 0o777)
+                {
+                    if let Some(reason) = safety.normal_mode_omission_reason(&error) {
+                        omitted_normal_mode = Some(reason.to_owned());
+                    } else {
+                        return Err(error);
+                    }
+                }
             } else if expected_metadata.is_none()
                 && dst.supports_mode_write_at(
                     dst_path
@@ -403,12 +423,24 @@ pub(super) fn copy_one(
                 )?
             {
                 if let Some(mode) = expected_source_mode {
-                    dst.set_mode(&temp_path, mode)?;
+                    if let Err(error) = dst.set_mode(&temp_path, mode) {
+                        if let Some(reason) = safety.normal_mode_omission_reason(&error) {
+                            omitted_normal_mode = Some(reason.to_owned());
+                        } else {
+                            return Err(error);
+                        }
+                    }
                 }
             }
             if dst.supports_mtime_write() {
                 if let Some(mtime) = expected_source_mtime {
-                    dst.set_mtime(&temp_path, mtime)?;
+                    if let Err(error) = dst.set_mtime(&temp_path, mtime) {
+                        if let Some(reason) = safety.mtime_omission_reason(&error) {
+                            omitted_mtime = Some(reason.to_owned());
+                        } else {
+                            return Err(error);
+                        }
+                    }
                 }
             }
             dst.sync_file(&temp_path)?;
@@ -419,7 +451,22 @@ pub(super) fn copy_one(
                 dst.set_metadata_special_bits(&temp_path, metadata.source.mode & 0o7000)?;
                 dst.sync_file(&temp_path)?;
             }
-            verify_temp_metadata(dst, &temp_path, expected_metadata)?;
+            let mut verified_metadata = expected_metadata.cloned();
+            if omitted_normal_mode.is_some() {
+                if let Some(metadata) = &mut verified_metadata {
+                    metadata.normal_mode = false;
+                }
+            }
+            if let Some(issue) = omitted_windows_dacl {
+                if let Some(metadata) = &mut verified_metadata {
+                    metadata.acl = false;
+                    metadata.windows_dacl =
+                        Some(crate::windows_dacl::WindowsDaclTransfer::Omitted(
+                            crate::windows_dacl::WindowsDaclOmission::Target(issue),
+                        ));
+                }
+            }
+            verify_temp_metadata(dst, &temp_path, verified_metadata.as_ref())?;
             validate_anchor_identity(src, dst, safety)?;
             // Identität der fertigen Temp-Datei unmittelbar vor dem Commit binden.
             // Nur damit lässt sich ein späteres Aufräumen auf genau dieses Objekt
@@ -439,18 +486,44 @@ pub(super) fn copy_one(
                 transferred_size: expected_size,
                 transferred_hash: *transferred_hash.as_bytes(),
             })
-            .map(Some)
+            .and_then(|quarantined| {
+                if let Some(metadata) = verified_metadata.as_ref() {
+                    super::verify_selected_metadata(dst, dst_path, metadata).map_err(|error| {
+                        postcommit_metadata_error(
+                            dst_path,
+                            safety.quarantine.as_deref().filter(|_| quarantined),
+                            error,
+                        )
+                    })?;
+                }
+                Ok(Some(quarantined))
+            })
         })();
 
         match verify_and_commit {
             Ok(Some(quarantined)) => Ok(CopyResult::Complete {
                 quarantined,
                 recovery_paths: Vec::new(),
+                omitted_mtime,
+                omitted_normal_mode,
+                omitted_windows_dacl,
             }),
             Ok(None) => Ok(CopyResult::Cancelled {
                 recovery_paths: cleanup_or_retain(dst, &temp_path)?,
             }),
             Err(e) => {
+                // Nach einem möglicherweise wirksamen DACL-SET bleibt die eigene
+                // Temp-Datei erhalten, auch wenn der Adapter nur den Fehlercode trägt.
+                let e = if !temp_released
+                    && crate::error_code(&e) == crate::ErrorCode::OutcomeUnclear
+                {
+                    crate::error::with_recovery_paths(
+                        e,
+                        &[temp_path.to_string_lossy().into_owned()],
+                    )
+                } else {
+                    e
+                };
                 match cleanup_failed_temp(dst, &temp_path, temp_proof.as_ref(), temp_released, &e) {
                     Ok(()) => Err(e),
                     Err(cleanup) => Err(crate::error::with_recovery_path(e, &temp_path, &cleanup)),
@@ -567,6 +640,9 @@ pub(super) fn create_hardlink_one(request: HardlinkRequest<'_>) -> io::Result<(b
                 "Materialisiertes Hardlink-Ziel ist nicht planidentisch",
             ));
         }
+        if metadata.named_streams {
+            super::verify_selected_metadata(dst, &target_anchor, metadata)?;
+        }
         if let Ok(current) = dst.stat(&target_path) {
             if (current.device, current.inode) == (anchor.device, anchor.inode) {
                 return Ok((false, Vec::new()));
@@ -608,6 +684,10 @@ pub(super) fn create_hardlink_one(request: HardlinkRequest<'_>) -> io::Result<(b
                 ));
             }
             dst.sync_dir(parent)?;
+            if metadata.named_streams {
+                verify_planned_metadata(src, &source_path, dst, &target_path, Some(metadata))?;
+                verify_temp_metadata(dst, &temp_path, Some(metadata))?;
+            }
             validate_anchor_identity(src, dst, safety)?;
             commit_temp(CommitTempRequest {
                 dst,
@@ -642,7 +722,18 @@ pub(super) fn create_hardlink_one(request: HardlinkRequest<'_>) -> io::Result<(b
                 )),
             };
         }
-        result.map(|quarantined| (quarantined, Vec::new()))
+        result.and_then(|quarantined| {
+            if metadata.named_streams {
+                super::verify_selected_metadata(dst, &target_path, metadata).map_err(|error| {
+                    postcommit_metadata_error(
+                        &target_path,
+                        safety.quarantine.as_deref().filter(|_| quarantined),
+                        error,
+                    )
+                })?;
+            }
+            Ok((quarantined, Vec::new()))
+        })
     })();
     if staging_scope.is_none() {
         return result;
@@ -652,6 +743,28 @@ pub(super) fn create_hardlink_one(request: HardlinkRequest<'_>) -> io::Result<(b
             recovery_paths.push(path);
         }
     })
+}
+
+fn postcommit_metadata_error(
+    target: &Path,
+    quarantine: Option<&Path>,
+    error: io::Error,
+) -> io::Error {
+    let mut paths = vec![target];
+    paths.extend(quarantine);
+    // Der Basistausch ist bereits erfolgt. Ein gewöhnlicher Lesefehler darf
+    // danach weder einen unveränderten Ausgang noch den Intentabschluss erlauben.
+    crate::error::with_recovery_context(
+        crate::coded_error(
+            io::ErrorKind::Other,
+            crate::ErrorCode::OutcomeUnclear,
+            format!(
+                "Die Zieldatei wurde bereits übernommen, aber ihr Metadatenabschluss ist nicht bestätigt ({error}). Ziel und vorhandene Quarantäne prüfen"
+            ),
+        ),
+        &[&error],
+        &paths,
+    )
 }
 
 /// Bindet einen Temp-Eintrag an seine bereits beobachtete Identität.
@@ -782,6 +895,24 @@ fn transfer_file_data(
         sandbox,
     } = request;
     if let Some(extents) = sparse_extents {
+        let parent = dst_path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Sparse-Ziel besitzt keinen Elternordner",
+            )
+        })?;
+        let unit = if super::sparse::has_holes(extents, expected_size) {
+            dst.sparse_allocation_unit(parent)?
+        } else {
+            None
+        };
+        if let Some(unit) = unit {
+            if !super::sparse::aligned(extents, expected_size, unit)? {
+                return Err(crate::real_mode::plan_drift(
+                    "Sparse-Zielgeometrie passt nicht mehr zum bestätigten Transfer",
+                ));
+            }
+        }
         let mut reader = src.open_sparse_read(src_path)?;
         let (temp_path, mut writer) = create_sparse_temp(dst, dst_path, sandbox)?;
         let result = (|| -> io::Result<(bool, blake3::Hasher, u64)> {
@@ -839,6 +970,7 @@ fn transfer_file_data(
             )? {
                 return Ok((false, hash, logical_offset));
             }
+            reader.finish()?;
             writer.set_len(expected_size)?;
             let mut hole_start = 0u64;
             for extent in extents {
@@ -848,7 +980,22 @@ fn transfer_file_data(
                 hole_start = extent.offset + extent.length;
             }
             if hole_start < expected_size {
-                writer.punch_hole(hole_start, expected_size - hole_start)?;
+                // Den ganzen letzten Block der neuen Temp freigeben, ohne EOF zu
+                // verschieben. APFS meldet den Nullrest sonst weiter als Daten.
+                let length = expected_size - hole_start;
+                let length = match unit {
+                    Some(unit) => length
+                        .div_ceil(u64::from(unit))
+                        .checked_mul(u64::from(unit))
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Sparse-EOF-Blockgrenze läuft über",
+                            )
+                        })?,
+                    None => length,
+                };
+                writer.punch_hole(hole_start, length)?;
             }
             writer.flush()?;
             Ok((true, hash, expected_size))
@@ -1127,11 +1274,11 @@ fn commit_temp(request: CommitTempRequest<'_>) -> io::Result<bool> {
     guard_path(safety.sandbox(), temp_path, "Temporärdatei")?;
     guard_path(safety.sandbox(), dst_path, "Schreibziel")?;
 
-    if let Some(execution) = safety.local_execution() {
+    if safety.content_sync_permit().is_some() || safety.local_execution().is_some() {
         // Der Sync behält seinen bestätigten Quellhash und Zielvorzustand. Nur
         // der versiegelte normale Einstieg darf den gemeinsamen schwächeren
         // Commit nutzen; stärkere Ersetzungen behalten die Quarantäne.
-        if !replacing || execution.irreversible_replacements > 0 {
+        if !replacing || safety.irreversible_replacements() {
             let replacement = if replacing {
                 let proof = expected_target_proof.ok_or_else(|| {
                     plan_changed(
@@ -2003,10 +2150,13 @@ mod tests {
             owner: false,
             acl: false,
             incompatible_acl_model: false,
+            windows_dacl: None,
             normal_mode: false,
             special_mode_bits: false,
             xattrs: false,
             resource_fork: false,
+            named_streams: false,
+            directory_streams: None,
             sparse_extents: false,
             hardlinks: true,
         };

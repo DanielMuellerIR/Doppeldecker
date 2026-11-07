@@ -32,6 +32,20 @@ pub(crate) struct AppError {
     pub(crate) message: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) recovery_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) directory_stream_report:
+        Option<Box<doppeldecker_core::directory_streams::DirectoryStreamReport>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) directory_dacl_report:
+        Option<Box<doppeldecker_core::directory_dacl::DirectoryDaclReport>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) file_dacl_report: Option<Box<doppeldecker_core::file_dacl::FileDaclReport>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::frontend_payload::serialize_report"
+    )]
+    pub(crate) created_directory_dacl_report:
+        Option<Box<doppeldecker_core::created_directory_dacl::CreatedDirectoryDaclReport>>,
 }
 
 impl AppError {
@@ -40,6 +54,10 @@ impl AppError {
             code: code.into(),
             message: message.into(),
             recovery_paths: Vec::new(),
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: Default::default(),
         }
     }
 }
@@ -48,10 +66,22 @@ impl AppError {
 /// gewöhnliche I/O-Fehler werden nach ihrer Fehlerart eingeordnet.
 impl From<std::io::Error> for AppError {
     fn from(error: std::io::Error) -> Self {
+        let stream_report = doppeldecker_core::error::directory_stream_report(&error);
+        let dacl_report = doppeldecker_core::error::directory_dacl_report(&error);
         AppError {
             code: doppeldecker_core::error_code(&error).as_str().into(),
             message: error.to_string(),
             recovery_paths: doppeldecker_core::error::recovery_paths(&error),
+            directory_stream_report: (!stream_report.is_empty()).then(|| Box::new(stream_report)),
+            directory_dacl_report: (!dacl_report.is_empty()).then(|| Box::new(dacl_report)),
+            created_directory_dacl_report: {
+                let report = doppeldecker_core::error::created_directory_dacl_report(&error);
+                (!report.is_empty()).then(|| Box::new(report))
+            },
+            file_dacl_report: {
+                let report = doppeldecker_core::error::file_dacl_report(&error);
+                (!report.is_empty()).then(|| Box::new(report))
+            },
         }
     }
 }
@@ -211,9 +241,11 @@ fn safe_context(raw: &str) -> String {
         | "Queue-Fehler"
         | "Quarantäne-Fehler"
         | "Remote-Löschen"
+        | "Remote-Bearbeitung"
         | "Öffnen fehlgeschlagen"
         | "Realmodus-Fehler"
         | "Lokaler Sync"
+        | "Dateisync"
         | "Bidirektionaler Sync"
         | "Bidirektionale Queue"
         | "Bidirektionalen Abschluss prüfen"
@@ -225,6 +257,10 @@ fn safe_context(raw: &str) -> String {
         | "CLI-Einrichtung"
         | "Dateivergleich"
         | "Datei-Zwischenablage"
+        | "Duplizieren"
+        | "ZIP-Archiv"
+        | "ZIP entpacken"
+        | "Zwischenstand"
         | "Einstellungen"
         | "Projektinformationen"
         | "Favorit öffnen"
@@ -733,6 +769,62 @@ mod tests {
     }
 
     #[test]
+    fn verzeichnisstream_bilanz_erreicht_fehler_dto_optional() {
+        use doppeldecker_core::directory_streams::{
+            DirectoryStreamEffect, DirectoryStreamOutcome, DirectoryStreamReport,
+        };
+        let report = DirectoryStreamReport {
+            completed: vec![],
+            uncertain: vec![DirectoryStreamOutcome {
+                directory: "ordner".into(),
+                effect: DirectoryStreamEffect::Remove {
+                    before: doppeldecker_core::metadata::NamedBlobSummary {
+                        name: b"alt".to_vec(),
+                        value: doppeldecker_core::metadata::BlobSummary::from_bytes(b"inhalt"),
+                    },
+                },
+            }],
+        };
+        let error = doppeldecker_core::error::with_directory_stream_report(
+            std::io::Error::other("Antwortverlust"),
+            &report,
+        );
+        let value = tauri::ipc::InvokeError::from(AppError::from(error)).0;
+        assert_eq!(
+            value["directory_stream_report"],
+            serde_json::to_value(report).unwrap()
+        );
+        assert!(value["message"]
+            .as_str()
+            .unwrap()
+            .contains("Ausgang unklar"));
+    }
+
+    #[test]
+    fn directory_dacl_report_reaches_error_dto_without_stream_reclassification() {
+        let report = doppeldecker_core::directory_dacl::DirectoryDaclReport {
+            completed: Vec::new(),
+            uncertain: vec![doppeldecker_core::directory_dacl::DirectoryDaclOutcome {
+                directory: "folder".into(),
+                before_digest: [1; 32],
+                after_digest: [2; 32],
+            }],
+        };
+        let error = doppeldecker_core::error::with_directory_dacl_report(
+            std::io::Error::other("Antwortverlust"),
+            &report,
+        );
+        let value = tauri::ipc::InvokeError::from(AppError::from(error)).0;
+        assert_eq!(
+            value["directory_dacl_report"],
+            serde_json::to_value(report).unwrap()
+        );
+        assert!(value.get("directory_stream_report").is_none());
+        let plain = serde_json::to_value(AppError::new("io", "ohne ACL-Wirkung")).unwrap();
+        assert!(plain.get("directory_dacl_report").is_none());
+    }
+
+    #[test]
     fn capability_probe_code_erreicht_den_tauri_fehler() {
         let error = AppError::from(doppeldecker_core::capability_probe_required(
             "Capability-Probe fehlt",
@@ -772,5 +864,46 @@ mod tests {
             tauri::ipc::InvokeError::from(AppError::new("invalid_input", "Textfehler")).0,
             serde_json::json!({"code":"invalid_input", "message":"Textfehler"}),
         );
+    }
+    #[test]
+    fn created_directory_dacl_error_event_keeps_origin_object_and_normal_creation() {
+        use doppeldecker_core::created_directory_dacl::*;
+        let key = CreatedDirectoryEffectKey {
+            origin: CreatedDirectoryOrigin::ExclusiveMinimalCreate,
+            directory: "/target/folder".into(),
+            file_id: 42,
+            object_namespace: [1; 32],
+        };
+        let mut report = CreatedDirectoryDaclReport::default();
+        report.observe_created(CreatedDirectoryObservation {
+            effect_key: key,
+            ordinary_metadata_applied: true,
+        });
+        report.uncertain.push(CreatedDirectoryDaclOutcome {
+            origin: CreatedDirectoryOrigin::ExclusiveMinimalCreate,
+            directory: "/target/folder".into(),
+            file_id: 42,
+            object_namespace: [1; 32],
+            before_digest: [2; 32],
+            after_digest: [3; 32],
+        });
+        let error = doppeldecker_core::error::with_created_directory_dacl_report(
+            doppeldecker_core::coded_error(
+                std::io::ErrorKind::Other,
+                doppeldecker_core::ErrorCode::OutcomeUnclear,
+                "Rechte offen",
+            ),
+            &report,
+        );
+        let value = tauri::ipc::InvokeError::from(AppError::from(error)).0;
+        let mut expected = serde_json::to_value(&report).unwrap();
+        assert_eq!(expected["created"][0]["effect_key"]["file_id"], 42);
+        assert_eq!(expected["uncertain"][0]["file_id"], 42);
+        expected["created"][0]["effect_key"]["file_id"] = serde_json::json!("42");
+        expected["uncertain"][0]["file_id"] = serde_json::json!("42");
+        assert_eq!(value["created_directory_dacl_report"], expected);
+        assert_eq!(value["code"], "outcome_unclear");
+        assert!(value.get("file_dacl_report").is_none());
+        assert!(value.get("directory_dacl_report").is_none());
     }
 }

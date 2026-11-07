@@ -83,10 +83,7 @@ fn load_state(store: &Path) -> io::Result<(Vec<Favorite>, bool)> {
             "Favoriten-Ablage ist keine reguläre Datei oder zu groß",
         ));
     }
-    let mut payload = Vec::with_capacity(metadata.len() as usize);
-    file.by_ref()
-        .take(MAX_FAVORITES_BYTES + 1)
-        .read_to_end(&mut payload)?;
+    let payload = read_store_payload(&mut file, metadata.len() as usize)?;
     let parsed = serde_json::from_slice::<FavoriteStore>(&payload)
         .map(|document| {
             if document.version != FAVORITES_VERSION {
@@ -129,6 +126,22 @@ fn load_state(store: &Path) -> io::Result<(Vec<Favorite>, bool)> {
             ))
         }
     }
+}
+
+fn read_store_payload(reader: &mut impl Read, capacity: usize) -> io::Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(capacity);
+    reader
+        .take(MAX_FAVORITES_BYTES + 1)
+        .read_to_end(&mut payload)?;
+    // Die Datei kann seit der Metadatenabfrage gewachsen sein. Abgeschnittene
+    // Bytes dürfen weder als JSON gelten noch eine Korruptionskopie erzeugen.
+    if payload.len() as u64 > MAX_FAVORITES_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Favoriten-Ablage ist beim Lesen zu groß",
+        ));
+    }
+    Ok(payload)
 }
 
 /// Initialisiert eine fehlende Ablage unter demselben Lock wie normale Änderungen.
@@ -354,6 +367,16 @@ fn validate_favorites(favorites: &[Favorite]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wachsender_favoritenbestand_scheitert_vor_dem_json_parser() {
+        let mut payload = vec![b' '; MAX_FAVORITES_BYTES as usize + 1];
+        payload[..2].copy_from_slice(b"[]");
+        // Gültiges Altformat trotz nachträglich überschrittener Dateigröße.
+        assert!(serde_json::from_slice::<Vec<Favorite>>(&payload).is_ok());
+        let error = read_store_payload(&mut payload.as_slice(), 2).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 
     #[test]
     #[ignore = "wird nur vom isolierten FIFO-Gegenlauf mit eigener Markierung gestartet"]

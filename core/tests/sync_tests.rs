@@ -137,6 +137,7 @@ struct MetadataTestVfs {
     fail_owner: bool,
     fail_sync: bool,
     ignore_mode_write: bool,
+    narrow_sparse: Option<(u64, u64)>,
 }
 
 impl MetadataTestVfs {
@@ -150,6 +151,7 @@ impl MetadataTestVfs {
             fail_owner: true,
             fail_sync: false,
             ignore_mode_write: false,
+            narrow_sparse: None,
         }
     }
 
@@ -293,8 +295,10 @@ impl Vfs for MetadataTestVfs {
                 owner: doppeldecker_core::Capability::Unsupported,
                 special_mode_bits: doppeldecker_core::Capability::Unsupported,
                 acl_model: AclModel::Unsupported,
+                acl: doppeldecker_core::Capability::Unknown,
                 xattrs: doppeldecker_core::Capability::Unsupported,
                 resource_fork: doppeldecker_core::Capability::Unsupported,
+                named_streams: doppeldecker_core::Capability::Unsupported,
                 sparse_extents: doppeldecker_core::Capability::Unsupported,
                 hardlinks: doppeldecker_core::Capability::Unsupported,
             })
@@ -317,7 +321,19 @@ impl Vfs for MetadataTestVfs {
     }
 
     fn metadata_manifest(&self, path: &Path) -> std::io::Result<MetadataManifest> {
-        self.inner.metadata_manifest(path)
+        let manifest = self.inner.metadata_manifest(path)?;
+        if let Some((offset, length)) = self.narrow_sparse {
+            if self.inner.stat(path)?.is_file {
+                return manifest.with_sparse_observation(
+                    Some(vec![doppeldecker_core::metadata::DataExtent {
+                        offset,
+                        length,
+                    }]),
+                    None,
+                );
+            }
+        }
+        Ok(manifest)
     }
 
     fn write_acl_exact(&self, path: &Path, acl: Option<&Acl>) -> std::io::Result<()> {
@@ -1812,6 +1828,32 @@ fn fehlende_zielhardlinks_werden_bilanziert_und_sperren_strict() {
         &mut ignore_progress,
     )
     .unwrap();
+    let noop = plan(
+        &source,
+        src.path(),
+        &target,
+        dst.path(),
+        &native_best_effort_opts(SyncMode::Update),
+    )
+    .unwrap();
+    assert!(noop.actions.is_empty());
+    assert_eq!(
+        noop.metadata_report
+            .issues
+            .iter()
+            .filter(|issue| issue.class == doppeldecker_core::MetadataClass::Hardlinks)
+            .map(|issue| issue.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.bin", "b.bin"]
+    );
+    let class = noop
+        .metadata_report
+        .classes
+        .iter()
+        .find(|class| class.class == doppeldecker_core::MetadataClass::Hardlinks)
+        .unwrap();
+    assert_eq!((class.transferred, class.omitted), (0, 2));
+    assert_eq!(noop.metadata_observations.len(), 2);
     let a = fs::metadata(dst.path().join("a.bin")).unwrap();
     let b = fs::metadata(dst.path().join("b.bin")).unwrap();
     assert_ne!(a.ino(), b.ino());
@@ -3859,8 +3901,22 @@ fn native_ordner_mtime_wird_nach_eigener_kindkopie_im_realmodus_finalisiert() {
             metadata: MetadataProfile::NativeStrict,
             ..Default::default()
         };
-        let prepared =
-            doppeldecker_core::prepare_local_real_run(&source, &target, options.clone()).unwrap();
+        let registry_root = ::tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let registry_queue = doppeldecker_core::OperationQueue::open(
+            registry_root.path().join("operations-queue.json"),
+        )
+        .unwrap();
+        let prepared = doppeldecker_core::prepare_local_real_run_for_queue(
+            &registry_queue,
+            &source,
+            &target,
+            options.clone(),
+            None,
+        )
+        .unwrap();
         assert_eq!(prepared.preview().plan.copy_count, 1);
         assert_eq!(
             prepared.preview().plan.delete_count,
@@ -3956,4 +4012,90 @@ fn native_ordnerabschluss_zaehlt_nur_direkte_nicht_ausgeschlossene_kindaktionen(
             .collect::<Vec<_>>();
         assert_eq!(directory_paths, vec!["ordner/tief"]);
     }
+}
+
+#[test]
+fn native_best_effort_fine_sparse_layout_keeps_verified_content() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let dst = LocalVfs::new();
+    let Some(unit) = dst.sparse_allocation_unit(target.path()).unwrap() else {
+        return;
+    };
+    assert!(unit > 1 && unit <= 1024 * 1024);
+    let mut bytes = vec![0u8; unit as usize * 2];
+    bytes[unit as usize / 2..unit as usize].fill(0x41);
+    fs::write(source.path().join("file.bin"), &bytes).unwrap();
+    let src = MetadataTestVfs {
+        narrow_sparse: Some((u64::from(unit / 2), u64::from(unit / 2))),
+        fail_owner: false,
+        ..MetadataTestVfs::new()
+    };
+    let plan = plan(
+        &src,
+        source.path(),
+        &dst,
+        target.path(),
+        &native_best_effort_opts(SyncMode::AddOnly),
+    )
+    .unwrap();
+    assert!(
+        matches!(&plan.actions[0],Action::CopyFile{metadata:Some(value),..} if !value.sparse_extents)
+    );
+    assert_eq!(
+        plan.metadata_report
+            .issues
+            .iter()
+            .filter(|issue| issue.class == doppeldecker_core::MetadataClass::SparseExtents)
+            .count(),
+        1
+    );
+    execute(
+        ExecuteRequest {
+            src: &src,
+            src_root: source.path(),
+            dst: &dst,
+            dst_root: target.path(),
+            plan: &plan,
+            safety: &real(),
+        },
+        &Cancel::new(),
+        &mut ignore_progress,
+    )
+    .unwrap();
+    assert_eq!(fs::read(target.path().join("file.bin")).unwrap(), bytes);
+}
+
+#[test]
+fn native_strict_never_downgrades_fine_sparse_layout_before_mutation() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let dst = LocalVfs::new();
+    let Some(unit) = dst.sparse_allocation_unit(target.path()).unwrap() else {
+        return;
+    };
+    assert!(unit > 1 && unit <= 1024 * 1024);
+    let mut bytes = vec![0u8; unit as usize * 2];
+    bytes[unit as usize / 2..unit as usize].fill(0x41);
+    fs::write(source.path().join("file.bin"), &bytes).unwrap();
+    let src = MetadataTestVfs {
+        narrow_sparse: Some((u64::from(unit / 2), u64::from(unit / 2))),
+        fail_owner: false,
+        ..MetadataTestVfs::new()
+    };
+    let error = plan(
+        &src,
+        source.path(),
+        &dst,
+        target.path(),
+        &SyncOptions {
+            mode: SyncMode::AddOnly,
+            compare: Compare::ContentHash,
+            metadata: MetadataProfile::NativeStrict,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(fs::read_dir(target.path()).unwrap().count(), 0);
 }

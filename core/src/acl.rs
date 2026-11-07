@@ -52,6 +52,12 @@ mod platform {
                     "NFSv4-ACL ist mit Linux-POSIX-ACL nicht kompatibel",
                 ))
             }
+            Some(Acl::WindowsDacl(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows-DACL wird nicht in eine lokale POSIX-ACL übersetzt",
+                ))
+            }
             None => (&[][..], &[][..]),
         };
         if let Some(acl) = acl {
@@ -339,6 +345,12 @@ mod platform {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "POSIX-ACL ist mit macOS-NFSv4-ACL nicht kompatibel",
+                ))
+            }
+            Some(Acl::WindowsDacl(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows-DACL wird nicht in eine lokale NFSv4-ACL übersetzt",
                 ))
             }
             None => &[],

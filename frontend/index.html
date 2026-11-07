@@ -8,6 +8,10 @@
          Inline-Script wegen der strikten CSP; Details in theme-boot.js). -->
     <script src="theme-boot.js"></script>
     <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="duplicate.css" />
+    <link rel="stylesheet" href="archive-pack.css" />
+    <link rel="stylesheet" href="archive-read.css" />
+    <link rel="stylesheet" href="batch-rename.css" />
   </head>
   <body>
     <div id="app">
@@ -90,6 +94,11 @@
             <ul class="connection-list" id="connection-list"></ul>
           </section>
         </div>
+        <button class="quarantine-shortcut" id="btn-remote-edits" hidden title="Geöffnete Remote-Bearbeitungen zurückspeichern">
+          <span aria-hidden="true">✎</span>
+          <span>Remote-Bearbeitung</span>
+          <span class="quarantine-count" id="remote-edit-count">0</span>
+        </button>
         <button class="quarantine-shortcut" id="btn-quarantine" title="Quarantäneläufe anzeigen und wiederherstellen">
           <span class="quarantine-icon" aria-hidden="true"></span>
           <span>Quarantäne</span>
@@ -125,6 +134,16 @@
                die Spalte einmalig an den Inhalt an (siehe column-layout.js). -->
           <div class="pane-tabs" role="tablist" aria-label="Linke Pane-Tabs"></div>
           <div class="pane-content" id="pane-panel-left" role="tabpanel">
+          <div class="pane-filter" role="group" aria-label="Linke Dateiliste filtern">
+            <input class="pane-filter-text" type="search" aria-label="Name oder Endung links filtern"
+                   placeholder="Name oder Endung filtern" title="Filtert den geladenen Ordner, ohne Unterordner zu durchsuchen"
+                   spellcheck="false" autocomplete="off" />
+            <select class="pane-filter-kind" aria-label="Dateityp links filtern">
+              <option value="all">Alle Typen</option><option value="files">Dateien</option><option value="folders">Ordner</option>
+            </select>
+            <button class="icon-btn pane-filter-clear" type="button" aria-label="Linken Filter leeren" title="Filter leeren (Escape)" disabled>×</button>
+            <button class="icon-btn pane-search" type="button" aria-label="Linke Pane: Unterordner durchsuchen" title="Namen in Unterordnern suchen (⌘/Ctrl+Shift+F)">⌕</button>
+          </div>
           <div class="list-header">
             <span class="col col-icon"></span>
             <span class="col col-name" data-sort="name" role="button" tabindex="0">Name</span>
@@ -173,6 +192,16 @@
           </div>
           <div class="pane-tabs" role="tablist" aria-label="Rechte Pane-Tabs"></div>
           <div class="pane-content" id="pane-panel-right" role="tabpanel">
+          <div class="pane-filter" role="group" aria-label="Rechte Dateiliste filtern">
+            <input class="pane-filter-text" type="search" aria-label="Name oder Endung rechts filtern"
+                   placeholder="Name oder Endung filtern" title="Filtert den geladenen Ordner, ohne Unterordner zu durchsuchen"
+                   spellcheck="false" autocomplete="off" />
+            <select class="pane-filter-kind" aria-label="Dateityp rechts filtern">
+              <option value="all">Alle Typen</option><option value="files">Dateien</option><option value="folders">Ordner</option>
+            </select>
+            <button class="icon-btn pane-filter-clear" type="button" aria-label="Rechten Filter leeren" title="Filter leeren (Escape)" disabled>×</button>
+            <button class="icon-btn pane-search" type="button" aria-label="Rechte Pane: Unterordner durchsuchen" title="Namen in Unterordnern suchen (⌘/Ctrl+Shift+F)">⌕</button>
+          </div>
           <div class="list-header">
             <span class="col col-icon"></span>
             <span class="col col-name" data-sort="name" role="button" tabindex="0">Name</span>
@@ -306,7 +335,7 @@
           <button class="icon-btn" id="queue-popover-close" type="button"
                   aria-label="Queue-Popover schließen">×</button>
         </div>
-        <p class="queue-popover-note">Genau eine Operation läuft. Pause startet keine neue Operation; ein laufender Transfer endet sicher oder wird über „Abbrechen“ gestoppt.</p>
+        <p class="queue-popover-note">Pro Fenster läuft höchstens eine Operation. Pause startet keine neue Operation; ein laufender Transfer endet sicher oder wird über „Abbrechen“ gestoppt.</p>
         <div class="queue-popover-controls">
           <button class="btn ghost small" id="queue-toggle-pause" type="button"></button>
           <button class="btn ghost small" id="queue-toggle-stop" type="button"></button>

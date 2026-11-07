@@ -1,6 +1,6 @@
 # Gewöhnliche WebDAV-Ordneranlage
 
-Stand: 2026-10-18. GUI „Neuer Ordner“ und CLI `mkdir` verwenden eine eigene
+Stand: 2026-10-29. GUI „Neuer Ordner“ und CLI `mkdir` verwenden eine eigene
 additive Ausführungsklasse. Eine rekursive Löschfähigkeit oder künstliche
 Schreib-/Löschprobe ist dafür nicht erforderlich. Strikter Ziel-Sync und allgemeine VFS-Mutationen bleiben
 ohne gemeinsame Root-/Elternbindung passiv gesperrt;
@@ -27,8 +27,12 @@ Core genau ein `MKCOL` mit genau einer getaggten `If`-Bedingung für den unmitte
 `If-None-Match: *`. Er sendet kein probeweises `PUT`, `MOVE` oder `DELETE`.
 
 Erfolg verlangt HTTP 201 sowie einen unabhängigen Readback: exakter Name, echte
-leere Collection, eindeutiger Elternlisting-Eintrag, übereinstimmende Tokens und
-weiterhin dieselbe Elternkette und Sitzung. Eine ETag in der Anlegeantwort ist
+leere Collection, eindeutiger Elternlisting-Eintrag und übereinstimmende Tokens.
+Der übrige vollständige Elternbestand muss einschließlich seiner Metadaten und
+Versionen unverändert sein. Dann darf die eigene Kindanlage die Inhaltsversion
+des unmittelbaren Elternordners ändern; die neue Version wird bis zum Ende des
+Readbacks erneut geprüft. Vorfahrenversionen und Sitzung bleiben gebunden.
+Eine ETag in der Anlegeantwort ist
 optional; wenn vorhanden, muss sie stark sein und mit dem Readback übereinstimmen.
 Ohne diese ETag benennt das Ergebnis ausdrücklich den fehlenden direkten
 Identitätsvergleich zwischen Antwort und Readback.
@@ -44,9 +48,11 @@ Vorfahrenwechsel kann trotzdem vor der Drifterkennung wirken.
 Best Effort vertraut den serverseitigen Bedingungen ohne künstliche Gegenprobe.
 Es beweist weder dauerhafte Speicherung noch unter allen Umständen, dass Antwort
 und späterer Readback denselben neu angelegten Ordner meinen. Server ohne starke
-Eltern-ETags bleiben konkret gesperrt. Ändert eine Collection ihre ETag durch die
-Anlage, kann die Nachprüfung den Lauf als unklar einstufen, obwohl der neue Ordner
-vorhanden ist. Dies ist keine allgemeine WebDAV-Schreibfreigabe.
+Eltern-ETags bleiben konkret gesperrt. Eine zusätzliche Änderung an anderen
+Mitgliedern oder Vorfahren ergibt weiterhin einen unklaren Ausgang. Dazu gehört
+eine Versionierung, die die eigene Kindanlage bis in Vorfahren propagiert; diese
+gewöhnliche Ordnerklasse kann sie nicht einem unveränderten Vorfahren zuordnen.
+Dies ist keine allgemeine WebDAV-Schreibfreigabe.
 
 Vorhandene Namen werden erhalten. HTTP 405, 409 oder 412 werden ausschließlich
 lesend eingeordnet: beobachtete Kollision, veränderte Elternkette oder konkrete
@@ -56,9 +62,8 @@ dem Prüfpfad. Der mögliche neue Ordner bleibt stehen; es gibt weder automatisc
 Wiederholversuch noch aufräumendes Löschen. Die GUI zeigt einen kurzen Fehler und
 aufklappbare vollständige Details samt Prüfpfaden.
 
-SFTP-mkdir bleibt wegen fehlendem an den Elternordner gebundenem MKDIR in v3
-gesperrt: Ein Elternwechsel könnte außerhalb des gewählten Bereichs schreiben.
-Diese Grenze wird durch den WebDAV-Weg nicht gelockert.
+Die gewöhnliche SFTP-Ordneranlage besitzt ihren eigenen
+[pfadbasierten Best-Effort-Vertrag](sftp-writes.md).
 
 ## Standardbezug und Prüfung
 
@@ -71,7 +76,9 @@ darf deshalb keine Eintrittsschranke für die gewöhnliche Ordneranlage sein.
 `core/tests/webdav_folder.rs` prüft einen isolierten HTTPS-Server mit standardgemäß
 abgelehntem Collection-DELETE, Unicode-/Prozentnamen, fehlender Antwort-ETag,
 Namenskollisionen, falschem oder fehlendem Readback, Antwortverlust, Eltern- und
-Profilrootwechsel sowie fehlenden Elternbedingungen. Wire-Zähler belegen genau
+Profilrootwechsel sowie fehlenden Elternbedingungen. Eigene wechselnde
+Elternversionen werden akzeptiert; zusätzliche fremde Namen, entfernte oder
+inhaltlich geänderte Nachbareinträge bleiben unklar. Wire-Zähler belegen genau
 eine angeforderte Mutation und keine künstliche Probe oder automatische Bereinigung.
 Browserfälle prüfen Vertrag vor Namenseingabe, Klassenweitergabe, veraltete
 Navigation und zugängliche vollständige Fehlerdetails.

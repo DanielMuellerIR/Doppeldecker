@@ -3,6 +3,7 @@
 //! Profile enthalten nur öffentliche Zertifikat-Pins und Schlüsselbundreferenzen.
 //! Passwortwerte, TLS-Sitzungen und Realmodus-Permits bleiben ausschließlich im RAM.
 
+use crate::frontend_payload::FrontendQueueSnapshot;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,9 +11,9 @@ use std::time::{Duration, Instant};
 use doppeldecker_core::{
     load_webdav_profiles as core_load_profiles, prepare_webdav_download,
     prepare_webdav_queue_entry, prepare_webdav_upload, Entry, OperationQueue, Progress, QueueEntry,
-    QueueExecutionResult, QueueOperation, QueueSnapshot, RealRunPreview, RemoteCapabilities,
-    RemoteProfileBinding, RemoteProfileProtocol, SftpQueueDirection, SftpQueuePreparation,
-    SyncOptions, SyncPlan, VersionedProfile, WebDavProfile, WebDavServerIdentity, WebDavVfs,
+    QueueExecutionResult, QueueOperation, RealRunPreview, RemoteCapabilities, RemoteProfileBinding,
+    RemoteProfileProtocol, SftpQueueDirection, SftpQueuePreparation, SyncOptions, SyncPlan,
+    VersionedProfile, WebDavProfile, WebDavServerIdentity, WebDavVfs,
 };
 use tauri::{Manager, State, WebviewWindow};
 
@@ -451,8 +452,7 @@ pub(crate) fn discard_webdav_sync(window: WebviewWindow, state: State<AppState>)
 pub(crate) async fn run_webdav_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    confirmation: String,
-    backup_confirmed: bool,
+    effects_confirmed: bool,
 ) -> Result<(), AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -470,13 +470,10 @@ pub(crate) async fn run_webdav_sync(
                     &app,
                     &pending.profile_bindings,
                 )?;
-                let preview = pending.prepared.preview();
-                if confirmation != preview.confirmation_phrase
-                    || (preview.backup_confirmation_required && !backup_confirmed)
-                {
+                if !effects_confirmed {
                     return Err(AppError::new(
                         "confirmation_mismatch",
-                        "WebDAV-Laufbestätigung stimmt nicht exakt überein",
+                        "WebDAV-Sync-Wirkung wurde nicht bestätigt",
                     ));
                 }
                 Ok(())
@@ -490,7 +487,7 @@ pub(crate) async fn run_webdav_sync(
             move |on_progress| {
                 prepared
                     .prepared
-                    .confirm(&confirmation, backup_confirmed)?
+                    .confirm_effects(effects_confirmed)?
                     .execute_with_audit(&audit, &cancel, on_progress)
             },
         );
@@ -518,7 +515,7 @@ pub(crate) async fn enqueue_webdav_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
     request: EnqueueWebDavRequest,
-) -> Result<QueueSnapshot, AppError> {
+) -> Result<FrontendQueueSnapshot, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let label = window.label();
@@ -567,7 +564,7 @@ pub(crate) async fn enqueue_webdav_sync(
         })?;
         emit_queue_snapshot(&app, label, &queue);
         start_queue_worker(app, label.to_owned());
-        Ok(queue.snapshot())
+        Ok(queue.snapshot().into())
     })
     .await
     .map_err(|_| AppError::new("app", "WEBDAV-Worker wurde unterbrochen"))?
@@ -615,7 +612,7 @@ pub(crate) fn prepare_remote_queue_entry(
                 "sync-error",
                 AppError::new(
                     "app",
-                    "WebDAV-Lauf ist geprüft; Queue öffnen und die einmalige Laufphrase bestätigen",
+                    "WebDAV-Lauf ist geprüft; Queue öffnen und die angezeigte Wirkung bestätigen",
                 ),
             )
         }
@@ -634,9 +631,8 @@ pub(crate) async fn approve_webdav_queue_entry(
     app: tauri::AppHandle,
     window: WebviewWindow,
     operation_id: String,
-    confirmation: String,
-    backup_confirmed: bool,
-) -> Result<QueueSnapshot, AppError> {
+    effects_confirmed: bool,
+) -> Result<FrontendQueueSnapshot, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let label = window.label().to_owned();
@@ -668,13 +664,10 @@ pub(crate) async fn approve_webdav_queue_entry(
                         "WebDAV-Queue-Vorbereitung gehört zu einem anderen Eintrag",
                     ));
                 }
-                let preview = prepared.prepared.preview();
-                if confirmation != preview.confirmation_phrase
-                    || (preview.backup_confirmation_required && !backup_confirmed)
-                {
+                if !effects_confirmed {
                     return Err(AppError::new(
                         "confirmation_mismatch",
-                        "WebDAV-Queue-Bestätigung stimmt nicht exakt überein",
+                        "WebDAV-Queue-Wirkung wurde nicht bestätigt",
                     ));
                 }
                 Ok(())
@@ -700,11 +693,10 @@ pub(crate) async fn approve_webdav_queue_entry(
             let events = window.clone();
             let mut last = Instant::now() - Duration::from_secs(1);
             let mut terminal_progress = None;
-            let result = doppeldecker_core::execute_prepared_sftp_queue_entry(
+            let result = doppeldecker_core::execute_prepared_sftp_queue_entry_effects(
                 &queue_for_worker,
                 prepared.prepared,
-                &confirmation,
-                backup_confirmed,
+                effects_confirmed,
                 &audit,
                 &cancel,
                 &mut |progress| {
@@ -757,7 +749,7 @@ pub(crate) async fn approve_webdav_queue_entry(
                 }
             });
         });
-        Ok(queue.snapshot())
+        Ok(queue.snapshot().into())
     })
     .await
     .map_err(|_| AppError::new("app", "WEBDAV-Worker wurde unterbrochen"))?

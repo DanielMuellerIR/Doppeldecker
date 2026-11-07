@@ -1,6 +1,6 @@
 # SFTP-Anzeigelisting und Auslassungen
 
-Stand: 2026-10-18.
+Stand: 2026-11-01.
 
 Die interaktive SFTP-Liste bleibt eine pfadbasierte Best-Effort-Anzeige. Root,
 Elternkette, Hostkey und Sitzung werden geprüft; fehlende atomare Namespacebindung
@@ -23,6 +23,16 @@ Dateityp werden ausgelassen. Unabhängige gültige Dateien bleiben sichtbar und 
 den bestehenden begrenzten Inhaltsweg nutzbar. Symlinks und belegte Spezialtypen
 bleiben als solche sichtbar; eine fehlende Dateigröße bleibt `null`, echte 0 Byte
 bleiben 0. Fehlende Zeiten und Eigentümer werden nicht erfunden.
+
+OpenSSH kann Eigentümer- und Gruppennamen über
+`users-groups-by-id@openssh.com` Version 1 liefern. Je Pane-Listing werden höchstens
+32 Benutzer- und 32 Gruppen-IDs abgefragt. Unbekannte Namen, andere Server und
+fehlgeschlagene optionale Abfragen behalten die numerische Anzeige; nach einem
+Fehler erfolgt bis zum Reconnect keine weitere Namensabfrage. Lokale Kontonamen
+werden nicht auf entfernte IDs übertragen. Diese Anzeige erweitert weder
+Schreibrechte noch die Identitätsdomäne eines Sync-Laufs. Protokollgegenläufe und
+echte isolierte OpenSSH-Läufe bestehen auf macOS und Linux; die native macOS-Pane
+zeigt die Servernamen auch im Informationsdialog.
 
 `omitted` enthält Anzeigenamen und Gründe. `display_name` maskiert Steuerzeichen
 und Backslashes; der Wert ist ausdrücklich kein verwendbarer Dateipfad.

@@ -32,6 +32,13 @@ ersetzen weder Dateirechte noch die frische Plan-, Identitäts- und Readbackprü
 `Portable` bleibt der Standard; diese Änderung schaltet keine neue Metadatenklasse
 oder mutierende Probe frei.
 
+Für die lokale Sparse-Darstellbarkeit liest der Adapter auf APFS, ext4 und Btrfs zusätzlich
+`f_frsize` am gehaltenen Elternordner und prüft dessen Mount vor und nach der
+Abfrage. Die Blockgröße erteilt keine Schreibfähigkeit. Sie begrenzt konkret
+bekannte Lochgrenzen; andere Treiber bleiben in dieser zusätzlichen Abfrage
+unbekannt. Profilentscheidung, ungerades EOF und Grenzen stehen im
+[Sparse-Vertrag](metadata-stage2-design.md#lokale-allokationsgrenzen).
+
 ## Gegenlauf mit eigenen Images
 
 Der opt-in-Test `core/tests/local_metadata_mounts.rs` erwartet ausschließlich

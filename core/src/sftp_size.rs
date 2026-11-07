@@ -1,4 +1,4 @@
-//! Größen aus derselben begrenzten Metadatenvorbereitung wie SFTP-Downloads.
+//! Größen aus derselben iterativen Metadatenvorbereitung wie SFTP-Downloads.
 //! Es entsteht weder ein vollständiges Sync-Listing noch ein Datei-READ-Handle.
 
 use super::*;
@@ -9,7 +9,7 @@ use crate::directory_size::{
 use crate::{Cancel, ErrorCode};
 use std::path::PathBuf;
 
-pub const SFTP_DIRECTORY_SIZE_LIMITATION: &str = "SFTP-Ordnergröße · Best Effort: beobachteter Bestand, keine atomare Momentaufnahme. SFTP v3 bindet OPENDIR nicht atomar an den Pane-Root; ein unbemerkter Pfadtausch zwischen den Prüfungen bleibt möglich. Pro Ordner höchstens 1000 Einträge und 16 Unterordnerebenen; höchstens 100 direkte Ordner und 60 Sekunden je Anfrage zuzüglich laufendem Request/Cleanup. Symlinks und nicht belegbare Metadaten werden ausgelassen. Kein Dateiinhalt wird geöffnet. Jede Berechnung liest frisch; kein dauerhafter Größencache.";
+pub const SFTP_DIRECTORY_SIZE_LIMITATION: &str = "SFTP-Ordnergröße · Best Effort: beobachteter Bestand, keine atomare Momentaufnahme. SFTP v3 bindet OPENDIR nicht atomar an den Pane-Root; ein unbemerkter Pfadtausch zwischen den Prüfungen bleibt möglich. Die iterative Berechnung ist abbrechbar; jeder Request besitzt eine Frist, vollständige Belege brauchen Speicher proportional zum Bestand. Symlinks und nicht belegbare Metadaten werden ausgelassen. Kein Dateiinhalt wird geöffnet. Jede Berechnung liest frisch; kein dauerhafter Größencache.";
 
 impl SftpVfs {
     /// Liefert pro ausgewähltem Ordner eine frische beobachtete Bilanz. Ein Fehler
@@ -25,7 +25,7 @@ impl SftpVfs {
     ) -> io::Result<DirectorySizeStats> {
         let paths = names.iter().map(|name| root.join(name)).collect::<Vec<_>>();
         crate::sftp::validate_interactive_content_selection(root, &paths)?;
-        let bounded = cancel.until(std::time::Instant::now() + Duration::from_secs(60));
+        let bounded = cancel.clone();
         let generation = self.session_generation();
         let mut stats = DirectorySizeStats {
             requested: paths.len() as u64,
@@ -63,17 +63,6 @@ impl SftpVfs {
                     limitations: vec![SFTP_DIRECTORY_SIZE_LIMITATION.into()],
                 })
             })();
-            let measured = measured.map_err(|error| {
-                if bounded.is_cancelled() && !cancel.is_cancelled() {
-                    crate::coded_error(
-                        io::ErrorKind::TimedOut,
-                        ErrorCode::ConnectionLost,
-                        "SFTP-Größenberechnung erreichte die Gesamtfrist von 60 Sekunden",
-                    )
-                } else {
-                    error
-                }
-            });
             let result = measured.unwrap_or_else(|error| DirectorySizeResult {
                 path: path.clone(),
                 bytes: 0,

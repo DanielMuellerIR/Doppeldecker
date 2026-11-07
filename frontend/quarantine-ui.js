@@ -22,7 +22,7 @@ export function createQuarantineUi({
   let navigationSequence = 0;
   let badgeSequence = 0;
 
-  const sftpQuarantineLimitation = "Dateidownload, Sync und Quarantäneverwaltung gesperrt: SFTP v3 bindet READDIR, LSTAT und OPEN nicht atomar an den gewählten Pane-Root.";
+  const sftpQuarantineLimitation = "Für SFTP ist keine Providerquarantäne verfügbar. Dauerhaftes Löschen ist über das Dateimenü möglich.";
   // Der Grund oben gehört zu SFTP v3. Das Backend meldet `listing: false` aber auch
   // für FTPS und WebDAV, und dort sind Dateidownload und Sync gerade nicht gesperrt.
   // Welche Provider betroffen sind, weiss allein der Core; das Frontend nennt

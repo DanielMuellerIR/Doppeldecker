@@ -41,20 +41,20 @@ function metadataText(entry) {
   return values.filter(Boolean).join(" · ");
 }
 
-function actionLabel(action) {
+function actionLabel(action, permanentRemovals = false) {
   return {
     Add: "＋",
     Update: "⟳",
-    Quarantine: "Quarantäne",
+    Quarantine: permanentRemovals === null ? "entfernen" : permanentRemovals ? "dauerhaft entfernen" : "Quarantäne",
     Skip: "ausgelassen",
   }[action] || action;
 }
 
-function actionAriaLabel(action) {
+function actionAriaLabel(action, permanentRemovals = false) {
   return {
     Add: "Hinzufügen",
     Update: "Aktualisieren",
-    Quarantine: "In Quarantäne verschieben",
+    Quarantine: permanentRemovals === null ? "Entfernen" : permanentRemovals ? "Dauerhaft entfernen" : "In Quarantäne verschieben",
     Skip: "Sicher auslassen",
   }[action] || action;
 }
@@ -67,14 +67,14 @@ function affectedAriaLabel(side) {
   }[side] || "betroffene Seite unbekannt";
 }
 
-function badgeHtml(row, side) {
+function badgeHtml(row, side, permanentRemovals) {
   const affected = row.affected_side === side;
   // Eine Auslassung verändert keine Seite, braucht aber weiterhin einen sichtbaren
   // Status. Er steht neutral in der Zielspalte, nicht als behauptete Zielwirkung.
   const neutralSkip = row.action === "Skip" && side === "Target";
   if (!affected && !neutralSkip) return "";
   const css = row.action.toLowerCase();
-  return `<span class="sync-diff-badge ${css}" aria-label="${escapeHtml(actionAriaLabel(row.action))}">${escapeHtml(actionLabel(row.action))}</span>`;
+  return `<span class="sync-diff-badge ${css}" aria-label="${escapeHtml(actionAriaLabel(row.action, permanentRemovals))}">${escapeHtml(actionLabel(row.action, permanentRemovals))}</span>`;
 }
 
 function indentHtml(depth) {
@@ -84,7 +84,7 @@ function indentHtml(depth) {
     : "";
 }
 
-function sideHtml(row, side, issues, metadataClassLabels) {
+function sideHtml(row, side, issues, metadataClassLabels, permanentRemovals) {
   const entry = row[side.toLowerCase()] || null;
   const pathParts = String(row.path || "").split("/");
   const name = pathParts.at(-1) || row.path || "—";
@@ -100,22 +100,23 @@ function sideHtml(row, side, issues, metadataClassLabels) {
       <small class="sync-diff-meta">${escapeHtml(metadataText(entry))}</small>
       ${issueText ? `<small class="sync-diff-issue" title="${escapeHtml(issueText)}">⚠ ${escapeHtml(issueText)}</small>` : ""}
     </span>
-    ${badgeHtml(row, side)}
+    ${badgeHtml(row, side, permanentRemovals)}
   </div>`;
 }
 
-function rowHtml(row, index, total, selected, issues, metadataClassLabels) {
-  const label = `${row.path}: ${actionAriaLabel(row.action)}, ${affectedAriaLabel(row.affected_side)}`;
+function rowHtml(row, index, total, selected, issues, metadataClassLabels, permanentRemovals) {
+  const label = `${row.path}: ${actionAriaLabel(row.action, permanentRemovals)}, ${affectedAriaLabel(row.affected_side)}`;
   return `<div id="sync-comparison-option-${index}" class="sync-diff-row${selected ? " selected" : ""}"
     data-i="${index}" role="option" aria-selected="${selected}" aria-posinset="${index + 1}"
     aria-setsize="${total}" aria-label="${escapeHtml(label)}">
-    ${sideHtml(row, "Source", issues, metadataClassLabels)}
-    ${sideHtml(row, "Target", issues, metadataClassLabels)}
+    ${sideHtml(row, "Source", issues, metadataClassLabels, permanentRemovals)}
+    ${sideHtml(row, "Target", issues, metadataClassLabels, permanentRemovals)}
   </div>`;
 }
 
 export function createSyncComparisonView({ root, list, categorySummary, metadataClassLabels }) {
   let rows = [];
+  let permanentRemovals = false;
   let selected = 0;
   let issuesByPath = new Map();
 
@@ -157,6 +158,7 @@ export function createSyncComparisonView({ root, list, categorySummary, metadata
         index === selected,
         issuesByPath.get(rows[index].path) || [],
         metadataClassLabels,
+        permanentRemovals,
       ));
     }
     list.dataset.virtualized = String(virtualized);
@@ -173,7 +175,8 @@ export function createSyncComparisonView({ root, list, categorySummary, metadata
     renderRows();
   }
 
-  function render(comparison, metadataReport = null) {
+  function render(comparison, metadataReport = null, presentation = {}) {
+    permanentRemovals = presentation.permanentRemovals === null ? null : Boolean(presentation.permanentRemovals);
     rows = Array.isArray(comparison?.rows) ? comparison.rows : [];
     selected = 0;
     issuesByPath = new Map();
@@ -187,7 +190,7 @@ export function createSyncComparisonView({ root, list, categorySummary, metadata
     categorySummary.textContent = [
       `${counts.additions || 0} hinzufügen`,
       `${counts.updates || 0} aktualisieren`,
-      `${counts.quarantines || 0} Quarantäne`,
+      `${counts.quarantines || 0} ${permanentRemovals === null ? "entfernen" : permanentRemovals ? "dauerhaft entfernen" : "Quarantäne"}`,
       `${counts.skipped || 0} ausgelassen`,
     ].join(" · ");
     root.hidden = rows.length === 0;

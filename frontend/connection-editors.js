@@ -301,10 +301,17 @@ export function createConnectionEditors({
     const userInput = shell.query("#sftp-user");
     const rootInput = shell.query("#sftp-root");
     const secureSecret = wireSecureSecret(shell, "sftp", editorProfileId);
+    const auth = shell.query("#sftp-auth");
     const agentInput = shell.query("#sftp-agent");
     const passwordRow = shell.query("#sftp-password-row");
     const agentRow = shell.query("#sftp-agent-row");
     const renderAgentKeys = () => {
+      if (agentKeys.length && !auth.querySelector('option[value="agent"]')) {
+        const option = document.createElement("option");
+        option.value = "agent";
+        option.textContent = "Gebundener SSH-Agent-Schlüssel";
+        auth.append(option);
+      }
       agentInput.innerHTML = agentKeys.map((key, index) =>
         `<option value="${index}">${escapeHtml(key.comment || key.algorithm)} · ${escapeHtml(fingerprint(key.sha256))}</option>`,
       ).join("");
@@ -327,7 +334,6 @@ export function createConnectionEditors({
       hostInput.value = suggested.host || "";
       portInput.value = String(suggested.port || 22);
     }
-    const auth = shell.query("#sftp-auth");
     if (existingAuthentication?.type === "ssh_agent") {
       auth.value = "agent";
     } else if (preserveUnsupportedAuthentication) {
@@ -554,14 +560,16 @@ export function createConnectionEditors({
           <option value="plaintext">FTP · unverschlüsselt</option>
         </select></label>
         <label class="wide" id="ftps-policy-row">Zertifikatsprüfung<select id="ftps-policy">
+          <option value="web_pki">Öffentliche Kette, Gültigkeit und Servername</option>
           <option value="web_pki_and_pin">Öffentliche PKI plus exakter Pin</option>
           <option value="pinned_certificate">Extern geprüftes privates Zertifikat plus exakter Pin</option>
           <option value="unverified_certificate">Exakter Pin ohne Identitätsprüfung</option>
         </select><small>„Ohne Identitätsprüfung“ verschlüsselt die Verbindung und bindet das beobachtete Zertifikat, bestätigt aber nicht, wem der Server gehört.</small></label>
         ${secureSecretControl(editing)}
+        <button type="button" class="btn ghost wide" id="ftps-refresh-certificate" hidden>Zertifikat neu ermitteln</button>
         <div class="real-warning wide" id="ftps-certificate">Noch kein Zertifikat ermittelt. Der erste Schritt führt nur AUTH TLS aus; es erfolgt weder Anmeldung noch Dateizugriff.</div>
       </div>`,
-      "Zertifikat ermitteln",
+      "Prüfen und speichern",
     );
     shell.show(() => {
     const nameInput = shell.query("#ftps-name");
@@ -592,72 +600,91 @@ export function createConnectionEditors({
     const transport = shell.query("#ftps-transport");
     const policy = shell.query("#ftps-policy");
     const certificateNote = shell.query("#ftps-certificate");
+    const refreshCertificate = shell.query("#ftps-refresh-certificate");
+    let replacedPin = null;
     const endpoint = () => `${hostInput.value.trim()}\n${Number(portInput.value)}\n${transport.value}`;
     const originalIdentityEndpoint = originalPin ? `${originalEndpoint}\n${originalTransport}` : null;
     if (originalPin) pinEndpoint = originalIdentityEndpoint;
     const updateTransport = () => {
       const plaintext = transport.value === "plaintext";
       policyRow.hidden = plaintext;
+      refreshCertificate.hidden = plaintext || policy.value === "web_pki" || !pin;
       if (plaintext) {
         certificateNote.innerHTML = "<b>Unverschlüsseltes FTP:</b> Nutzername, Passwort, Verzeichnisnamen und Dateiinhalte sind auf dem Transportweg lesbar. Doppeldecker verbindet trotzdem ohne weitere Bestätigung.";
         shell.primary.textContent = editing ? "Änderungen speichern" : "FTP-Profil speichern";
         return;
       }
       const selectedEndpoint = endpoint();
-      if (originalPin && selectedEndpoint === originalIdentityEndpoint) {
-        pin = originalPin;
-        pinEndpoint = originalIdentityEndpoint;
-      } else if (selectedEndpoint !== pinEndpoint) {
-        pin = null;
-        pinEndpoint = null;
+      if (selectedEndpoint !== pinEndpoint) {
+        pin = selectedEndpoint === originalIdentityEndpoint ? originalPin : null;
+        pinEndpoint = pin ? originalIdentityEndpoint : null;
+        replacedPin = null;
+      }
+      if (policy.value === "web_pki") {
+        certificateNote.textContent = "Vor dem Speichern werden öffentliche Zertifikatskette, Gültigkeit und Servername geprüft; es erfolgt weder Anmeldung noch Dateizugriff. Gültige Zertifikatserneuerungen benötigen keinen neuen Profilpin.";
+        shell.primary.textContent = "Prüfen und speichern";
+        return;
       }
       if (pin) {
-        certificateNote.innerHTML = `<b>Gebundenes Zertifikat:</b><br><code>${escapeHtml(fingerprint(pin.sha256))}</code><br>Bei einer Änderung von Host oder Port muss das Zertifikat neu ermittelt werden.`;
-        shell.primary.textContent = editing ? "Änderungen speichern" : "FTPS-Profil speichern";
+        certificateNote.innerHTML = replacedPin
+          ? `<b>Bisheriger Fingerabdruck:</b><br><code>${escapeHtml(fingerprint(replacedPin.sha256))}</code><br><b>Neu ermittelter Fingerabdruck:</b><br><code>${escapeHtml(fingerprint(pin.sha256))}</code><br>Vor dem Speichern vergleichen. Die gewählte Zertifikatsprüfung bleibt erhalten.`
+          : `<b>Gebundenes Zertifikat:</b><br><code>${escapeHtml(fingerprint(pin.sha256))}</code><br>Bei einer Änderung von Host oder Port muss das Zertifikat neu ermittelt werden.`;
+        shell.primary.textContent = replacedPin ? "Neues Zertifikat binden und speichern" : editing ? "Änderungen speichern" : "FTPS-Profil speichern";
       } else {
         certificateNote.textContent = "Noch kein Zertifikat für diesen Host und Port ermittelt. Der erste Schritt führt nur AUTH TLS aus; es erfolgt weder Anmeldung noch Dateizugriff.";
         shell.primary.textContent = "Zertifikat ermitteln";
       }
     };
+    policy.addEventListener("change", updateTransport);
     transport.addEventListener("change", updateTransport);
     hostInput.addEventListener("input", updateTransport);
     portInput.addEventListener("input", updateTransport);
+    const discoverCertificate = async () => {
+      const host = hostInput.value.trim();
+      const port = Number(portInput.value);
+      const requestedEndpoint = endpoint();
+      const previousPin = pin;
+      const request = shell.beginRequest();
+      shell.setEditingDisabled(true);
+      try {
+        const discoveredPin = await invoke("discover_ftps_certificate", { host, port });
+        if (!shell.owns(request) || endpoint() !== requestedEndpoint) return;
+        replacedPin = requestedEndpoint === originalIdentityEndpoint ? originalPin : previousPin;
+        pin = discoveredPin;
+        pinEndpoint = requestedEndpoint;
+        updateTransport();
+        if (!previousPin) {
+          certificateNote.innerHTML = `<b>SHA-256-Fingerabdruck:</b><br><code>${escapeHtml(fingerprint(pin.sha256))}</code><br>Vor dem Binden außerhalb Doppeldeckers vergleichen. Die gewählte Zertifikatsprüfung bleibt erhalten.`;
+        }
+      } catch (error) {
+        if (shell.owns(request)) showError("FTPS-Zertifikat", error);
+      } finally {
+        if (shell.owns(request)) shell.setEditingDisabled(false);
+      }
+    };
+    refreshCertificate.addEventListener("click", discoverCertificate);
     shell.primary.addEventListener("click", async () => {
       const host = hostInput.value.trim();
       const port = Number(portInput.value);
       if (!host || !port) return showDock(`<span class="pill none">Unvollständig</span>Host und gültiger Port fehlen.`, { closable: true });
       updateTransport();
       const plaintext = transport.value === "plaintext";
-      if (!plaintext && !pin) {
+      if (!plaintext && policy.value === "web_pki") {
         const requestedEndpoint = endpoint();
         const request = shell.beginRequest();
         shell.setEditingDisabled(true);
         try {
-          const discoveredPin = await invoke("discover_ftps_certificate", { host, port });
-          if (!shell.owns(request) || endpoint() !== requestedEndpoint) return;
-          pin = discoveredPin;
-          pinEndpoint = requestedEndpoint;
-          const ipLiteral = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.includes(":");
-          // Früher wechselte die Auswahl hier still von „öffentliche PKI plus Pin"
-          // auf „Zertifikat ungeprüft". Eine ausdrücklich gewählte Prüfstufe darf die
-          // Oberfläche nicht ohne Rückfrage absenken; sichtbar wurde es nur, wenn der
-          // Nutzer das Auswahlfeld danach noch einmal las. Die Wahl bleibt jetzt
-          // stehen, und der Hinweistext benennt die Lage.
-          const ipLiteralConflict = ipLiteral && policy.value === "web_pki_and_pin";
-          certificateNote.innerHTML = policy.value === "unverified_certificate"
-            ? `<b>TLS aktiv, Identität ungeprüft:</b><br><code>${escapeHtml(fingerprint(pin.sha256))}</code><br>Das Zertifikat wird gegen spätere Wechsel gepinnt; eine öffentliche Namensprüfung findet nicht statt.`
-            : ipLiteralConflict
-              ? `<b>SHA-256-Fingerabdruck außerhalb Doppeldeckers vergleichen:</b><br><code>${escapeHtml(fingerprint(pin.sha256))}</code><br><b>Achtung:</b> Für eine IP-Adresse ohne passenden Namenseintrag kann die öffentliche PKI-Prüfung nicht gelingen. Entweder einen Hostnamen eintragen oder die Prüfstufe bewusst auf „Zertifikat ungeprüft" stellen.`
-              : `<b>SHA-256-Fingerabdruck außerhalb Doppeldeckers vergleichen:</b><br><code>${escapeHtml(fingerprint(pin.sha256))}</code><br>Nur wenn er zum erwarteten Server gehört, im zweiten Schritt binden.`;
-          shell.primary.textContent = "FTPS-Profil speichern";
+          const observed = await invoke("verify_ftps_certificate", { host, port });
+          if (!shell.owns(request) || endpoint() !== requestedEndpoint || policy.value !== "web_pki") return;
+          certificateNote.innerHTML = `<b>Öffentliche Zertifikatsprüfung erfolgreich:</b><br><code>${escapeHtml(fingerprint(observed.sha256))}</code><br>Dieser Fingerabdruck wird nicht als dauerhafter Pin gespeichert.`;
         } catch (error) {
-          if (!shell.owns(request)) return;
-          showError("FTPS-Zertifikat", error);
+          if (shell.owns(request)) showError("FTPS-Zertifikat", error);
+          return;
         } finally {
-          if (shell.owns(request)) {
-            shell.setEditingDisabled(false);
-          }
+          if (shell.owns(request)) shell.setEditingDisabled(false);
         }
+      } else if (!plaintext && !pin) {
+        await discoverCertificate();
         return;
       }
       const credentials = readPasswordProfileFields(
@@ -684,7 +711,7 @@ export function createConnectionEditors({
           username,
           requested_root: requestedRoot,
           transport_security: selectedTransport,
-          certificate: plaintext ? null : pin,
+          certificate: plaintext || selectedPolicy === "web_pki" ? null : pin,
           certificate_policy: selectedPolicy,
           password_reference: reference,
         },
@@ -698,6 +725,8 @@ export function createConnectionEditors({
         shell.close();
         if (plaintext) {
           showDock(`<span class="pill update">FTP unverschlüsselt</span>${escapeHtml(name)} · Passwort nur im Schlüsselbund, Transport ohne TLS.`, { closable: true });
+        } else if (selectedPolicy === "web_pki") {
+          showDock(`<span class="pill ok">FTPS-Profil ${editing ? "aktualisiert" : "gespeichert"}</span>${escapeHtml(name)} · Öffentliche Zertifikatskette, Gültigkeit und Servername geprüft.`, { closable: true });
         } else if (selectedPolicy === "unverified_certificate") {
           showDock(`<span class="pill update">FTPS · Identität ungeprüft</span>${escapeHtml(name)} · TLS und Zertifikatspin aktiv.`, { closable: true });
         } else {

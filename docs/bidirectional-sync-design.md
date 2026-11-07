@@ -1,6 +1,6 @@
 # Bidirektionaler Sync
 
-Stand: 2026-10-18
+Stand: 2026-10-29
 
 Status: Verbindlicher Implementierungsvertrag. Der lokale Baseline-, Konflikt-,
 Journal-, Resume-/Rollback- und Typwechselvertrag ist umgesetzt. Remote-Endpunkte
@@ -22,6 +22,43 @@ geheimnisfreien Endpunkt- und Profilbindungen; ältere Versionen werden nur nach
 ihrem jeweiligen Migrationsvertrag gelesen. POSIX-Modi werden nur gebunden, wenn
 beide Seiten sie lesen und schreiben können. Secretwerte, Sitzungen, Handles und
 Permits werden nicht persistiert.
+
+Die strikte Klasse verwendet in GUI und CLI die Queue-gebundenen
+`*_for_queue`-Einstiege. Deren Registrywurzel stammt aus dem gehaltenen
+Prozesslock der Fensterqueue, nicht aus dem möglicherweise getrennten
+Baselineverzeichnis. Die bisherigen ungebundenen Core-Einstiege verweigern
+eine Vorbereitung mit `unsupported`; ein Baselinepfad allein liefert keinen
+Nachweis über die Zwischenstände anderer Fenster.
+
+Die Vorbereitung bindet beide Endpunkte, die gemeinsame Registry und deren
+Änderungsstand. Frische Scans, Bestätigung, jede Projektion, Typwechsel sowie
+Resume und Rollback behalten diesen Kontext. Während eigener Wirkungen gilt die
+Ownerausnahme für beide Seiten desselben Laufs; fremde Owner bleiben geprüft.
+Abschlussprüfungen nehmen auch den eigenen Owner wieder vollständig hinzu.
+Recovery erteilt erhaltenen Altintents keine Ausnahme von der Prüfung vor dem
+Start. Unklare oder noch vorhandene registrierte Reste in einer der Syncwurzeln
+blockieren weitere Wirkungen und den Baselinecommit, ohne automatisch entfernt
+zu werden.
+
+Vor jeder Queueausführung erhalten sämtliche Unterprojektionen die tatsächliche
+Operations-ID des persistierten Eintrags. Ein direkter GUI- oder CLI-Start baut
+seine RAM-Vorschau nach dem bewiesenen Claim frisch unter dieser ID auf und
+vergleicht die bestätigten Plan- und Baselinedigests. Resume und Rollback bleiben
+an denselben Eintrag gebunden. So gelangen auch erhaltene private Arbeitsdateien
+außerhalb der Panes nach einem Prozessabbruch zum richtigen Recoveryeintrag;
+Erfolg und Rollback bewahren diese Pfade vor dem Entfernen des Corejournals.
+Die frische Bindung verlängert die ursprüngliche Bestätigungsfrist nicht. Der
+bestätigte Gesamtlauf behält sie vor jedem noch nicht begonnenen Wirkungsabschnitt;
+auch aufgeschobene Typwechsel und erst später vorbereitete Unterprojektionen erhalten
+keine neue Frist. Zusätzliche Scans dürfen keinen erstmaligen Datentausch nach Ablauf
+freigeben. Ein bereits begonnener Typwechsel wird mit seinen Wiederanlaufbelegen
+abgeschlossen. Ein Queue-Leerlauf besitzt ebenfalls
+einen dauerhaften Abschlussbeleg, lässt aber Baselinebytes und Generation unverändert.
+
+Der heutige strikte Vertrag erlaubt echte Remote-Endpunkte ausschließlich als
+Quelle mit lokalem Wirkungsziel. Native Remote-Zieltemps benötigen vor einer
+späteren Freigabe zusätzlich eine eigene Registrierung; die jetzige
+Registrybindung erteilt diese Providerfreigabe nicht.
 
 ## Grundsatz und Sicherheitsinvarianten
 
@@ -230,10 +267,9 @@ Mengengrenzen. [Bedienvertrag](conflict-decisions.md):
   gewählte Hauptseite, die andere erhält einen vorab kollisionsgeprüften Namen,
 - `Skip`: keine Mutation und keine Baseline-Änderung für diesen Pfad.
 
-Die lokale Grenze von 100 Typwechseln zählt frühere Entscheidungen mit. Eine
-weitere solche Wahl erscheint gesperrt, auch bei `KeepBoth`; zulässiges
-Überspringen bleibt erreichbar. Anzeige und spätere Vorbereitung verwenden
-dieselbe Grenze.
+Typwechsel besitzen keine feste 100er-Sperre. Entscheidungen und kumulierter
+Umfang werden in der Vorschau bilanziert und mit ihrer tatsächlichen Wirkung
+bestätigt; Überspringen bleibt erreichbar.
 
 `KeepBoth` erzeugt den Konfliktnamen bereits bei der Vorschau aus Basename,
 Seitenrolle, UTC-Zeit und Zufallssuffix. Der exakte Name und seine Abwesenheit auf
@@ -278,7 +314,7 @@ Version 1.
 - einen kanonischen BLAKE3-Plan-Digest.
 
 Offene Konflikte machen den Plan nicht ausführbar. Jede nachträgliche Entscheidung
-erzeugt einen neuen Digest und eine neue Zufallsphrase.
+erzeugt einen neuen Digest und verlangt eine neue Wirkungsentscheidung.
 
 ## Provider- und Richtungsfähigkeiten
 
@@ -298,7 +334,7 @@ Capability-Proben. Das gilt ebenso für Resume und Rollback: Deren Wirkungen lie
 auf den ursprünglichen Zielseiten. Eine unveränderte Seite erhält keine erfundene
 positive Schreibfähigkeit; die vorhandenen Zielgates bleiben vollständig wirksam.
 Eigene Probenreste werden niemals durch einen neuen Snapshot als bestätigter
-Bestand übernommen. Ein künstlicher FTPS-Gegenlauf
+Bestand übernommen. Der [AP14-Gegenbeleg](test-stability-2026-10-06.md#ftps-eigene-proben-veränderten-den-leeren-plan)
 prüft diese Grenze mit einer verlorenen MKD-Antwort und einem echten Quelldownload.
 
 Damit kann ein Paar asymmetrisch sein. FTPS, WebDAV oder SMB dürfen beispielsweise
@@ -426,15 +462,14 @@ Eine Vorbereitung bleibt im Backend-RAM, gilt einmalig und höchstens zehn Minut
 Sie bindet Baseline, beide Snapshots, alle Konfliktentscheidungen, Providerfähigkeiten,
 Quarantäneproben, Platzbilanz und Plan-Digest.
 
-Jeder Lauf verlangt eine exakte Zufallsphrase `BEIDE <Paarname> <Nonce>`.
-Sobald Ersetzungen, Löschungen oder Konfliktauflösungen vorkommen, ist außerdem die
-unabhängige Backup-Bestätigung Pflicht. Die bekannten 100-Ersetzungs- sowie
-50-Einträge-/5-%-Löschgrenzen gelten pro Zielseite und können nicht per Frontend-Bool
-abgeschaltet werden.
+Jeder Lauf bestätigt seine sichtbare Wirkung ohne Routinephrase oder behauptete
+externe Backupprobe. Ersetzungen, Löschungen und Konfliktauflösungen bleiben
+pfadgenau sichtbar; hohe Entfernungszahlen/-anteile und leere Quellen erzeugen
+Warnungen. Vollständige Scans, Platzbedarf und Quarantäne bleiben gebunden.
 
 Die persistente Queue speichert nur Pair-ID, erwartete Baseline-/Plan-Digests und die
 geheimnisfreien Konfliktentscheidungen. Vor Ausführung verbindet sie beide Provider
-frisch, wiederholt alle Proofs und fordert eine neue Laufphrase. Nach App-Neustart ist
+frisch, wiederholt alle Proofs und fordert eine neue Wirkungsbestätigung. Nach App-Neustart ist
 jedes Permit verloren; ein bereits mutierendes Journal wird als Recovery-Fall statt
 als normaler Queue-Eintrag geladen.
 

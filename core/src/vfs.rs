@@ -12,12 +12,18 @@ use crate::metadata::{ForkKind, MetadataCapabilities, MetadataManifest, XattrVal
 
 /// Seek-fähiger Quellstrom für Sparse-Dateien. Der Sync springt damit über Löcher,
 /// statt sie als lange Folgen physischer Nullbytes zu lesen.
-pub trait SparseRead: Read + Seek + Send {}
+pub trait SparseRead: Read + Seek + Send {
+    /// Vor dem Zielabschluss prüfen und entfernte Lesehandles fehlererhaltend schließen.
+    /// EOF allein beendet keinen Seek-fähigen Reader.
+    fn finish(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
-impl<T: Read + Seek + Send> SparseRead for T {}
+impl SparseRead for std::fs::File {}
 
-/// Seek-fähiger Zielstrom für Sparse-Dateien. `set_len` legt die logische Dateigröße
-/// fest, ohne die nicht beschriebenen Bereiche physisch zu allokieren.
+/// Seek-fähiger Zielstrom für Sparse-Dateien. `set_len` legt die logische Größe
+/// fest; die genaue Lochstruktur benötigt `punch_hole` und den Abschluss-Readback.
 pub trait SparseWrite: Write + Seek + Send {
     fn set_len(&mut self, size: u64) -> io::Result<()>;
     /// Einen bestätigten Lochbereich explizit deallokieren. Nur seek-basiertes
@@ -73,7 +79,7 @@ impl SparseWrite for std::fs::File {
     }
 }
 
-/// Öffentlicher Wirkungsbeleg einer begrenzten interaktiven Inhaltsauswahl. Der Digest
+/// Öffentlicher Wirkungsbeleg einer interaktiven Inhaltsauswahl. Der Digest
 /// bindet beobachtete Namen/Attribute, keine atomare Namespace- oder Syncgarantie.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InteractiveSourceTree {
@@ -87,7 +93,7 @@ pub struct InteractiveSourceTree {
 
 impl InteractiveSourceTree {
     pub fn limitations(&self) -> Vec<String> {
-        std::iter::once(format!("Begrenzter Quellbaum: {} Datei(en), {} Ordner, {} Byte; {} ausgelassene(r) Eintrag/Teilbaum. Höchstens 1000 Einträge, 16 Unterordnerebenen und 16 GiB Gesamtinhalt; Vorbereitung höchstens 60 Sekunden zuzüglich laufendem Request/Cleanup.", self.files, self.directories, self.bytes, self.omitted.len()))
+        std::iter::once(format!("Beobachteter Quellbaum: {} Datei(en), {} Ordner, {} Byte; {} ausgelassene(r) Eintrag/Teilbaum. Vollständige Belege benötigen Speicher proportional zum Bestand; Abbruch bleibt möglich.", self.files, self.directories, self.bytes, self.omitted.len()))
             .chain(self.omitted.iter().map(|item| format!("Nicht übertragen: {} — {}", item.path, item.reason)))
             .collect()
     }
@@ -96,20 +102,21 @@ impl InteractiveSourceTree {
         if self.digest.len() != 64
             || !self.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
             || self.entries == 0
-            || self.entries > 1000
             || (self.directories == 0 && self.omitted.is_empty())
             || self.directories > self.entries
             || self.files > self.entries
-            || self.omitted.len() > 1000
-            || self.files + self.directories + self.omitted.len() as u64 != self.entries
-            || self.bytes > 16 * 1024 * 1024 * 1024
+            || self
+                .files
+                .checked_add(self.directories)
+                .and_then(|total| total.checked_add(self.omitted.len() as u64))
+                != Some(self.entries)
             || self.omitted.iter().any(|item| {
                 item.path.len() > 4096 || item.reason.is_empty() || item.reason.len() > 8192
             })
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Ungültiger begrenzter interaktiver Baumbeleg",
+                "Ungültiger interaktiver Baumbeleg",
             ));
         }
         Ok(())
@@ -120,6 +127,102 @@ impl InteractiveSourceTree {
 pub struct SourceReadOmission {
     pub path: String,
     pub reason: String,
+}
+
+/// Kurzlebiger Zeitwert für gewöhnliche Kopien; Listingwerte bleiben in Sekunden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileTimestamp {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+impl FileTimestamp {
+    pub fn validate(self) -> io::Result<()> {
+        if self.nanoseconds >= 1_000_000_000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Ungültige Nanosekunden des Zeitwerts",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub type FileCreationTime = FileTimestamp;
+
+#[cfg(target_os = "macos")]
+pub use crate::local_fs::copy_metadata::attributes::{
+    Source as FileCopyMetadataSource, Target as FileCopyMetadataTarget,
+};
+#[cfg(not(target_os = "macos"))]
+pub struct FileCopyMetadataSource {
+    _private: (),
+}
+#[cfg(not(target_os = "macos"))]
+pub struct FileCopyMetadataTarget {
+    _private: (),
+}
+
+#[derive(Debug, Default)]
+pub struct FileCopyMetadataReport {
+    pub limitations: Vec<String>,
+    pub resource_fork_incomplete: bool,
+}
+
+pub struct FileCopyWriter {
+    pub writer: Box<dyn Write + Send>,
+    pub removal_proof: Option<ProofListEntry>,
+    pub metadata: Option<FileCopyMetadataTarget>,
+}
+pub struct FileCopyDirectory {
+    pub removal_proof: Option<ProofListEntry>,
+    pub metadata: Option<FileCopyMetadataTarget>,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl FileCopyMetadataSource {
+    pub(crate) fn version_digest(&self) -> [u8; 32] {
+        [0; 32]
+    }
+    pub(crate) fn resource_digest(&self) -> Option<[u8; 32]> {
+        None
+    }
+    pub(crate) fn resource_needed(&self) -> bool {
+        false
+    }
+    pub(crate) fn verify(&self, _cancel: &crate::Cancel) -> io::Result<()> {
+        Ok(())
+    }
+    pub(crate) fn needs_copy(&self) -> bool {
+        false
+    }
+    pub(crate) fn omitted_report(&self) -> FileCopyMetadataReport {
+        FileCopyMetadataReport::default()
+    }
+    pub(crate) fn omitted_flags_report(&self) -> FileCopyMetadataReport {
+        FileCopyMetadataReport::default()
+    }
+    pub(crate) fn creation_time(&self) -> Option<FileCreationTime> {
+        None
+    }
+}
+#[cfg(not(target_os = "macos"))]
+impl FileCopyMetadataTarget {
+    pub(crate) fn apply(
+        &self,
+        _source: &FileCopyMetadataSource,
+        _cancel: &crate::Cancel,
+    ) -> io::Result<FileCopyMetadataReport> {
+        Ok(FileCopyMetadataReport::default())
+    }
+}
+
+/// Reine Anzeigefakten; Verstecktmarkierungen verändern keine Plan-/Permit-Digests.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DirectoryDisplayEntry {
+    #[serde(flatten)]
+    pub entry: Entry,
+    pub safely_decoded: bool,
+    pub is_hidden: bool,
 }
 
 /// Ein Eintrag (Datei, Ordner oder Symlink) in einem Verzeichnis.
@@ -372,12 +475,24 @@ pub trait Vfs: Send + Sync {
         Ok(())
     }
 
+    /// Nach nachweislich eigenen Mirror-Entfernungen dürfen Collectionversionen
+    /// ihrer gehaltenen Eltern frisch gebunden werden; keine neue Auswahl.
+    fn observe_content_sync_removals(&self, _parent: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Nur der Inhaltssync reicht die bestätigte Quellzeit an den bereits
+    /// dateigebundenen Tempkontext weiter; Standardprovider benötigen keinen Hinweis.
+    fn hint_content_sync_mtime(&self, _mtime: Option<i64>) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Diese private Zielsicht erlaubt additive Inhalte, weder Overwrite noch Move.
     fn additive_content_target_only(&self) -> bool {
         false
     }
 
-    /// Pfadgenaue Metadatenauslassungen des aktuellen Dateikontexts.
+    /// Konkrete Einschränkungen des Schreibkontexts, etwa Metadaten oder Temp-Recovery.
     fn interactive_write_limitations(&self) -> Vec<String> {
         Vec::new()
     }
@@ -494,6 +609,97 @@ pub trait Vfs: Send + Sync {
     /// providerverwaltet, statt eine nicht nachprüfbare Änderung zu behaupten.
     fn supports_mtime_write(&self) -> bool {
         true
+    }
+
+    fn read_copy_mtime(&self, _path: &Path, entry: &Entry) -> io::Result<Option<FileTimestamp>> {
+        Ok(entry.mtime.map(|seconds| FileTimestamp {
+            seconds,
+            nanoseconds: 0,
+        }))
+    }
+
+    /// Adapter unterstützt Nanosekunden; der Ziel-Readback prüft die tatsächliche Auflösung.
+    fn supports_precise_copy_mtime(&self) -> bool {
+        false
+    }
+
+    fn set_copy_mtime(&self, path: &Path, time: FileTimestamp) -> io::Result<()> {
+        time.validate()?;
+        self.set_mtime(path, time.seconds)
+    }
+
+    fn read_copy_creation_time(
+        &self,
+        _path: &Path,
+        entry: &Entry,
+    ) -> io::Result<Option<FileCreationTime>> {
+        Ok(entry.created.map(|seconds| FileCreationTime {
+            seconds,
+            nanoseconds: 0,
+        }))
+    }
+
+    /// Ein fehlender Schreibweg ist eine sichtbare Metadatenauslassung und keine
+    /// allgemeine Absage der gewöhnlichen Kopie.
+    fn set_creation_time(&self, _path: &Path, _time: FileCreationTime) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Das Ziel unterstützt keine Erstellungszeitänderung",
+        ))
+    }
+
+    /// Sichtbarkeitsbeobachtung für lesende Suche, keine Mutationsfreigabe.
+    fn entry_is_hidden(&self, _path: &Path, entry: &Entry) -> io::Result<bool> {
+        Ok(entry.name.starts_with('.'))
+    }
+
+    /// Kurzlebiger nativer Quellzustand für gewöhnliche Kopien. Ein fehlender
+    /// Adapter bedeutet keine allgemeine Schreibsperre.
+    fn read_copy_metadata(
+        &self,
+        _path: &Path,
+        _entry: &Entry,
+        _cancel: &crate::Cancel,
+    ) -> io::Result<Option<FileCopyMetadataSource>> {
+        Ok(None)
+    }
+
+    /// Abschluss am sichtbaren Ziel, insbesondere nach dem Rename aus privatem
+    /// Staging. Nur der Provider kennt dessen weiterhin gebundenen finalen Root.
+    fn finish_copy_metadata(
+        &self,
+        _path: &Path,
+        source: &FileCopyMetadataSource,
+        _target: &FileCopyMetadataTarget,
+    ) -> io::Result<FileCopyMetadataReport> {
+        Ok(source.omitted_flags_report())
+    }
+
+    /// Metadatenziel gegebenenfalls direkt aus dem exklusiv erzeugten Writer-FD
+    /// gewinnen; späteres Öffnen eines austauschbaren Tempnamens reicht nicht.
+    fn open_write_new_for_copy(
+        &self,
+        path: &Path,
+        _metadata: bool,
+    ) -> Result<FileCopyWriter, MutationFailure> {
+        self.open_write_new_with_removal_proof(path)
+            .map(|(writer, removal_proof)| FileCopyWriter {
+                writer,
+                removal_proof,
+                metadata: None,
+            })
+    }
+
+    fn create_dir_for_copy(
+        &self,
+        path: &Path,
+        _metadata: bool,
+    ) -> Result<FileCopyDirectory, MutationFailure> {
+        self.create_dir_with_removal_proof(path)
+            .map(|removal_proof| FileCopyDirectory {
+                removal_proof,
+                metadata: None,
+            })
     }
 
     /// Stärkste für diese Sitzung bewiesene Commit-Klasse neuer Dateien. Der
@@ -639,6 +845,13 @@ pub trait Vfs: Send + Sync {
         }
     }
 
+    /// Bekannte Allokationsblockgröße am konkreten lokalen Ziel-Elternordner.
+    /// Fehlende Geometrie ist keine Zusage beliebiger Sparse-Grenzen. Die Abfrage
+    /// ist rein lesend und erteilt keine Schreibfähigkeit.
+    fn sparse_allocation_unit(&self, _parent: &Path) -> io::Result<Option<u32>> {
+        Ok(None)
+    }
+
     /// Reguläre Datei seek-fähig lesen. Provider ohne exakte Sparse-Semantik müssen
     /// ausdrücklich ablehnen; ein normaler Strom würde Löcher unbemerkt verdichten.
     fn open_sparse_read(&self, _path: &Path) -> io::Result<Box<dyn SparseRead>> {
@@ -646,6 +859,12 @@ pub trait Vfs: Send + Sync {
             io::ErrorKind::Unsupported,
             "Provider unterstützt keine Sparse-Leseströme",
         ))
+    }
+
+    /// Optionale laufgebundene Schreibprobe vor dem Plan, ausschließlich im
+    /// gewählten Zielroot. Die Fähigkeitsabfrage selbst bleibt rein lesend.
+    fn prepare_sparse_write(&self, _source_acl: crate::metadata::AclModel) -> io::Result<()> {
+        Ok(())
     }
 
     /// Garantiert neue Sparse-Datei seek-fähig anlegen.
@@ -678,6 +897,21 @@ pub trait Vfs: Send + Sync {
     /// POSIX-Rechte setzen. Auf macOS/Linux geschieht das am bereits ohne Symlink-Folgen
     /// geöffneten Handle; spätere Remote-Provider dürfen `Unsupported` liefern.
     fn set_mode(&self, path: &Path, mode: u32) -> io::Result<()>;
+
+    /// Gewöhnliche Rechteänderung an einem frisch beobachteten Eintrag. Normale
+    /// rwx-Bits ändern, vorhandene Sonderbits erhalten und Ergebnis zurücklesen.
+    /// Pfadbasierte Provider benennen ihre verbleibende Best-Effort-Grenze separat.
+    fn set_interactive_mode(
+        &self,
+        _path: &Path,
+        _expected: &Entry,
+        _mode: u32,
+    ) -> io::Result<Entry> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Provider bietet keine interaktive Rechteänderung",
+        ))
+    }
 
     /// Numerischen Owner/Gruppe am geöffneten Eintrag setzen. Diese Stufe ist vom
     /// Portable-Modus getrennt, weil `fchown` Sonderbits sicherheitsbedingt löschen kann.
@@ -720,7 +954,167 @@ pub trait Vfs: Send + Sync {
         ))
     }
 
-    /// Typisierte ACL am sicher geöffneten Zieleintrag exakt ersetzen oder entfernen.
+    /// Windows-DACL-Schreibkontext mit einer gebundenen eigenen Temp-Datei prüfen.
+    /// Mutierende Probe ausschließlich während einer ausdrücklich vorbereiteten
+    /// nativen Inhaltssync-Ausführung; plan() und Fähigkeitenabfragen bleiben lesend.
+    fn prepare_windows_dacl_write(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn windows_dacl_write_support(
+        &self,
+    ) -> io::Result<crate::windows_dacl::WindowsDaclWriteSupport> {
+        Ok(crate::windows_dacl::WindowsDaclWriteSupport::Unavailable(
+            crate::windows_dacl::WindowsDaclTargetIssue::UnsupportedBackend,
+        ))
+    }
+
+    /// Eigene Ordnerprobe für NativeBestEffort vorbereiten. Der Datei-Roundtrip
+    /// erteilt diese getrennte Fähigkeit nicht; reine Planung ruft keine Probe auf.
+    fn prepare_file_dacl_write(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn file_dacl_write_support(&self) -> io::Result<crate::windows_dacl::WindowsDaclWriteSupport> {
+        Ok(crate::windows_dacl::WindowsDaclWriteSupport::Unavailable(
+            crate::windows_dacl::WindowsDaclTargetIssue::UnsupportedBackend,
+        ))
+    }
+    fn file_dacl_recovery_observation(
+        &self,
+        _path: &Path,
+        _expected_root: &crate::RootIdentity,
+    ) -> io::Result<crate::file_dacl::FileDaclRecoveryObservation> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Kein Datei-DACL-Recoveryvertrag",
+        ))
+    }
+    fn begin_file_dacl_transaction(
+        &self,
+        _path: &Path,
+        _plan: &crate::file_dacl::FileDaclPlan,
+    ) -> io::Result<Box<dyn crate::file_dacl::FileDaclTransaction>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Kein Datei-DACL-Inplace-Vertrag",
+        ))
+    }
+
+    fn created_directory_foreign_root_scope(
+        &self,
+        _root: &crate::RootIdentity,
+    ) -> io::Result<Option<crate::created_directory_dacl::CreatedDirectoryRootScope>> {
+        Ok(None)
+    }
+    fn created_directory_root_scope(
+        &self,
+        _path: &Path,
+        _root: &crate::RootIdentity,
+    ) -> io::Result<Option<crate::created_directory_dacl::CreatedDirectoryRootScope>> {
+        Ok(None)
+    }
+    fn created_directory_dacl_write_support(
+        &self,
+    ) -> io::Result<crate::windows_dacl::WindowsDaclWriteSupport> {
+        Ok(crate::windows_dacl::WindowsDaclWriteSupport::Unavailable(
+            crate::windows_dacl::WindowsDaclTargetIssue::UnsupportedBackend,
+        ))
+    }
+    /// Optionale V7-Anlage: normaler exklusiver CREATE mit gehaltenem Originalhandle.
+    /// None bedeutet fehlenden Vertrag; der Aufrufer verwendet dann genau einmal mkdir.
+    fn create_directory_dacl_receipt(
+        &self,
+        _path: &Path,
+    ) -> io::Result<Option<Box<dyn crate::created_directory_dacl::CreatedDirectoryDaclReceipt>>>
+    {
+        Ok(None)
+    }
+    /// Eigener früher V8-Einstieg; ein nicht unterstützender Provider erzeugt
+    /// dadurch keinen Ordner und erhält keine allgemeine neue Fähigkeit.
+    fn create_directory_before_children_receipt(
+        &self,
+        _path: &Path,
+    ) -> io::Result<Option<Box<dyn crate::created_directory_dacl::CreatedDirectoryDaclReceipt>>>
+    {
+        Ok(None)
+    }
+    fn set_created_directory_mtime(
+        &self,
+        _path: &Path,
+        _mtime: i64,
+        _expected: &crate::created_directory_dacl::CreatedDirectoryEffectKey,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Dieser Provider besitzt keinen originalgebundenen Ordnerzeitabschluss",
+        ))
+    }
+    fn created_directory_dacl_recovery_observation(
+        &self,
+        path: &Path,
+        root: &crate::RootIdentity,
+    ) -> io::Result<crate::created_directory_dacl::CreatedDirectoryDaclRecoveryObservation> {
+        let observed = self.directory_dacl_recovery_observation(path, root)?;
+        Ok(
+            crate::created_directory_dacl::CreatedDirectoryDaclRecoveryObservation {
+                file_id: observed.base_id,
+                object_namespace: crate::created_directory_dacl_registry::object_namespace(root)?,
+                context: observed.context,
+                dacl: observed.dacl,
+            },
+        )
+    }
+
+    fn prepare_directory_dacl_write(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn directory_dacl_write_support(
+        &self,
+    ) -> io::Result<crate::windows_dacl::WindowsDaclWriteSupport> {
+        Ok(crate::windows_dacl::WindowsDaclWriteSupport::Unavailable(
+            crate::windows_dacl::WindowsDaclTargetIssue::UnsupportedBackend,
+        ))
+    }
+
+    /// ID, Owner/Group und DACL aus demselben gehaltenen echten Ordner lesen.
+    /// Der bestätigte Root bleibt während der Beobachtung gebunden.
+    fn directory_dacl_recovery_observation(
+        &self,
+        _path: &Path,
+        _expected_root: &crate::RootIdentity,
+    ) -> io::Result<crate::windows_dacl::DirectoryDaclRecoveryObservation> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Provider unterstützt keinen gebundenen Verzeichnis-DACL-Readback",
+        ))
+    }
+
+    /// Bestehenden Unterordner und bestätigte Vorher-DACL halten. Nach apply muss
+    /// der Aufrufer den Wirkungsbericht dauerhaft sichern, bevor finish abschließt.
+    fn begin_directory_dacl_transaction(
+        &self,
+        _path: &Path,
+        _plan: &crate::directory_dacl::DirectoryDaclPlan,
+    ) -> io::Result<Box<dyn crate::directory_dacl::DirectoryDaclTransaction>> {
+        Err(crate::windows_dacl::write_omission(
+            crate::windows_dacl::WindowsDaclTargetIssue::UnsupportedBackend,
+        ))
+    }
+
+    fn write_windows_dacl_exact(
+        &self,
+        _path: &Path,
+        _acl: &crate::windows_security::WindowsDacl,
+        _context: &crate::windows_dacl::WindowsDaclWriteContext,
+    ) -> io::Result<()> {
+        Err(crate::windows_dacl::write_omission(
+            crate::windows_dacl::WindowsDaclTargetIssue::UnsupportedBackend,
+        ))
+    }
+
+    /// Typisierte POSIX-/NFSv4-ACL am sicher geöffneten Zieleintrag exakt ersetzen.
+    /// Windows-DACLs verwenden ausschließlich ihren getrennten Schreibkontext.
     fn write_acl_exact(&self, _path: &Path, _acl: Option<&crate::metadata::Acl>) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -765,6 +1159,48 @@ pub trait Vfs: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Provider unterstützt keine separaten Fork-Inhaltsströme",
+        ))
+    }
+
+    /// Benannten Datenstrom getrennt vom Basispfad lesen; kein xattr-/Fork-Fallback.
+    fn open_named_stream_read(
+        &self,
+        _path: &Path,
+        _name: &[u8],
+    ) -> io::Result<Box<dyn Read + Send>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Provider unterstützt keine benannten Datenströme",
+        ))
+    }
+
+    /// Strom exklusiv an einer eigenen neuen regulären Temp-Datei anlegen.
+    /// Ein vorhandener Strom kollidiert, eine fehlende Basisdatei wird nie erzeugt.
+    fn open_named_stream_write_new(
+        &self,
+        _path: &Path,
+        _name: &[u8],
+    ) -> io::Result<Box<dyn Write + Send>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Provider unterstützt keine benannten Datenströme",
+        ))
+    }
+
+    /// Getrennter Best-Effort-Vertrag für zusammengeführte Ordner. Die Fähigkeit
+    /// regulärer Streamtemps erlaubt diese dauerhaften Einzelwirkungen nicht.
+    fn supports_directory_stream_updates(&self, _root: &Path) -> io::Result<bool> {
+        Ok(false)
+    }
+    fn begin_directory_stream_update(
+        &self,
+        _path: &Path,
+        _expected_base: &crate::sync::SyncTargetProof,
+        _expected_streams: &[crate::metadata::NamedBlobSummary],
+    ) -> io::Result<Box<dyn crate::directory_streams::DirectoryStreamTransaction>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Provider unterstützt keine gebundenen Verzeichnisstreamupdates",
         ))
     }
 
@@ -988,6 +1424,37 @@ pub trait Vfs: Send + Sync {
         false
     }
 
+    /// Ausschließlich ein privater interaktiver Adapter darf diesen schwächeren
+    /// Löschweg anbieten. Er verspricht keine atomare Objektbedingung; der Aufrufer
+    /// benötigt einen frisch bestätigten vollständigen Plan und sichtbare Risiken.
+    fn supports_best_effort_permanent_delete(&self) -> bool {
+        false
+    }
+
+    /// Konkrete technische Absage einer gewöhnlichen endgültigen Wirkung.
+    /// Der Default ergänzt keine Sperre; private Adapter dürfen einzelne Klassen
+    /// vor der Vorschau ausnehmen, ohne unabhängige Dateiwirkungen zu blockieren.
+    fn best_effort_permanent_delete_blocker(&self, _directory: bool) -> Option<String> {
+        None
+    }
+
+    /// Entfernt einen bestätigten Einzelrecord mit der stärksten verfügbaren
+    /// Versionsbedingung. Auch die Best-Effort-Klasse muss einen vorhandenen
+    /// Provider-Token bis in die Mutation tragen; daraus entsteht keine atomare
+    /// Bindung aller Eltern. Pfadbasierte Provider behalten ihren sichtbaren
+    /// Wettlauf und entfernen ausschließlich ein Blatt oder einen leeren Ordner.
+    fn remove_permanent_best_effort_if_matches(
+        &self,
+        path: &Path,
+        expected: &ProofListEntry,
+    ) -> io::Result<()> {
+        if expected.entry.is_dir {
+            self.remove_move_empty_dir_best_effort(path)
+        } else {
+            self.remove_move_leaf_best_effort(path)
+        }
+    }
+
     /// Meldet nur dann `true`, wenn [`Vfs::remove_if_matches`] Prüfung und Wirkung
     /// atomar verbindet und jeder Fehler garantiert mutationsfrei bleibt.
     fn supports_remove_if_matches(&self) -> bool {
@@ -1054,6 +1521,13 @@ pub trait Vfs: Send + Sync {
     /// Inhalte treffen.
     fn remove_move_empty_dir_best_effort(&self, path: &Path) -> io::Result<()> {
         self.remove_dir(path)
+    }
+
+    /// Nur eine private gemeinsame interaktive Sicht zweier ausdrücklich gebundener
+    /// Pane-Roots darf den gewöhnlichen Best-Effort-Move ohne Inhaltskopie anbieten.
+    /// Daraus entsteht weder eine No-Replace- noch eine Syncfähigkeit.
+    fn supports_interactive_best_effort_move(&self) -> bool {
+        false
     }
 
     /// Führt das gewöhnliche Protokoll-Rename des Providers genau einmal aus, ohne
@@ -1177,11 +1651,13 @@ pub struct LocalVfs {
     staging_owner: Option<crate::local_staging::StagingOwner>,
     sync_binding: Option<std::sync::Arc<LocalSyncVfsBinding>>,
     verified_reads: Option<std::sync::Arc<crate::local_read::VerifiedLocalFiles>>,
+    sync_protected_entries: Vec<PathBuf>,
 }
 
 #[derive(Clone, Default)]
 struct LocalSyncVfsBinding {
     require_temp_recovery: bool,
+    prefer_temp_recovery: bool,
     execution: Option<crate::real_mode::LocalSyncExecution>,
     parents: std::sync::Arc<Vec<crate::local_fs::RootHandle>>,
     neighbor: Option<std::sync::Arc<crate::local_staging::NeighborStaging>>,
@@ -1195,6 +1671,41 @@ fn unsupported_sync(error: &io::Error) -> bool {
 }
 
 impl LocalVfs {
+    /// Auch eine rein lesende HOME-Vorschau berücksichtigt den ausdrücklich
+    /// reservierten Sicherungsbereich auf beiden Seiten nicht als Nutzdaten.
+    pub fn with_sync_scope(self, source: &Path, target: &Path) -> io::Result<Self> {
+        if crate::real_mode::is_home_root(source)? || crate::real_mode::is_home_root(target)? {
+            Ok(self
+                .with_sync_protected_entry(source)
+                .with_sync_protected_entry(target))
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Nur die gebundene Syncansicht schützt den eigenen internen Sicherungsbereich.
+    /// Stat und Mutationen bleiben für Quarantäne/Recovery erreichbar; Scanner und
+    /// Planer sehen diesen ausdrücklich ausgeschlossenen direkten Kindpfad nicht.
+    pub(crate) fn with_sync_protected_entry(mut self, root: &Path) -> Self {
+        self.sync_protected_entries
+            .push(root.join(".doppeldecker-quarantine"));
+        self
+    }
+
+    fn sync_entry_visible(&self, parent: &Path, name: &str) -> bool {
+        !self
+            .sync_protected_entries
+            .iter()
+            .any(|protected| parent.join(name) == *protected)
+    }
+
+    pub(crate) fn verified_source_binding_digest(&self) -> io::Result<Option<[u8; 32]>> {
+        self.verified_reads
+            .as_ref()
+            .map(|files| files.binding_digest())
+            .transpose()
+    }
+
     pub(crate) fn with_verified_reads(
         mut self,
         items: &[PathBuf],
@@ -1209,6 +1720,40 @@ impl LocalVfs {
         ));
         Ok(self)
     }
+
+    /// Erzeugte Ergebnisse behalten ihre versiegelten Inhaltsdigests auch nach
+    /// einer späteren Konfliktentscheidung; frische Dateiversionen ersetzen sie nicht.
+    pub(crate) fn with_expected_content_hashes(
+        mut self,
+        expected: &std::collections::BTreeMap<PathBuf, [u8; 32]>,
+    ) -> io::Result<Self> {
+        let files = self
+            .verified_reads
+            .as_mut()
+            .and_then(std::sync::Arc::get_mut)
+            .ok_or_else(|| {
+                io::Error::other("Erzeugte Quelle benötigt eine eigene gebundene Leseansicht")
+            })?;
+        files.expect_content_hashes(expected)?;
+        Ok(self)
+    }
+    // FTP behält außerhalb tatsächlich mehrdeutiger Namensgruppen seine bisherige
+    // Inhaltsklasse und Bilanz. Bindungs-/Statfehler werden auch hier weitergereicht.
+    pub(crate) fn with_verified_name_group_reads(
+        self,
+        items: &[PathBuf],
+        cancel: &crate::Cancel,
+    ) -> io::Result<Self> {
+        let mut bound = self.with_verified_reads(items, cancel)?;
+        if !bound
+            .verified_reads
+            .as_ref()
+            .is_some_and(|files| files.has_name_group_omissions())
+        {
+            bound.verified_reads = None;
+        }
+        Ok(bound)
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -1221,13 +1766,23 @@ impl LocalVfs {
         self
     }
 
-    /// Auch ein begrenzter SFTP-Download kann vor dem lokalen Commit abstürzen.
+    /// Auch ein interaktiver Remote-Download kann vor dem lokalen Commit abstürzen.
     /// Sein Tempintent nutzt denselben privaten Recoveryindex wie schwacher Sync;
     /// daraus entsteht weder ein Wiederholungs- noch ein Löschrecht.
     pub(crate) fn with_required_temp_recovery(self, queue: &Path, operation: &str) -> Self {
         let mut value = self.with_staging_owner(queue, operation);
         std::sync::Arc::make_mut(value.sync_binding.get_or_insert_with(Default::default))
             .require_temp_recovery = true;
+        value
+    }
+
+    /// Gewöhnliche additive Downloads nutzen einen privaten Recoveryindex,
+    /// wenn der Queueordner ihn tragen kann. Fehlt dessen exklusiver Namespace,
+    /// bleibt die Kopie möglich und bilanziert die fehlende dauerhafte Recovery.
+    pub(crate) fn with_preferred_temp_recovery(self, queue: &Path, operation: &str) -> Self {
+        let mut value = self.with_staging_owner(queue, operation);
+        std::sync::Arc::make_mut(value.sync_binding.get_or_insert_with(Default::default))
+            .prefer_temp_recovery = true;
         value
     }
 
@@ -1278,6 +1833,14 @@ impl LocalVfs {
                 continue;
             }
             let path = crate::path::checked_join(target, &row.path)?;
+            // Eine Entfernung benennt den Eintrag selbst um. Ihr gehaltener
+            // Operationsroot muss daher dessen Elternordner enthalten; der
+            // zu entfernende Ordner wäre als eigene Rename-Wurzel unbrauchbar.
+            let path = if row.action == crate::sync::ComparisonAction::Quarantine {
+                path.parent().unwrap_or(target).to_path_buf()
+            } else {
+                path
+            };
             for parent in path.ancestors().take_while(|p| p.starts_with(target)) {
                 match self.stat(parent) {
                     Ok(entry) if entry.is_dir && !entry.is_symlink => {
@@ -1317,6 +1880,32 @@ impl LocalVfs {
         }
     }
 
+    pub fn list_display_entries(&self, path: &Path) -> io::Result<Vec<DirectoryDisplayEntry>> {
+        crate::local_fs::list_display(self.root_for(path), path)
+    }
+
+    fn open_local_write_new(&self, path: &Path) -> io::Result<std::fs::File> {
+        let file = match self.root_for(path) {
+            Some(root) => crate::local_fs::open_write_new_beneath(root, path)?,
+            None => crate::local_fs::open_write_new(path)?,
+        };
+        if let Some(stage) = self.staging.as_ref().filter(|stage| stage.contains(path)) {
+            stage
+                .inherit_file(&file)
+                .and_then(|()| stage.record("created", path, None))
+                .map_err(|error| {
+                    crate::coded_error(
+                        io::ErrorKind::Other,
+                        crate::ErrorCode::OutcomeUnclear,
+                        format!(
+                            "Temp angelegt, Vorbereitung nicht bestätigt ({error}); Recovery: {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+        }
+        Ok(file)
+    }
     fn root_for(&self, path: &Path) -> Option<&crate::local_fs::RootHandle> {
         if let Some(stage) = self.neighbor_staging() {
             if path.starts_with(stage.parent.path()) {
@@ -1411,11 +2000,157 @@ impl LocalVfs {
             staging_owner: None,
             sync_binding: None,
             verified_reads: None,
+            sync_protected_entries: Vec::new(),
         })
     }
 }
 
 impl Vfs for LocalVfs {
+    #[cfg(target_os = "macos")]
+    fn entry_is_hidden(&self, path: &Path, entry: &Entry) -> io::Result<bool> {
+        crate::local_fs::observed_entry_is_hidden(self.root_for(path), path, entry)
+    }
+    #[cfg(target_os = "macos")]
+    fn read_copy_metadata(
+        &self,
+        path: &Path,
+        entry: &Entry,
+        cancel: &crate::Cancel,
+    ) -> io::Result<Option<FileCopyMetadataSource>> {
+        crate::local_fs::copy_metadata::attributes::Source::open(
+            self.root_for(path),
+            path,
+            entry,
+            cancel,
+        )
+        .map(Some)
+    }
+    #[cfg(target_os = "macos")]
+    fn open_write_new_for_copy(
+        &self,
+        path: &Path,
+        metadata: bool,
+    ) -> Result<FileCopyWriter, MutationFailure> {
+        let file = self.open_local_write_new(path).map_err(|error| {
+            if crate::error_code(&error) == crate::ErrorCode::OutcomeUnclear {
+                MutationFailure::OutcomeUnclear(error)
+            } else {
+                MutationFailure::Unchanged(error)
+            }
+        })?;
+        let target = if metadata {
+            Some(
+                FileCopyMetadataTarget::from_file(self.root_for(path), path, &file).map_err(
+                    |error| {
+                        MutationFailure::OutcomeUnclear(crate::error::with_recovery_paths(
+                            error,
+                            &[path.to_string_lossy().into_owned()],
+                        ))
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        Ok(FileCopyWriter {
+            writer: Box::new(file),
+            removal_proof: None,
+            metadata: target,
+        })
+    }
+    #[cfg(target_os = "macos")]
+    fn create_dir_for_copy(
+        &self,
+        path: &Path,
+        metadata: bool,
+    ) -> Result<FileCopyDirectory, MutationFailure> {
+        let removal_proof = self.create_dir_with_removal_proof(path)?;
+        let target = if metadata {
+            Some(
+                FileCopyMetadataTarget::from_directory(self.root_for(path), path).map_err(
+                    |error| {
+                        MutationFailure::OutcomeUnclear(crate::error::with_recovery_paths(
+                            error,
+                            &[path.to_string_lossy().into_owned()],
+                        ))
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        Ok(FileCopyDirectory {
+            removal_proof,
+            metadata: target,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_copy_metadata(
+        &self,
+        path: &Path,
+        source: &FileCopyMetadataSource,
+        target: &FileCopyMetadataTarget,
+    ) -> io::Result<FileCopyMetadataReport> {
+        if !source.has_locked_flag() {
+            return Ok(FileCopyMetadataReport::default());
+        }
+        // Der gehaltene Ziel- und Stagingordner kann unter einer ausgetauschten
+        // Pane-Wurzel wieder auftauchen. Auch die äußere Bindung gilt weiter.
+        if !self.anchor_is_current()? {
+            return Err(crate::real_mode::plan_drift(
+                "Kopierwurzel vor dem Sperrabschluss verändert",
+            ));
+        }
+        let report = target.finish_flags(self.root_for(path), source, path)?;
+        if !self.anchor_is_current()? {
+            return Err(crate::real_mode::plan_drift(
+                "Kopierwurzel nach dem Sperrabschluss verändert",
+            ));
+        }
+        Ok(report)
+    }
+
+    fn read_copy_mtime(&self, path: &Path, entry: &Entry) -> io::Result<Option<FileTimestamp>> {
+        crate::local_fs::read_copy_mtime(self.root_for(path), path, entry).map(Some)
+    }
+
+    fn supports_precise_copy_mtime(&self) -> bool {
+        true
+    }
+
+    fn set_copy_mtime(&self, path: &Path, time: FileTimestamp) -> io::Result<()> {
+        crate::local_fs::set_copy_mtime(self.root_for(path), path, time)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_copy_creation_time(
+        &self,
+        path: &Path,
+        entry: &Entry,
+    ) -> io::Result<Option<FileCreationTime>> {
+        crate::local_fs::read_copy_creation_time(self.root_for(path), path, entry)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_creation_time(&self, path: &Path, time: FileCreationTime) -> io::Result<()> {
+        crate::local_fs::set_copy_creation_time(self.root_for(path), path, time)
+    }
+
+    fn interactive_write_limitations(&self) -> Vec<String> {
+        if self
+            .sync_binding
+            .as_ref()
+            .is_some_and(|binding| binding.prefer_temp_recovery)
+            && self.staging.is_none()
+            && self.neighbor_staging().is_none()
+        {
+            vec!["Keine dauerhafte Temp-Recovery: Ohne privaten Recoveryindex können nach einem Prozessabbruch unvollständige Nachbardateien verbleiben, deren Pfade nicht im Queuejournal gebunden sind.".into()]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn interactive_source_tree(&self) -> io::Result<Option<InteractiveSourceTree>> {
         self.verified_reads
             .as_ref()
@@ -1513,7 +2248,13 @@ impl Vfs for LocalVfs {
             .sync_binding
             .as_ref()
             .is_some_and(|binding| binding.require_temp_recovery);
-        let neighbor = if stage.is_none() && (self.sync_execution().is_some() || require_recovery) {
+        let prefer_recovery = self
+            .sync_binding
+            .as_ref()
+            .is_some_and(|binding| binding.prefer_temp_recovery);
+        let neighbor = if stage.is_none()
+            && (self.sync_execution().is_some() || require_recovery || prefer_recovery)
+        {
             self.staging_owner
                 .as_ref()
                 .map(|owner| {
@@ -1548,6 +2289,7 @@ impl Vfs for LocalVfs {
             staging: stage.map(std::sync::Arc::new),
             staging_owner: self.staging_owner.clone(),
             verified_reads: self.verified_reads.clone(),
+            sync_protected_entries: self.sync_protected_entries.clone(),
             sync_binding: Some(std::sync::Arc::new(LocalSyncVfsBinding {
                 neighbor: neighbor.map(std::sync::Arc::new),
                 ..self.sync_binding.as_deref().cloned().unwrap_or_default()
@@ -1716,17 +2458,20 @@ impl Vfs for LocalVfs {
     }
 
     fn list(&self, path: &Path) -> io::Result<Vec<Entry>> {
-        match self.root_for(path) {
-            Some(root) => crate::local_fs::list_beneath(root, path),
-            None => crate::local_fs::list(path),
-        }
+        let mut entries = match self.root_for(path) {
+            Some(root) => crate::local_fs::list_beneath(root, path)?,
+            None => crate::local_fs::list(path)?,
+        };
+        entries.retain(|entry| self.sync_entry_visible(path, &entry.name));
+        Ok(entries)
     }
 
     fn list_complete(&self, path: &Path) -> io::Result<CompleteDirectoryListing> {
-        let entries = match self.root_for(path) {
+        let mut entries = match self.root_for(path) {
             Some(root) => crate::local_fs::list_complete_beneath(root, path)?,
             None => crate::local_fs::list_complete(path)?,
         };
+        entries.retain(|entry| self.sync_entry_visible(path, &entry.entry.name));
         Ok(CompleteDirectoryListing {
             entries,
             provider_token: None,
@@ -1817,26 +2562,8 @@ impl Vfs for LocalVfs {
     }
 
     fn open_write_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
-        let file = match self.root_for(path) {
-            Some(root) => crate::local_fs::open_write_new_beneath(root, path)?,
-            None => crate::local_fs::open_write_new(path)?,
-        };
-        if let Some(stage) = self.staging.as_ref().filter(|stage| stage.contains(path)) {
-            stage
-                .inherit_file(&file)
-                .and_then(|()| stage.record("created", path, None))
-                .map_err(|error| {
-                    crate::coded_error(
-                        io::ErrorKind::Other,
-                        crate::ErrorCode::OutcomeUnclear,
-                        format!(
-                            "Temp angelegt, Vorbereitung nicht bestätigt ({error}); Recovery: {}",
-                            path.display()
-                        ),
-                    )
-                })?;
-        }
-        Ok(Box::new(file))
+        self.open_local_write_new(path)
+            .map(|file| Box::new(file) as Box<dyn Write + Send>)
     }
 
     fn open_write_new_with_removal_proof(
@@ -1852,6 +2579,10 @@ impl Vfs for LocalVfs {
                     MutationFailure::Unchanged(error)
                 }
             })
+    }
+
+    fn sparse_allocation_unit(&self, parent: &Path) -> io::Result<Option<u32>> {
+        crate::local_fs::sparse_allocation_unit(self.root_for(parent), parent)
     }
 
     fn open_sparse_read(&self, path: &Path) -> io::Result<Box<dyn SparseRead>> {

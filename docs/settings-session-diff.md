@@ -1,6 +1,6 @@
 # Einstellungen, Sitzungswiederherstellung und Dateivergleich
 
-Stand: 2026-10-19.
+Stand: 2026-10-28.
 
 ## Globale Einstellungen
 
@@ -18,17 +18,12 @@ Das Backend speichert globale Einstellungen atomar in `desktop-settings.json` im
 App-Konfigurationsordner. Eine beschädigte oder verlinkte Datei wird sichtbar
 gemeldet und nicht überschrieben. Änderungen werden feldweise zusammengeführt,
 damit ein älterer Dialog in einem zweiten Fenster keine fremde Wahl zurücksetzt.
-Der blaue Himmel ist die Vorgabe. Unter macOS ändert die Wahl das laufende Dock-Icon und setzt über
-`NSWorkspace` ein dauerhaftes Findericon am App-Bundle. Wegen des Finder-/Dock-Caches
-kann nach dem Beenden noch das blaue Standardicon erscheinen. Abhilfe: Im
-Kontextmenü des Dockicons „Optionen → Im Finder anzeigen“ wählen; dadurch wird die
-Anzeige aktualisiert. Diese Cache-Eigenheit wird als bekannte Einschränkung
-akzeptiert und nicht weiter verfolgt. Die signierten Ressourcen
-unter `Contents` bleiben unverändert; macOS ergänzt Custom-Icon-Metadaten am Bundle. Die normale
-Signaturprüfung und Gatekeeper akzeptieren diese; `codesign --strict` beanstandet
-die zusätzlichen Finder-Metadaten. Schreibgeschützte Bundles können nur das
-Laufzeiticon übernehmen. Auf Linux erhalten die laufenden Fenster das gewählte
-Icon. Ein gescheitertes Icon bricht weder den App-Start noch das Speichern
+Der blaue Himmel ist die Vorgabe. Unter macOS ändert die Wahl ausschließlich das
+Dock-Icon des laufenden Prozesses. Die Auswahl bleibt gespeichert und wird beim
+nächsten App-Start erneut angewendet. Nach Prozessende zeigt das Dock das originale
+Bundleicon. Die App schreibt keine Finder-Custom-Icons, Resource Forks oder
+FinderInfo-Metadaten an ihr Bundle, damit dessen Signatur unverändert gültig bleibt.
+Auf Linux erhalten die laufenden Fenster das gewählte Icon. Ein gescheitertes Icon bricht weder den App-Start noch das Speichern
 ab. Beim Start übernimmt das Hauptfenster den einmaligen Queue-Fehler. Ein synchron
 zurückgemeldeter Fehler beim Speichern (fehlender Verzeichnis-fsync, Icon setzen)
 geht als `settings-error` an das auslösende Fenster; das Frontend zeigt ihn unter
@@ -37,7 +32,7 @@ reagiert. Fehler beim asynchronen macOS-Dock-Icon oder beim Icon eines neu gebau
 nur mit dem Kontext `Fenstericon` und dem Fehlercode in `errors.jsonl` protokolliert.
 macOS liest die aktuelle Iconwahl erst im ausführenden Hauptthread-Task. Ein
 verspäteter Auftrag aus einem anderen Fenster kann dadurch keine ältere Auswahl
-wiederherstellen; die Regression ist im [Review-Abschluss](release-validation.md)
+wiederherstellen; die Regression ist im [Review-Abschluss](code-review-2026-10-13.md)
 belegt.
 Beim ersten Start dieser Version übergibt das
 Frontend Theme, Größeneinheit, automatische lokale Ordnergrößen und LAN-Suche aus
@@ -49,6 +44,14 @@ Die Datei ist bewusst streng: Ein unbekanntes Feld gilt als Lesefehler, und dann
 speichert diese App-Version keine Einstellung mehr (fail-closed, damit eine ältere
 Version keine Werte einer neueren still verwirft). Wer ein Feld ergänzt, erhöht
 deshalb `version` und schreibt eine Migration für den alten Stand.
+
+### Frühere Icon-Persistenzprüfungen
+
+Die folgenden Prüfungen dokumentieren den früheren Finder-Schreibweg. Seit
+2026-10-28 ist dieser entfernt: Custom-Icon-Metadaten machten die strikte Signatur
+eines echten notarisierten Bundles ungültig. Die damalige Probe an einem
+unsignierten Testbundle bewies keine Signaturverträglichkeit. Die früher
+beschriebene Finder-Cache-Abhilfe gehört nicht mehr zum aktuellen Produktverhalten.
 
 ### Icon-Persistenz: Prüfung 2026-10-12
 
@@ -63,7 +66,7 @@ wie oben beschrieben Custom-Icon-Metadaten.
 ### Visuelle Dock-Abnahme 2026-10-13: abgeschlossen mit Cache-Einschränkung
 
 Geprüft wurde die Developer-ID-signierte, notarisierte Version 0.1.123 aus
-dem damaligen Produktstand auf macOS 26.7.1 (25G241), gestartet über den Sandbox-Launcher
+Commit `de251fa` auf macOS 26.7.1 (25G241), gestartet über den Sandbox-Launcher
 mit isolierter Konfiguration.
 Die tatsächliche App lag unter `/Applications/Doppeldecker.app`.
 
@@ -112,7 +115,7 @@ gebunden und je Fenster einmalig übernommen. Dieser kurze Zugriff wartet nicht 
 Mutex des schreibenden Einstellungsstores. Der vollständige Live- und Dateistand
 bleibt erhalten; Remember-Reihenfolge, atomarer Write und Beenden-Barriere ändern
 sich dadurch nicht. Neue Fenster ohne gespeicherte Geometrie verwenden weiterhin
-ihre Standarddarstellung. [Prüfbericht](release-validation.md).
+ihre Standarddarstellung. [Prüfbericht](code-review-2026-10-19-startgeometrie.md).
 
 Beim Neustart liest Doppeldecker zuerst die gespeicherten Profile und ersetzt eine
 alte Profilrevision durch den aktuellen gespeicherten Stand. Das erste Listing
@@ -126,7 +129,7 @@ hinterlassen. Beim Start werden diese Dateien weder als Einstellungen übernomme
 noch nach ihrem Namen bereinigt. Dateipräfix und Prozesssperre ersetzen keinen
 beim Erzeugen gebundenen Besitzbeleg. Ebenso bleiben frühere Fensterjournale mit
 Historie und möglichen Recoverypfaden erhalten. Eine automatische Alterslöschung
-ist nicht vorgesehen; [Prüfung der Aufbewahrung](release-validation.md).
+ist nicht vorgesehen; [Prüfung der Aufbewahrung](code-review-2026-10-19-konfigurationsreste.md).
 
 ## Dateivergleich
 

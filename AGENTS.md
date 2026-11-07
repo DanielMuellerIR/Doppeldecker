@@ -1,10 +1,14 @@
 # Doppeldecker — dauerhafte Projektregeln
 
-Stand: 2026-07-29. Dual-Pane-Dateimanager für macOS und Linux. Praktische
-Dateiarbeit und Datenintegrität sind gleichrangige Produktziele. Doppeldecker nutzt
-die stärkste verfügbare Absicherung, bietet bei begrenzbaren Restrisiken einen
-sichtbaren Best-Effort-Weg und verweigert nur Wirkungen, deren Ziel oder Schaden
-nicht verlässlich begrenzt werden kann.
+Stand: 2026-10-28. Dual-Pane-Dateimanager für macOS und Linux. Vorrangiges Produktziel
+ist umfassende, komfortable, schnelle und effiziente Dateiarbeit. Datenintegrität
+unterstützt dieses Ziel; zusätzliche Absicherung ist kein Selbstzweck und rechtfertigt
+keine pauschalen Sperren üblicher Dateiaktionen. Keine allgemeine Vorschaupflicht:
+gewöhnliche Copy-/Move-/Rename-/mkdir-Aktionen laufen direkt, Konflikte und konkrete
+Löschwirkungen bekommen passende Entscheidungen. Sync und größere Sammeländerungen
+besitzen eigene Vorschauen. Fehlende atomare Protokollgarantien führen zu einem
+ehrlich benannten Best-Effort-Weg. Aktueller Funktionsstand und Ausbauziel bleiben
+in der Dokumentation unterscheidbar.
 
 ## Einstieg und Architektur
 
@@ -21,7 +25,7 @@ Tauri v2 mit Vanilla-HTML/CSS/JS und drei Rust-Crates:
   zwischen abgesicherter Ausführung, Best Effort und echter Absage.
 - `fuzz/`: Parser-Fuzzing; `vendor/smb2`: gezielter SMB-Capability-Patch.
 
-**Verbindliche Produktanforderung: Doppeldecker unterstützt
+**Verbindliche Produktanforderung (Daniel, 2026-08-03/06): Doppeldecker unterstützt
 mehrere gleichzeitig arbeitende Fenster.** Die Provider-Verbindungen sind wie
 eingehängte Ziele prozessweit sichtbar. Jedes Fenster besitzt dagegen zwingend seine
 eigene Operations-Queue, Single-Flight-Schranke, Realmodus-Vorbereitungen und
@@ -43,6 +47,15 @@ descriptor-relativ mit `openat`/`renameat`/`unlinkat`, `O_NOFOLLOW` und gehalten
 Root. Jede Elternkomponente wird ohne Symlinkfolgen geöffnet; finale Identität und
 Mount/Volume bleiben bis zum Ende gebunden.
 
+Für gewöhnliche interaktive SFTP-Aktionen gilt zusätzlich der ausdrücklich
+zugelassene pfadbasierte Best-Effort-Vertrag: lexikalisch begrenzte Auswahl,
+frische LSTAT-/REALPATH-/Elternprüfungen, keine beobachteten Symlinks, genau ein
+mutierender Versuch und Ergebnisprüfung. SFTP v3 kann einen gleichzeitigen
+serverseitigen Elternpfadtausch nicht atomar ausschließen; eine Umleitung auf einen
+anderen Pfad desselben Serverkontos bleibt ein sichtbares akzeptiertes Restrisiko.
+Eine zusätzliche SSH-Exec-/Serverhelferpflicht ist dafür nicht vorgesehen. Diese
+interaktive Klasse erteilt keine strikte Sync-/Mirror- oder Quarantänefähigkeit.
+
 - Quelle und Ziel dürfen weder gleich noch ineinander verschachtelt sein.
 - Symlinks, Spezialdateien, unsicher dekodierbare Namen und unbekannte Provider-
   Fähigkeiten sichtbar bilanzieren. Nur die konkret davon abhängige Wirkung
@@ -52,17 +65,31 @@ Mount/Volume bleiben bis zum Ende gebunden.
   Fehlt atomarer No-Replace, ist ein sichtbar bestätigter Best-Effort-Commit mit
   frischem Zielcheck und Readback zulässig; stilles Ersetzen bleibt verboten.
 - Metadaten folgen dem gewählten Profil. `Portable` ist sicherer Default;
-  `NativeBestEffort` verlangt ContentHash und bleibt für Mirror gesperrt;
+  `NativeBestEffort` verlangt ContentHash und bleibt für strikten Mirror gesperrt;
+  gewöhnlicher Inhaltssync bilanziert technisch begründete Metadatenauslassungen
+  gesondert, ohne unvollständige Dateibestände als vollständig zu behandeln.
   `NativeStrict` nur nach vollständigem Scan ohne unbekannte/ausgelassene Fähigkeit.
 - Owner, ACL, xattrs, Resource Forks, sparse Extents, Hardlinks, Rechte und Sonderbits
   sind manifestgebunden. Nicht darstellbare Klassen sichtbar bilanzieren, nie still
   als erfolgreich melden.
+- Numerische Owner-/Gruppen-IDs brauchen eine bestätigte gemeinsame Identitätsdomäne.
+  Gewöhnlicher Remote-Sync darf gleiche Zahlen nicht als gleiche Benutzer deuten;
+  fehlende Zuordnung sichtbar auslassen und NativeStrict nicht herabstufen.
 - Vor sicherheits- oder datenrelevanten Wirkungen (etwa dem Quarantäne-`purge`)
   entscheidet nie ein boolesches `exists()` über Abwesenheit: Ein Stat-,
   Verbindungs- oder Providerfehler ist dort kein „nicht vorhanden“. Fehlererhaltend
   `stat` prüfen und nur ein echtes `NotFound` als Abwesenheit werten.
 
 ## Sync-Sicherheitsvertrag
+
+Gewöhnlicher Inhaltssync über Remote-Endpunkte besitzt den getrennten Vertrag aus
+[`docs/content-sync.md`](docs/content-sync.md). Remote-Mirror darf nach konkreter
+Wirkungsbestätigung vorhandene Fassungen endgültig ersetzen und zusätzliche
+Zielinhalte endgültig entfernen (Produktentscheidung 2026-10-28). Fehlende
+Wiederherstellung und tatsächliche Teilwirkungen müssen sichtbar bleiben;
+Quarantäne darf nicht vorgetäuscht werden. Starke lokale Ziele behalten ihre echte
+Quarantäne. Die folgenden Quarantänegates beschreiben den getrennten strikten
+Syncvertrag und werden nicht als pauschale Remote-Sync-Sperre wiederverwendet.
 
 `plan()` verändert nichts; `execute()` führt nur den exakt bestätigten, frisch
 gebundenen Plan aus. Dieser Vertrag schützt besonders Ersetzungen und rekursive
@@ -86,14 +113,15 @@ Verbindliche Schranken:
   erzeugt Marker sowie getrennte `quelle/`-/`ziel/`-Panes. Nie `/`, `$HOME`, Repo,
   Cloud-Sync-Ordner, Originaldaten oder einen gefährlichen Elternpfad als Sandbox setzen.
 - Lokaler Realmodus hält Root-Deskriptoren, Volume-/Mountidentitäten, vollständige
-  Listings, Plan-Digest, Platz- und Restore-Probe. Zufallsphrase und Permit gelten
-  einmalig und höchstens zehn Minuten; sie sind nicht serialisierbar.
-- Mirror verlangt ContentHash, Backupbestätigung, vollständigen Zweitscan und die
-  Mengenlimits. Leere Quelle ist gesperrt; ebenso mehr als 100 Einträge oder mehr als
-  25 % des Zielbestands. Ordner rekursiv nach Einträgen und Bytes zählen.
-  Der bestätigte lokale Realmodus setzt zusätzlich die strengeren Grenzen von
-  50 Einträgen und 5 % durch (`core/src/real_mode.rs`); sie ersetzen keinen
-  der übrigen Mirror-Belege.
+  Listings, Plan-Digest, Platz- und Restore-Probe. Vorbereitung und Permit gelten höchstens zehn Minuten;
+  Permits sind einmalig und nicht serialisierbar. Die Oberfläche bestätigt die
+  konkrete Wirkung ohne Routine-Laufphrase.
+- Mirror verlangt ContentHash, vollständigen Zweitscan, Quarantäne und eine
+  wirkungsbezogene Bestätigung. Leere Quellen, hohe Entfernungszahlen und -anteile
+  werden deutlich gewarnt und dürfen bewusst bestätigt werden; die früheren
+  50-/100-Eintrags- und 5-/25-Prozent-Grenzen sind keine Sperren mehr. Ordner
+  rekursiv nach Einträgen und Bytes zählen. Normale Sync-Starts benötigen keine
+  Laufphrase oder behauptete externe Backupbestätigung.
 - Sobald Konflikte, Symlinks, Spezialdateien oder unvollständige Listings ausgelassen
   wurden, jede Mirror-Entfernung des Laufs sperren.
 - Kopien vollständig vor Entfernungen ausführen. Ersetzte/überzählige Ziele in
@@ -115,7 +143,7 @@ Move auch die Quelle darunter liegen.
   das folgende `mkdir` scheitert mit `EEXIST`. Die tatsächliche Anlage ist die Probe;
   jede Änderung an dieser Stelle auf case-sensitivem und case-insensitivem Dateisystem
   testen. Belegt 2026-09-10: Ein Fix über `Vfs::has_exact_names` wurde umgesetzt und
-  wieder verworfen, weil er macOS gebrochen hätte.
+  wieder verworfen, weil er macOS gebrochen hätte (dokumentierter Plattformgegenlauf vom 2026-09-10).
 
 - Löschen immer über den descriptor-relativen macOS-/XDG-Papierkorb: atomarer Claim,
   Identitätsprüfung, Crash-Journal, fail-closed Recovery. Kein Copy-and-delete-
@@ -148,8 +176,11 @@ Zertifikatsidentität. Solche Profile und jede aktive Pane weisen ihren konkrete
 Transportstatus sichtbar aus, laufen aber ohne zusätzliche Bestätigungsfrage.
 
 Ein explizites `ftp://` darf unverschlüsselt verbinden; `ftps://` darf niemals still
-auf Klartext zurückfallen. Bei FTPS bleibt das beobachtete Zertifikat auch ohne
-Namens-/WebPKI-Prüfung gegen spätere Wechsel gepinnt. Reconnect darf nur bei derselben
+auf Klartext zurückfallen. FTPS prüft standardmäßig öffentliche Zertifikatskette,
+Gültigkeit und Servernamen ohne dauerhaften Profilpin; reguläre gültige Erneuerungen
+dürfen neue Verbindungen nicht sperren. Exakte Pins bleiben eine ausdrückliche
+Option, insbesondere für private oder ungeprüfte Zertifikate. Reconnect laufender
+Vorbereitungen darf nur bei derselben
 für den gewählten Modus verfügbaren Provideridentität fortsetzen: Hostkey bei SFTP,
 Zertifikat bei FTPS und bei Klartext-FTP mindestens Endpunkt, Root und
 Serverfähigkeits-Digests. Unvollständige Listings oder schwache Durability sperren
@@ -183,7 +214,7 @@ erst, und das Listing bleibt mit einem unspezifischen Fehler liegen.
   verändert oder Probenreste hinterlassen. Die Validierung gehört an den Anfang der
   Funktion.
 - Ein Server darf `MKD` auch für einen schon vorhandenen Ordner mit Erfolg beantworten
-  (dm0.de tut das). Ein Erfolgscode ist damit **kein** Beweis für exklusives Anlegen:
+  (bei manchen Servern beobachtet). Ein Erfolgscode ist damit **kein** Beweis für exklusives Anlegen:
   vorher den vollständigen Elternbestand listen, danach den neuen Ordner zurücklesen.
   Ein bestehender Name bleibt eine sichtbare Kollision, kein stiller Treffer.
 - `MLSD` standardkonform aushandeln: benötigte Felder mit `OPTS MLST` anfordern, eine
@@ -224,8 +255,9 @@ erst, und das Listing bleibt mit einem unspezifischen Fehler liegen.
   Abfrage im Frontend. Eine
   `provider !== "local"`-Sperre hat „Ordner anlegen" für alle Remote-Panes blockiert,
   obwohl die damaligen Provider `create_dir` samt Gate und Readback bereits
-  umsetzten. SFTP ist inzwischen wegen fehlender atomarer Root-/Elternbindung im
-  Backend gesperrt; diese konkrete Grenze ist keine pauschale Remote-Sperre.
+  umsetzten. Die interaktive SFTP-Klasse darf fehlende atomare Root-/Elternbindung
+  ausdrücklich als Best Effort behandeln; strikte Sync-Sperren gelten nicht
+  automatisch für sie.
   Vor einer Frontend-Sperre erst den Backend-Vertrag lesen; ist die
   Operation dort nicht vorgesehen, gehört die Absage ebenfalls dorthin.
 - Eine strikte Sync-Capability darf nicht ungeprüft für eine gewöhnliche
@@ -259,7 +291,8 @@ erst, und das Listing bleibt mit einem unspezifischen Fehler liegen.
 - App-Icon: Das Flugzeug diagonal von links oben nach rechts unten zeigen, den Raum
   ausnutzen und konstruktive Details wie Rippen, Streben, Motor und Fahrwerk behalten.
   Keine comicartig abgerundeten Pillen-, Gummi- oder Ballonformen und keine roten oder
-  gelben Hintergründe; Komplementärfarben bevorzugen.
+  gelben Hintergründe; Komplementärfarben bevorzugen (Daniel, 2026-09-02;
+  Lern-Inbox-Fragment 2026-09-02-13).
 
 ## Bauen und testen
 
@@ -288,6 +321,10 @@ zu den Abhängigkeiten des Kerns passt.
 GUI-Sandbox-Smoke): Exit-Code 0 nur, wenn alle ausgeführten Gates grün sind; `--json`
 schreibt JSON Lines auf stdout. Nach einem vollständigen grünen Lauf bereinigt es
 `target/debug` oberhalb von 6 GiB; Teilgate-Läufe und Release-Artefakte bleiben erhalten.
+Für manuelle Builds, isolierte Kandidaten und deren Abschluss deshalb zusätzlich
+[Builddaten und Agentenausgaben](docs/build-output-retention.md) beachten:
+unnötige neue Target-Bäume vermeiden, Ausgaben begrenzen und entbehrliche
+Zwischenprodukte nach Abnahme aufräumen.
 
 `./build-app` baut eine Developer-ID-signierte, notarisierte `Doppeldecker.app` in
 den Projekt-Root (Modus `macos-install`; stabile Signatur hält macOS-Berechtigungen,
@@ -302,7 +339,7 @@ bekommt zuerst die App ihr Ticket, dann das Image.
 fest: das Ticket vor dem ersten Schreiben ins Installationsverzeichnis, und keinen
 absoluten Build-Mac-Pfad im ausgelieferten Bundle. Diese Prüfungen nie dadurch
 „belegen", dass man `./install` oder `./release` gegen die echten Ziele laufen lässt —
-das löscht und ersetzt die installierte App und reicht eine echte Notarisierung ein.
+das löscht und ersetzt Daniels installierte App und reicht eine echte Notarisierung ein.
 
 Das DMG wird dabei bewusst selbst gepackt statt mit `tauri bundle --bundles dmg`:
 Der Tauri-Bundler signiert die App beim Packen neu und löscht sie danach aus
@@ -375,6 +412,13 @@ Nutzerdaten bleiben unberührt.
 
 Die offene Arbeit steht in [`backlog.md`](backlog.md). Erledigte Schnitt-/Testchronik gehört
 in `CHANGELOG.md` oder die Release Notes, nicht in den Startkontext.
+READMEs bleiben kurze Produkteinstiege und verlinken Fachdetails. Im Backlog nennt
+jeder Punkt Wirkung, Fertigkriterium und höchstens einen Detailverweis; keine
+wiederholten Prüfzahlen oder Ablaufchroniken.
+Backlog und Roadmap kurz halten: nur offene Aufgaben, Prioritäten, Fertigkriterien
+und Detailverweise; keine wiederholten Testzahlen oder erledigte Chronik.
+Metadaten-Releaseziel ist belegte ForkLift-Parität; darüber hinausgehende
+Spezialfähigkeiten bleiben Zukunftswünsche, keine pauschalen Releasegates.
 
 Vor Spezialarbeit gezielt [`docs/INDEX.md`](docs/INDEX.md) und das verlinkte Vertragsdokument lesen.
 Unter `vendor/smb2/**` liegen fremde `CLAUDE.md`-Dateien: vendorte, verschachtelte

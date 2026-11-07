@@ -16,10 +16,10 @@ use crate::progress::{Cancel, Progress};
 use crate::real_mode::{
     bind_capabilities_digest, binding_digest, build_listing_proof, confirmation_mismatch,
     confirmation_phrase, create_real_audit_context, create_real_permit, ensure_quarantine_root,
-    ensure_same_mount, execute_real_with_audit, execute_real_with_audit_detailed, impact_for_plan,
-    plan_drift, reserve_quarantine_run_name, run_restore_probe as run_local_restore_probe,
-    validate_real_plan, validate_real_target, RealAuditContext, RealAuditExecutionSuccess,
-    RealAuditRun, RealPermitRequest, RealRunPreview, REAL_PERMIT_LIFETIME,
+    ensure_same_mount, execute_real_with_audit_detailed, impact_for_plan, plan_drift,
+    reserve_quarantine_run_name, run_restore_probe as run_local_restore_probe, validate_real_plan,
+    validate_real_target, RealAuditContext, RealAuditExecutionSuccess, RealAuditRun,
+    RealPermitRequest, RealRunPreview, REAL_PERMIT_LIFETIME,
 };
 use crate::remote::combine_probe_outcome;
 use crate::remote_rename::{ProviderRenameCapabilities, RenameReport};
@@ -33,7 +33,7 @@ use crate::{
 };
 
 enum RunVfs {
-    Local(LocalVfs),
+    Local(Box<LocalVfs>),
     Projected(Arc<dyn Vfs>),
     Sftp(Arc<SftpVfs>),
     Ftps(Arc<FtpsVfs>),
@@ -44,7 +44,7 @@ enum RunVfs {
 impl RunVfs {
     fn as_vfs(&self) -> &dyn Vfs {
         match self {
-            Self::Local(vfs) => vfs,
+            Self::Local(vfs) => vfs.as_ref(),
             Self::Projected(vfs) => vfs.as_ref(),
             Self::Sftp(vfs) => vfs.as_ref(),
             Self::Ftps(vfs) => vfs.as_ref(),
@@ -216,7 +216,6 @@ fn cleanup_probe_quarantine_root(
 struct BoundProbeQuarantineRoot {
     path: PathBuf,
     identity: ProofListEntry,
-    removal_proof: Option<ProofListEntry>,
 }
 
 fn same_probe_proof(left: &ProofListEntry, right: &ProofListEntry) -> bool {
@@ -369,7 +368,6 @@ fn ensure_probe_quarantine_root(
         return Ok(BoundProbeQuarantineRoot {
             path: base.to_path_buf(),
             identity,
-            removal_proof: None,
         });
     }
     match vfs.create_dir_with_removal_proof(base) {
@@ -420,7 +418,6 @@ fn ensure_probe_quarantine_root(
                     Ok(BoundProbeQuarantineRoot {
                         path: base.to_path_buf(),
                         identity,
-                        removal_proof: Some(proof),
                     })
                 }
                 Err(sync_error) => {
@@ -957,7 +954,16 @@ pub struct ProviderDeleteCapabilities {
     pub provider: ProviderKind,
     pub quarantine: bool,
     pub permanent: bool,
+    pub limitations: Vec<String>,
     pub blockers: Vec<String>,
+}
+
+pub(crate) fn ordinary_remote_limitation(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Smb => "SMB verwendet echte exklusive Tempanlage und serverseitiges No-Replace-Rename; bestätigtes Ersetzen verwirft die Altversion dauerhaft. Root, Eltern, Bestand und Ergebnis werden frisch geprüft. Das erste Öffnen bleibt pfadbasiert: Gleichzeitiger Elternwechsel ist nicht atomar ausgeschlossen. Keine künstlichen Schreibproben oder blinden Mutationswiederholungen.",
+        ProviderKind::Ftps => "FTP/FTPS verwendet die echte STOU-Tempanlage, frische Zielprüfung und genau ein RNFR/RNTO; bestätigtes Ersetzen verwirft die Altversion dauerhaft. Zwischen Bestandscheck und Rename bleibt ein Kollisionsfenster; ein später Name-/Elternwechsel kann ein anderes Objekt treffen. Keine künstlichen Schreibproben oder blinden Mutationswiederholungen; bei Antwortverlust bleibt der Ausgang sichtbar unklar.",
+        _ => "WebDAV verwendet frische Versionsbedingungen, vollständige Listings und Ergebnisreadback als Best Effort; Elternwechsel bleiben möglich. Dauerhafte Löschungen und Ersetzungen besitzen keine Quarantäne. Keine blinde Mutationswiederholung.",
+    }
 }
 
 /// Reine Anzeige vor einer abbrechbaren Inhaltsvorbereitung. Die konkrete
@@ -967,8 +973,8 @@ pub fn interactive_file_preparation_notice(
     target: ProviderKind,
     move_source: bool,
 ) -> Option<&'static str> {
-    if source == ProviderKind::Sftp {
-        Some(crate::sftp::SFTP_CONTENT_READ_LIMITATION)
+    if source == ProviderKind::Sftp || target == ProviderKind::Sftp {
+        Some(crate::sftp::SFTP_WRITE_LIMITATION)
     } else if source == ProviderKind::Ftps || target == ProviderKind::Ftps {
         Some("FTP-/FTPS-Dateioperation wird vorbereitet. Abbruch verhindert die spätere Einreihung; ein bereits laufender Serverzugriff wird noch geprüft beendet.")
     } else if source == ProviderKind::Local && target == ProviderKind::WebDav && !move_source {
@@ -978,6 +984,7 @@ pub fn interactive_file_preparation_notice(
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct InteractiveFileOwner {
     pub(crate) staging: crate::local_staging::StagingOwner,
     pub(crate) profiles: Vec<crate::RemoteProfileBinding>,
@@ -999,18 +1006,7 @@ pub fn validate_interactive_file_transfer_request(
     move_source: bool,
     overwrite: bool,
 ) -> io::Result<()> {
-    if source == ProviderKind::Local && target == ProviderKind::WebDav && !move_source && overwrite
-    {
-        return Err(crate::error::coded_error(
-            io::ErrorKind::Unsupported,
-            crate::ErrorCode::Unsupported,
-            crate::webdav::FILE_REPLACE_BLOCKER,
-        ));
-    }
-    if source == ProviderKind::Sftp && (target != ProviderKind::Local || move_source || overwrite) {
-        return Err(io::Error::new(io::ErrorKind::Unsupported,
-            "SFTP-Inhalte erlauben ausschließlich additive Downloads begrenzter Inhaltsauswahlen in ein lokales Ziel; Remote-Ziel, Verschieben und Ersetzen bleiben gesperrt"));
-    }
+    let _ = (source, target, move_source, overwrite);
     Ok(())
 }
 
@@ -1152,8 +1148,8 @@ impl ProviderEndpoint {
         let ftps_selection =
             self.kind() == ProviderKind::Ftps || request.target.kind() == ProviderKind::Ftps;
         let current_conflicts = if ftps_selection {
-            let source = self.file_context()?.0;
-            let target = request.target.file_context()?.0;
+            let source = self.ordinary_file_context()?.0;
+            let target = request.target.ordinary_file_context()?.0;
             crate::find_recursive_conflicts(
                 source.as_ref(),
                 target.as_ref(),
@@ -1196,7 +1192,7 @@ impl ProviderEndpoint {
         let mut ftps_file_probe_used = false;
         if rename_candidate {
             let rename = if self.kind() == ProviderKind::Ftps {
-                let vfs = self.file_context()?.0;
+                let vfs = self.ordinary_file_context()?.0;
                 let mut files = false;
                 let mut directories = false;
                 let mut supported = true;
@@ -1237,7 +1233,7 @@ impl ProviderEndpoint {
                         capabilities: None,
                     });
                 }
-                if self.kind() != ProviderKind::Ftps {
+                if !matches!(self.kind(), ProviderKind::Ftps | ProviderKind::Sftp) {
                     let mut reasons = rename.blockers;
                     reasons.extend(rename.limitations.into_iter().filter(|note| {
                         note != crate::remote_rename::SOURCE_PATH_BINDING_LIMITATION
@@ -1280,9 +1276,7 @@ impl ProviderEndpoint {
             }
             if let ProviderEndpointInner::Ftps(vfs, root) = &request.target.inner {
                 vfs.restrict_to_directories()?;
-                if needs_directory_create {
-                    vfs.probe_directory_create_capability_at(root)?;
-                }
+                let _ = (needs_directory_create, root);
                 return Ok(ProviderFileTargetPreparation {
                     skip_only: false,
                     choice_required: false,
@@ -1301,11 +1295,18 @@ impl ProviderEndpoint {
                 });
             }
         }
-        let capabilities = match request.capabilities_override {
+        let mut capabilities = match request.capabilities_override {
             Some(capabilities) => capabilities,
             None if ftps_file_probe_used => request.target.file_capabilities(false, false)?,
             None => request.target.probe_file_target_capabilities()?,
         };
+        if request.overwrite {
+            if let ProviderEndpointInner::Sftp(vfs, _) = &request.target.inner {
+                capabilities
+                    .limitations
+                    .extend(vfs.interactive_replace_limitations());
+            }
+        }
         Ok(ProviderFileTargetPreparation {
             skip_only: false,
             choice_required: false,
@@ -1340,8 +1341,8 @@ impl ProviderEndpoint {
         conflicts: &[String],
         maximum_entries: usize,
     ) -> io::Result<Option<FileSelectionEffects>> {
-        let source = self.file_context()?.0;
-        let target = request.target.file_context()?.0;
+        let source = self.ordinary_file_context()?.0;
+        let target = request.target.ordinary_file_context()?.0;
         // Ohne vollständige begrenzte Bilanz keine vereinfachte Klasse vergeben.
         // Der reguläre Datei-/Quellvertrag prüft seine Fähigkeiten unabhängig weiter.
         let mut effects = FileSelectionEffects::default();
@@ -1430,9 +1431,9 @@ impl ProviderEndpoint {
         &self,
         request: &ProviderFileTargetProbe<'_>,
     ) -> io::Result<Option<bool>> {
-        let source = self.file_context()?.0;
+        let source = self.ordinary_file_context()?.0;
         let target = (request.target.kind() == ProviderKind::Ftps)
-            .then(|| request.target.file_context())
+            .then(|| request.target.ordinary_file_context())
             .transpose()?
             .map(|context| context.0);
         let mut pending = request
@@ -1678,6 +1679,212 @@ impl ProviderEndpoint {
         Ok((vfs, root))
     }
 
+    /// Wirkungsbezogene gewöhnliche Dateiaktionen. Die SFTP-Sicht trägt nur
+    /// beobachtete Pfadbelege; Materialisierung für Sync verwendet weiter SftpVfs.
+    pub fn ordinary_file_context(&self) -> io::Result<(Arc<dyn Vfs>, PathBuf)> {
+        match &self.inner {
+            ProviderEndpointInner::Sftp(vfs, root) => {
+                return Ok((
+                    vfs.interactive_mutations(root, &Cancel::new(), None)?,
+                    root.clone(),
+                ))
+            }
+            ProviderEndpointInner::Ftps(vfs, root) => {
+                return Ok((vfs.ordinary_mutations(root)?, root.clone()))
+            }
+            ProviderEndpointInner::Smb(vfs, root) => {
+                return Ok((
+                    vfs.ordinary_mutations(root, &Cancel::new(), None)?,
+                    root.clone(),
+                ))
+            }
+            ProviderEndpointInner::WebDav(vfs, root) => {
+                return Ok((vfs.ordinary_delete(root)?, root.clone()))
+            }
+            _ => {}
+        }
+        self.file_context()
+    }
+
+    pub(crate) fn queue_reference(&self) -> crate::BidirectionalQueueEndpoint {
+        use crate::BidirectionalQueueEndpoint as Q;
+        let root = self.root().to_string_lossy().into_owned();
+        match &self.inner {
+            ProviderEndpointInner::Local(_) => Q::Local { root },
+            ProviderEndpointInner::Sftp(vfs, _) => Q::Sftp {
+                connection: Box::new(vfs.connection_config().clone()),
+                root,
+            },
+            ProviderEndpointInner::Ftps(vfs, _) => Q::Ftps {
+                connection: Box::new(vfs.connection_config().clone()),
+                root,
+            },
+            ProviderEndpointInner::WebDav(vfs, _) => Q::WebDav {
+                connection: Box::new(vfs.connection_config().clone()),
+                root,
+            },
+            ProviderEndpointInner::Smb(vfs, _) => Q::Smb {
+                connection: Box::new(vfs.connection_config().clone()),
+                root,
+            },
+            ProviderEndpointInner::TestRemoteLocal(_, _) => Q::Local { root },
+        }
+    }
+    pub(crate) fn content_sync_endpoint_binding(
+        &self,
+        identity: &crate::RootIdentity,
+    ) -> io::Result<crate::EndpointBinding> {
+        let account = match &self.inner {
+            ProviderEndpointInner::Local(_) => None,
+            ProviderEndpointInner::Sftp(vfs, _) => Some(vfs.account_digest()),
+            ProviderEndpointInner::Ftps(vfs, _) => Some(vfs.account_digest()),
+            ProviderEndpointInner::WebDav(vfs, _) => Some(vfs.identity().account_digest),
+            ProviderEndpointInner::Smb(vfs, _) => Some(vfs.identity().account_digest),
+            ProviderEndpointInner::TestRemoteLocal(_, _) => None,
+        };
+        match account {
+            Some(account) => crate::EndpointBinding::remote(identity, account),
+            None => crate::EndpointBinding::local(identity),
+        }
+    }
+    pub(crate) fn matches_queue_endpoint(
+        &self,
+        endpoint: &crate::BidirectionalQueueEndpoint,
+    ) -> bool {
+        use crate::BidirectionalQueueEndpoint as Q;
+        if self.root().to_str() != Some(endpoint.root()) {
+            return false;
+        }
+        match (&self.inner, endpoint) {
+            (ProviderEndpointInner::Local(_), Q::Local { .. }) => true,
+            (ProviderEndpointInner::Sftp(vfs, _), Q::Sftp { connection, .. }) => {
+                vfs.connection_config() == connection.as_ref()
+            }
+            (ProviderEndpointInner::Ftps(vfs, _), Q::Ftps { connection, .. }) => {
+                vfs.connection_config() == connection.as_ref()
+            }
+            (ProviderEndpointInner::WebDav(vfs, _), Q::WebDav { connection, .. }) => {
+                vfs.connection_config() == connection.as_ref()
+            }
+            (ProviderEndpointInner::Smb(vfs, _), Q::Smb { connection, .. }) => {
+                vfs.connection_config() == connection.as_ref()
+            }
+            _ => false,
+        }
+    }
+
+    pub fn content_sync_root_identity(&self, cancel: &Cancel) -> io::Result<crate::RootIdentity> {
+        self.content_sync_context(false, cancel, None)?
+            .root_identity(self.root())
+    }
+
+    pub(crate) fn content_sync_local_context(
+        &self,
+        plan: &SyncPlan,
+        execution: crate::real_mode::LocalSyncExecution,
+        quarantine: bool,
+        owner: Option<InteractiveFileOwner>,
+    ) -> io::Result<Arc<dyn Vfs>> {
+        let ProviderEndpointInner::Local(root) = &self.inner else {
+            return Err(invalid(
+                "Lokale Inhaltssync-Sicht benötigt einen lokalen Endpunkt",
+            ));
+        };
+        let internal = crate::real_mode::is_home_root(root)?;
+        let anchor = if quarantine && !internal {
+            root.parent()
+                .ok_or_else(|| invalid("Lokales Ziel ohne Eltern"))?
+        } else {
+            root.as_path()
+        };
+        let mut local = LocalVfs::rooted(anchor)?
+            .with_file_commit_root(&LocalVfs::rooted(root)?)
+            .with_sync_execution(Some(execution))
+            .with_sync_parents(root, plan)?;
+        if internal {
+            local = local.with_sync_protected_entry(root);
+        }
+        if let Some(owner) = owner {
+            local =
+                local.with_required_temp_recovery(&owner.staging.queue, &owner.staging.operation);
+        }
+        Ok(Arc::new(local))
+    }
+
+    pub(crate) fn content_sync_delete_context(
+        &self,
+        cancel: &Cancel,
+        owner: Option<InteractiveFileOwner>,
+    ) -> io::Result<Arc<dyn Vfs>> {
+        match &self.inner {
+            ProviderEndpointInner::WebDav(vfs, root) => vfs.ordinary_delete(root),
+            ProviderEndpointInner::Local(root)
+            | ProviderEndpointInner::TestRemoteLocal(_, root) => {
+                crate::content_sync::local_delete_context(root)
+            }
+            _ => self.content_sync_context(true, cancel, owner),
+        }
+    }
+
+    pub(crate) fn finish_content_sync_result(
+        &self,
+        result: io::Result<SyncStats>,
+    ) -> io::Result<SyncStats> {
+        match &self.inner {
+            ProviderEndpointInner::Ftps(vfs, _) => vfs.finish_sync_result(result, |stats| stats),
+            _ => result,
+        }
+    }
+
+    pub(crate) fn interactive_permission_context(
+        &self,
+        cancel: &Cancel,
+    ) -> io::Result<Arc<dyn Vfs>> {
+        match &self.inner {
+            ProviderEndpointInner::Sftp(vfs, root) => vfs.content_sync_context(root, cancel, None),
+            ProviderEndpointInner::Ftps(vfs, root) => vfs.content_sync_mutations(root),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Provider unterstützt keinen gewöhnlichen Unix-Rechteeditor",
+            )),
+        }
+    }
+
+    pub(crate) fn content_sync_context(
+        &self,
+        target: bool,
+        cancel: &Cancel,
+        owner: Option<InteractiveFileOwner>,
+    ) -> io::Result<Arc<dyn Vfs>> {
+        match &self.inner {
+            ProviderEndpointInner::Sftp(vfs, root) => vfs.content_sync_context(root, cancel, owner),
+            ProviderEndpointInner::Ftps(vfs, root) if target => vfs.content_sync_mutations(root),
+            ProviderEndpointInner::Ftps(vfs, root) => vfs.ordinary_mutations(root),
+            ProviderEndpointInner::Smb(vfs, root) if target => {
+                vfs.content_sync_mutations(root, cancel, owner)
+            }
+            ProviderEndpointInner::Smb(vfs, root) => vfs.content_sync_reader(root, cancel, owner),
+            ProviderEndpointInner::WebDav(vfs, root) if target => {
+                vfs.content_sync_upload(root, cancel, owner)
+            }
+            ProviderEndpointInner::Local(root) => {
+                let mut local = LocalVfs::rooted(root)?;
+                if crate::real_mode::is_home_root(root)? {
+                    local = local.with_sync_protected_entry(root);
+                }
+                Ok(Arc::new(if let Some(owner) = owner {
+                    local.with_preferred_temp_recovery(
+                        &owner.staging.queue,
+                        &owner.staging.operation,
+                    )
+                } else {
+                    local
+                }))
+            }
+            _ => Ok(self.file_context()?.0),
+        }
+    }
+
     /// Nur für interaktives Öffnen und additive lokale Downloads.
     /// Der SFTP-Adapter liefert ausdrücklich keine Planner-Root-/Listingbelege.
     pub fn interactive_file_read_context(
@@ -1725,11 +1932,93 @@ impl ProviderEndpoint {
             vfs.require_mutation_owner()?;
         }
         crate::fileops::validate_file_operation_paths(items, target.root())?;
-        let (source_vfs, _) = self.interactive_file_read_context(items, cancel)?;
-        if self.kind() == ProviderKind::Local && !move_source && !overwrite {
+        if move_source {
+            if let (
+                ProviderEndpointInner::Sftp(source, root),
+                ProviderEndpointInner::Sftp(destination, target_root),
+            ) = (&self.inner, &target.inner)
+            {
+                if Arc::ptr_eq(source, destination) {
+                    let move_owner = owner.as_ref().map(|owner| InteractiveFileOwner {
+                        staging: owner.staging.clone(),
+                        profiles: owner.profiles.clone(),
+                    });
+                    if let Some(context) = source.interactive_shared_move(
+                        root,
+                        target_root,
+                        items,
+                        cancel,
+                        move_owner,
+                    )? {
+                        return Ok(InteractiveFileContexts {
+                            source_vfs: context.clone(),
+                            target_vfs: context,
+                            target_capabilities: None,
+                        });
+                    }
+                }
+            }
+        }
+        if target.kind() == ProviderKind::Local && !move_source && !overwrite {
+            if let ProviderEndpointInner::WebDav(vfs, root) = &self.inner {
+                return Ok(InteractiveFileContexts {
+                    source_vfs: vfs.interactive_files(root, items, cancel)?,
+                    target_vfs: target.file_context()?.0,
+                    target_capabilities: None,
+                });
+            }
+        }
+        let mut source_vfs = if self.kind() == ProviderKind::Sftp
+            && target.kind() == ProviderKind::Local
+            && !move_source
+            && !overwrite
+        {
+            self.interactive_file_read_context(items, cancel)?.0
+        } else if let ProviderEndpointInner::Sftp(vfs, root) = &self.inner {
+            vfs.interactive_mutation_source(
+                root,
+                items,
+                cancel,
+                owner.as_ref().map(|owner| InteractiveFileOwner {
+                    staging: owner.staging.clone(),
+                    profiles: owner.profiles.clone(),
+                }),
+            )?
+        } else if let ProviderEndpointInner::Smb(vfs, root) = &self.inner {
+            if target.kind() == ProviderKind::Local && !move_source && !overwrite {
+                vfs.interactive_files(root, items, cancel)?
+            } else {
+                vfs.ordinary_mutations(
+                    root,
+                    cancel,
+                    owner.as_ref().map(|o| InteractiveFileOwner {
+                        staging: o.staging.clone(),
+                        profiles: o.profiles.clone(),
+                    }),
+                )?
+            }
+        } else if let ProviderEndpointInner::Ftps(vfs, root) = &self.inner {
+            if target.kind() == ProviderKind::Local && !move_source && !overwrite {
+                vfs.interactive_files(root, items, cancel)?
+            } else {
+                vfs.ordinary_mutations(root)?
+            }
+        } else {
+            self.interactive_file_read_context(items, cancel)?.0
+        };
+        if self.kind() == ProviderKind::Local
+            && matches!(target.kind(), ProviderKind::Ftps | ProviderKind::Smb)
+            && !move_source
+            && !overwrite
+        {
+            source_vfs = Arc::new(
+                LocalVfs::rooted(self.root())?.with_verified_name_group_reads(items, cancel)?,
+            );
+        }
+        if self.kind() == ProviderKind::Local && !move_source {
             if let ProviderEndpointInner::WebDav(vfs, root) = &target.inner {
                 drop(source_vfs);
-                let source_vfs =
+                let source_vfs: Arc<dyn Vfs> =
                     Arc::new(LocalVfs::rooted(self.root())?.with_verified_reads(items, cancel)?);
                 let target_vfs = vfs.interactive_upload(root, cancel, owner)?;
                 return Ok(InteractiveFileContexts {
@@ -1741,8 +2030,19 @@ impl ProviderEndpoint {
         }
         Ok(InteractiveFileContexts {
             source_vfs,
-            target_vfs: target.file_context()?.0,
-            target_capabilities: None,
+            target_vfs: if let ProviderEndpointInner::Sftp(vfs, root) = &target.inner {
+                vfs.interactive_mutations(root, cancel, owner)?
+            } else if let ProviderEndpointInner::Smb(vfs, root) = &target.inner {
+                vfs.ordinary_mutations(root, cancel, owner)?
+            } else if let ProviderEndpointInner::Ftps(vfs, root) = &target.inner {
+                vfs.ordinary_mutations(root)?
+            } else if let ProviderEndpointInner::WebDav(vfs, root) = &target.inner {
+                vfs.interactive_upload(root, cancel, owner)?
+            } else {
+                target.file_context()?.0
+            },
+            target_capabilities: (target.kind() == ProviderKind::WebDav)
+                .then(crate::webdav::ordinary_upload_capabilities),
         })
     }
 
@@ -1763,6 +2063,12 @@ impl ProviderEndpoint {
     pub fn interactive_file_read_limitations(&self) -> Vec<String> {
         if self.kind() == ProviderKind::Sftp {
             vec![crate::sftp::SFTP_CONTENT_READ_LIMITATION.into()]
+        } else if self.kind() == ProviderKind::Ftps {
+            vec![crate::ftps::FTP_CONTENT_READ_LIMITATION.into()]
+        } else if self.kind() == ProviderKind::WebDav {
+            vec![crate::webdav::WEBDAV_CONTENT_READ_LIMITATION.into()]
+        } else if self.kind() == ProviderKind::Smb {
+            vec![crate::smb::SMB_CONTENT_READ_LIMITATION.into()]
         } else {
             Vec::new()
         }
@@ -1774,17 +2080,33 @@ impl ProviderEndpoint {
         cache: &Path,
         cancel: &Cancel,
     ) -> io::Result<crate::RemoteSnapshot> {
+        self.download_interactive_snapshot_with_options(
+            source,
+            cache,
+            cancel,
+            crate::SnapshotOptions::default(),
+        )
+    }
+
+    pub fn download_interactive_snapshot_with_options(
+        &self,
+        source: &Path,
+        cache: &Path,
+        cancel: &Cancel,
+        options: crate::SnapshotOptions,
+    ) -> io::Result<crate::RemoteSnapshot> {
         let (vfs, _) = self.interactive_file_read_context(&[source.to_path_buf()], cancel)?;
-        if self.kind() == ProviderKind::Sftp {
-            crate::remote_snapshot::download_passive_remote_snapshot(
-                vfs.as_ref(),
-                source,
-                cache,
-                cancel,
-            )
-        } else {
-            crate::download_remote_snapshot(vfs.as_ref(), source, cache, cancel)
-        }
+        crate::download_remote_snapshot_with_options(vfs.as_ref(), source, cache, cancel, options)
+    }
+
+    pub fn verify_interactive_remote_original(
+        &self,
+        source: &Path,
+        original: &crate::RemoteOriginalProof,
+        cancel: &Cancel,
+    ) -> io::Result<()> {
+        let (vfs, _) = self.interactive_file_read_context(&[source.to_path_buf()], cancel)?;
+        crate::verify_remote_original(vfs.as_ref(), source, original, cancel)
     }
 
     pub fn list_interactive(&self) -> io::Result<ProviderInteractiveListing> {
@@ -1797,7 +2119,7 @@ impl ProviderEndpoint {
                 security: Some(listing.security),
             });
         }
-        let (vfs, root) = self.file_context()?;
+        let (vfs, root) = self.ordinary_file_context()?;
         let listing = vfs.list_complete(&root)?;
         if !listing.complete {
             return Err(io::Error::new(
@@ -1839,6 +2161,13 @@ impl ProviderEndpoint {
     /// Die Überlappungsprüfung ist Teil dieses lesenden Schritts und muss vor jeder
     /// Capability-Probe stattfinden, weil einzelne Providerproben mutieren können.
     pub fn shares_runtime_namespace(&self, other: &Self) -> io::Result<bool> {
+        if let (ProviderEndpointInner::Sftp(source, _), ProviderEndpointInner::Sftp(target, _)) =
+            (&self.inner, &other.inner)
+        {
+            if source.account_digest() != target.account_digest() {
+                return Ok(false);
+            }
+        }
         // Verschiedene Providerklassen teilen keinen adressierbaren Namespace.
         // Dies behauptet keine atomare SFTP-Rootidentität und gibt weder Sync noch
         // Remote-Mutationen frei. Additive lokale Downloads ersetzen keine Quelle.
@@ -1847,8 +2176,8 @@ impl ProviderEndpoint {
         {
             return Ok(false);
         }
-        let (source_vfs, source_root) = self.file_context()?;
-        let (target_vfs, target_root) = other.file_context()?;
+        let (source_vfs, source_root) = self.ordinary_file_context()?;
+        let (target_vfs, target_root) = other.ordinary_file_context()?;
         let source_identity = source_vfs.root_identity(&source_root)?;
         let target_identity = target_vfs.root_identity(&target_root)?;
         let (same_namespace, source_path, target_path) = root_namespace_relation(
@@ -1877,8 +2206,23 @@ impl ProviderEndpoint {
         if let ProviderEndpointInner::WebDav(vfs, root) = &self.inner {
             return vfs.create_interactive_directory(root, &name);
         }
-        self.probe_directory_create_capability()?;
-        let (vfs, parent) = self.file_context()?;
+        if let ProviderEndpointInner::Sftp(vfs, root) = &self.inner {
+            let context = vfs.interactive_mutations(root, &Cancel::new(), None)?;
+            let path = root.join(&name);
+            context.create_dir(&path)?;
+            return Ok(crate::DirectoryCreateReport {
+                path,
+                execution_class: expected_class,
+                limitations: vec![crate::sftp::SFTP_WRITE_LIMITATION.into()],
+            });
+        }
+        if !matches!(
+            &self.inner,
+            ProviderEndpointInner::Ftps(_, _) | ProviderEndpointInner::Smb(_, _)
+        ) {
+            self.probe_directory_create_capability()?;
+        }
+        let (vfs, parent) = self.ordinary_file_context()?;
         let path = crate::create_dir(vfs.as_ref(), &parent, &name, &None)?;
         self.finish_ftps_intents()?;
         Ok(crate::DirectoryCreateReport {
@@ -2002,300 +2346,76 @@ impl ProviderEndpoint {
         }
     }
 
-    /// Führt nur die zerstörungsfreien Proben aus, die interaktives F5/F6/Rename
-    /// tatsächlich benötigen. Die Rückgabe beschreibt Blocker pro Wirkung.
+    /// Meldet die gewöhnlichen Wirkungen ohne künstliche Schreibproben.
+    /// Reale Berechtigungen und Bedingungen prüft erst die konkrete Operation.
     pub fn probe_file_capabilities(&self) -> io::Result<ProviderFileCapabilities> {
         self.file_capabilities(true, true)
     }
 
-    /// Ein Kopierziel benötigt keine künstliche Quellentfernung. Die vollständige
-    /// STOU-/Rename-Probe belegt dabei auch ihren eigenen Verzeichnis-Container.
+    /// Ein Kopierziel benötigt weder künstliche Quellentfernung noch
+    /// Verzeichniscontainer. Die echte Tempdatei trägt seine erste Schreibwirkung.
     pub fn probe_file_target_capabilities(&self) -> io::Result<ProviderFileCapabilities> {
         self.file_capabilities(false, true)
     }
 
     /// Eine Move-Quelle benötigt keinen Datei-Commit- oder Renameversuch.
     pub fn probe_file_source_removal_capabilities(&self) -> io::Result<ProviderFileCapabilities> {
-        if let ProviderEndpointInner::Ftps(vfs, root) = &self.inner {
-            if vfs.directories_only() {
-                vfs.probe_directory_create_capability_at(root)?;
-                return Ok(ProviderFileCapabilities {
-                    provider: ProviderKind::Ftps, copy_new: false, copy_new_best_effort: false,
-                    replace: false, replace_best_effort: false, remove_source: false,
-                    remove_source_best_effort: true, rename_noreplace: false,
-                    limitations: vec!["FTPS entfernt ausschließlich manifestgebundene, frisch leer gelistete Ordner mit RMD und Readback (Best Effort). Dateien und rekursives Löschen bleiben gesperrt.".into()],
-                    blockers: Vec::new(),
-                });
-            }
-            let capabilities = vfs.probe_permanent_delete_capability_at(root)?;
-            return Ok(ProviderFileCapabilities {
-                provider: ProviderKind::Ftps, copy_new: false, copy_new_best_effort: false,
-                replace: false, replace_best_effort: false, remove_source: false,
-                remove_source_best_effort: capabilities.permanent_delete,
-                rename_noreplace: false,
-                limitations: vec!["FTPS-Quellentfernung folgt ausschließlich dem bestätigten manifestgebundenen Best-Effort-Vertrag; zwischen Readback und DELE/RMD bleibt ein Austauschfenster.".into()],
-                blockers: Vec::new(),
-            });
-        }
         self.probe_file_capabilities()
     }
 
     fn file_capabilities(
         &self,
         probe_source_removal: bool,
-        probe_content: bool,
+        _probe_content: bool,
     ) -> io::Result<ProviderFileCapabilities> {
         let provider = self.kind();
-        let mut blockers = Vec::new();
+        if let ProviderEndpointInner::Ftps(vfs, _) = &self.inner {
+            vfs.ordinary_preparation_ready()?;
+        }
         let mut limitations = Vec::new();
-        // Ein anderer paralleler Aufruf kann den gemeinsamen Cache inzwischen
-        // neu belegen. Nur das Ergebnis dieser eigenen Teilprobe erteilt Ersetzen.
-        let mut ftps_replace_best_effort = false;
-        let (
-            copy_new,
-            copy_new_best_effort,
-            remove_source,
-            remove_source_best_effort,
-            rename_noreplace,
-        ) = match &self.inner {
-            ProviderEndpointInner::Local(root)
-            | ProviderEndpointInner::TestRemoteLocal(_, root) => {
-                // Der lokale VFS begrenzt jede Wirkung descriptor-relativ auf genau
-                // ein Blatt beziehungsweise einen frisch leeren Ordner. Er besitzt
-                // hier aber keinen atomaren Token zwischen Readback und Remove.
-                let assured = LocalVfs::rooted(root)?.file_commit_class_at(root)?
-                    == crate::vfs::FileCommitClass::Assured;
-                if !assured {
-                    limitations.push(crate::vfs::LOCAL_FILE_COMMIT_LIMITATION.into());
+        let mut blockers = Vec::new();
+        let (copy_new, copy_new_best_effort, rename_noreplace, remove_source_best_effort) =
+            match &self.inner {
+                ProviderEndpointInner::Local(root)
+                | ProviderEndpointInner::TestRemoteLocal(_, root) => {
+                    let assured = LocalVfs::rooted(root)?.file_commit_class_at(root)?
+                        == crate::vfs::FileCommitClass::Assured;
+                    if !assured {
+                        limitations.push(crate::vfs::LOCAL_FILE_COMMIT_LIMITATION.into());
+                    }
+                    if provider != ProviderKind::Local {
+                        blockers.push("Starkes Ersetzen benötigt ein identitätsgebundenes bedingtes Rename; die gewöhnliche Klasse verwendet stattdessen dauerhaftes Best Effort".into());
+                    }
+                    (assured, !assured, assured, true)
                 }
-                (assured, !assured, false, true, assured)
-            }
-            ProviderEndpointInner::Sftp(vfs, _) => {
-                // Die interaktiven SFTP-v3-Standardwirkungen werden vom Provider
-                // bereits als schwächere lebende Fähigkeiten ausgewiesen. Hier darf
-                // keine weitere Probe mutieren: Ohne bedingtes mkdir ließe sich ihr
-                // eigener Cleanup nicht sicher an den angelegten Namen binden.
-                let capabilities = vfs.capabilities();
-                let assured =
-                    capabilities.permits_add_only() && capabilities.permits_directory_create();
-                let best_effort = !assured
-                    && capabilities.complete_listing
-                    && capabilities.best_effort_file_commit;
-                if best_effort {
-                    limitations.push(
-                        "Nur neue reguläre Dateien laufen als Best Effort; SFTP-Ordneranlage bleibt ausdrücklich gesperrt."
-                            .into(),
-                    );
+                ProviderEndpointInner::Sftp(vfs, root) => {
+                    vfs.interactive_mutations(root, &Cancel::new(), None)?;
+                    limitations.push(crate::sftp::SFTP_WRITE_LIMITATION.into());
+                    (false, true, false, probe_source_removal)
                 }
-                if !capabilities.permits_directory_create() {
-                    limitations.push(
-                        "SFTP-Ordneranlage ist gesperrt: SFTP v3 bindet MKDIR nicht atomar an den gewählten Pane-Root und Elternordner."
-                            .into(),
-                    );
+                ProviderEndpointInner::Ftps(_, _) => {
+                    limitations.push(ordinary_remote_limitation(provider).into());
+                    (false, true, false, probe_source_removal)
                 }
-                blockers.push(
-                    "SFTP-Dateidownload und Sync sind gesperrt: SFTP v3 bindet READDIR, LSTAT und OPEN nicht atomar an den gewählten Pane-Root. Nur das interaktive Pane-Listing läuft sichtbar als pfadbasiertes Best Effort."
-                        .into(),
-                );
-                // Auch REMOVE/RMDIR besitzt keine Elternhandle-Bindung. Ein
-                // vorheriger Readback begrenzt die spätere Außenwirkung nicht.
-                let removable_best_effort = false;
-                (
-                    assured,
-                    best_effort,
-                    false,
-                    removable_best_effort,
-                    capabilities.atomic_noreplace_rename,
-                )
-            }
-            ProviderEndpointInner::Ftps(vfs, root) => {
-                let removable = if probe_source_removal {
-                    vfs.probe_directory_create_capability_at(root)?;
-                    match vfs.probe_permanent_delete_capability_at(root) {
-                        Ok(value) => value.permanent_delete,
-                        Err(error)
-                            if matches!(
-                                crate::error_code(&error),
-                                crate::ErrorCode::OutcomeUnclear
-                                    | crate::ErrorCode::ConnectionLost
-                                    | crate::ErrorCode::PlanDrift
-                                    | crate::ErrorCode::Interrupted
-                            ) =>
-                        {
-                            return Err(error)
-                        }
-                        Err(error) => {
-                            blockers.push(format!("FTPS-Quellentfernung: {error}"));
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-                let content_capabilities = if probe_content {
-                    vfs.probe_add_only_capabilities_at(root)
-                } else {
-                    vfs.file_capabilities_at(root)
-                };
-                match content_capabilities {
-                    Ok(capabilities) => {
-                        ftps_replace_best_effort = capabilities.best_effort_file_replace;
-                        let assured = capabilities.permits_add_only()
-                            && capabilities.permits_directory_create();
-                        // Ein Server mit überschreibendem RNTO verliert neue Dateien
-                        // nicht mehr komplett: Der Best-Effort-Commit ist bewiesen
-                        // und wird als eigene, sichtbar eingeschränkte Wirkung gemeldet.
-                        let best_effort = !assured
-                            && capabilities.complete_listing
-                            && capabilities.best_effort_file_commit
-                            && capabilities.permits_directory_create();
-                        if best_effort {
-                            limitations.push(
-                                "Neue Dateien laufen als Best-Effort-Commit: Der Server ersetzt bei RNTO vorhandene Ziele; der Bestand wird unmittelbar vor dem Commit geprüft, ein kleines Kollisionsfenster bleibt."
-                                    .into(),
-                            );
-                        }
-                        (
-                            assured,
-                            best_effort,
-                            false,
-                            removable,
-                            capabilities.atomic_noreplace_rename,
-                        )
-                    }
-                    Err(error)
-                        if matches!(
-                            crate::error_code(&error),
-                            crate::ErrorCode::OutcomeUnclear
-                                | crate::ErrorCode::ConnectionLost
-                                | crate::ErrorCode::PlanDrift
-                                | crate::ErrorCode::Interrupted
-                        ) =>
-                    {
-                        return Err(error)
-                    }
-                    Err(error) => {
-                        blockers.push(format!("FTPS-Datei-Commit: {error}"));
-                        (false, false, false, removable, false)
-                    }
+                ProviderEndpointInner::Smb(_, _) => {
+                    limitations.push(ordinary_remote_limitation(provider).into());
+                    (true, false, true, probe_source_removal)
                 }
-            }
-            ProviderEndpointInner::WebDav(_, _) => {
-                blockers.push(crate::webdav::STRICT_MUTATION_BLOCKER.into());
-                (false, false, false, false, false)
-            }
-            ProviderEndpointInner::Smb(vfs, root) => {
-                let directory_create = match vfs.probe_directory_create_capability_at(root) {
-                    Ok(capabilities) => capabilities.permits_directory_create(),
-                    Err(error) => {
-                        blockers.push(Self::probe_blocker_or_error(
-                            error,
-                            "SMB-Verzeichnis-Create",
-                        )?);
-                        false
-                    }
-                };
-                let removable = if directory_create {
-                    match vfs.probe_delete_capability_at(root) {
-                        Ok(capabilities) => capabilities.permits_entry_delete(),
-                        Err(error) => {
-                            blockers
-                                .push(Self::probe_blocker_or_error(error, "SMB-Quellentfernung")?);
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-                match vfs.probe_add_only_capabilities_at(root) {
-                    Ok(capabilities) => (
-                        capabilities.permits_add_only() && directory_create,
-                        false,
-                        false,
-                        removable,
-                        capabilities.atomic_noreplace_rename,
-                    ),
-                    Err(error) => {
-                        blockers.push(Self::probe_blocker_or_error(error, "SMB-Datei-Commit")?);
-                        (false, false, false, removable, false)
-                    }
+                ProviderEndpointInner::WebDav(_, _) => {
+                    return Ok(crate::webdav::ordinary_upload_capabilities())
                 }
-            }
-        };
-        let replace = if provider == ProviderKind::Local {
-            false
-        } else if copy_new && rename_noreplace {
-            let (vfs, _) = self.file_context()?;
-            if !vfs.supports_rename_noreplace_if_matches() {
-                blockers.push(
-                    "Ersetzen benötigt ein identitätsgebundenes bedingtes Rename; ein normales No-Replace-Rename bindet die geparkte Altversion nicht bis zur Wirkung"
-                        .into(),
-                );
-                false
-            } else {
-                match self.probe_delete_capabilities() {
-                    Ok(capabilities) if capabilities.quarantine => true,
-                    Ok(capabilities) => {
-                        blockers.extend(capabilities.blockers);
-                        false
-                    }
-                    Err(error) => {
-                        blockers.push(Self::probe_blocker_or_error(error, "Ersetzungsquarantäne")?);
-                        false
-                    }
-                }
-            }
-        } else {
-            false
-        };
-        let replace_best_effort = !replace
-            && match &self.inner {
-                ProviderEndpointInner::Local(_) | ProviderEndpointInner::TestRemoteLocal(_, _) => {
-                    true
-                }
-                ProviderEndpointInner::Ftps(_, _) => ftps_replace_best_effort,
-                ProviderEndpointInner::WebDav(vfs, _) => {
-                    vfs.capabilities().best_effort_file_replace
-                }
-                _ => false,
             };
-        if !replace {
-            if replace_best_effort {
-                limitations.push(if provider == ProviderKind::Local {
-                    "Lokales Ersetzen läuft sichtbar als Best Effort: Ohne atomaren bedingten Backup-Cleanup wird die bestätigte Altdatei nicht als wiederherstellbare Sicherung versprochen; Doppeldecker prüft das Ziel unmittelbar vorher, mutiert genau einmal und liest das Ergebnis zurück."
-                        .into()
-                } else {
-                    "Bestätigte vorhandene reguläre Dateien können als Best Effort ersetzt werden: Die Altversion wird ohne Quarantäne dauerhaft verworfen; Doppeldecker prüft das Ziel unmittelbar vorher, mutiert genau einmal und liest das Ergebnis zurück."
-                        .into()
-                });
-            } else {
-                blockers.push(
-                    "Ersetzen benötigt eine geprüfte Quarantäne oder eine getrennte Best-Effort-Ersetzungsprobe"
-                        .into(),
-                );
-            }
-        }
+        limitations.push("Bestätigte vorhandene reguläre Dateien können als Best Effort ersetzt werden: Die Altversion wird ohne Quarantäne dauerhaft verworfen; Zielbestand unmittelbar vorher prüfen, genau eine Mutation und Ergebnisreadback.".into());
         if remove_source_best_effort {
-            limitations.push(
-                "Move-Quellen werden als Best Effort nach vollständigem frischem Readback manifestgebunden Blatt für Blatt und Ordner nur leer entfernt; zwischen Readback und Einzelwirkung bleibt ein begrenztes Austauschfenster."
-                    .into(),
-            );
-        } else if !remove_source {
-            blockers.push(
-                "Quellentfernung ist für diese Verbindung weder provideratomar noch als begrenzter Best-Effort-Pfad verfügbar"
-                    .into(),
-            );
-        }
-        if !rename_noreplace {
-            blockers.push("No-Replace-Rename ist für diese Sitzung nicht bewiesen".into());
+            limitations.push("Move-Quellen werden als Best Effort nach vollständigem frischem Readback manifestgebunden Blatt für Blatt und Ordner nur leer entfernt; zwischen Readback und Einzelwirkung bleibt ein Austauschfenster.".into());
         }
         Ok(ProviderFileCapabilities {
             provider,
             copy_new,
             copy_new_best_effort,
-            replace,
-            replace_best_effort,
-            remove_source,
+            replace: false,
+            replace_best_effort: true,
+            remove_source: false,
             remove_source_best_effort,
             rename_noreplace,
             limitations,
@@ -2303,256 +2423,48 @@ impl ProviderEndpoint {
         })
     }
 
-    /// Prüft den Löschpfad der konkreten Sitzung. SFTP und SMB werden nur nach einer
-    /// echten Parken-/Restore-Probe als wiederherstellbar freigegeben. WebDAV
-    /// darf andernfalls ausschließlich den getrennt bestätigten, ETag-bedingten
-    /// endgültigen Pfad anbieten; FTPS besitzt keine gleichwertige Bedingung.
+    /// Gewöhnliche Löschfreigabe ist rein lesend. Fehlende Quarantäne verhindert
+    /// kein ausdrücklich dauerhaftes Löschen; strikte Restore-/Purgeverträge
+    /// bleiben über ihre eigenen Methoden getrennt.
     pub fn probe_delete_capabilities(&self) -> io::Result<ProviderDeleteCapabilities> {
         let provider = self.kind();
-        let mut blockers = Vec::new();
-        // Die Restore-Probe benutzt später genau `rename_noreplace_if_matches`.
-        // Solange der Provider diese Primitive nicht wirklich implementiert, darf
-        // die Capability-Ermittlung keine Quarantäneobjekte anlegen und danach so
-        // tun, als könne sie deren Identität bis zum Rückweg halten. WebDAV darf
-        // unabhängig davon seinen bedingten endgültigen Löschweg prüfen; FTPS,
-        // SFTP und SMB bleiben ohne starke Quarantäne mutationsfrei zu.
-        match &self.inner {
-            ProviderEndpointInner::Ftps(vfs, _) if !vfs.supports_bound_restore_probe() => {
-                blockers.push(
-                    "FTPS-Quarantäne benötigt ein identitätsgebundenes bedingtes Rename".into(),
-                );
-                blockers.push(
-                    "FTPS-Dauerlöschen ist gesperrt: DELE/RMD kann den bestätigten Objekt-Token nicht atomar bis in die Löschwirkung tragen".into(),
-                );
-                return Ok(ProviderDeleteCapabilities {
-                    provider,
-                    quarantine: false,
-                    permanent: false,
-                    blockers,
-                });
-            }
-            ProviderEndpointInner::WebDav(vfs, root) if !vfs.supports_bound_restore_probe() => {
-                blockers.push(
-                    "WebDAV-Quarantäne benötigt ein identitätsgebundenes bedingtes Rename".into(),
-                );
-                let permanent = if vfs.capabilities().permanent_delete {
-                    true
-                } else {
-                    match vfs.probe_permanent_delete_capability_at(root) {
-                        Ok(capabilities) => capabilities.permanent_delete,
-                        Err(error) => {
-                            blockers
-                                .push(Self::probe_blocker_or_error(error, "WebDAV-Dauerlöschen")?);
-                            false
-                        }
-                    }
-                };
-                return Ok(ProviderDeleteCapabilities {
-                    provider,
-                    quarantine: false,
-                    permanent,
-                    blockers,
-                });
-            }
-            ProviderEndpointInner::Sftp(vfs, _) if !vfs.supports_bound_restore_probe() => {
-                blockers.push(
-                    "SFTP-Quarantäne benötigt ein identitätsgebundenes bedingtes Rename".into(),
-                );
-                return Ok(ProviderDeleteCapabilities {
-                    provider,
-                    quarantine: false,
-                    permanent: false,
-                    blockers,
-                });
-            }
-            ProviderEndpointInner::Smb(vfs, _) if !vfs.supports_bound_restore_probe() => {
-                blockers.push(
-                    "SMB-Quarantäne benötigt ein identitätsgebundenes bedingtes Rename".into(),
-                );
-                return Ok(ProviderDeleteCapabilities {
-                    provider,
-                    quarantine: false,
-                    permanent: false,
-                    blockers,
-                });
-            }
-            _ => {}
-        }
-        let (quarantine, permanent) = match &self.inner {
-            ProviderEndpointInner::Local(_) => (false, false),
-            ProviderEndpointInner::TestRemoteLocal(kind, _) => {
-                let quarantine = matches!(kind, ProviderKind::Sftp | ProviderKind::Smb);
-                if !quarantine {
-                    blockers.push(
-                        "Testendpunkt simuliert keinen wiederherstellbaren Löschvertrag".into(),
-                    );
-                }
-                (quarantine, false)
-            }
+        let (quarantine, permanent, limitations) = match &self.inner {
+            ProviderEndpointInner::Local(_) => (false, false, Vec::new()),
+            ProviderEndpointInner::TestRemoteLocal(kind, _) => (
+                matches!(kind, ProviderKind::Sftp | ProviderKind::Smb),
+                false,
+                Vec::new(),
+            ),
             ProviderEndpointInner::Sftp(vfs, root) => {
-                let base = root.join(".doppeldecker-quarantine");
-                let mut bound_base = None;
-                let result = (|| {
-                    let directory = vfs.probe_directory_create_capability_at(root)?;
-                    let delete = vfs.probe_delete_capability_at(root)?;
-                    let add_only = vfs.probe_add_only_capabilities_at(root)?;
-                    let rename = vfs.probe_rename_capability_at(root)?;
-                    // Diese vier SFTP-Abfragen sind absichtlich rein lesend. Erst
-                    // wenn sie den vollständigen starken Vertrag bereits tragen,
-                    // darf die Restore-Probe überhaupt einen Namen anlegen. Sonst
-                    // könnte schon ihr eigener Cleanup fremd ausgetauschte Inhalte
-                    // pfadbasiert entfernen.
-                    if !directory.permits_directory_create()
-                        || !delete.permits_entry_delete()
-                        || !add_only.permits_add_only()
-                        || !rename.atomic_noreplace_rename
-                        || !rename.atomic_replace_rename
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "SFTP-Quarantäne benötigt vor jeder Probe bereits identitätsgebundene Create-, Delete- und Rename-Fähigkeiten",
-                        ));
-                    }
-                    bound_base = Some(ensure_probe_quarantine_root(vfs.as_ref(), root, &base)?);
-                    run_bound_restore_probe(
-                        vfs.as_ref(),
-                        root,
-                        bound_base.as_ref().expect("unmittelbar zuvor gesetzt"),
-                    )?;
-                    vfs.mark_quarantine_verified(vfs.session_generation())?;
-                    Ok::<_, io::Error>(())
-                })();
-                let cleanup = cleanup_probe_quarantine_root(
-                    vfs.as_ref(),
-                    root,
-                    &base,
-                    bound_base
-                        .as_ref()
-                        .and_then(|bound| bound.removal_proof.as_ref()),
-                );
-                let result =
-                    combine_probe_outcome("Quarantäne", result, cleanup, &base.to_string_lossy());
-                match result {
-                    Ok(()) => (true, false),
-                    Err(error) => {
-                        blockers.push(Self::probe_blocker_or_error(error, "SFTP-Quarantäne")?);
-                        (false, false)
-                    }
-                }
+                vfs.interactive_mutations(root, &Cancel::new(), None)?;
+                (
+                    false,
+                    true,
+                    vec![
+                        crate::sftp::SFTP_WRITE_LIMITATION.into(),
+                        crate::sftp::SFTP_DELETE_LIMITATION.into(),
+                    ],
+                )
             }
-            ProviderEndpointInner::Smb(vfs, root) => {
-                let base = root.join(".doppeldecker-quarantine");
-                let mut bound_base = None;
-                let result = (|| {
-                    vfs.probe_directory_create_capability_at(root)?;
-                    vfs.probe_delete_capability_at(root)?;
-                    vfs.probe_add_only_capabilities_at(root)?;
-                    vfs.probe_rename_capability_at(root)?;
-                    bound_base = Some(ensure_probe_quarantine_root(vfs.as_ref(), root, &base)?);
-                    run_bound_restore_probe(
-                        vfs.as_ref(),
-                        root,
-                        bound_base.as_ref().expect("unmittelbar zuvor gesetzt"),
-                    )?;
-                    vfs.mark_quarantine_verified(vfs.session_generation())?;
-                    Ok::<_, io::Error>(())
-                })();
-                let cleanup = cleanup_probe_quarantine_root(
-                    vfs.as_ref(),
-                    root,
-                    &base,
-                    bound_base
-                        .as_ref()
-                        .and_then(|bound| bound.removal_proof.as_ref()),
-                );
-                let result =
-                    combine_probe_outcome("Quarantäne", result, cleanup, &base.to_string_lossy());
-                match result {
-                    Ok(()) => (true, false),
-                    Err(error) => {
-                        blockers.push(Self::probe_blocker_or_error(error, "SMB-Quarantäne")?);
-                        (false, false)
-                    }
-                }
-            }
-            ProviderEndpointInner::Ftps(vfs, root) => {
-                let base = root.join(".doppeldecker-quarantine");
-                let mut bound_base = None;
-                let quarantine_result = (|| {
-                    vfs.probe_directory_create_capability_at(root)?;
-                    vfs.probe_add_only_capabilities_at(root)?;
-                    let rename_capabilities = vfs.probe_rename_capability_at(root)?;
-                    // Ohne No-Replace-Beweis kann die Quarantäne nie freigegeben
-                    // werden (`mark_quarantine_verified` verlangt ihn). Der frühe
-                    // Abbruch erspart dem Server die Anlage des Quarantäneordners
-                    // samt Restore-Probe, die ohnehin am Rename-Gate scheitern würde.
-                    if !rename_capabilities.atomic_noreplace_rename {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "FTPS-Quarantäne benötigt bewiesenes No-Replace-Rename",
-                        ));
-                    }
-                    bound_base = Some(ensure_probe_quarantine_root(vfs.as_ref(), root, &base)?);
-                    run_bound_restore_probe(
-                        vfs.as_ref(),
-                        root,
-                        bound_base.as_ref().expect("unmittelbar zuvor gesetzt"),
-                    )?;
-                    vfs.mark_quarantine_verified(vfs.session_generation())?;
-                    Ok::<_, io::Error>(())
-                })();
-                // FTPS schützt normale RMD-Aufrufe bis zur expliziten Löschprobe.
-                // Die Probe wird deshalb auch für eine erfolgreiche Quarantäne
-                // ausgeführt, damit ein ausschließlich für die Prüfung angelegter
-                // Basisordner anschließend wieder verschwindet.
-                let cleanup = cleanup_probe_quarantine_root(
-                    vfs.as_ref(),
-                    root,
-                    &base,
-                    bound_base
-                        .as_ref()
-                        .and_then(|bound| bound.removal_proof.as_ref()),
-                );
-                let quarantine_result = combine_probe_outcome(
-                    "Quarantäne",
-                    quarantine_result,
-                    cleanup,
-                    &base.to_string_lossy(),
-                );
-                match quarantine_result {
-                    Ok(()) => (true, false),
-                    Err(quarantine_error) => {
-                        blockers.push(Self::probe_blocker_or_error(
-                            quarantine_error,
-                            "FTPS-Quarantäne",
-                        )?);
-                        blockers.push(
-                            "FTPS-Dauerlöschen ist gesperrt: DELE/RMD besitzt keine provideratomare Objektbedingung".into(),
-                        );
-                        (false, false)
-                    }
-                }
-            }
-            ProviderEndpointInner::WebDav(_, _) => {
-                blockers.push(crate::webdav::STRICT_MUTATION_BLOCKER.into());
-                (false, false)
+            _ => {
+                (false, true, vec![ordinary_remote_limitation(provider).into(),
+                    "Dauerhaftes Löschen ohne Wiederherstellung: vollständige Umfangsplanung, frische Einzelprüfung und Abwesenheitsreadback. Ein später Name-/Elternwechsel kann ein anderes Objekt treffen. WebDAV-Collection-DELETE bleibt wegen seiner nicht auf leere Ordner begrenzbaren rekursiven Wirkung technisch ausgespart; bestätigte Dateien bleiben einzeln entfernbar. Unklare Wirkungen werden nie automatisch wiederholt.".into()])
             }
         };
-        if !quarantine && !permanent && blockers.is_empty() {
-            blockers.push("Für diesen Endpoint ist kein Remote-Löschvertrag verfügbar".into());
-        }
         Ok(ProviderDeleteCapabilities {
             provider,
             quarantine,
             permanent,
-            blockers,
+            limitations,
+            blockers: if quarantine || permanent {
+                Vec::new()
+            } else {
+                vec!["Lokale Einträge verwenden den Systempapierkorb".into()]
+            },
         })
     }
 
-    /// Prüft die Rename-Semantik der konkreten Sitzung wirkungsspezifisch und
-    /// liefert die stärkste verfügbare Ausführungsklasse samt Einschränkungen.
-    /// Ein Server ohne beweisbares No-Replace verliert dadurch nicht mehr die
-    /// gesamte Umbenennung, sondern fällt sichtbar auf Best Effort zurück.
+    /// Gewöhnliches Rename prüft die tatsächliche Wirkung ohne künstliche Probe.
     pub fn probe_rename_capabilities(&self) -> io::Result<ProviderRenameCapabilities> {
         self.probe_rename_capabilities_inner(None)
     }
@@ -2571,7 +2483,7 @@ impl ProviderEndpoint {
                 "Rename-Quelle liegt nicht unmittelbar im gewählten Pane-Root",
             ));
         }
-        let entry = self.file_context()?.0.stat(path)?;
+        let entry = self.ordinary_file_context()?.0.stat(path)?;
         if entry.is_symlink || (!entry.is_file && !entry.is_dir) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2596,7 +2508,7 @@ impl ProviderEndpoint {
 
     fn probe_rename_capabilities_inner(
         &self,
-        types: Option<(bool, bool)>,
+        _types: Option<(bool, bool)>,
     ) -> io::Result<ProviderRenameCapabilities> {
         let provider = self.kind();
         let mut assured = false;
@@ -2612,64 +2524,14 @@ impl ProviderEndpoint {
                     blockers.push("Dieses lokale Volume unterstützt kein exklusives Rename; Kopieren bleibt als bestätigtes Best Effort verfügbar".into());
                 }
             }
-            ProviderEndpointInner::Sftp(vfs, _) => {
-                // SFTP-v3-Rename ist eine interaktive Standardprimitive. Eine
-                // mutierende Probe könnte ihre eigenen Objekte ohne bedingtes
-                // Remove nicht sicher aufräumen; daher lesen wir nur die lebende,
-                // beim Sitzungsaufbau gesetzte Best-Effort-Fähigkeit.
-                let capabilities = vfs.capabilities();
-                if capabilities.atomic_noreplace_rename {
-                    assured = true;
-                } else if capabilities.complete_listing && capabilities.best_effort_rename {
-                    best_effort = true;
-                    limitations.push(
-                        "SFTP v3 garantiert beim gewöhnlichen Rename kein atomar kollisionsfreies Ziel; Doppeldecker prüft den vollständigen Bestand unmittelbar vorher und liest das Ergebnis zurück."
-                            .into(),
-                    );
-                } else {
-                    blockers.push(
-                        "Die SFTP-Sitzung bietet weder No-Replace noch ein sichtbares Best-Effort-Rename"
-                            .into(),
-                    );
-                }
+            ProviderEndpointInner::Sftp(vfs, root) => {
+                vfs.interactive_mutations(root, &Cancel::new(), None)?;
+                best_effort = true;
+                limitations.push(crate::sftp::SFTP_WRITE_LIMITATION.into());
             }
-            ProviderEndpointInner::Ftps(vfs, root) => {
-                let result = (|| -> io::Result<(bool, bool)> {
-                    if let Some((files, directories)) = types {
-                        let mut assured = true;
-                        let mut plain = true;
-                        for directory in [false, true] {
-                            if (directory && directories) || (!directory && files) {
-                                let observed = vfs.probe_rename_kind_at(root, directory)?;
-                                assured &= observed.0;
-                                plain &= observed.1;
-                            }
-                        }
-                        Ok((assured, plain))
-                    } else {
-                        let capabilities = vfs.probe_rename_capability_at(root)?;
-                        // Ohne ausgewählten Typ darf die Bilanz keinen einzelnen
-                        // Typbeleg als allgemeine No-Replace-Garantie ausgeben.
-                        Ok((
-                            vfs.rename_assured_at(root, false)?
-                                && vfs.rename_assured_at(root, true)?,
-                            capabilities.best_effort_rename,
-                        ))
-                    }
-                })();
-                match result {
-                    Ok((true, _)) => assured = true,
-                    Ok((false, true)) => {
-                        best_effort = true;
-                        limitations.push("Ein atomar kollisionsfreies Rename ist für diese Auswahl nicht belegt. Der Bestand wird unmittelbar vorher geprüft; ein kleines Kollisionsfenster bis zur Ausführung bleibt.".into());
-                    }
-                    Ok(_) => {
-                        blockers.push("Die Rename-Probe belegte kein gewöhnliches Rename".into())
-                    }
-                    Err(error) => {
-                        blockers.push(Self::probe_blocker_or_error(error, "FTPS-Rename-Probe")?)
-                    }
-                }
+            ProviderEndpointInner::Ftps(_, _) => {
+                best_effort = true;
+                limitations.push("FTP/FTPS prüft Quelle, Eltern und freien Zielnamen frisch und führt genau ein RNFR/RNTO aus. Zwischen Zielprüfung und Rename bleibt ein Kollisionsfenster; ein gleichzeitiger Name- oder Elternwechsel kann ein anderes Objekt treffen. Keine Tempdatei und kein Inhaltsdownload. Bei Antwortverlust bleibt der Ausgang unklar; kein automatischer Wiederholversuch.".into());
             }
             ProviderEndpointInner::WebDav(vfs, root) => {
                 match vfs.probe_rename_capability_at(root) {
@@ -2679,12 +2541,10 @@ impl ProviderEndpoint {
                     }
                 }
             }
-            ProviderEndpointInner::Smb(vfs, root) => match vfs.probe_rename_capability_at(root) {
-                Ok(_) => assured = true,
-                Err(error) => {
-                    blockers.push(Self::probe_blocker_or_error(error, "SMB-Rename-Probe")?)
-                }
-            },
+            ProviderEndpointInner::Smb(_, _) => {
+                assured = true;
+                limitations.push("SMB schützt vorhandene Ziele mit serverseitigem No-Replace. Root, Elternpfade und Quellbelege werden frisch geprüft; das anfängliche Öffnen der Quelle bleibt pfadbasiert. Der anschließende Readback prüft alten und neuen Namen sowie den Ergebnistyp. Bei unklarem Ausgang beide Namen prüfen; kein automatischer Wiederholversuch.".into());
+            }
         }
         // Beide Klassen sichern nur das ZIEL. Die Quelle ist in beiden über ihren
         // Pfad gebunden, deshalb hängt diese Einschränkung an jeder verfügbaren
@@ -2703,6 +2563,128 @@ impl ProviderEndpoint {
         })
     }
 
+    pub(crate) fn remote_batch_source(
+        &self,
+        path: &Path,
+        cancel: &Cancel,
+    ) -> io::Result<(crate::Entry, [u8; 32])> {
+        match &self.inner {
+            ProviderEndpointInner::Sftp(vfs, root) => vfs.batch_rename_source(root, path, cancel),
+            ProviderEndpointInner::WebDav(vfs, root) if path.parent() == Some(root) => {
+                vfs.batch_rename_source(path, cancel)
+            }
+            ProviderEndpointInner::Ftps(vfs, root) if path.parent() == Some(root) => {
+                vfs.batch_rename_source(path, cancel)
+            }
+            ProviderEndpointInner::Smb(vfs, root) if path.parent() == Some(root) => {
+                vfs.batch_rename_source(path)
+            }
+            _ => Err(invalid(
+                "Remote-Stapel benötigt einen unterstützten Endpunkt",
+            )),
+        }
+    }
+    pub(crate) fn remote_batch_parents(
+        &self,
+        cancel: &Cancel,
+    ) -> io::Result<Option<crate::sftp_batch_rename::ParentProof>> {
+        match &self.inner {
+            ProviderEndpointInner::Sftp(vfs, root) => {
+                vfs.batch_rename_parents(root, cancel).map(Some)
+            }
+            ProviderEndpointInner::Smb(_, _) => Ok(None),
+            ProviderEndpointInner::WebDav(vfs, root) => {
+                vfs.batch_rename_parents(root, cancel).map(Some)
+            }
+            ProviderEndpointInner::Ftps(vfs, root) => {
+                vfs.batch_rename_parents(root, cancel).map(Some)
+            }
+            _ => Err(invalid(
+                "Remote-Stapel benötigt einen unterstützten Endpunkt",
+            )),
+        }
+    }
+    pub(crate) fn remote_batch_context(&self, cancel: &Cancel) -> io::Result<Arc<dyn Vfs>> {
+        match &self.inner {
+            ProviderEndpointInner::Sftp(vfs, root) => vfs.interactive_mutations(root, cancel, None),
+            ProviderEndpointInner::Smb(vfs, root) => vfs.ordinary_mutations(root, cancel, None),
+            ProviderEndpointInner::WebDav(vfs, _) => Ok(vfs.clone()),
+            ProviderEndpointInner::Ftps(vfs, root) => {
+                vfs.require_mutation_owner()?;
+                vfs.ordinary_mutations(root)
+            }
+            _ => Err(invalid(
+                "Remote-Stapel benötigt einen unterstützten Endpunkt",
+            )),
+        }
+    }
+    pub(crate) fn execute_webdav_batch_rename(
+        &self,
+        old: &Path,
+        new_name: &str,
+        identity: &crate::RootIdentity,
+        parents: &crate::remote_batch_rename::ParentProof,
+        source: [u8; 32],
+    ) -> io::Result<(RenameReport, crate::remote_batch_rename::RemoteBatchRefresh)> {
+        crate::validate_ordinary_rename_request(
+            self.kind(),
+            self.root(),
+            old,
+            new_name,
+            Some(crate::RenameExecutionClass::BestEffort),
+        )?;
+        let ProviderEndpointInner::WebDav(vfs, _) = &self.inner else {
+            return Err(invalid("WebDAV-Stapel braucht WebDAV"));
+        };
+        vfs.execute_batch_rename(old, new_name, identity, parents, source)
+    }
+    pub(crate) fn execute_smb_batch_spelling(
+        &self,
+        old: &Path,
+        new_name: &str,
+        identity: &crate::RootIdentity,
+        source: [u8; 32],
+    ) -> io::Result<()> {
+        let ProviderEndpointInner::Smb(vfs, root) = &self.inner else {
+            return Err(invalid("SMB-Schreibweisenstapel benötigt SMB"));
+        };
+        crate::validate_ordinary_rename_request(ProviderKind::Smb, root, old, new_name, None)?;
+        vfs.batch_spelling_rename(root, old, &root.join(new_name), identity, source)
+    }
+
+    pub(crate) fn execute_remote_batch_rename(
+        &self,
+        context: &dyn Vfs,
+        old: &Path,
+        new_name: &str,
+        class: crate::RenameExecutionClass,
+        limitations: Vec<String>,
+    ) -> io::Result<RenameReport> {
+        crate::validate_ordinary_rename_request(
+            self.kind(),
+            self.root(),
+            old,
+            new_name,
+            if matches!(self.kind(), ProviderKind::Smb | ProviderKind::Ftps) {
+                None
+            } else {
+                Some(class)
+            },
+        )?;
+        // Dieselbe Einzelmutation wie F2; der Stapel hält die geprüfte Sitzung,
+        // statt sie zwischen den Zeilen still neu zu binden.
+        let report = crate::remote_rename::rename_with_class(
+            context,
+            old,
+            new_name,
+            &None,
+            class,
+            limitations,
+            None,
+        )?;
+        self.finish_ftps_intents()?;
+        Ok(report)
+    }
     /// Gewöhnliche Umbenennung mit zuvor angezeigter Klasse. WebDAV verwendet
     /// seine eigene gebundene Einzelwirkung ohne künstliche Schreib-/Löschprobe.
     pub fn execute_ordinary_rename(
@@ -2745,7 +2727,7 @@ impl ProviderEndpoint {
                 capabilities.blockers.join("; "),
             )
         })?;
-        let (vfs, _) = self.file_context()?;
+        let (vfs, _) = self.ordinary_file_context()?;
         let limitations = capabilities.limitations.clone();
         let report = match &self.inner {
             ProviderEndpointInner::Ftps(ftps, _) => {
@@ -2812,6 +2794,35 @@ impl ProviderEndpoint {
         Ok(report)
     }
 
+    /// Vollständige Inhaltssicht der expliziten Best-Effort-Klasse; die dauerhafte
+    /// Paarbindung verwendet weiterhin die echte Konto- und Rootidentität.
+    pub(crate) fn content_sync_snapshot_context(
+        &self,
+        cancel: &Cancel,
+    ) -> io::Result<(Arc<dyn Vfs>, PathBuf, crate::EndpointBinding)> {
+        let root = self.root().to_path_buf();
+        match &self.inner {
+            ProviderEndpointInner::Local(_) | ProviderEndpointInner::TestRemoteLocal(_, _) => {
+                validate_real_target(&root)?
+            }
+            _ => validate_remote_root(&root, "Remote-Inhaltssync")?,
+        }
+        let vfs = self.content_sync_context(false, cancel, None)?;
+        let identity = vfs.root_identity(&root)?;
+        let account = match &self.inner {
+            ProviderEndpointInner::Local(_) | ProviderEndpointInner::TestRemoteLocal(_, _) => None,
+            ProviderEndpointInner::Sftp(vfs, _) => Some(vfs.account_digest()),
+            ProviderEndpointInner::Ftps(vfs, _) => Some(vfs.account_digest()),
+            ProviderEndpointInner::WebDav(vfs, _) => Some(vfs.identity().account_digest),
+            ProviderEndpointInner::Smb(vfs, _) => Some(vfs.identity().account_digest),
+        };
+        let binding = match account {
+            Some(account) => crate::EndpointBinding::remote(&identity, account)?,
+            None => crate::EndpointBinding::local(&identity)?,
+        };
+        Ok((vfs, root, binding))
+    }
+
     /// Liefert eine gehaltene Lesesicht samt dauerhafter Paarbindung. Beide Seiten
     /// eines bidirektionalen Paars sind spätere Ziele; gefährliche Root-Wurzeln werden
     /// deshalb bereits in der reinen Planstufe wie Realmodus-Ziele abgelehnt.
@@ -2826,7 +2837,13 @@ impl ProviderEndpoint {
                 let parent = root
                     .parent()
                     .ok_or_else(|| invalid("Lokaler Endpunkt besitzt keinen Elternordner"))?;
-                (Arc::new(LocalVfs::rooted(parent)?), None)
+                let vfs = LocalVfs::rooted(parent)?;
+                let vfs = if crate::real_mode::is_home_root(root)? {
+                    vfs.with_sync_protected_entry(root)
+                } else {
+                    vfs
+                };
+                (Arc::new(vfs), None)
             }
             ProviderEndpointInner::Sftp(vfs, root) => {
                 validate_remote_target(root)?;
@@ -2864,11 +2881,23 @@ impl ProviderEndpoint {
                 if target {
                     validate_real_target(&root)?;
                 }
+                let internal_quarantine = crate::real_mode::is_home_root(&root)?;
                 let anchor = if target { &parent } else { &root };
+                let vfs = LocalVfs::rooted(anchor)?;
+                let vfs = if internal_quarantine {
+                    vfs.with_sync_protected_entry(&root)
+                } else {
+                    vfs
+                };
+                let target_parent = if target && internal_quarantine {
+                    root.clone()
+                } else {
+                    parent
+                };
                 Ok(MaterializedEndpoint {
-                    vfs: RunVfs::Local(LocalVfs::rooted(anchor)?),
+                    vfs: RunVfs::Local(Box::new(vfs)),
                     root,
-                    target_parent: parent,
+                    target_parent,
                 })
             }
             ProviderEndpointInner::Sftp(vfs, root) => {
@@ -2970,6 +2999,7 @@ pub struct PreparedSftpRealRun {
     prepared_at: SystemTime,
     expires_at: SystemTime,
     capabilities: ProviderTransferCapabilities,
+    staging: Option<crate::real_mode::RunStagingBinding>,
 }
 
 pub struct SftpRealRun {
@@ -2985,42 +3015,132 @@ pub struct SftpRealRun {
 pub type PreparedProviderRealRun = PreparedSftpRealRun;
 pub type ProviderRealRun = SftpRealRun;
 
-/// Bereitet eine beliebige Provider→Provider-Richtung mit demselben Permit- und
-/// Quarantänevertrag vor. Kein Endpunkt und keine Sitzung wird serialisiert.
+/// Kompatibilität für bereits geschlossen an eine FTPS-Queue gebundene Endpunkte.
+/// Kontextfreie Starts stoppen vor Proben; neue Aufrufer verwenden die explizite
+/// Fensterqueue-Factory. Der strikte Permit-/Quarantänevertrag bleibt unverändert.
 pub fn prepare_provider_transfer(
     source: ProviderEndpoint,
     target: ProviderEndpoint,
     options: SyncOptions,
 ) -> io::Result<PreparedProviderRealRun> {
+    options.validate()?;
+    // Ein schon geschlossen gebundener FTPS-Owner hält seinen echten privaten
+    // Queuekontext; alle anderen öffentlichen Starts benötigen die explizite Factory.
+    let owner=match (&target.inner,&source.inner) {
+        (ProviderEndpointInner::Ftps(vfs,_),_)=>Some(vfs.staging_owner_context()?),
+        (_,ProviderEndpointInner::Ftps(vfs,_))=>Some(vfs.staging_owner_context()?),
+        _=>None,
+    }.ok_or_else(||coded_error(io::ErrorKind::Unsupported,ErrorCode::Unsupported,"Provider-Sync benötigt den privaten Fensterqueue-Kontext; prepare_provider_transfer_for_queue verwenden"))?;
+    for endpoint in [&source, &target] {
+        if let ProviderEndpointInner::Ftps(vfs, _) = &endpoint.inner {
+            if vfs.staging_owner_context()?.queue.parent() != owner.queue.parent() {
+                return Err(plan_drift(
+                    "Provider-Endpunkte gehören zu verschiedenen privaten Queuekontexten",
+                ));
+            }
+        }
+    }
+    let registry = crate::staging_guard::KnownStagingRegistry::for_owner(&owner)?;
+    prepare_provider_transfer_bound(source, target, options, registry, owner)
+}
+
+pub fn prepare_provider_transfer_for_queue(
+    queue: &crate::OperationQueue,
+    source: ProviderEndpoint,
+    target: ProviderEndpoint,
+    options: SyncOptions,
+) -> io::Result<PreparedProviderRealRun> {
+    prepare_provider_transfer_owned(queue, None, source, target, options)
+}
+pub(crate) fn prepare_provider_transfer_owned(
+    queue: &crate::OperationQueue,
+    operation: Option<&str>,
+    source: ProviderEndpoint,
+    target: ProviderEndpoint,
+    options: SyncOptions,
+) -> io::Result<PreparedProviderRealRun> {
+    options.validate()?;
+    let registry = crate::staging_guard::KnownStagingRegistry::for_queue(queue)?;
+    let source = source.with_queue_owner(queue, operation, &[])?;
+    let target = target.with_queue_owner(queue, operation, &[])?;
+    let owner = match &target.inner {
+        ProviderEndpointInner::Ftps(vfs, _) => vfs.staging_owner_context()?,
+        _ => queue.ftps_owner(operation)?.0,
+    };
+    prepare_provider_transfer_bound(source, target, options, registry, owner)
+}
+fn prepare_provider_transfer_bound(
+    source: ProviderEndpoint,
+    target: ProviderEndpoint,
+    options: SyncOptions,
+    registry: crate::staging_guard::KnownStagingRegistry,
+    owner: crate::local_staging::StagingOwner,
+) -> io::Result<PreparedProviderRealRun> {
+    let cancel = Cancel::new();
+    let (sv, sr, sb) = source.content_sync_snapshot_context(&cancel)?;
+    let (tv, tr, tb) = target.content_sync_snapshot_context(&cancel)?;
+    let staging = crate::real_mode::RunStagingBinding::new(
+        registry,
+        [
+            crate::staging_guard::StagingEndpoint {
+                vfs: sv,
+                root: sr,
+                binding: sb,
+            },
+            crate::staging_guard::StagingEndpoint {
+                vfs: tv,
+                root: tr,
+                binding: tb,
+            },
+        ],
+        owner.clone(),
+    )?;
     let source = source.materialize(false)?;
-    let target = target.materialize(true)?;
-    prepare_remote_run(
+    let mut target = target.materialize(true)?;
+    if let RunVfs::Local(local) = target.vfs {
+        target.vfs = RunVfs::Local(Box::new(
+            local.with_staging_owner(&owner.queue, &owner.operation),
+        ));
+    }
+    prepare_remote_run_guarded(
         source.vfs,
         source.root,
         target.vfs,
         target.root,
         target.target_parent,
         options,
+        Some(staging),
     )
 }
 
 /// Providerneutrale Variante für bidirektionale Gewinnerprojektionen. Der echte
 /// Zielendpunkt wird erst hier materialisiert, damit dessen konkrete Remote-Proben,
 /// Quarantäne und Sitzungsgeneration im normalen Realmodusvertrag bleiben.
-pub(crate) fn prepare_projected_provider_transfer(
+pub(crate) fn prepare_projected_provider_transfer_guarded(
     source: Arc<dyn Vfs>,
     projection_root: PathBuf,
     target: ProviderEndpoint,
     options: SyncOptions,
+    staging: Option<crate::real_mode::RunStagingBinding>,
 ) -> io::Result<PreparedProviderRealRun> {
-    let target = target.materialize(true)?;
-    prepare_remote_run(
+    if let Some(binding) = &staging {
+        binding.check(false, false)?;
+    }
+    let mut target = target.materialize(true)?;
+    if let (Some(binding), RunVfs::Local(local)) = (&staging, &mut target.vfs) {
+        let owner = binding.owner();
+        **local = local
+            .clone()
+            .with_staging_owner(&owner.queue, &owner.operation);
+    }
+    prepare_remote_run_guarded(
         RunVfs::Projected(source),
         projection_root,
         target.vfs,
         target.root,
         target.target_parent,
         options,
+        staging,
     )
 }
 
@@ -3181,6 +3301,7 @@ fn probe_target_add_only_for_mode<T>(
     probe()
 }
 
+#[cfg(test)]
 fn prepare_remote_run(
     source_vfs: RunVfs,
     source_root: PathBuf,
@@ -3188,6 +3309,25 @@ fn prepare_remote_run(
     target_root: PathBuf,
     target_parent: PathBuf,
     options: SyncOptions,
+) -> io::Result<PreparedSftpRealRun> {
+    prepare_remote_run_guarded(
+        source_vfs,
+        source_root,
+        target_vfs,
+        target_root,
+        target_parent,
+        options,
+        None,
+    )
+}
+fn prepare_remote_run_guarded(
+    source_vfs: RunVfs,
+    source_root: PathBuf,
+    target_vfs: RunVfs,
+    target_root: PathBuf,
+    target_parent: PathBuf,
+    mut options: SyncOptions,
+    staging: Option<crate::real_mode::RunStagingBinding>,
 ) -> io::Result<PreparedSftpRealRun> {
     // Optionssyntax ist reine Eingabevalidierung und muss vor jedem Listing sowie
     // erst recht vor mutierenden Capability-Proben scheitern können.
@@ -3197,6 +3337,22 @@ fn prepare_remote_run(
             io::ErrorKind::Unsupported,
             "WebDAV-Quellen verlangen ContentHash zusätzlich zur ETag-Bindung",
         ));
+    }
+    let internal_quarantine =
+        target_vfs.uses_local_restore_probe() && crate::real_mode::is_home_root(&target_root)?;
+    if internal_quarantine
+        && !options
+            .exclude
+            .iter()
+            .any(|pattern| pattern == ".doppeldecker-quarantine/**")
+    {
+        // Die geschützte HOME-Quarantäne gehört auch auf der Gegenseite nicht zur
+        // Syncauswahl. Das gebundene Optionsobjekt zeigt den Ausschluss ausdrücklich.
+        options.exclude.push(".doppeldecker-quarantine/**".into());
+        options.validate()?;
+    }
+    if let Some(binding) = &staging {
+        binding.check(false, false)?;
     }
     ensure_directory(source_vfs.as_vfs(), &source_root, "Quelle")?;
     ensure_directory(target_vfs.as_vfs(), &target_root, "Ziel")?;
@@ -3228,6 +3384,14 @@ fn prepare_remote_run(
         None
     };
 
+    if staging.is_some() {
+        if let Some(ftps) = target_vfs.ftps() {
+            ftps.finish_operation_intents()?;
+        }
+    }
+    if let Some(binding) = &staging {
+        binding.check(false, false)?;
+    }
     let source_listing =
         build_listing_proof(source_vfs.as_vfs(), &source_root, source_identity.clone());
     let target_listing =
@@ -3254,6 +3418,9 @@ fn prepare_remote_run(
     };
     let mut validation_options = options.clone();
     validation_options.mode = required_target_mode;
+    if let Some(binding) = &staging {
+        binding.check(false, false)?;
+    }
     validate_real_plan(&plan, &validation_options)?;
     if required_target_mode == SyncMode::Mirror
         && remote_capabilities.is_some_and(|value| !value.durable_directory_flush)
@@ -3288,6 +3455,12 @@ fn prepare_remote_run(
                 // Restorevertrag. Die hier eingeführte Providergrenze gilt für
                 // Remote-Artefakte, deren Protokollnamen parallel austauschbar sind.
                 ensure_quarantine_root(target_vfs.as_vfs(), &target_parent, &quarantine_root)?;
+                if internal_quarantine {
+                    crate::real_mode::protect_internal_quarantine(
+                        target_vfs.as_vfs(),
+                        &quarantine_root,
+                    )?;
+                }
                 run_local_restore_probe(target_vfs.as_vfs(), &target_root, &quarantine_root)?;
             } else {
                 let bound_quarantine = ensure_probe_quarantine_root(
@@ -3369,8 +3542,30 @@ fn prepare_remote_run(
         &target_listing,
     )?;
     let target_capabilities_digest = target_vfs.as_vfs().safety_capabilities_digest()?;
-    let plan_digest = bind_capabilities_digest(base_plan_digest, target_capabilities_digest);
+    if staging.is_some() {
+        if let Some(ftps) = target_vfs.ftps() {
+            ftps.finish_operation_intents()?;
+        }
+    }
+    if let Some(binding) = &staging {
+        binding.check(false, false)?;
+    }
+    let mut plan_digest = bind_capabilities_digest(base_plan_digest, target_capabilities_digest);
+    if let Some(binding) = &staging {
+        plan_digest = binding.bind_digest(plan_digest)?;
+    }
     let confirmation_phrase = confirmation_phrase(&target_root)?;
+    let mut scope_warnings =
+        crate::real_mode::sync_impact_warnings(&source_root, &target_root, &plan);
+    if matches!(&target_identity, crate::real_mode::RootIdentity::Local(_)) {
+        scope_warnings.extend(crate::real_mode::target_scope_warnings(&target_root)?);
+    }
+    if internal_quarantine {
+        scope_warnings.push(format!(
+            "Sicherungsbereich {} bleibt auf beiden Seiten ausdrücklich vom Sync ausgeschlossen.",
+            quarantine_root.display()
+        ));
+    }
     let preview = RealRunPreview {
         source_identity,
         target_identity,
@@ -3382,6 +3577,7 @@ fn prepare_remote_run(
         impact,
         plan_digest,
         confirmation_phrase,
+        scope_warnings,
         prepared_at_unix_ms: unix_millis(prepared_at)?,
         expires_at_unix_ms: unix_millis(expires_at)?,
         restore_probe_ok,
@@ -3400,16 +3596,33 @@ fn prepare_remote_run(
         prepared_at,
         expires_at,
         capabilities,
+        staging,
     })
 }
 
 impl PreparedSftpRealRun {
+    pub(crate) fn limit_confirmation_deadline(&mut self, deadline: SystemTime) -> io::Result<()> {
+        self.expires_at = self.expires_at.min(deadline);
+        self.preview.expires_at_unix_ms = unix_millis(self.expires_at)?;
+        Ok(())
+    }
+
     pub fn preview(&self) -> &RealRunPreview {
         &self.preview
     }
 
     pub fn capabilities(&self) -> ProviderTransferCapabilities {
         self.capabilities
+    }
+
+    pub fn confirm_effects(self, effects_confirmed: bool) -> io::Result<SftpRealRun> {
+        if !effects_confirmed {
+            return Err(confirmation_mismatch(
+                "Remote-Sync-Wirkung wurde nicht bestätigt",
+            ));
+        }
+        let phrase = self.preview.confirmation_phrase.clone();
+        self.confirm(&phrase, true)
     }
 
     pub fn confirm(self, phrase: &str, backup_confirmed: bool) -> io::Result<SftpRealRun> {
@@ -3441,6 +3654,9 @@ impl PreparedSftpRealRun {
             return Err(plan_drift(
                 "Geprüfte Ziel-Fähigkeiten änderten sich seit der Vorschau",
             ));
+        }
+        if let Some(binding) = &self.staging {
+            binding.check(false, false)?;
         }
         let source_identity = self.source_vfs.as_vfs().root_identity(&self.source_root)?;
         let target_identity = self.target_vfs.as_vfs().root_identity(&self.target_root)?;
@@ -3500,7 +3716,10 @@ impl PreparedSftpRealRun {
             ));
         }
 
-        let permit = create_real_permit(RealPermitRequest {
+        if let Some(binding) = &self.staging {
+            binding.check(false, false)?;
+        }
+        let mut permit = create_real_permit(RealPermitRequest {
             plan_digest: self.preview.plan_digest,
             target_capabilities_digest: self.target_vfs.as_vfs().safety_capabilities_digest()?,
             source_identity,
@@ -3515,6 +3734,9 @@ impl PreparedSftpRealRun {
             issued_at: now.max(self.prepared_at),
             expires_at: self.expires_at,
         })?;
+        if let Some(binding) = self.staging {
+            permit.bind_staging_context(binding);
+        }
         let audit = create_real_audit_context(
             self.preview.plan_digest,
             &self.preview.source_identity,
@@ -3559,10 +3781,15 @@ impl SftpRealRun {
             cancel,
             on_progress,
         );
-        match self.target_vfs.ftps() {
+        let result = match self.target_vfs.ftps() {
             Some(ftps) => ftps.finish_sync_result(result, |stats| stats),
             None => result,
+        };
+        let stats = result?;
+        if let Some(permit) = self.safety.real_permit() {
+            permit.check_staging(true, true)?;
         }
+        Ok(stats)
     }
 
     pub fn execute_with_audit(
@@ -3571,24 +3798,9 @@ impl SftpRealRun {
         cancel: &Cancel,
         on_progress: &mut dyn FnMut(&Progress),
     ) -> io::Result<SyncStats> {
-        let result = execute_real_with_audit(
-            RealAuditRun {
-                source_vfs: self.source_vfs.as_vfs(),
-                source_root: &self.source_root,
-                target_vfs: self.target_vfs.as_vfs(),
-                target_root: &self.target_root,
-                plan: &self.plan,
-                safety: &self.safety,
-                audit: &self.audit,
-                audit_path,
-            },
-            cancel,
-            on_progress,
-        );
-        match self.target_vfs.ftps() {
-            Some(ftps) => ftps.finish_sync_result(result, |stats| stats),
-            None => result,
-        }
+        let success = self.execute_with_audit_detailed(audit_path, cancel, on_progress)?;
+        success.validate_staging_completion()?;
+        success.append_completion_audit()
     }
 
     pub(crate) fn execute_with_audit_detailed(
@@ -3638,7 +3850,7 @@ pub(crate) fn reject_overlapping_roots(
     reject_related_paths(same_namespace, &source_path, &target_path)
 }
 
-fn root_namespace_relation(
+pub(crate) fn root_namespace_relation(
     source_identity: &crate::RootIdentity,
     source_root: &Path,
     target_identity: &crate::RootIdentity,
@@ -3779,6 +3991,23 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    thread_local! {static TEST_PROVIDER_REGISTRIES:std::cell::RefCell<Vec<tempfile::TempDir>>=const {std::cell::RefCell::new(Vec::new())};}
+    fn prepare_provider_transfer(
+        source: ProviderEndpoint,
+        target: ProviderEndpoint,
+        options: SyncOptions,
+    ) -> io::Result<PreparedProviderRealRun> {
+        let root = tempfile::Builder::new()
+            .permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .tempdir()?;
+        let queue = crate::OperationQueue::open(root.path().join("operations-queue.json"))?;
+        let result = super::prepare_provider_transfer_for_queue(&queue, source, target, options);
+        TEST_PROVIDER_REGISTRIES.with(|roots| roots.borrow_mut().push(root));
+        result
+    }
+
     use crate::vfs::{CompleteDirectoryListing, MutationFailure, ProofListEntry};
     use crate::{Entry, RemoteCapabilities};
     use std::io::{Read, Write};
@@ -3786,6 +4015,111 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn smb_additive_lokale_auswahl_bindet_namensgruppen_und_auslassungsdrift() {
+        smb_assert_local_name_group(["a", "A"]);
+    }
+
+    #[test]
+    fn smb_additive_lokale_unicodegruppe_bindet_auslassungsdrift() {
+        smb_assert_local_name_group(["é", "e\u{301}"]);
+    }
+
+    fn smb_assert_local_name_group(group: [&str; 2]) {
+        let area = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(area.path()).unwrap();
+        let source_root = root.join("source");
+        let target_root = root.join("target");
+        std::fs::create_dir(&source_root).unwrap();
+        std::fs::create_dir(&target_root).unwrap();
+        for name in [group[0], group[1], "good"] {
+            std::fs::write(source_root.join(name), name).unwrap();
+        }
+        let source = ProviderEndpoint::local(&source_root).unwrap();
+        let target = ProviderEndpoint::test_remote_local(ProviderKind::Smb, &target_root).unwrap();
+        let items = [
+            source_root.join(group[0]),
+            source_root.join(group[1]),
+            source_root.join("good"),
+        ];
+        let contexts = source
+            .interactive_file_contexts(&target, &items, false, false, &Cancel::new())
+            .unwrap();
+        let tree = contexts
+            .source_vfs
+            .interactive_source_tree()
+            .unwrap()
+            .unwrap();
+        assert_eq!((tree.files, tree.omitted.len()), (1, 2));
+        let stats = crate::fileops::copy_items(
+            crate::fileops::FileOperationRequest {
+                src: contexts.source_vfs.as_ref(),
+                dst: contexts.target_vfs.as_ref(),
+                items: &items,
+                dst_dir: &target_root,
+                policy: crate::fileops::OverwritePolicy::Skip,
+                sandbox: &None,
+            },
+            &Cancel::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!((stats.files, stats.skipped), (1, 2));
+        assert_eq!(std::fs::read(target_root.join("good")).unwrap(), b"good");
+        assert_eq!(std::fs::read_dir(&target_root).unwrap().count(), 1);
+        std::fs::write(source_root.join(group[0]), b"changed omitted member").unwrap();
+        let error = contexts.source_vfs.interactive_source_tree().unwrap_err();
+        assert_eq!(crate::error_code(&error), crate::ErrorCode::PlanDrift);
+        let current = source
+            .interactive_file_contexts(&target, &items, false, false, &Cancel::new())
+            .unwrap();
+        assert_ne!(
+            current
+                .source_vfs
+                .interactive_source_tree()
+                .unwrap()
+                .unwrap(),
+            tree
+        );
+        for (move_source, overwrite) in [(true, false), (false, true)] {
+            let contexts = source
+                .interactive_file_contexts(&target, &items, move_source, overwrite, &Cancel::new())
+                .unwrap();
+            assert!(contexts
+                .source_vfs
+                .interactive_source_tree()
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn smb_additive_lokale_kopie_ohne_gruppe_behaelt_bisherige_quellklasse() {
+        let area = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(area.path()).unwrap();
+        let source_root = root.join("source");
+        let target_root = root.join("target");
+        std::fs::create_dir(&source_root).unwrap();
+        std::fs::create_dir(&target_root).unwrap();
+        std::fs::write(source_root.join("good"), b"good").unwrap();
+        let source = ProviderEndpoint::local(&source_root).unwrap();
+        let target = ProviderEndpoint::test_remote_local(ProviderKind::Smb, &target_root).unwrap();
+        let contexts = source
+            .interactive_file_contexts(
+                &target,
+                &[source_root.join("good")],
+                false,
+                false,
+                &Cancel::new(),
+            )
+            .unwrap();
+        assert!(contexts
+            .source_vfs
+            .interactive_source_tree()
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn ftps_wirkungsgrenze_laesst_regulaere_dateivorbereitung_verfuegbar() {
@@ -4371,10 +4705,7 @@ mod tests {
         std::fs::create_dir(&parent).unwrap();
         let vfs = RestoreProbeRaceVfs::new();
         let bound = ensure_probe_quarantine_root(&vfs, &parent, &base).unwrap();
-        let proof = bound
-            .removal_proof
-            .as_ref()
-            .expect("der Test-VFS bindet die Ordneranlage atomar");
+        let proof = &bound.identity;
 
         let error = cleanup_probe_quarantine_root(&vfs, &parent, &base, Some(proof))
             .expect_err("Der ausgetauschte Probeordner darf kein Erfolg sein");
@@ -4543,9 +4874,9 @@ mod tests {
     fn ungueltiger_ausschluss_stoppt_vor_jedem_providerzugriff() {
         let missing = PathBuf::from("/doppeldecker-test-darf-nicht-geoeffnet-werden");
         let error = match prepare_remote_run(
-            RunVfs::Local(LocalVfs::new()),
+            RunVfs::Local(Box::default()),
             missing.join("quelle"),
-            RunVfs::Local(LocalVfs::new()),
+            RunVfs::Local(Box::default()),
             missing.join("ziel"),
             missing,
             SyncOptions {
@@ -4711,8 +5042,8 @@ mod tests {
         let source = temp.path().join("quelle");
         let target = source.join("unterziel");
         std::fs::create_dir_all(&target).unwrap();
-        let source_vfs = RunVfs::Local(crate::LocalVfs::new());
-        let target_vfs = RunVfs::Local(crate::LocalVfs::new());
+        let source_vfs = RunVfs::Local(Box::default());
+        let target_vfs = RunVfs::Local(Box::default());
         let probed = std::cell::Cell::new(false);
 
         let error = bind_nonoverlapping_roots_before_probe(

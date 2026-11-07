@@ -183,7 +183,7 @@ nicht eine leere Warnungsliste. Ein fehlender Claim braucht keinen erfundenen
 Wiederherstellungspfad. Neue v1-Läufe und damit ein laufendes Anwachsen dieses
 Altbestands entstehen durch die Anwendung nicht mehr. Es gibt weder automatische
 Alterslöschung noch eine nachträglich erfundene Nutzerquittierung.
-[Prüfbericht und Grenze](release-validation.md).
+[Prüfbericht und Grenze](code-review-2026-10-19-papierkorb-drift.md).
 
 ## Prüfung und verbleibende Arbeit
 

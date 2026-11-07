@@ -78,6 +78,7 @@ fn from_volume_bits(bits: &[u32; 4], valid: &[u32; 4], flags: u64) -> MetadataCa
     MetadataCapabilities {
         owner: permissions,
         special_mode_bits: permissions,
+        acl: Capability::Unknown,
         acl_model: match feature(1, libc::VOL_CAP_INT_EXTENDED_SECURITY) {
             Capability::Exact => AclModel::Nfs4,
             Capability::Unsupported => AclModel::Unsupported,
@@ -89,6 +90,7 @@ fn from_volume_bits(bits: &[u32; 4], valid: &[u32; 4], flags: u64) -> MetadataCa
             other => other,
         },
         resource_fork: feature(1, libc::VOL_CAP_INT_NAMEDSTREAMS),
+        named_streams: Capability::Unsupported,
         sparse_extents: feature(0, libc::VOL_CAP_FMT_SPARSE_FILES),
         hardlinks: feature(0, libc::VOL_CAP_FMT_HARDLINKS),
     }
@@ -143,8 +145,10 @@ fn for_linux_filesystem(filesystem: &str) -> MetadataCapabilities {
             owner: Capability::Exact,
             special_mode_bits: Capability::Exact,
             acl_model: AclModel::Posix,
+            acl: crate::metadata::Capability::Unknown,
             xattrs: Capability::Exact,
             resource_fork: Capability::Unsupported,
+            named_streams: Capability::Unsupported,
             sparse_extents: Capability::Exact,
             hardlinks: Capability::Exact,
         },
@@ -152,8 +156,10 @@ fn for_linux_filesystem(filesystem: &str) -> MetadataCapabilities {
             owner: Capability::Unsupported,
             special_mode_bits: Capability::Unsupported,
             acl_model: AclModel::Unsupported,
+            acl: Capability::Unknown,
             xattrs: Capability::Unsupported,
             resource_fork: Capability::Unsupported,
+            named_streams: Capability::Unsupported,
             sparse_extents: Capability::Unsupported,
             hardlinks: Capability::Unsupported,
         },
@@ -232,7 +238,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn fehlende_volume_bits_bleiben_unbekannt_und_owner_ignorieren_sperrt_rechte() {
         let unknown = from_volume_bits(&[0; 4], &[0; 4], 0);
-        assert_eq!(unknown, MetadataCapabilities::unknown());
+        let mut expected = MetadataCapabilities::unknown();
+        // Der lokale Adapter besitzt unabhängig von Volume-Bits keinen
+        // generischen Zugriff auf benannte SMB-Datenströme.
+        expected.named_streams = Capability::Unsupported;
+        assert_eq!(unknown, expected);
         let ignored = from_volume_bits(&[0; 4], &[u32::MAX; 4], libc::MNT_IGNORE_OWNERSHIP as u64);
         assert_eq!(ignored.owner, Capability::Unsupported);
         assert_eq!(ignored.special_mode_bits, Capability::Unsupported);

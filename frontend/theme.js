@@ -1,4 +1,5 @@
 import { writeStoredValue } from "./ui-utils.js";
+import { invoke } from "./tauri-api.js";
 
 // Darstellung ohne Abhängigkeit vom übrigen App-Zustand. Theme-Boot setzt die erste
 // Wahl bereits vor dem Rendern; dieses Modul übernimmt danach Persistenz und
@@ -17,6 +18,10 @@ export function setTheme(nextPreference, persist = true) {
   const root = document.documentElement;
   root.dataset.theme = preference;
   root.dataset.resolvedTheme = resolved;
+  if (root.dataset.platform === "linux") {
+    void invoke("sync_native_theme", { preference, dark: resolved === "dark" })
+      .catch(error => console.warn("Native Darstellung konnte nicht aktualisiert werden.", error));
+  }
   // Die Darstellung funktioniert auch ohne lokale Persistenz weiter.
   if (persist) writeStoredValue(STORAGE_KEY, preference);
 }

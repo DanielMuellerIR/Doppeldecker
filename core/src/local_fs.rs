@@ -37,7 +37,36 @@ use crate::metadata::{
 };
 use crate::vfs::{entry_extension, Entry, LocalMountIdentity, LocalRootIdentity, ProofListEntry};
 
+#[cfg(target_os = "macos")]
+pub(crate) mod copy_metadata;
+#[cfg(target_os = "macos")]
+mod finder_comments;
+#[cfg(target_os = "macos")]
+mod finder_tags;
+#[cfg(target_os = "macos")]
+pub(crate) use copy_metadata::{read_copy_creation_time, set_copy_creation_time};
+#[cfg(target_os = "macos")]
+pub(crate) use finder_comments::{edit_comment_beneath, read_comment_beneath};
 mod metadata_capabilities;
+#[cfg(target_os = "macos")]
+pub(crate) use finder_tags::{
+    edit_interactive_finder_tags_beneath, read_interactive_finder_tags_beneath,
+};
+
+#[cfg(target_os = "macos")]
+pub(crate) mod file_flags;
+#[cfg(target_os = "macos")]
+mod hidden_flags;
+#[cfg(target_os = "macos")]
+pub(crate) use hidden_flags::{
+    edit_visibility_beneath, observed_entry_is_hidden, read_visibility_beneath,
+};
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_SPARSE_LAYOUT: std::cell::RefCell<Option<(PathBuf, Vec<DataExtent>)>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 pub(crate) struct FileCapabilities {
     pub commit_class: crate::vfs::FileCommitClass,
@@ -210,6 +239,7 @@ impl RootHandle {
         }
         Ok(match crate::acl::read_fd(self.fd())? {
             None => true,
+            Some(crate::metadata::Acl::WindowsDacl(_)) => false,
             Some(crate::metadata::Acl::Nfs4(acl)) => acl.entries.is_empty(),
             Some(crate::metadata::Acl::Posix(acl)) => acl.access.iter().all(|entry| {
                 entry.tag == crate::metadata::PosixAclTag::UserObject || entry.permissions & 2 == 0
@@ -229,6 +259,7 @@ impl RootHandle {
         }
         Ok(match crate::acl::read_fd(self.fd())? {
             None => true,
+            Some(crate::metadata::Acl::WindowsDacl(_)) => false,
             Some(crate::metadata::Acl::Nfs4(acl)) => acl.entries.is_empty(),
             Some(crate::metadata::Acl::Posix(acl)) => acl.access.iter().all(|entry| {
                 entry.tag == crate::metadata::PosixAclTag::UserObject || entry.permissions == 0
@@ -472,6 +503,57 @@ fn statvfs_from_fd(fd: &OwnedFd) -> io::Result<libc::statvfs> {
     Ok(statvfs)
 }
 
+pub(crate) fn sparse_allocation_unit(
+    root: Option<&RootHandle>,
+    parent: &Path,
+) -> io::Result<Option<u32>> {
+    let mut current = parent;
+    let directory = loop {
+        match open_dir_nofollow_from(root, current, false) {
+            Ok(directory) => break directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if root.is_some_and(|root| current == root.path) {
+                    return Err(error);
+                }
+                current = current.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let before = mount_identity_from_fd(&directory)?;
+    #[cfg(target_os = "macos")]
+    let known = before.fs_type == "apfs";
+    #[cfg(target_os = "linux")]
+    let known = matches!(
+        metadata_capabilities::linux_filesystem_name(&directory)?.as_str(),
+        "ext4" | "btrfs"
+    );
+    let unit = if known {
+        let stat = statvfs_from_fd(&directory)?;
+        let unit = u32::try_from(stat.f_frsize).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Lokale Sparse-Blockgröße ist zu groß",
+            )
+        })?;
+        if !unit.is_power_of_two() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Ungültige lokale Sparse-Blockgröße",
+            ));
+        }
+        Some(unit)
+    } else {
+        None
+    };
+    if mount_identity_from_fd(&directory)? != before {
+        return Err(io::Error::other(
+            "Mount änderte sich während der Sparse-Geometrieabfrage",
+        ));
+    }
+    Ok(unit)
+}
+
 fn available_bytes_from_fd(fd: &OwnedFd) -> io::Result<u64> {
     let stat = statvfs_from_fd(fd)?;
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
@@ -712,7 +794,7 @@ fn cached_principal(
     value
 }
 
-fn principal_buffer_size(key: libc::c_int) -> usize {
+pub(crate) fn principal_buffer_size(key: libc::c_int) -> usize {
     // POSIX erlaubt -1 als „unbestimmt". 16 KiB decken übliche lokale und
     // Verzeichnisdienst-Einträge ab; ERANGE wird unten bis 1 MiB vergrößert.
     let value = unsafe { libc::sysconf(key) };
@@ -840,20 +922,21 @@ pub(crate) fn list_complete_beneath(
 /// Durchlaufs offen; jeder Eintrag wird gegen genau diesen Deskriptor gestatet.
 /// `.` und `..` bleiben ausgespart. `build` bekommt neben dem fertigen `Entry`
 /// auch den rohen Namen, damit ein Aufrufer die Dekodierbarkeit bilanzieren kann,
-/// ohne den Durchlauf ein zweites Mal zu schreiben.
+/// ohne den Durchlauf ein zweites Mal zu schreiben. Das letzte Argument enthält
+/// die Sichtbarkeit aus Punktname oder nativer Verstecktmarkierung.
 fn read_dir_entries<T>(
     root: Option<&RootHandle>,
     path: &Path,
-    mut build: impl FnMut(&[u8], &OsStr, Entry) -> T,
+    mut build: impl FnMut(&[u8], &OsStr, Entry, bool) -> T,
 ) -> io::Result<Vec<T>> {
-    read_dir_entries_bounded(root, path, usize::MAX, &mut build)
+    read_dir_entries_checked(root, path, None, &mut build)
 }
 
-fn read_dir_entries_bounded<T>(
+fn read_dir_entries_checked<T>(
     root: Option<&RootHandle>,
     path: &Path,
-    maximum: usize,
-    mut build: impl FnMut(&[u8], &OsStr, Entry) -> T,
+    cancel: Option<&crate::Cancel>,
+    mut build: impl FnMut(&[u8], &OsStr, Entry, bool) -> T,
 ) -> io::Result<Vec<T>> {
     let directory = open_dir_nofollow_from(root, path, false)?;
     let mut out = Vec::new();
@@ -863,45 +946,78 @@ fn read_dir_entries_bounded<T>(
         if bytes == b"." || bytes == b".." {
             continue;
         }
-        if out.len() >= maximum {
+        if cancel.is_some_and(crate::Cancel::is_cancelled) {
             return Err(crate::coded_error(
-                io::ErrorKind::InvalidInput,
-                crate::ErrorCode::InvalidInput,
-                "Upload-Ordnerlisting überschreitet 1000 Einträge",
+                io::ErrorKind::Interrupted,
+                crate::ErrorCode::Interrupted,
+                "Lokales Uploadlisting abgebrochen",
             ));
         }
         let name = OsStr::from_bytes(bytes);
         let stat = statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
         let created = creation_time_at(&directory, name, &stat);
         let entry = entry_from_stat(name.to_string_lossy().into_owned(), &stat, created);
-        out.push(build(bytes, name, entry));
+        let hidden = bytes.first() == Some(&b'.') || stat_is_marked_hidden(&stat);
+        out.push(build(bytes, name, entry, hidden));
     }
     Ok(out)
 }
 
 fn list_from(root: Option<&RootHandle>, path: &Path) -> io::Result<Vec<Entry>> {
-    read_dir_entries(root, path, |_raw_name, _name, entry| entry)
+    read_dir_entries(root, path, |_raw_name, _name, entry, _hidden| entry)
 }
 
 fn list_complete_from(root: Option<&RootHandle>, path: &Path) -> io::Result<Vec<ProofListEntry>> {
-    read_dir_entries(root, path, |raw_name, name, entry| ProofListEntry {
-        entry,
-        raw_name: raw_name.to_vec(),
-        safely_decoded: name.to_str().is_some(),
-        provider_token: None,
+    read_dir_entries(root, path, |raw_name, name, entry, _hidden| {
+        ProofListEntry {
+            entry,
+            raw_name: raw_name.to_vec(),
+            safely_decoded: name.to_str().is_some(),
+            provider_token: None,
+        }
+    })
+}
+
+fn stat_is_marked_hidden(stat: &Stat) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        stat.st_flags & libc::UF_HIDDEN != 0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = stat;
+        false
+    }
+}
+pub(crate) fn list_display(
+    root: Option<&RootHandle>,
+    path: &Path,
+) -> io::Result<Vec<crate::vfs::DirectoryDisplayEntry>> {
+    read_dir_entries(root, path, |_raw, name, entry, is_hidden| {
+        crate::vfs::DirectoryDisplayEntry {
+            entry,
+            safely_decoded: name.to_str().is_some(),
+            is_hidden,
+        }
     })
 }
 
 pub(crate) fn list_upload_beneath(
     root: &RootHandle,
     path: &Path,
+    cancel: &crate::Cancel,
 ) -> io::Result<Vec<ProofListEntry>> {
-    read_dir_entries_bounded(Some(root), path, 1000, |raw, name, entry| ProofListEntry {
-        entry,
-        raw_name: raw.to_vec(),
-        safely_decoded: name.to_str().is_some(),
-        provider_token: None,
-    })
+    read_dir_entries_checked(
+        Some(root),
+        path,
+        Some(cancel),
+        |raw, name, entry, _hidden| ProofListEntry {
+            entry,
+            raw_name: raw.to_vec(),
+            safely_decoded: name.to_str().is_some(),
+            provider_token: None,
+        },
+    )
 }
 
 pub(crate) fn stat(path: &Path) -> io::Result<Entry> {
@@ -1025,7 +1141,7 @@ fn metadata_manifest_from(root: Option<&RootHandle>, path: &Path) -> io::Result<
                     "Mount änderte sich während des Manifest-Scans",
                 ));
             }
-            return MetadataManifest::new(
+            let manifest = MetadataManifest::new(
                 (capabilities.owner != crate::metadata::Capability::Unsupported).then_some(Owner {
                     uid: after.st_uid,
                     gid: after.st_gid,
@@ -1036,7 +1152,19 @@ fn metadata_manifest_from(root: Option<&RootHandle>, path: &Path) -> io::Result<
                 resource_fork,
                 sparse_extents,
                 None,
-            );
+            )?;
+            #[cfg(test)]
+            let manifest = TEST_SPARSE_LAYOUT.with(|value| {
+                if let Some((source_root, extents)) = &*value.borrow() {
+                    if path.starts_with(source_root)
+                        && FileType::from_raw_mode(before.st_mode).is_file()
+                    {
+                        return manifest.with_sparse_observation(Some(extents.clone()), None);
+                    }
+                }
+                Ok(manifest)
+            })?;
+            return Ok(manifest);
         }
     }
     Err(io::Error::other(
@@ -1783,9 +1911,105 @@ pub(crate) fn set_mtime_beneath(root: &RootHandle, path: &Path, mtime: i64) -> i
 }
 
 fn set_mtime_from(root: Option<&RootHandle>, path: &Path, mtime: i64) -> io::Result<()> {
-    let file = File::from(open_final_from(root, path, OFlags::RDONLY, Mode::empty())?);
-    let timestamp = filetime::FileTime::from_unix_time(mtime, 0);
-    filetime::set_file_handle_times(&file, None, Some(timestamp))
+    set_copy_mtime(
+        root,
+        path,
+        crate::vfs::FileTimestamp {
+            seconds: mtime,
+            nanoseconds: 0,
+        },
+    )
+}
+
+fn copy_mtime_value(stat: &Stat) -> io::Result<crate::vfs::FileTimestamp> {
+    let time = crate::vfs::FileTimestamp {
+        seconds: stat.st_mtime,
+        nanoseconds: u32::try_from(stat.st_mtime_nsec)
+            .map_err(|_| io::Error::other("Ungültige Änderungszeit"))?,
+    };
+    time.validate()?;
+    Ok(time)
+}
+fn check_copy_time_visible(
+    root: Option<&RootHandle>,
+    path: &Path,
+    file: &File,
+) -> io::Result<Stat> {
+    let stat = fstat(file)?;
+    let visible = stat_from(root, path)?;
+    let actual = entry_from_stat(visible.name.clone(), &stat, None);
+    if visible.device != actual.device || visible.inode != actual.inode {
+        return Err(crate::real_mode::plan_drift(
+            "Objekt oder Wurzel während der Zeitübernahme verändert",
+        ));
+    }
+    if !actual.is_file && !actual.is_dir || actual.is_symlink {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Kopierzeiten benötigen eine reguläre Datei oder einen Ordner",
+        ));
+    }
+    if let Some(root) = root {
+        if !root.is_current()? {
+            return Err(crate::real_mode::plan_drift(
+                "Wurzel während der Zeitübernahme verändert",
+            ));
+        }
+        root.current_mount_identity()?;
+    }
+    Ok(stat)
+}
+pub(crate) fn read_copy_mtime(
+    root: Option<&RootHandle>,
+    path: &Path,
+    expected: &Entry,
+) -> io::Result<crate::vfs::FileTimestamp> {
+    let file = File::from(open_final_from(
+        root,
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?);
+    let before = check_copy_time_visible(root, path, &file)?;
+    let actual = entry_from_stat(expected.name.clone(), &before, None);
+    if !crate::batch_rename::same_source(expected, &actual) {
+        return Err(crate::real_mode::plan_drift(
+            "Quelle vor dem Lesen der Änderungszeit verändert",
+        ));
+    }
+    copy_mtime_value(&before)
+}
+pub(crate) fn set_copy_mtime(
+    root: Option<&RootHandle>,
+    path: &Path,
+    time: crate::vfs::FileTimestamp,
+) -> io::Result<()> {
+    time.validate()?;
+    let file = File::from(open_final_from(
+        root,
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?);
+    let before = check_copy_time_visible(root, path, &file)?;
+    let timestamp = filetime::FileTime::from_unix_time(time.seconds, time.nanoseconds);
+    filetime::set_file_handle_times(&file, None, Some(timestamp))?;
+    let after = check_copy_time_visible(root, path, &file)?;
+    if after.st_dev != before.st_dev
+        || after.st_ino != before.st_ino
+        || copy_mtime_value(&after)?.seconds != time.seconds
+    {
+        return Err(crate::real_mode::plan_drift(
+            "Änderungszeit nach der Übernahme abweichend",
+        ));
+    }
+    if copy_mtime_value(&after)? != time {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Zieldateisystem erhält die Nanosekunden nicht",
+        ));
+    }
+    Ok(())
 }
 
 /// POSIX-Rechte am sicher geöffneten Eintrag setzen. Verzeichnisse brauchen eigene
@@ -1793,6 +2017,215 @@ fn set_mtime_from(root: Option<&RootHandle>, path: &Path, mtime: i64) -> io::Res
 /// kann ein eingeschleuster Symlink chmod nie auf sein externes Ziel lenken.
 pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     set_mode_from(None, path, mode)
+}
+
+/// Interaktives chmod bindet das Objekt bis zum Readback an einen Deskriptor.
+/// Linux O_PATH ermöglicht auch Modus 000; macOS EVTONLY kann dafür Leserecht
+/// verlangen. Diese Absage eröffnet keinen ungebundenen chmod-Fallback.
+pub(crate) fn set_interactive_mode_beneath(
+    root: &RootHandle,
+    path: &Path,
+    expected: &Entry,
+    mode: u32,
+) -> io::Result<Entry> {
+    if mode & !0o777 != 0 || expected.is_symlink || (!expected.is_file && !expected.is_dir) {
+        return Err(crate::coded_error(
+            io::ErrorKind::Unsupported,
+            crate::ErrorCode::Unsupported,
+            "Rechteänderungen benötigen eine reguläre Datei oder einen Ordner ohne Symlink",
+        ));
+    }
+    let (fd, before) = open_interactive_metadata_entry(root, path, expected)?;
+    let requested = interactive_permission_bits(&before) & 0o7000 | mode;
+    #[cfg(target_os = "macos")]
+    let result: io::Result<()> =
+        fchmod(&fd, Mode::from_raw_mode(requested as _)).map_err(Into::into);
+    #[cfg(target_os = "linux")]
+    let result: io::Result<()> = {
+        // fchmod lehnt O_PATH ab. fchmodat2 mit EMPTY_PATH adressiert genau den
+        // gehaltenen FD, auch ohne Leserecht; kein pfadbasierter chmod-Fallback.
+        let status = unsafe {
+            libc::syscall(
+                libc::SYS_fchmodat2,
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                requested,
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+    result?;
+    let readback = (|| {
+        let after = fstat(&fd)?;
+        let actual = entry_from_stat(expected.name.clone(), &after, None);
+        let visible = stat_beneath(root, path)?;
+        if interactive_permission_bits(&after) != requested
+            || actual.device != expected.device
+            || actual.inode != expected.inode
+            || visible.device != actual.device
+            || visible.inode != actual.inode
+            || visible.mode != Some(mode)
+            || !root.is_current()?
+        {
+            return Err(io::Error::other(
+                "Rechte oder sichtbare Objektidentität nach chmod abweichend",
+            ));
+        }
+        root.current_mount_identity()?;
+        Ok(actual)
+    })();
+    readback.map_err(|error| {
+        crate::error::with_recovery_paths(
+            crate::coded_error(
+                io::ErrorKind::Other,
+                crate::ErrorCode::OutcomeUnclear,
+                format!("chmod ausgeführt, Abschluss unklar: {error}"),
+            ),
+            &[path.to_string_lossy().into_owned()],
+        )
+    })
+}
+
+fn open_interactive_metadata_entry(
+    root: &RootHandle,
+    path: &Path,
+    expected: &Entry,
+) -> io::Result<(OwnedFd, Stat)> {
+    if expected.is_symlink || (!expected.is_file && !expected.is_dir) {
+        return Err(crate::coded_error(
+            io::ErrorKind::Unsupported,
+            crate::ErrorCode::Unsupported,
+            "Metadatenänderungen benötigen eine reguläre Datei oder einen Ordner ohne Symlink",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    let flags = OFlags::from_bits_retain(libc::O_EVTONLY as u32);
+    #[cfg(target_os = "linux")]
+    let flags = OFlags::PATH;
+    let fd = open_final_from(Some(root), path, flags, Mode::empty())?;
+    let before = fstat(&fd)?;
+    let observed = entry_from_stat(expected.name.clone(), &before, None);
+    if !crate::batch_rename::same_source(expected, &observed) || !root.is_current()? {
+        return Err(crate::real_mode::plan_drift(
+            "Objekt oder Ordner änderte sich vor der Metadatenänderung",
+        ));
+    }
+    root.current_mount_identity()?;
+    Ok((fd, before))
+}
+
+pub(crate) fn set_interactive_owner_beneath(
+    root: &RootHandle,
+    path: &Path,
+    expected: &Entry,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> io::Result<(Entry, Owner, bool)> {
+    if (uid.is_none() && gid.is_none()) || uid == Some(u32::MAX) || gid == Some(u32::MAX) {
+        return Err(crate::coded_error(
+            io::ErrorKind::InvalidInput,
+            crate::ErrorCode::InvalidInput,
+            "Eigentümer/Gruppe benötigen mindestens eine gültige ID; -1 ist kein Zielwert",
+        ));
+    }
+    let (fd, before) = open_interactive_metadata_entry(root, path, expected)?;
+    let desired = Owner {
+        uid: uid.unwrap_or(before.st_uid),
+        gid: gid.unwrap_or(before.st_gid),
+    };
+    // chown kann Sonderbits löschen. Stimmen beide IDs bereits, ist dafür kein
+    // Systemaufruf nötig; das gilt auch bei explizit eingetragenen aktuellen IDs.
+    let attempted = desired.uid != before.st_uid || desired.gid != before.st_gid;
+    if attempted {
+        #[cfg(target_os = "macos")]
+        let result: io::Result<()> =
+            fchown(&fd, uid.map(Uid::from_raw), gid.map(Gid::from_raw)).map_err(Into::into);
+        #[cfg(target_os = "linux")]
+        let result: io::Result<()> = {
+            let status = unsafe {
+                libc::fchownat(
+                    fd.as_raw_fd(),
+                    c"".as_ptr(),
+                    uid.unwrap_or(u32::MAX),
+                    gid.unwrap_or(u32::MAX),
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        };
+        result.map_err(|error| {
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EPERM | libc::EACCES | libc::EINVAL | libc::EBADF | libc::EROFS)
+            ) {
+                error
+            } else {
+                interactive_owner_unclear(path, error)
+            }
+        })?;
+    }
+    let checked = (|| {
+        let after = fstat(&fd)?;
+        let actual = entry_from_stat(expected.name.clone(), &after, None);
+        let visible = stat_beneath(root, path)?;
+        if after.st_uid != desired.uid
+            || after.st_gid != desired.gid
+            || actual.device != expected.device
+            || actual.inode != expected.inode
+            || visible.device != actual.device
+            || visible.inode != actual.inode
+            || visible.owner != actual.owner
+            || visible.group != actual.group
+            || actual.mode != expected.mode
+            || !root.is_current()?
+        {
+            return Err(io::Error::other(
+                "Eigentümer, Gruppe oder sichtbare Objektidentität nach chown abweichend",
+            ));
+        }
+        root.current_mount_identity()?;
+        Ok((
+            actual,
+            desired,
+            interactive_permission_bits(&before) & 0o7000
+                != interactive_permission_bits(&after) & 0o7000,
+        ))
+    })();
+    checked.map_err(|error| {
+        if attempted { interactive_owner_unclear(path, error) }
+        else { crate::real_mode::plan_drift("Eigentümer/Gruppe bereits passend, aber Objektabschluss verändert; keine Änderung begonnen") }
+    })
+}
+
+fn interactive_owner_unclear(path: &Path, error: io::Error) -> io::Error {
+    crate::error::with_recovery_paths(
+        crate::coded_error(
+            io::ErrorKind::Other,
+            crate::ErrorCode::OutcomeUnclear,
+            format!("Eigentümeränderung begonnen, Abschluss unklar: {error}"),
+        ),
+        &[path.to_string_lossy().into_owned()],
+    )
+}
+
+fn interactive_permission_bits(stat: &Stat) -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        u32::from(stat.st_mode & 0o7777)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        stat.st_mode & 0o7777
+    }
 }
 
 pub(crate) fn set_mode_beneath(root: &RootHandle, path: &Path, mode: u32) -> io::Result<()> {
@@ -2530,6 +2963,50 @@ pub(crate) fn hard_link_between(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copy_mtime_rejects_swaps_symlinks_and_invalid_values_without_external_change() {
+        use std::os::unix::fs::symlink;
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().canonicalize().unwrap();
+        let path = root.join("file");
+        std::fs::write(&path, b"original").unwrap();
+        let held = RootHandle::open_nofollow(&root).unwrap();
+        let expected = stat_beneath(&held, &path).unwrap();
+        std::fs::rename(&path, root.join("old")).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        assert_eq!(
+            crate::error_code(&read_copy_mtime(Some(&held), &path, &expected).unwrap_err()),
+            crate::ErrorCode::PlanDrift
+        );
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().canonicalize().unwrap().join("sentinel");
+        std::fs::write(&sentinel, b"external").unwrap();
+        let before = std::fs::metadata(&sentinel).unwrap().modified().unwrap();
+        symlink(&sentinel, root.join("link")).unwrap();
+        let time = crate::vfs::FileTimestamp {
+            seconds: 1_600_000_000,
+            nanoseconds: 942_123_456,
+        };
+        assert!(set_copy_mtime(Some(&held), &root.join("link"), time).is_err());
+        assert_eq!(
+            std::fs::metadata(&sentinel).unwrap().modified().unwrap(),
+            before
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"external");
+        assert_eq!(
+            set_copy_mtime(
+                Some(&held),
+                &root.join("absent"),
+                crate::vfs::FileTimestamp {
+                    nanoseconds: 1_000_000_000,
+                    ..time
+                }
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
     use std::io::Write;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -2541,6 +3018,30 @@ mod tests {
     fn canonical_tempdir() -> tempfile::TempDir {
         let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         tempfile::tempdir_in(root).unwrap()
+    }
+
+    #[test]
+    fn sparse_geometry_is_readonly_and_keeps_held_root_and_symlink_boundary() {
+        let area = canonical_tempdir();
+        let root = area.path().join("root");
+        let outside = area.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let anchor = RootHandle::open_nofollow(&root).unwrap();
+        let expected = sparse_allocation_unit(Some(&anchor), &root).unwrap();
+        assert_eq!(
+            sparse_allocation_unit(Some(&anchor), &root.join("missing/child")).unwrap(),
+            expected
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        symlink(&outside, root.join("link")).unwrap();
+        assert!(sparse_allocation_unit(Some(&anchor), &root.join("link")).is_err());
+        std::fs::rename(&root, area.path().join("held")).unwrap();
+        symlink(&outside, &root).unwrap();
+        assert_eq!(
+            sparse_allocation_unit(Some(&anchor), &root).unwrap(),
+            expected
+        );
     }
 
     fn fifo_call_finishes_with_error(

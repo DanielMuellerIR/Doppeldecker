@@ -863,3 +863,88 @@ fn normaler_stou_name_ist_vor_dem_ersten_inhaltsbyte_dauerhaft_bekannt() {
         }
     }
 }
+
+#[test]
+fn gewoehnliche_ftps_wirkungen_brauchen_keine_kuenstlichen_proben() {
+    for tls in [false, true] {
+        let fixture = Fixture::new(tls);
+        std::fs::create_dir_all(fixture.root.path().join("pane/Baum/Tief")).unwrap();
+        std::fs::write(fixture.root.path().join("pane/Baum/Tief/Alt"), b"Alt").unwrap();
+        std::fs::write(fixture.root.path().join("Sentinel"), b"Erhalten").unwrap();
+        let config = private_config();
+        let queue =
+            crate::OperationQueue::open(config.path().canonicalize().unwrap().join("queue.json"))
+                .unwrap();
+        let provider = Arc::new(
+            FtpsVfs::connect(fixture.config.clone(), Arc::new(TestSecrets))
+                .unwrap()
+                .for_queue_preparation(&queue, Path::new("/pane"))
+                .unwrap(),
+        );
+        let endpoint = crate::ProviderEndpoint::ftps(provider.clone(), Path::new("/pane")).unwrap();
+        let caps = endpoint.probe_file_capabilities().unwrap();
+        assert!(
+            caps.copy_new_best_effort && caps.replace_best_effort && caps.remove_source_best_effort
+        );
+        assert!(
+            !provider.capabilities().best_effort_file_commit,
+            "Die gewöhnliche Freigabe darf keinen strikten Fähigkeitscache verändern"
+        );
+        let (vfs, root) = endpoint.ordinary_file_context().unwrap();
+        crate::create_dir(vfs.as_ref(), &root, "Neu", &None).unwrap();
+        let duplicate = crate::create_dir(vfs.as_ref(), &root, "Neu", &None).unwrap_err();
+        assert_eq!(duplicate.kind(), io::ErrorKind::AlreadyExists);
+        let local = tempfile::tempdir().unwrap();
+        let local_root = local.path().canonicalize().unwrap();
+        std::fs::write(local_root.join("Datei"), b"Neu und vollstaendig").unwrap();
+        std::fs::write(fixture.root.path().join("pane/Datei"), b"Alt").unwrap();
+        let source = crate::LocalVfs::rooted(&local_root).unwrap();
+        let result = crate::fileops::copy_items(
+            crate::fileops::FileOperationRequest {
+                src: &source,
+                dst: vfs.as_ref(),
+                items: &[local_root.join("Datei")],
+                dst_dir: &root,
+                policy: crate::fileops::OverwritePolicy::Overwrite,
+                sandbox: &None,
+            },
+            &crate::Cancel::new(),
+            &mut |_| {},
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read(fixture.root.path().join("pane/Datei")).unwrap(),
+            b"Neu und vollstaendig"
+        );
+        assert!(endpoint.probe_delete_capabilities().unwrap().permanent);
+        let plan = crate::plan_remote_delete(vfs.as_ref(), &root, &[root.join("Baum")]).unwrap();
+        assert_eq!(plan.entries, 3);
+        let deleted = crate::execute_remote_delete(
+            vfs.as_ref(),
+            &plan,
+            crate::RemoteDeleteMode::Permanent,
+            &crate::Cancel::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(deleted.entries, 3);
+        provider.finish_operation_intents().unwrap();
+        assert!(!fixture.root.path().join("pane/Baum").exists());
+        assert_eq!(
+            std::fs::read(fixture.root.path().join("Sentinel")).unwrap(),
+            b"Erhalten"
+        );
+        let mut names = std::fs::read_dir(fixture.root.path().join("pane"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                std::ffi::OsString::from("Datei"),
+                std::ffi::OsString::from("Neu")
+            ]
+        );
+    }
+}

@@ -5,6 +5,638 @@ folgt Keep a Changelog; Versionen verwenden Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.125] - 2026-11-07
+
+- Native Linux-Menüleisten und aufklappende Menüs folgen der Darstellung Hell,
+  Dunkel oder Automatisch, einschließlich laufender Systemwechsel.
+
+- Das Linux-AppImage verwendet den Wayland-Client des Systems. So passen dessen
+  Symbole zu Mesa/EGL; ein mitgelieferter älterer Client ließ WebKit auf aktuellen
+  Grafikstacks vor dem ersten Fensterinhalt abbrechen.
+
+- Linux unterstützt die optionale Administratorfreigabe für lokale Rechte und
+  Eigentümer/Gruppe über einen begrenzten Polkit-Metadatenhelfer. Abbruch,
+  Identitätsprüfung und Readback folgen demselben Corevertrag wie auf macOS.
+  Ein benutzereigener AppImage-Installer legt Starter und Menüeintrag an und
+  erhält einen stabilen, beschreibbaren Pfad für den vorhandenen GitHub-Updater.
+
+- Geöffnete Metadateneditoren werden in den sichtbaren Dialogbereich gerollt,
+  damit ihre Eingaben und Hilfetexte oberhalb der festen Schaltflächen lesbar bleiben.
+
+- Erfolgreiche Archivuploads geben ihre belegten lokalen Ergebnisdaten nach dem
+  dauerhaften Queueabschluss frei. Das Entfernen wartender Aufträge bereinigt
+  deren Zwischenstand; Abbruch, Fehler und Konfliktpausen behalten ihn. Aktive
+  Leser, fremde Inhalte und ältere ungebundene Reste bleiben geschützt.
+
+- Lokale Metadateneditoren verwenden eine gemeinsame Auswahlprüfung und einen
+  gemeinsamen abbrechbaren Ausführungsrahmen je Fenster.
+
+- Bei einem nicht lesbaren Queue-Journal lässt sich die App nach einem klaren
+  Hinweis regulär beenden. Das Journal bleibt erhalten; laufende Operationen und
+  offene Vorbereitungen lassen sich damit nicht übergehen.
+
+- Das Linux-AppImage enthält die für WebKit benötigte GStreamer-Runtime und
+  portable GIO-Starthooks. Die Paketprüfung erfasst lokale Buildpfade auch in
+  Skripten und Symlinks.
+
+- Beim Übergang vom lokalen Packen oder Entpacken zum Upload zeigt die
+  Fortschrittsanzeige eine verständliche Phase statt eines internen Bezeichners.
+
+- Lokale Rechte und Eigentümer/Gruppe lassen sich auf macOS optional mit
+  Administratorfreigabe ändern. Ein eigens eingerichteter Metadatenhelfer prüft
+  jede Anfrage; Systemfreigabe, Abbruch und Teilwirkungen bleiben sichtbar.
+
+- Gewöhnliche lokale macOS-Kopien erhalten die Dateisperre von Dateien und neuen
+  Ordnern. Ein unklarer Abschluss stoppt den Lauf mit erhaltener Move-Quelle
+  und sichtbarer Teilwirkung; fehlende Zielfähigkeiten erscheinen als Hinweis.
+
+- Der Informationsdialog sperrt und entsperrt lokale macOS-Objekte und ändert die
+  Finder-Anzeige der Dateierweiterung, auch für Auswahlen. Andere Flags und
+  Finder-Informationen bleiben erhalten; unklare Teilwirkungen werden bilanziert.
+
+- Lokale Datei- und Ordnerkopien auf macOS und Linux erhalten die Nanosekunden
+  der Änderungszeit. Reduzierte Zielauflösung bleibt sichtbar; kopierende Moves
+  prüfen auch nachträgliche Änderungen innerhalb derselben Sekunde.
+
+- SFTP-Panes und Informationsdialog zeigen die vom OpenSSH-Server gelieferten
+  Eigentümer- und Gruppennamen. Ohne passende Servererweiterung bleiben numerische
+  IDs sichtbar; lokale Konten werden nicht als entfernte Identitäten ausgegeben.
+
+- Der Informationsdialog liest, speichert und entfernt macOS-Finder-Kommentare,
+  auch für Auswahlen. Finder und Kommentar-Attribut werden abgeglichen; nötige
+  Systemfreigabe, Abbruch und unklare Teilwirkungen bleiben sichtbar.
+
+- Der Informationsdialog bearbeitet die macOS-Verstecktmarkierung einzeln oder
+  für eine Auswahl. Pane-Filter und Unterordnersuche berücksichtigen sie;
+  Punktnamen bleiben ein eigener Grund für Unsichtbarkeit.
+
+- Gewöhnliche lokale macOS-Kopien übernehmen Tags, Finder-Informationen, lesbare
+  xattrs, Resource Forks und Verstecktmarkierung. Fehlende Klassen bleiben sichtbar;
+  kopierende Moves behalten Quellen mit unvollständigem Resource Fork und prüfen
+  nachträgliche native Änderungen vor dem Quellabbau.
+
+- Gewöhnliche Kopien auf macOS erhalten die Erstellungszeit von Dateien und neuen
+  Ordnern einschließlich Nanosekunden. Bestehende Zusammenführungsordner behalten
+  ihre eigenen Zeiten; fehlende Zielfähigkeiten erscheinen als Metadatenhinweis.
+
+- Der Informationsdialog zeigt und bearbeitet lokale macOS-Finder-Tags samt
+  Farben. Einzeländerungen und Sammelzuweisungen erhalten andere Attribute; alte
+  Finder-Farbmarkierungen sind getrennt sichtbar und entfernbar. Unklare
+  Teilwirkungen bleiben in der Ergebnisbilanz.
+
+- SMB-Downloads scheitern nicht mehr allein daran, dass erst der offene Handle
+  die Hardlink-Anzahl liefert. Der stärkere Beleg bleibt bis zum Leseende gebunden.
+
+- Der Informationsdialog ändert normale Unix-Rechte jetzt auch über SFTP und
+  FTP/FTPS, wahlweise rekursiv. Sonderbits bleiben erhalten; der Editor zeigt die
+  Best-Effort-Grenze. Antwortverlust und Profilwechsel erhalten eine Teilbilanz,
+  ohne Schreibbefehle blind zu wiederholen.
+
+- Im Informationsdialog lassen sich lokale Eigentümer und Gruppen über Namen oder
+  IDs ändern. Leere Felder bleiben unverändert; unzulässige Wechsel werden
+  abgelehnt und Änderungen besonderer Rechtebits bilanziert. Eingabeentwürfe und
+  der an Anfrage/Fenster gebundene Abbruch gelten für beide Metadateneditoren.
+
+- Lokale Auswahlen lassen sich als ZIP zur entfernten Gegenpane übertragen.
+  Ganze ZIPs, einzelne Archivdateien und Unterbäume lassen sich auch auf
+  Remoteziele entpacken. Ein Queueeintrag verbindet die lokale Erzeugung mit dem
+  Upload; Konfliktpausen und Neustarts verwenden dieselben geprüften Bytes.
+  Archivhinweise und Zwischenstand bleiben über die Queue erreichbar.
+
+- Vor dem ersten Rename abgebrochene oder durch Drift gestoppte Namenzyklen
+  hinterlassen keinen irreführenden Recoveryauftrag. SMB-No-Replace-Kollisionen
+  erhalten den Beleg für unveränderte Namen und bereinigbare eigene Temps.
+  CLI-Doppelfehler erhalten auch die Bilanz neu angelegter Ordnerrechte.
+
+- Entfernte Datei- und Ordnernamenzyklen verwenden einen freien Zwischennamen und bilanzieren
+  jeden Rename dauerhaft. Nach Abbruch oder Neustart zeigt die Queue bestätigte
+  Positionen und unklare Schritte zur manuellen Prüfung; offene Zwischenstände
+  bleiben auch in enthaltenen Sync-Wurzeln aus Läufen ausgeschlossen.
+
+- Im Informationsdialog lassen sich normale Unix-Rechte ausgewählter lokaler
+  Dateien und Ordner ändern, auf Wunsch auch alle enthaltenen Objekte.
+  Ergebnisblätter und ein auftragsspezifischer Abbruch halten große Auswahlen
+  bedienbar. Größenereignisse erhalten Rechteentwürfe und Auswahl.
+
+- Die Releaseplanung begrenzt Metadaten auf belegte ForkLift-Parität. Roadmap und
+  Backlog trennen offene Arbeit von der erhaltenen historischen Umsetzungschronik.
+
+- Gewöhnlicher nativer SMB-Sync erhält auch explizite WRITE_DAC-Denys an
+  Datei-Temps und bei reinen Rechteänderungen bestehender Dateien. Die benötigte
+  Änderungsberechtigung wird vor dem einzigen SET gewährt; der frische Abschluss
+  liest danach ohne erneute WRITE_DAC-Anforderung.
+
+- Gewöhnlicher nativer SMB-Sync erhält auf neuen und ersetzten Datei-Temps auch
+  explizite Verbote für Lesen/Schreiben erweiterter Attribute und Dateiausführung.
+  Der frische Abschluss fordert diese Rechte nicht an; Kombinationen mit
+  Daten-Schreib-/Anhängeverboten behalten ihren vorher gewährten FLUSH-Zugriff.
+
+- Gewöhnlicher NativeBestEffort-Sync erhält SMB-Sparse-Bereiche und benannte
+  Datenströme auch bei konkret nicht verfügbarer DACL-Zielübernahme. Die ACL bleibt
+  gesondert bilanziert; der eigene Sparse-Abschluss verlangt dann kein WRITE_DAC.
+  Unvorbereitete oder unklare Zielkontexte erhalten keine zusätzliche Freigabe.
+
+- Gewöhnlicher NativeBestEffort-Sync zwischen geeigneten SMB-Endpunkten erhält
+  Sparse-Bereiche zusammen mit benannten Datenströmen und den bereits unterstützten
+  Datei-DACLs. Auch explizite Daten-Schreib-/Anhängeverbote verwenden nur einen
+  vorab gewährten Abschlusszugriff. DACL-SET, Metadaten-FLUSH und Rename behalten
+  ihre exakten Readbacks und einmaligen Abschlüsse; unklare Teilwirkungen bleiben
+  für die Wiederherstellung sichtbar. Späte Metadatenänderungen nach dem
+  abgeschlossenen Sparse-Temp-FLUSH sind gesperrt.
+
+- Gewöhnlicher NativeBestEffort-Sync erhält Sparse-Bereiche lokaler Quellen auf
+  geeigneten SMB-Zielen. Eigene neue Temps behalten ihre Identität durch Transfer,
+  Rename und Metadatenabschluss; unklare Ausgänge bleiben ohne automatische
+  Wiederholung sichtbar. Bekannte Hardlink-Auslassungen lokaler Quellen bleiben
+  auch im leeren Folgelauf sichtbar, wenn das Ziel keine gemeinsamen Dateiobjekte erzeugen kann.
+
+- NativeBestEffort-Sync auf lokale APFS-/ext4-/Btrfs-Ziele kopiert Inhalte auch bei
+  nachweisbar feineren Sparse-Quellgrenzen und bilanziert die nicht darstellbare
+  Struktur gesondert. Folgeläufe bleiben ohne erneute Inhaltskopie leer;
+  Hardlink-Gruppen und andere Metadaten bleiben erhalten. Sparse-Kopien behandeln
+  außerdem einen ungeraden EOF-Lochrest ohne ungültigen Teilblock-Punch.
+
+- Gewöhnlicher nativer Sync von SMB zu einem geeigneten lokalen Ziel kann die
+  vollständig gemeldeten Sparse-Bereiche erhalten. Begrenzte und abgewiesene
+  Abfragen bleiben konkrete Metadatenauslassungen; der logische Inhalt bleibt
+  übertragbar. Ein eigener gehaltener Seek-Reader prüft und schließt die Quelle
+  vor dem Ziel-Commit, auch bei leeren oder vollständig gelochten Dateien.
+
+- Bekannte SMB-Hardlink-Auslassungen bleiben auch im leeren Sync-Folgelauf und
+  bei reinen Rechteänderungen sichtbar. Die gemeldete Linkzahl ist jetzt an das
+  Metadatenmanifest gebunden; eine gewöhnliche Einzeldatei mit Linkzahl 1 erhält
+  keine pauschale Hardlink-Warnung mehr. Eine vollständige Gruppenzuordnung oder
+  das Schreiben von SMB-Hardlinks wird daraus nicht abgeleitet.
+
+- Neue und ersetzte reguläre SMB-Dateien können nach der vollständigen Inhalts-
+  und Datenstromübertragung auch explizite Schreib- und Anhängverbote erhalten.
+  Der Speicherabschluss verwendet dafür ein vor der Rechteänderung gewährtes
+  Handle. Zeitabschluss und Commit bleiben an die originale Temp-Datei gebunden;
+  unklare Ausgänge erhalten Temp und Intent ohne automatische Wiederholung.
+
+- Reine Rechteänderungen bestehender regulärer SMB-Dateien erhalten zusätzlich
+  explizite Deny-ACEs für Löschen, Attributschreiben, Lesen und Schreiben erweiterter
+  Attribute sowie Ausführen. Die DACL bleibt exakt erhalten; eine Löschfreigabe
+  über den Elternordner kann den Datei-Deny weiterhin überstimmen.
+
+- Reine Rechteänderungen bestehender regulärer SMB-Dateien erhalten jetzt auch
+  explizite Verbote zum Schreiben und Anhängen von Dateiinhalten. Inhalt, Datenströme
+  und Dateiidentität bleiben erhalten; die bisherigen Temp- und Ordnerverträge
+  behalten ihre Grenzen. Bereits gleiche, für diesen Dateiabschluss unterstützte
+  Rechte melden keine falsche ACL-Auslassung aus der stärkeren Temp-Prüfung mehr.
+
+- Neue leere SMB-Ordner behalten eine beim Zeit-Readback erkannte Objektabweichung
+  als Plan-Drift. Ein später wieder passender Readback kann diese Beobachtung
+  nicht mehr in einen erfolgreichen Metadatenabschluss verwandeln.
+- Auch historische V7-Ordnerberichte übertragen Objekt-IDs an die Oberfläche als
+  exakte Dezimalzeichenfolgen. Verschiedene Anlagen desselben Pfads bleiben bei
+  großen IDs getrennt sichtbar; gespeicherte Journale und Digests bleiben unverändert.
+
+- Geeignete geschützte explizite SMB-Ordnerrechte können im gewöhnlichen
+  `NativeBestEffort`-Inhaltssync auf selbst neu angelegte nichtleere Ordner bereits
+  vor den Kindern übertragen werden. Rechteabschluss und geschlossene Handles
+  gehen den normalen Kinderaktionen voraus; die finale Ordnerzeit bleibt an die
+  originale ID gebunden. Teilwirkungen und Auslassungen bleiben in Queue, Audit,
+  CLI und Oberfläche getrennt sichtbar. Abweichende Datei-Temp-SID-Kontexte werden
+  weiterhin konkret ausgelassen. Der bisherige Leerordnervertrag bleibt erhalten;
+  Wiederholung, Wiederherstellung und automatische Kinderfortsetzung werden nicht
+  eingeführt. Die neuen V8-Berichte erhalten auch große Objekt-IDs als exakte
+  Dezimalzeichenfolgen; das ältere V7-Wireformat bleibt unverändert.
+
+- Gewöhnlicher SMB-Inhaltssync meldet exakt beobachtete Windows-DACLs nicht mehr
+  zusätzlich als unlesbare ACLs. Konkrete Abfragefehler und begründete
+  Schreibauslassungen behalten ihre ursprüngliche Fehlerklasse und Bilanz.
+
+- Gewöhnlicher SMB-Sync mit `NativeBestEffort` bilanziert eine nachweisliche
+  `WRITE_ATTRIBUTES`-Openabsage vor jedem Zeit-SET als konkrete Privilegienauslassung.
+  Unabhängige Inhalte werden weiter übertragen. Auch neue leere Ordner behalten
+  nach endgültiger Receiptfreigabe ihren ehrlichen unvollständigen Metadatenbericht;
+  ihre Zeit und Rechte werden nicht erneut gesetzt. Das Abschlussaudit erhält den
+  tatsächlichen Metadatenbericht einschließlich dieser Auslassung. Strikte Profile und unklare
+  Ausgänge nach möglichem SET behalten ihre bisherigen Grenzen.
+
+- Die CLI erhält bei bidirektionalen Ausführungs- und Rollbackfehlern auch nach
+  einem zusätzlichen Queue-Journalfehler beide Meldungen und die vereinigten
+  Wiederanlaufpfade; ein möglicher Ausgang bleibt ausdrücklich unklar.
+- Die lesende WebDAV-Sicherheitsbeobachtung zählt optionale Antwortbeschreibungen
+  auf Multistatus-Ebene nicht mehr als zusätzliche Ressource. Ignorierte
+  Antwortbeschreibungen dürfen `xml:lang` tragen; Ressourcen- und Identitätsprüfung
+  sowie alle übrigen Parsergrenzen bleiben unverändert.
+- Fortschrittsereignisse ersetzen Datei-, Ordner- und Neuordner-Rechteberichte
+  vollständig. Wiederholte Ereignisse vervielfachen die Anzeige nicht mehr;
+  ein leerer Folgebericht entfernt die vorherigen Berichtselemente.
+
+- Reine Datei-Rechteänderungen beachten im Update-Sync dieselbe Zeitordnung wie
+  andere native Metadaten. Ältere oder zeitlich unbekannte Quellen bleiben als
+  Versionskonflikt sichtbar; ein anderer Hardlinkname umgeht diesen Konflikt nicht.
+- Bestätigte strikte bidirektionale Läufe behalten ihre ursprüngliche Frist auch
+  für aufgeschobene Typwechsel und frisch vorbereitete Löschprojektionen.
+  Bereits abgeschlossene Teilwirkungen und ihre Wiederanlaufbelege bleiben erhalten.
+
+- Ein getrennter nativer SMB-Vertrag übernimmt geeignete geschützte explizite
+  Quellrechte auf selbst neu angelegte, nachweislich leere Unterordner ohne
+  Ordnerdatenströme. Normale Anlage und Metadaten bleiben zuerst; fehlende
+  Zusatzrechte lassen nur die Rechtewirkung aus. Nichtleere oder unvollständig
+  beobachtete Ordner bleiben eine erklärte Implementierungsauslassung.
+- Neue Ordnerrechte besitzen eigene V7-Belege mit Herkunft und Objekt-ID sowie
+  Queuejournalversion 36. Normale Anlage, bestätigte Rechte und unklare Ausgänge
+  bleiben getrennt sichtbar. Der bewusste Abschluss prüft nur Identität und
+  Rechte; erneutes Setzen, automatische Rücksetzung und entfernte Bereinigung
+  finden nicht statt. Ältere Verträge und strikte Profile behalten ihre Grenzen.
+
+- Gewöhnlicher nativer SMB-Sync kann geeignete reine Datei-DACL-Abweichungen
+  ohne Inhaltskopie oder Dateitausch übernehmen. Die ausdrückliche Bestätigung
+  erklärt die dauerhafte Wirkung auf alle bestehenden und neuen Namen desselben
+  Dateiobjekts, auch außerhalb der ausgewählten Ordner. Bekannte gleiche Aliasziele
+  werden einmal geändert; widersprüchliche Sollrechte bleiben sichtbar ausgelassen.
+- Datei-Rechtewirkungen besitzen einen eigenen V6-Intent und getrennte bestätigte
+  beziehungsweise unklare Berichte in Queue, Audit, CLI und Oberfläche. Ein
+  lesender bewusster Abschluss prüft Identität und aktuellen Rechtezustand, ohne
+  erneutes Setzen oder automatische Wiederherstellung. Alte Temp-/Ordnerverträge
+  und strikte Metadatenprofile behalten ihre Grenzen.
+
+- Gewöhnlicher nativer SMB-Sync überträgt geeignete geschützte explizite DACLs
+  auch auf bestehende Unterordner. Die Vorschau bestätigt Zielpfade und dauerhafte
+  Wirkung; die Rechte folgen erst nach Inhalten und übrigen Metadaten. Ordner,
+  Kinder, Datenströme und Owner/Group bleiben bei dieser Rechteänderung erhalten.
+- Bestätigte und unklare Ordnerrechte bleiben getrennt in Fortschritt, Fehlern
+  und Queue gespeichert. Offene Ausgänge sperren automatische Wiederholung.
+  Ein besonderer Queueabschluss in Oberfläche und CLI prüft Identität und Rechte
+  frisch, ohne SET, Rücksetzung oder entfernte Bereinigung. Alte Journale und
+  Pläne ohne diese Klasse behalten ihre Form und ihren strikten Vertrag.
+
+- WebDAV beobachtet native ACL-/Owner-Properties je Objekt und bilanziert konkrete
+  Zugriffs- und Bereitstellungslücken getrennt für Quelle und Ziel. Auch ein leerer
+  Folgelauf behält Bericht und Manifestbindung. Lesbarer Inhalt bleibt übertragbar;
+  opake oder fehlende ACL-Werte erzeugen keinen künstlichen Dateitausch. Bestehende
+  Manifeste ohne diese Beobachtungen behalten ihre bisherige Form und Digests.
+
+- Gewöhnlicher NativeBestEffort-Sync übernimmt eine begrenzte Klasse geschützter
+  expliziter Windows-DACLs auf neue eigene reguläre Basisdateien. Eine vorbereitete
+  Roundtrip-Probe belegt den exakten Zielvertrag; normalisierende Server und nicht
+  darstellbare Formen bleiben begründete Auslassungen bei weiterhin möglichem
+  Inhaltssync. Reine ACL-Unterschiede erzeugen keinen Dateitausch. Unklare
+  SET-Ausgänge behalten Temp und Recoveryintent zur Prüfung.
+- SMB-Temp-Bereinigung und DACL-Dateicommit binden die ursprüngliche Datei-ID
+  am gehaltenen Handle. Ein fremder Nachfolger am Tempnamen wird weder gelöscht
+  noch als eigene neue Datei übernommen.
+- Windows-Metadatenbeobachtungen bleiben auch bei Noop im Plan digestgebunden.
+  Drift stoppt vor dem ersten Nutzdaten-Effekt; Queuezuordnung prüft ihren eigenen
+  vorbereiteten DACL-Kontext erneut.
+
+- SMB liest geordnete Windows-DACLs und Owner-/Group-SIDs in native Manifeste.
+  Fehlende ACL-Leserechte und nicht unterstützte oder ungültige Antworten bleiben
+  je Objekt sichtbar, ohne lesbaren Inhaltssync pauschal zu sperren. Abweichende
+  ACLs und SIDs bleiben auch im leeren Folgelauf als Auslassung bilanziert.
+  Der Adapter bleibt lesend; bestehende Manifest-Digests behalten ihre Form.
+
+- Gewöhnlicher SMB-Sync überträgt im Profil NativeBestEffort auch benannte
+  Verzeichnisströme. Die Vorschau bestätigt Ergänzungen, dauerhafte Ersetzungen
+  und Entfernungen einzeln; Ordner und ihre normalen Kinder bleiben erhalten.
+  Alle Streamkopien laufen vor Entfernungen. Bestätigte und unklare Teilwirkungen
+  bleiben bei Abbruch, Fehler und Neustart in Queue und Audit sichtbar.
+
+- Nicht übertragbare benannte Dateiströme bleiben auch bei einem leeren
+  Update-Folgelauf im Metadatenbericht sichtbar. Gleicher Hauptinhalt wird dafür
+  nicht erneut geschrieben; vorhandene Zielströme bleiben erhalten.
+
+- Benannte SMB-Datenströme verwenden echte Lesehandles für ihre Basis und die
+  gebundenen Verzeichnisse. Diese Öffnung verhindert deren Umbenennen durch
+  unabhängige Sitzungen. Gewöhnlicher Inhaltssync begrenzt die zusätzlichen
+  Verzeichnisrechte auf die gewählte Wurzel und ihre Unterordner. Höhere
+  Vorfahren bleiben frisch geprüftes, sichtbar benanntes Best Effort.
+
+- SMB-Fähigkeitsabfragen verlangen nur die für ihre Source- oder Targetrolle
+  nötigen Rechte. Parallele Lesezugriffe scheitern dadurch nicht mehr an
+  unnötig angeforderten Löschrechten. Temporäre Sharesperren werden nicht als
+  dauerhaft fehlende Schreibfähigkeit ausgegeben.
+
+- Die SMB-Wirkungsvorschau zeigt den vollständigen Pfad aus Profilroot und
+  ausgewähltem Unterpfad sowie abweichende Ports und IPv6-Adressen korrekt an.
+
+- SMB-Verzeichnisstreams werden vollständig gelesen und manifestiert. Fehlende
+  Übertragung und unbeobachtete Quellbestände bleiben pfadgenau sichtbar, auch
+  bei einem sonst leeren Update. Zusammengeführte Zielordner behalten ihre
+  Streams; die Bilanz behauptet
+  dafür keinen Dateitausch oder Verlust. Beobachtet leere und unbekannte Mengen
+  bleiben getrennt.
+
+- Gewöhnlicher SMB-Inhaltssync erhält im nativen Profil benannte Datenströme
+  regulärer Dateien auf geeigneten SMB-Zielen. Reine Streamänderungen werden als
+  Update erkannt; vollständige Mengen und Hashes sind vor dem Dateitausch und
+  beim Abschluss geprüft. Bytebilanz und Metadatenbericht enthalten die neue
+  Klasse, nicht darstellbare Ziele und Verzeichnisstreams bleiben sichtbar.
+  Bestehende Manifeste ohne Streambeobachtung behalten JSON-Form und Digest.
+
+- Scheitert der Metadatenabschluss nach einem bereits erfolgten Dateicommit,
+  bleibt der Ausgang mit Ziel- und vorhandenen Quarantänepfaden ausdrücklich
+  unklar, statt den Transferintent als gewöhnlichen Lesefehler abzuschließen.
+
+- Die bidirektionale Best-Effort-Bestätigung bilanziert alle Teilwirkungen,
+  dauerhafte Ersetzungen und Entfernungen sowie lokale Quarantäne vollständig.
+  Aufklappbare Details zeigen sämtliche Konfliktkopienamen und pfadgenauen
+  Metadatenhinweise und sind auch per Tastatur erreichbar.
+
+- SFTP-Metadaten prüfen vor SETSTAT den zuvor gebundenen echten Eintragstyp.
+  Beobachtete Typwechsel bleiben ohne Metadatenmutation. Nicht darstellbare
+  SFTP-v3-Dateizeiten werden konkret bilanziert, während der Inhalt bei Portable
+  und NativeBestEffort übertragbar bleibt.
+
+- Inhaltssync bilanziert ein neueres abweichendes Ziel auch innerhalb einer
+  Hardlinkgruppe als ausgelassenen Versionskonflikt.
+
+- Gewöhnliche WebDAV-Ordneranlage akzeptiert die durch das eigene neue Kind
+  veränderte unmittelbare Elternversion nach vollständigem Bestandsvergleich.
+  Fremde Bestandsänderungen und veränderte Vorfahren bleiben unklar.
+
+- Ein unterbrochener letzter Registry-Journaleintrag wird unter gemeinsamer
+  Sperre atomar gesichert und repariert. Rohbytes und mögliche offene Intents
+  bleiben erhalten, alte Vorbereitungen verfallen und neue unabhängige Syncs
+  bleiben möglich. Vollständige Korruption wird nicht still übergangen.
+
+- Der strikte bidirektionale Sync bindet Vorbereitung, Resume, Rollback und
+  Typwechsel an die gemeinsame Zwischenstandsregistry aller Fenster. Die Bindung
+  bleibt bis zum Abschlussscan und Baselinecommit erhalten. Alte Laufjournale
+  behalten ihren strikten Wiederherstellungsvertrag.
+  GUI und CLI ordnen private Crash-Zwischenstände dem tatsächlichen Queueauftrag
+  zu und erhalten dessen Recoverypfade auch nach erfolgreichem Resume oder Rollback.
+  Leere Folgeläufe schließen den Queueauftrag mit unveränderter Baseline ab;
+  der direkte Start verlängert keine abgelaufene Bestätigungsfrist.
+
+- Gemeinsame Registryprüfungen verhindern, dass bekannte unvollständige Transfers
+  anderer Fenster als Nutzdateien in Inhaltssync, Forward-Abgleich oder normalen
+  lokalen Sync eingehen. Fehler und Abbruch bewahren belegte Recoverypfade;
+  Abschlussprüfungen erkennen auch zwischenzeitlich gestartete Übertragungen.
+
+- Gewöhnliche WebDAV-Schreibaktionen behalten wirksame Dateibedingungen und
+  berücksichtigen Nextclouds fehlende Collection-ETag-Bedingungen. Spiegeln
+  entfernt bestätigte Dateien einzeln und lässt rekursiv wirkende
+  Collection-Entfernungen mit konkreter Begründung aus.
+
+- Erfolgreich geprüfte FTP-/FTPS-Mutationen schließen ihre Transferintents ab.
+  Ein Verbindungsverlust oder unklarer Ausgang behält die Recoverybindung.
+
+- Die macOS-Iconwahl schreibt keine Finder-Metadaten mehr an das signierte
+  App-Bundle. Die gespeicherte Auswahl gilt für das Dock-Icon des laufenden
+  Prozesses und wird beim nächsten Start erneut angewendet.
+
+- WebDAV-Collections dürfen eine fehlende Inhaltslänge melden, wie dies
+  Nextcloud tut. Reguläre Dateien ohne notwendige Größe und andere erfolglose
+  Pflichtmetadaten bleiben gesperrt.
+
+- Bidirektionaler Best-Effort-Sync ist für Remote-Paare über die Fensterqueue
+  angebunden. Teilfehler und Prozessabbruch erhalten die letzte gemeinsame
+  Baseline. Ein frisch geplanter und bestätigter Neuabgleich ersetzt blinde
+  Wiederholung; bereits abgeschlossene Teilwirkungen bleiben sichtbar.
+
+- FTP/FTPS-Inhaltssync erhält beobachtete normale Rechte über SITE CHMOD mit
+  exaktem Readback. WebDAV-Dateien nutzen X-OC-MTime auf dem ersten PUT, ohne
+  erneuten Inhaltsupload. Eigentümer-IDs werden ohne bestätigte gemeinsame
+  Domäne nicht zwischen entfernten und lokalen Systemen übernommen.
+
+- Inhaltssync versucht Dateizeiten bei FTP/FTPS über MFMT und bei WebDAV über
+  bedingtes PROPPATCH zu erhalten. Der Abschluss bestätigt exakte Rücklesewerte
+  oder nennt die konkrete Setterablehnung beziehungsweise Zeitauflösung je Pfad.
+  Verbindungsverlust und unklare Antworten bleiben Fehler; NativeStrict wird
+  dadurch nicht herabgestuft.
+
+- Gewöhnlicher Inhaltssync ergänzt AddOnly, Update und Mirror für SFTP-,
+  FTP-/FTPS-, WebDAV- und SMB-Ziele sowie SFTP-Quellen. Vorschau, Fensterqueue
+  und CLI benennen Best Effort, konkrete Metadatenauslassungen und endgültige
+  Ersetzungen oder Entfernungen. Starke lokale Ziele erhalten die vorhandene
+  Quarantäne; ein unterbrochener Auftrag startet nach Neustart erst nach einer
+  frischen Vorschau und Zustimmung. Der bisherige strikte Syncvertrag bleibt
+  für seine eigenen Aufträge erhalten.
+
+- SFTP-Inhalte bleiben auch in bereits navigierten Ordnern mit mehr als 64
+  Pfadkomponenten lesbar und herunterladbar. Die verbliebene Tiefensperre ist
+  entfernt; die 4096-Byte-Pfadgrenze sowie Quellen-, Symlink- und
+  Sitzungsprüfungen bleiben erhalten.
+
+- Reine FTP-/FTPS- und WebDAV-Schreibweisenänderungen sind im Stapel erreichbar.
+  FTP bestätigt den exakten MLSD-Namen und beobachtbare Quellattribute; WebDAV
+  behält bedingtes MOVE und vollständigen Namespace-/ETag-Abschluss. Echte
+  Aliasgruppen, Serververweigerungen und unklare Ausgänge bleiben sichtbar;
+  es gibt keinen zusätzlichen Überschreib- oder Wiederholungsweg.
+
+- Neue SFTP-Profile bieten die SSH-Agent-Anmeldung auch dann an, wenn die
+  verfügbaren Schlüssel erst nach dem Öffnen des Editors eintreffen. Die bereits
+  gewählte Anmeldung bleibt dabei erhalten.
+
+- Reine SFTP-Case-/Unicode-Schreibweisenänderungen sind im Stapel über den
+  vorhandenen Best-Effort-Rename erreichbar. Erfolg verlangt den exakten neuen
+  Rohnamen und passende beobachtbare Quellattribute. Aufgelöste eigene Aliase
+  bleiben blockiert; unklare Abschlüsse stoppen den Rest ohne Wiederholung.
+
+- SFTP-Baumdownloads prüfen auch rekursiv ausgelassene Namensgruppen an
+  Dateiöffnung, Streamende und vor dem lokalen Commit frisch. Eine Änderung
+  ausschließlich am ausgelassenen Kind stoppt damit weitere Kopien bereits vor
+  dem nächsten Commit, während schon abgeschlossene Kopien erhalten bleiben.
+
+- Die ZIP-Entpackvorbereitung liest vorhandene Ziel-Elternbestände nur einmal
+  und indexiert deren Namensgruppen, statt sie für jeden Archiveintrag erneut
+  vollständig zu durchsuchen. Speicherbudget, Abbruch sowie frische Ziel- und
+  Commitprüfungen bleiben erhalten.
+
+- Die ZIP-Erzeugung lässt Doppelpunktnamen und betroffene Teilbäume bereits in
+  der Vorschau sichtbar aus. Eigene Archive enthalten dadurch keine Namen mehr,
+  die der gemeinsame Archivleser als unsicheren Pfad ablehnt; unabhängige Inhalte
+  bleiben packbar und wieder entpackbar.
+
+- Reine Case-/Unicode-Schreibweisenänderungen im SMB-Stapel verwenden einen
+  einzelnen serverseitigen No-Replace-Versuch und prüfen gespeicherte Rohnamen
+  samt FileID exakt. Echte Aliasgruppen, Serververweigerungen und unklare
+  Antworten bleiben sichtbar; es gibt keinen Retry oder überschreibenden Ersatz.
+
+- Ganze entfernte ZIP-Momentaufnahmen, einzelne reguläre Dateien und geöffnete
+  virtuelle Unterbäume lassen sich in die lokale Gegenpane entpacken. Die
+  Auswahl bleibt an Archivwurzel beziehungsweise geöffneten Ordner gebunden.
+  Die Queue hält eine pfadfreie Referenz und
+  prüft genau diese Aufnahme erneut; eine fehlende oder veränderte Quelle löst
+  keinen neuen Serverdownload aus. Herkunft und Cachegrenze bleiben sichtbar.
+  Entfernte Ziele bleiben gesperrt.
+
+- Lokale Stapelumbenennungen führen auch geschlossene Namenszyklen ab drei
+  Einträgen über mehrere atomare Austausche aus. Abbruch und Fehler zeigen eine
+  eigene Teilbilanz mit zuletzt bestätigtem Namen. Es gibt keinen temporären
+  Namen, automatischen Rücktausch oder Wiederaufnahme nach Prozessende.
+
+- Lokales Stapelumbenennen kann reine Case-/Unicode-Schreibweisenänderungen
+  atomar ohne Ersetzen versuchen. Ein gemeinsamer abschließender Namensscan
+  bestätigt die tatsächlich gespeicherte Schreibweise und Identität; fremde
+  Aliasnamen, Dateisystemverweigerungen und unklare Ausgänge bleiben sichtbar.
+  Es gibt keinen temporären Namen, Retry oder überschreibenden Ersatzweg.
+
+- Lokale Stapelumbenennungen führen exakte Zweierzyklen als einen atomaren
+  Namenstausch aus. Beide Quellen werden gemeinsam geprüft und beide Ergebnisse
+  zurückgelesen; mögliche Wirkung mit Fehler wird für beide Zeilen als unklar
+  bilanziert. Es gibt keinen temporären Namen, Retry oder automatischen Rücktausch.
+
+- Entfernte ZIP-Dateien lassen sich über geprüfte lokale Momentaufnahmen im
+  Archivbrowser lesen und passiv betrachten. Die Ansicht zeigt ihre Herkunft und
+  lässt sich bereits beim vollständigen Download abbrechen. Aktive Reader halten
+  die Aufnahme auch während laufender Inhaltsworker vor der Cachebereinigung
+  geschützt.
+
+- SFTP-, FTP-/FTPS-, WebDAV- und SMB-Stapelumbenennungen führen gültige azyklische Ketten aus.
+  Vorschau und Nummerierung behalten ihre Auswahlreihenfolge; nur bestätigte
+  Umbenennungen geben abhängige Namen frei. Providerabhängige Stop- und
+  Elternbelege bleiben erhalten, unklare Wirkungen werden nicht wiederholt.
+
+- Additive SMB-Downloads lassen ganze Case-/Unicode-Namensgruppen aus und binden
+  Quelle, ausgelassene Mitglieder und Queue-Neustart an den beobachteten Umfang.
+  Dateifakten werden am geöffneten Handle vor dem Lesen und nach tatsächlichem
+  EOF geprüft; fehlende Dateisystem-IDs bleiben sichtbar attributgebunden.
+
+- Additive WebDAV-Downloads lassen ganze Case-/Unicode-Namensgruppen aus.
+  Vorbereitete starke ETags autorisieren den GET; Quell-/Auslassungsbelege,
+  Streamabschluss und Queue-Neustart bleiben an den bestätigten Umfang gebunden.
+  FTP-/WebDAV-Downloads halten nach Möglichkeit einen dauerhaften lokalen Tempindex;
+  fehlt dessen privater Ablageort, bleiben Kopien mit konkretem Recoveryhinweis möglich.
+  Der Abschluss zeigt Recovery- und Metadatengrenzen als deduplizierte Zielhinweise.
+
+- Additive FTP-/FTPS-Downloads lassen ganze Case-/Unicode-Namensgruppen aus und
+  übertragen unabhängige Inhalte. Vollständige MLSD-Fakten binden auch ausgelassene
+  Mitglieder; Queue-Neustart verlangt bei geändertem Umfang erneut Zustimmung.
+  Frische Quellenprüfungen und geprüfter RETR-Abschluss schützen den lokalen Commit.
+
+- Die Queue akzeptiert bestätigte Namensgruppenauslassungen additiver lokaler
+  SMB-Kopien auch beim Einreihen und nach Neustart. Zuvor lehnte die
+  Journalvalidierung diese bereits vorbereitete Quellenklasse ab.
+
+- Lokales Stapelumbenennen führt azyklische Namensketten in der nötigen Reihenfolge
+  aus. Vorschau und Nummerierung bleiben unverändert geordnet; Fehler oder unklare
+  Ergebnisse sperren abhängige Zeilen, unabhängige Zeilen bleiben ausführbar.
+
+- Additive lokale Kopien nach SMB lassen mehrdeutige Case-/Unicode-Namensgruppen
+  vollständig aus. Unabhängige Inhalte bleiben übertragbar; ausgelassene
+  Mitglieder bleiben auch zwischen einzelnen Transfers driftgebunden.
+
+- Additive Kopien lokaler Dateien und Ordner nach FTP/FTPS lassen mehrdeutige
+  Case-/Unicode-Namensgruppen vollständig aus und übertragen unabhängige Inhalte.
+  Ausgelassene Mitglieder bleiben an die Quellbelege gebunden; neue Gruppen nach
+  Queue-Neustart verlangen eine frische Umfangsbestätigung vor jeder Zielwirkung.
+
+- Stapelumbenennen kann auf ausdrücklichen Wunsch gewöhnliche äußere Leerzeichen
+  im ursprünglichen Namen entfernen. Die Option ist standardmäßig aus; bestehende
+  Ziele und mehrdeutige Ergebnisgruppen bleiben geschützt, unabhängige Zeilen
+  ausführbar. Dateiendung, Präfix/Suffix und Nummerierung folgen danach.
+
+- Stapelumbenennen ergänzt optionale Nummern vor oder nach dem Namen mit Start,
+  Schritt und Mindeststellen. Die sichtbare Auswahlreihenfolge bleibt für die
+  gesamte Vorschau fest; blockierte Zeilen verbrauchen ihre Nummer. Lange
+  Providerhinweise lassen sich aufklappen, die Ergebniszeilen erhalten sichtbar
+  den Fokus. Der SMB-Hinweis beschreibt jetzt ausdrücklich den Rename-Zielschutz.
+
+- Stapelumbenennen unterstützt HTTPS-WebDAV mit bedingten Einzel-MOVEs und
+  vollständiger Teilbilanz. Eigene Collection-ETag-Änderungen werden nur bei exakt
+  belegter Namensänderung übernommen; fremde Änderungen stoppen den Rest.
+  Fehlende starke Kindbelege verhindern den Lauf vor der ersten Wirkung.
+
+- Stapelumbenennen unterstützt auch Klartext-FTP und FTPS. Die gehaltene Sitzung
+  und beobachtbare Quell-/Elternbelege gelten vor jeder Zeile; nach unklarem
+  Ausgang oder Drift stoppt der Rest ohne Reconnect oder mutierenden Retry.
+  Die Vorschau benennt Best Effort und dessen Pfad-/Kollisionsgrenzen.
+
+- Stapelumbenennen unterstützt SMB-Dateien und -Ordner über dieselbe Remote-
+  Ausführung wie SFTP. SMB schützt bestehende Ziele per No-Replace und stoppt bei
+  Bindungsverlust oder unklarem Ausgang; Quellbelege versprechen keine
+  unveränderten Inhalte. Rücklesefehler nach erfolgreichem SMB-Rename werden
+  ausdrücklich als unklar bilanziert.
+
+- Stapelumbenennen unterstützt SFTP-Dateien und -Ordner im selben Pane-Ordner
+  mit sichtbarer Best-Effort-Klasse. Profil-, Sitzungs- und Quelländerungen sowie
+  unklare Ausgänge stoppen den Rest ohne automatische Wiederholung; klare
+  Kollisionen lassen unabhängige Zeilen weiterlaufen.
+
+- Lokale ZIP-Erstellung bietet Deflate oder Stored, eine konkrete Inhalts- und
+  Metadatenvorschau und Ausführung über die Fensterqueue. Quellen werden ohne
+  vollständigen Vorhash gebunden; Drift verlangt neue Zustimmung, unklare
+  Ausgänge bleiben zur Prüfung erhalten.
+- Ein budgetierter ZIP-Lesekern erhält exakte Namen und doppelte Einträge und
+  prüft Inhaltsstreams vor dem Erfolgsbeleg. Die lokale Archivansicht bietet
+  virtuelle Ordner, Seiten, Problemzeilen und passive Text-/Bildvorschau;
+  einzelne Vorschauen sind unabhängig von der Sitzung abbrechbar.
+- Ganze lokale ZIP-Archive, einzelne gewählte Dateien oder geöffnete virtuelle
+  Unterordner lassen sich in den Ordner der anderen Pane entpacken.
+  Vorhandene Ordner werden zusammengeführt und reguläre Dateikonflikte konkret
+  entschieden. Inhaltsprüfung vor Commit, fenstergebundene Queue und persistente
+  Teilbilanz verhindern ungeprüfte Enddateien und blinde Wiederholung nach
+  Teilwirkungen. Mehrdeutige Archivnamen und nicht ausführbare Einträge bleiben
+  pfadgenaue Auslassungen; Teilkataloge brauchen eine ausdrückliche Teilaktion.
+
+- Lokales Duplizieren zeigt freie Kopienamen für Dateien und Ordner und führt
+  die bestätigte Zuordnung über die bestehende Fensterqueue aus. Abbruch und
+  Fensterschließen geben vorbereitete Zugriffe frei.
+- Lokale Stapelumbenennung bietet wörtliches Suchen/Ersetzen, Präfix und Suffix
+  mit geschützter letzter Dateiendung. Die Vorschau zeigt Kollisionen; die
+  Ausführung bilanziert jede Zeile einschließlich Abbruch und unklarer Ausgänge.
+- Abbrechbare rekursive Namenssuche mit sichtbaren Teilbilanzen, Fehlerdetails
+  und Navigation zum Trefferordner. Suche und Schnellfilter finden kanonisch
+  gleichwertige Unicode-Schreibweisen, ohne Aktionsnamen zu verändern.
+- F3 öffnet eine integrierte passive Vorschau für lokale und entfernte
+  UTF-8-Texte sowie statische PNG-/JPEG-Bilder. Ressourcenlimits werden vor
+  dem Download geprüft; ungeeignete Inhalte erhalten eine System-App-Alternative.
+
+- Lokale WebDAV-Baumkopien und direkte Mehrfachauswahlen lassen möglicherweise
+  gleichwertige Case-/Unicode-Namensgruppen pfadgenau aus. Unabhängige Dateien bleiben übertragbar;
+  ausgelassene Teilbäume bleiben erhalten und Änderungen verlangen neue Zustimmung.
+- Additive SFTP-Baumdownloads und direkte Mehrfachauswahlen lassen ebenfalls
+  ganze Case-/NFC-Namensgruppen aus und übertragen unabhängige Inhalte.
+  Vollständige Listing- und direkte Attributbelege erkennen weiterhin Änderungen
+  ausgelassener Gruppen; die Ordnergröße zählt alle Namen.
+
+- Endgültiges WebDAV-Löschen bleibt an die bestätigte Blattversion gebunden,
+  auch wenn sie sich erst zwischen letzter Prüfung und DELETE ändert.
+  Große Remote-Löschungen zeigen Umfang, fehlende Wiederherstellung und
+  Providergrenzen vor der zusätzlichen Phraseneingabe.
+- SFTP-Ersetzungen erklären den möglichen Verlust des Altziels ohne POSIX-Rename.
+  Interaktive Downloads prüfen die vollständigen Leseattribute vor READ und am
+  Ende; erkannte Drift beendet den Stream ohne automatische Wiederholung.
+  Originalformat-Snapshots unterstützen lange Dateiendungen.
+- Bidirektionale CLI-Läufe zeigen vor der Zustimmung beide Richtungen mit
+  Kopien, Ersetzungen, Quarantäneentfernungen und rekursiven Mengenwarnungen.
+  Die JSON-Vorschau enthält dieselbe Wirkungsbilanz.
+- Jede Pane besitzt einen Schnellfilter für Name/Endung und Dateityp mit
+  sichtbarer Trefferzahl. Escape leert den Filter; Dateiaktionen verwenden nur
+  sichtbare ausgewählte Einträge. Die bereits geladene Liste bleibt virtualisiert.
+
+- Gewöhnliche FTPS-, WebDAV- und SMB-Aktionen können reguläre Dateien ersetzen
+  und vollständige Auswahlen dauerhaft löschen. Künstliche Fähigkeitsproben
+  entfallen vor normalen Dateiaktionen; konkrete Best-Effort-Grenzen bleiben sichtbar.
+- Standardsnapshots lesen Remoteinhalte einmal mit Streaminghash. Lokale
+  WebDAV-Uploadquellen werden während des Transfers gehasht und halten nur die
+  aktuelle Datei offen. Starre Datei-, Auswahl-, Baumgrößen-, Tiefen- und
+  Vorbereitungszeitgrenzen der alten Inhaltsklasse entfallen.
+- Sync ersetzt feste Mengen- und Git-/HOME-Sperren durch konkrete Warnungen und
+  Wirkungsbestätigung. Bewusst leere Mirror-Quellen sind möglich; vollständige
+  Scans und Quarantäne bleiben erforderlich. HOME verwendet einen reservierten,
+  auf beiden Syncseiten ausgeschlossenen Quarantäneordner.
+- Remote-Konflikte zeigen nachladende Optionen in einem Dialog. Routine-Syncs und
+  gewöhnliches endgültiges Remote-Löschen benötigen keine Laufphrase. Große
+  endgültige Löschungen und Quarantäneleeren behalten ihre stärkere Bestätigung.
+- Remote-Dateien können im Originalformat geöffnet, passiv angesehen und in einer
+  externen Anwendung bearbeitet werden. Explizites Zurückspeichern verwendet
+  frische Original- und Konfliktbelege sowie die normale Fensterqueue.
+
+- Gewöhnliche SFTP-Aktionen ermöglichen Uploads und Baumkopien, Ordneranlage,
+  Umbenennen, Verschieben, bestätigtes Ersetzen und dauerhaftes Löschen. Sie
+  verwenden Standard-SFTP mit frischen Pfad- und Ergebnisprüfungen; die verbleibende
+  serverseitige Elternpfadumleitung ist ausdrücklich akzeptiertes Best Effort.
+  Moves innerhalb derselben Sitzung nutzen einen Server-Rename ohne Inhaltstransfer.
+  Fehlendes fsync und fehlende Quarantäne sperren diese Alltagsaktionen nicht.
+- Fehler bei Remote-Löschungen erhalten Wiederherstellungspfade auch im Audit.
+  Snapshot- und Vergleichspfade sowie CLI-Argumente werden vor Verbindung,
+  Secretzugriff oder Queueanlage geprüft. Während des Lesens gewachsene
+  Favoritendateien erhalten ihre Größenprüfung vor einer Korruptionssicherung.
+- FTPS prüft standardmäßig öffentliche Zertifikatskette, Gültigkeit und Servernamen
+  ohne dauerhaften Zertifikat-Pin. Gültige Erneuerungen sperren neue Verbindungen
+  nicht mehr. Bestehende Pin-Modi bleiben erhalten; der Verbindungseditor bietet
+  öffentliche Prüfung und ausdrückliches Erneuern eines gespeicherten Pins an.
+- Produktbeschreibung und Roadmap stellen komfortable, umfassende und effiziente
+  Dateiarbeit in den Vordergrund. Normale Dateiaktionen haben keine allgemeine
+  Vorschaupflicht. Ein Produktaudit benennt verbliebene Funktions- und Prüfkosten.
+
 ## [0.1.124] - 2026-10-19
 
 - Die beim Öffnen geplante Sync-Vorschau entwertet keinen gerade begonnenen

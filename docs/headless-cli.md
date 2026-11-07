@@ -60,7 +60,9 @@ Eine zweite Zeile wie `url ipv6: 2001:db8::1` wird als alternative Route
 übernommen. Ist sie während des Imports erreichbar, müssen SFTP-Hostkey
 beziehungsweise FTPS-Zertifikatspin zur Hauptroute passen. Ist etwa IPv6 gerade
 nicht geroutet, bleibt die ausdrücklich gelieferte Adresse dennoch gespeichert; vor
-einer späteren Anmeldung erzwingt der Provider denselben Pin. Für ausdrücklich
+einer späteren Anmeldung prüft der Provider die gewählte Identität. Öffentliche
+FTPS-Profile prüfen dabei weiterhin den primären Servernamen, auch wenn die
+Verbindung über eine alternative Netzwerkadresse aufgebaut wird. Für ausdrücklich
 gewähltes Klartext-FTP kann keine kryptografische Routengleichheit behauptet werden.
 Ein explizites `sftp://` wählt SFTP, `ftps://` explizites FTPS mit `AUTH TLS` und
 privatem Datenkanal und `ftp://` bewusst unverschlüsseltes FTP. Ohne Schema wird
@@ -68,7 +70,11 @@ zuerst SFTP und danach FTPS geprüft; Klartext ist niemals ein stiller Fallback.
 Automatisch erkanntes SFTP wird nur importiert, wenn der entdeckte Schlüssel bereits
 in OpenSSHs `known_hosts` gebunden ist.
 
-Vor dem Speichern werden Anmeldung und vollständiges Root-Listing geprüft. Eine
+Vor dem Speichern werden Anmeldung und vollständiges Root-Listing geprüft.
+Öffentlich gültige FTPS-Verbindungen werden ohne dauerhaften Zertifikat-Pin als
+`web_pki` gespeichert; Zertifikatskette, Gültigkeit und Servername werden bei jeder
+neuen Verbindung geprüft. Eine reguläre gültige Erneuerung braucht keinen neuen Pin.
+Eine
 fehlende öffentliche Zertifikats-/Namensprüfung darf FTPS sichtbar als
 `tls_identity_unverified` importieren; TLS und der beobachtete Zertifikatspin bleiben
 aktiv. `ftp://` wird als `plaintext` importiert. Erst danach landet das Passwort im
@@ -163,10 +169,11 @@ legen. Das direkt gebaute beziehungsweise installierte CLI setzt die Repo-Sperre
 nicht selbst und verwendet ohne diese Optionen weiterhin die normalen App-Pfade.
 
 Der Prozess führt Mount- und Root-Identität, vollständige Listings, Planbindung,
-Platzprüfung und Restore-Probe aus. Danach zeigt er eine zufällige Phrase. Nur die
-exakt über stdin zurückgegebene Phrase erzeugt das einmalige, zehn Minuten gültige
-Permit im selben Prozess. `update` und `mirror` verlangen zusätzlich die Zeile
-`BACKUP UND RESTORE BESTÄTIGT`. Der Kern erzwingt für beide Modi `content`.
+Platzprüfung und erforderliche Restore-Probe aus. Nach der sichtbaren
+Wirkungsbilanz bestätigt die Zeile `ja` den Lauf. Zufallsphrase und behauptete
+externe Backup-/Restorebestätigung sind keine Routinevoraussetzung mehr.
+Der Kern erzwingt für Update und Mirror weiterhin `content`; Quarantäne,
+frische Planbindung und einmaliges Zehn-Minuten-Permit bleiben erhalten.
 
 `Ctrl-C` setzt das gemeinsame Abbruchsignal. Der Lauf beendet die aktuelle sichere
 Grenze, schreibt seinen Audit-Abschluss und liefert Exitcode 130. Fehler liefern 2.
@@ -189,10 +196,9 @@ Ein Realmodus-Controller:
 
 1. startet `doppeldecker-cli --json real …` mit Pipes,
 2. liest `preparing` und `real_preview`,
-3. prüft die Vorschau und schreibt `preview.confirmation_phrase` mit Zeilenende auf
-   stdin,
-4. schreibt bei gefordertem Backup-Gate die zweite Bestätigungszeile,
-5. liest `progress` und abschließend `result` oder `error`.
+3. prüft die Vorschau und schreibt nach der Wirkungsentscheidung `ja` mit
+   Zeilenende auf stdin,
+4. liest `progress` und abschließend `result` oder `error`.
 
 Für den Provider-Sync gilt dieselbe Abfolge mit den Ereignissen
 `provider_sync_preparing`, `provider_sync_preview`, `progress` und
@@ -200,8 +206,7 @@ Für den Provider-Sync gilt dieselbe Abfolge mit den Ereignissen
 Root-, Identitäts-, Capability-, Listing- oder Planbeleg von der Vorschau ab, liefert
 das CLI `plan_drift`; der Controller muss neu vorbereiten und erneut bestätigen
 lassen. Scheitert schon die erneute Prüfung selbst, bleibt deren konkreter Code wie
-`not_found`, `connection_lost` oder `invalid_data` erhalten. Eine falsche Lauf- oder
-Backup-Bestätigung liefert `confirmation_mismatch`. Diese Fehler beenden den Prozess
+`not_found`, `connection_lost` oder `invalid_data` erhalten. Eine fehlende oder abgelehnte Wirkungsbestätigung liefert `confirmation_mismatch`. Diese Fehler beenden den Prozess
 mit Exitcode 2 und mutieren weder Ziel noch Audit.
 
 `sync`, `copy` und `move` prüfen beide gespeicherten Endpunktkonfigurationen vor
@@ -238,18 +243,16 @@ die bisherigen `rename`-Details behalten ihre strengeren Probeanforderungen.
 Bei `outcome_unclear` alten und neuen Namen prüfen und nicht blind wiederholen.
 
 Die [aktuelle Fähigkeitsmatrix](function-audit.md) gilt auch für alle CLI-Befehle:
-SFTP bietet `list` und additive lokale Datei- und Baumdownloads über `copy` als
-sichtbar pfadbasiertes Best Effort. Die Grenze beträgt 100 direkte Auswahlen,
-8 GiB je Datei sowie bei Bäumen 1000 Einträge, 16 Unterordnerebenen und 16 GiB.
-Ersetzen, Move und Remote-Mutationen
-bleiben gesperrt; [Lesebelege und Restrisiko](sftp-contents.md) gelten unverändert.
-Baumvorschauen liefern `source_tree` mit Digest, Eintrags-/Datei-/Ordnerzahlen,
-Bytes und pfadbezogenen Auslassungen. Eine spätere Abweichung erzeugt dieselbe
-`SourceTreeChanged`-Bestätigung wie in der GUI; der Aufruf behauptet keine strikte
-SFTP-Listingfähigkeit.
-SMB-Zielersetzungen, Update/Mirror und Quarantäne-Restore/Purge bleiben ohne identitätsgebundene Primitive gesperrt. Beispiele mit
-Remote-Profilen setzen ein bewusst angelegtes Profil und einen künstlichen oder
-ausdrücklich gewählten Root voraus.
+SFTP bietet Listing, Datei-/Baumkopien, Upload, mkdir, Rename, Move, bestätigtes
+Ersetzen und dauerhaftes Löschen als pfadbasiertes Best Effort. Feste Datei-,
+Auswahl-, Baumgrößen- und Tiefenlimits sowie die pauschale Vorbereitungsfrist der
+alten Leseklasse sind entfernt. Ressourcen-/Parser- und Requestgrenzen bleiben
+sichtbar. [Lesevertrag](sftp-contents.md), [Schreibvertrag](sftp-writes.md).
+Baumvorschauen liefern `source_tree` mit Digest, Zahlen und pfadbezogenen
+Auslassungen. Spätere Abweichungen erfordern dieselbe neue Wirkungsentscheidung
+wie in der GUI. FTPS, WebDAV und SMB bieten gewöhnliches reguläres Ersetzen und
+Dauerlöschen ohne künstliche Fähigkeitsproben; strikter Ziel-Sync und
+Quarantäne-Restore/Purge behalten ihre eigenen Einschränkungen.
 
 Ohne `--config-dir` verwendet das CLI denselben plattformüblichen
 `com.doppeldecker.desktop`-Konfigurationsordner wie die App. Ein abweichender
@@ -286,11 +289,11 @@ doppeldecker-cli capabilities --provider ftps --profile server --root /isoliert
 gestreamt; es gibt keinen lokalen Klartext-Spool. `copy` und `move` verwenden denselben
 `ProviderFile`-Queue-Executor wie F5/F6 in der GUI. Ohne Option stoppen vorhandene
 Ziele mit `already_exists`; `--skip-conflicts` führt vorhandene Ordner zusammen und
-überspringt nur kollidierende Blätter. `--replace` verwendet nach echter
-Quarantäne-/Restore-Probe die Phrase `ERSETZEN`; FTPS/WebDAV dürfen eine zuvor
-geprüfte reguläre Datei stattdessen sichtbar irreversibel als Best Effort ersetzen
-und verlangen dann `DAUERHAFT ERSETZEN`. Die exakte ausgegebene Phrase kommt über
-stdin. `move` verlangt zusätzlich seine eigene Quellphrase. Bei bewiesenem
+überspringt nur kollidierende Blätter. `--replace` ist die ausdrückliche
+Ersetzungsentscheidung; `move` bestätigt die Kopie samt anschließender
+Quellentfernung. Die konkrete Klasse und fehlende Wiederherstellung bleiben im
+`file_preview` und auf stderr sichtbar. Zusätzliche Routinephrasen entfallen.
+Bei bewiesenem
 No-Replace-Commit stoppt eine späte Kollision weiterhin, statt ein inzwischen
 entstandenes Ziel zu ersetzen; in der Best-Effort-Klasse (nächster Absatz) trägt
 diese Garantie allein die frische Bestandsprüfung — das verbleibende Fenster
@@ -346,7 +349,7 @@ automatische Remote-Löschung. [FTPS-Intentvertrag](ftps-stou-transport.md#wirku
 
 `sync` steuert denselben normalen Einweg-Provider-Sync wie
 `prepare_provider_sync` in der App. Quelle und Ziel dürfen lokal oder gespeicherte
-Remote-Endpunkte sein. Vorschau, zufällige Laufphrase, optionales Backup-Gate,
+Remote-Endpunkte sein. Vorschau, wirkungsbezogene Zustimmung,
 Fortschritt, Quarantäne und append-only Audit bleiben im selben Prozess gebunden.
 
 Remote-Löschen ist ein eigener gebundener Vollscan:
@@ -357,12 +360,12 @@ doppeldecker-cli delete --provider webdav --profile labor --root /isoliert \
 ```
 
 `quarantine` ist nur verfügbar, wenn Parken, Manifest, Restore und Readback bewiesen
-sind. `permanent` erscheint nur nach einer getrennten Datei-/Leerordner-Löschprobe und
-verlangt die exakte Phrase `DAUERHAFT LÖSCHEN …`. Es gibt in keiner Richtung einen
-stillen Fallback zwischen beiden Wirkungen. Derzeit bietet nur WebDAV den
-ETag-bedingten endgültigen Weg an. FTPS, SFTP und SMB geben `delete` weder als
-Quarantäne noch als Dauerlöschen frei. Das gewöhnliche, begrenzte Entfernen einer
-vollständig kopierten Move-Quelle ist ein eigener Best-Effort-Vertrag.
+sind. `--mode permanent` bestätigt die irreversible Wirkung ohne Papierkorb.
+Auswahl, vollständiger Rekursionsplan und Ergebnis werden frisch geprüft; es gibt
+keinen mutierenden Blind-Retry. Alle vier Remoteprovider besitzen diesen normalen
+Best-Effort-Weg. Erst mehr als 1000 Einträge oder 10 GiB verlangen zusätzlich die
+exakte ausgegebene Löschphrase. Zwischen Quarantäne und dauerhaftem Löschen gibt
+es keinen stillen Fallback.
 
 Lokale Einträge verwenden stattdessen denselben descriptor-relativen Systempapierkorb
 mit Crash-Journal wie die GUI:
@@ -417,13 +420,27 @@ doppeldecker-cli bidirectional rollback --pair-name Arbeitsdaten \
 ```
 
 `run` verwendet dieselben Argumente wie `plan`. `plan` verwirft sein mutationsloses
-Laufjournal nach der Vorschau. `run`, `resume`
-und `rollback` halten Root-Handles, Journal-Lock und zufällige Phrase im selben
-Prozess. Konfliktentscheidungen können als reguläre JSON-Datei mit höchstens 16 MiB
+Laufjournal nach der Vorschau. Text- und JSON-Vorschau bilanzieren beide Richtungen
+mit Additionen, Ersetzungen und rekursiv gezählten Quarantäneentfernungen samt
+Bytes, Anteilen und einer gegebenenfalls leeren Quelle. Der Textmodus nennt auch
+die konkreten Wirkungspfade vor der Zustimmung. Resume beschreibt den gebundenen
+Gesamtplan und führt ausschließlich noch offene Projektionen aus. `run`, `resume`
+und `rollback` halten Root-Handles, Journal-Lock und die wirkungsbezogene
+Zustimmung im selben Prozess. Konfliktentscheidungen können als reguläre JSON-Datei mit höchstens 16 MiB
 über `--resolutions` übergeben werden. Der Leser folgt keinem finalen Symlink und
 prüft Typ und Größe am geöffneten Handle. Ein nach der ersten Pfadprüfung
 eingewechselter FIFO blockiert nicht; Wachstum bleibt auch während des Lesens
-begrenzt. Ein Resume-Journal wird weder bei falscher Phrase
+begrenzt. Ein Resume-Journal wird weder bei abgelehnter Wirkung
 noch bei einem abgelehnten Scan verworfen. JSONL verwendet die Events
 `bidirectional_preview`, `bidirectional_result`,
 `bidirectional_rollback_preview` und `bidirectional_rollback_result`.
+
+Neue echte Läufe besitzen einen persistenten Strict-Queueeintrag. Dessen
+Operations-ID ist vor der ersten Dateiaktion an alle Unterprojektionen gebunden.
+Ergebnisereignisse nennen `operation_id` und erhaltene `recovery_paths`;
+der Textmodus zeigt diese Pfade ebenfalls an. Resume und Rollback schließen
+den zugehörigen Queueeintrag ab, bevor der Coreabschlussmarker entfernt wird.
+Frühere direkte Laufjournale ohne Queueeintrag behalten ihren getrennten
+strikten Recoveryweg. Ist die Datenwirkung bereits vollständig belegt, führt
+Resume oder Rollback ausschließlich den offenen Journalabschluss aus und meldet
+`bidirectional_completion_result`.

@@ -1,6 +1,7 @@
 # Goal: Mehrere Fenster
 
-Stand: 2026-08-06. Verbindliche Produktanforderung: Mehrere gleichzeitig nutzbare Fenster sind eine Grundvoraussetzung des
+Stand: 2026-08-06. Von Daniel am 2026-08-03 als verbindliche Produktanforderung
+gesetzt: Mehrere gleichzeitig nutzbare Fenster sind eine Grundvoraussetzung des
 Dual-Pane-Dateimanagers. Die Produkt- und Sicherheitsentscheidungen wurden am
 2026-08-06 konkretisiert und sind unten verbindlich festgehalten.
 

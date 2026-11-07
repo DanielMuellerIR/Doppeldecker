@@ -1,4 +1,26 @@
-# Grenze des bestätigten WebDAV-Dateiersetzens
+# WebDAV-Ersetzen: Best Effort und atomare Grenze
+
+Stand: 2026-10-20. Gewöhnliche reguläre Dateien können ausdrücklich als dauerhaftes
+Best Effort ersetzt werden. Der Upload erzeugt eine echte bedingte Tempdatei;
+MOVE verwendet `If-Match` für deren Version, `Overwrite: T` und genau eine
+getaggte If-Liste mit der bestätigten Altziel-ETag. Eine späte Zieländerung lehnt
+der Server damit ab. Zusätzliche getaggte Elternlisten werden nicht gesendet,
+weil sie die Altzielbedingung durch ODER abschwächen würden.
+
+Die vollständige Elternkette wird unmittelbar vor und nach der Wirkung geprüft.
+Sie ist nicht atomar an das MOVE gebunden. Eine gleichzeitige Vorfahrenumleitung
+kann deshalb ein anderes Objekt treffen, bevor der Readback den Ausgang als
+unklar meldet. Dieses Restrisiko ist Teil der normalen Best-Effort-Klasse;
+Quarantäne und Wiederherstellung werden nicht behauptet. Nach Antwortverlust
+erfolgt kein zweiter MOVE. Ein persistiertes `overwrite` ersetzt weder frische
+Konfliktbelege noch die aktuelle Best-Effort-Erwartung.
+
+[Der aktuelle Uploadvertrag](webdav-upload.md) beschreibt Ausführung und Tests.
+Der folgende Gegenbeleg erklärt weiter gültig, warum mehrere getaggte Listen keine
+vollständige atomare Elternbindung ergeben. Seine frühere allgemeine Absage
+gewöhnlichen Ersetzens wurde durch die getrennte schwächere Klasse ersetzt.
+
+## Historische Tragfähigkeitsprüfung vom 2026-10-18
 
 Stand: 2026-10-18. Die Tragfähigkeitsprüfung für gewöhnliches Ersetzen direkter
 lokaler regulärer Dateien ist negativ. Es gibt keine neue Ersetzungsfreigabe ohne

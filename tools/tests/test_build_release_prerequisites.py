@@ -24,6 +24,36 @@ class BuildReleasePrerequisitesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = load_build_release()
 
+    def test_linux_sidecars_enthalten_einen_ausfuehrbaren_helfer_ohne_codesign(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = "x86_64-unknown-linux-gnu"
+            release = root / "target" / target / "release"
+            release.mkdir(parents=True)
+            (release / "doppeldecker-cli").write_bytes(b"cli")
+            (release / "doppeldecker-metadata-helper").write_bytes(b"helper")
+            with (
+                mock.patch.object(self.module, "ROOT", root),
+                mock.patch.object(self.module, "rust_target_triple", return_value=target),
+                mock.patch.object(self.module.subprocess, "run") as run,
+            ):
+                self.module.prepare_cli_sidecar({})
+            self.assertEqual(run.call_count, 1)
+            helper = root / "target/sidecars" / f"doppeldecker-metadata-helper-{target}"
+            self.assertEqual(helper.read_bytes(), b"helper")
+            self.assertEqual(helper.stat().st_mode & 0o111, 0o111)
+
+    def test_linux_local_baut_ohne_zugriff_auf_den_signierschluessel(self):
+        with (
+            mock.patch.object(self.module.sys, "argv", ["build-release.py", "linux-local"]),
+            mock.patch.object(self.module, "release_environment", return_value={}),
+            mock.patch.object(self.module, "require_updater_signing_key") as require_key,
+            mock.patch.object(self.module, "run_tauri_build") as build,
+        ):
+            self.module.main()
+        require_key.assert_not_called()
+        build.assert_called_once_with("deb,appimage", {}, create_updater_artifacts=False)
+
     def test_tauri_build_installiert_gesperrte_node_abhaengigkeiten_zuerst(self) -> None:
         calls: list[tuple[str, ...]] = []
 

@@ -241,6 +241,9 @@ class UpdateReleaseContractTests(unittest.TestCase):
         commands: list[tuple] = []
         module.install_node_dependencies = lambda environment: None
         module.prepare_cli_sidecar = lambda environment: "../target/sidecars/doppeldecker-cli"
+        module.require_appimage_prerequisites = lambda environment: None
+        finalized = []
+        module.finalize_appimage_runtime = lambda environment: finalized.append(environment)
         signing = {
             "TAURI_SIGNING_PRIVATE_KEY": "geheim",
             "TAURI_SIGNING_PRIVATE_KEY_PASSWORD": "auch-geheim",
@@ -255,12 +258,14 @@ class UpdateReleaseContractTests(unittest.TestCase):
             )
 
         self.assertEqual(len(commands), 2)
+        self.assertEqual(finalized, [signing])
         bundles = []
-        for command in commands:
+        for index, command in enumerate(commands):
             self.assertNotIn("geheim", " ".join(command), "Ein Secret steht in argv")
             override = json.loads(command[command.index("--config") + 1])["bundle"]
             self.assertEqual(
                 override["externalBin"], ["../target/sidecars/doppeldecker-cli"]
+                + (["../target/sidecars/doppeldecker-metadata-helper"] if index == 1 else [])
             )
             bundles.append(override)
         self.assertIs(bundles[0].get("createUpdaterArtifacts"), True)

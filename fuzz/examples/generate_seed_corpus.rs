@@ -7,9 +7,8 @@
 use std::fs;
 use std::path::Path;
 
-use doppeldecker_core::{
-    prepare_local_bidirectional, BaselineStore, Cancel, MetadataManifest, PairId,
-};
+use doppeldecker_core::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue;
+use doppeldecker_core::{BaselineStore, Cancel, MetadataManifest, OperationQueue, PairId};
 use serde::Serialize;
 
 fn write_json(root: &Path, target: &str, value: &impl Serialize) {
@@ -38,12 +37,16 @@ fn main() {
     fs::write(left.join("gleich.txt"), b"Fuzz-Start\n").unwrap();
     fs::write(right.join("gleich.txt"), b"Fuzz-Start\n").unwrap();
     let baseline_path = temp.path().join("state/pair.json");
-    let prepared = prepare_local_bidirectional(
+    let queue = OperationQueue::open(temp.path().join("config/operations-queue.json")).unwrap();
+    let prepared = prepare_local_bidirectional_with_decisions_bound_for_queue(
+        &queue,
         PairId([0x42; 16]),
         "Fuzz-Startpaar",
         &left,
         &right,
         &baseline_path,
+        &[],
+        None,
     )
     .unwrap();
 

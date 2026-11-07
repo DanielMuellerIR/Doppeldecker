@@ -232,6 +232,7 @@ pub(crate) struct DesktopState {
     inner: Mutex<DesktopStore>,
     // Native Icon-Tasks dürfen nie hinter einem Store-fsync auf dem UI-Thread warten.
     current_icon: Mutex<IconChoice>,
+    current_theme: Mutex<Theme>,
     // Vor dem ersten Fensterbau aus der validierten Sitzung gebunden. Der native
     // Geometriepfad darf nie hinter einem Store-fsync oder Settings-Rename warten.
     startup_geometry: Mutex<BTreeMap<String, WindowGeometry>>,
@@ -460,6 +461,7 @@ pub(crate) fn initialize(app: &tauri::AppHandle) -> Result<(), AppError> {
         Err(error) => store.load_error = Some(error),
     }
     *state.current_icon.lock_recover() = store.document.preferences.icon;
+    *state.current_theme.lock_recover() = store.document.preferences.theme;
     Ok(())
 }
 
@@ -542,6 +544,7 @@ fn update_preferences(
     };
     let directory_sync_error = store.commit(next)?;
     *state.current_icon.lock_recover() = store.document.preferences.icon;
+    *state.current_theme.lock_recover() = store.document.preferences.theme;
     Ok((store.snapshot(), directory_sync_error, true))
 }
 
@@ -552,6 +555,67 @@ pub(crate) fn preferences(app: &tauri::AppHandle) -> Preferences {
         .document
         .preferences
         .clone()
+}
+
+#[tauri::command]
+pub(crate) fn sync_native_theme(
+    app: tauri::AppHandle,
+    preference: Theme,
+    dark: bool,
+) -> Result<(), AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        let handle = app.clone();
+        app.run_on_main_thread(move || {
+            let current = *handle.state::<DesktopState>().current_theme.lock_recover();
+            // Ein verspätetes Fenster darf eine inzwischen geänderte globale Wahl
+            // nicht zurücksetzen. Der kurze Cache vermeidet Store-fsync auf GTK.
+            if current != preference {
+                return;
+            }
+            apply_native_theme(dark);
+        })
+        .map_err(|error| AppError::new("window", error.to_string()))?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (app, preference, dark);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_native_theme(dark: bool) {
+    thread_local! {
+        static PROVIDER: std::cell::RefCell<Option<(bool, gtk::CssProvider)>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+    PROVIDER.with(|slot| {
+        let mut previous = slot.borrow_mut();
+        if previous
+            .as_ref()
+            .is_some_and(|(applied, _)| *applied == dark)
+        {
+            return;
+        }
+        let Some(screen) = gtk::gdk::Screen::default() else {
+            return;
+        };
+        let Some(provider) = gtk::CssProvider::named("Adwaita", dark.then_some("dark")) else {
+            return;
+        };
+        if let Some((_, old)) = previous.take() {
+            gtk::StyleContext::remove_provider_for_screen(&screen, &old);
+        }
+        // GTKs Prefer-Dark-Setting verändert auch WebKits System-Mediaquery.
+        // Ein CSS-Provider färbt Menüs einschließlich Popups, ohne „Auto“ nach
+        // einer expliziten Hell-/Dunkelwahl auf diese Wahl zurückzukoppeln.
+        gtk::StyleContext::add_provider_for_screen(
+            &screen,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        *previous = Some((dark, provider));
+    });
 }
 
 pub(crate) fn restore_windows(app: &tauri::AppHandle) -> BTreeMap<String, SavedWindow> {
@@ -782,7 +846,7 @@ pub(crate) fn seed_live_window(app: &tauri::AppHandle, label: &str, saved: Saved
     app.state::<DesktopState>().seed_live_window(label, saved);
 }
 
-/// Setzt das gewählte Icon: unter macOS dauerhaft am Bundle und im Dock, auf Linux das
+/// Setzt das gewählte Icon: unter macOS nur im Dock des laufenden Prozesses, auf Linux das
 /// Icon jedes offenen Fensters. Fenster-Icons gibt es auf macOS nicht — `tao`
 /// implementiert `set_window_icon` dort bewusst als No-op —, deshalb entfällt dort
 /// auch das Dekodieren des PNG je Fenster.
@@ -804,7 +868,7 @@ pub(crate) fn apply_icon(app: &tauri::AppHandle) -> Result<(), AppError> {
             apply_current_icon(&handle.state::<DesktopState>(), |choice| {
                 use objc2::{AllocAnyThread, MainThreadMarker};
                 use objc2_app_kit::{NSApplication, NSImage};
-                use objc2_foundation::{NSBundle, NSData};
+                use objc2_foundation::NSData;
                 // Die Closure läuft asynchron auf dem Hauptthread und kann kein
                 // Ergebnis an den Command zurückgeben. Ein Fehlschlag bleibt deshalb
                 // wenigstens im geheimnisfreien Fehlerlog nachvollziehbar.
@@ -822,23 +886,9 @@ pub(crate) fn apply_icon(app: &tauri::AppHandle) -> Result<(), AppError> {
                         crate::app_support::record_app_error(&handle, "Fenstericon", Some("image"));
                     return;
                 };
-                // Nach Prozessende liest das Dock wieder das Findericon des Bundles.
-                // NSWorkspace setzt dafür Custom-Icon-Metadaten, ohne signierte
-                // Ressourcen in Contents zu ersetzen. Nackte Entwicklungsbinaries
-                // besitzen kein App-Bundle und dürfen ihren Ordner nicht verändern.
-                let bundle_path = NSBundle::mainBundle().bundlePath();
-                if std::path::Path::new(&bundle_path.to_string())
-                    .extension()
-                    .is_some_and(|extension| extension == "app")
-                {
-                    if let Err(error) = set_bundle_icon(&bundle_path, &image) {
-                        let _ = crate::app_support::record_app_error(
-                            &handle,
-                            "Fenstericon",
-                            Some(&error.code),
-                        );
-                    }
-                }
+                // Finder-Custom-Icons erzeugen ResourceFork-/FinderInfo-Metadaten am
+                // App-Bundle und verletzen dessen strikte Signaturprüfung. Nur das
+                // Laufzeiticon setzen; die Wahl selbst bleibt in den Einstellungen.
                 unsafe {
                     NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image));
                 }
@@ -851,31 +901,11 @@ pub(crate) fn apply_icon(app: &tauri::AppHandle) -> Result<(), AppError> {
 
 /// Erst im seriellen Hauptthread-Task lesen: Ein älterer Command kann seinen Task
 /// erst nach einem neueren zustellen. Ein Revisionsvergleich vor dem Zustellen
-/// schützt deshalb weder das Laufzeiticon noch das dauerhaft gesetzte Bundleicon.
+/// schützt deshalb das Laufzeiticon nicht vor einer veralteten Auswahl.
 #[cfg(any(target_os = "macos", test))]
 fn apply_current_icon(state: &DesktopState, apply: impl FnOnce(IconChoice)) {
     let choice = *state.current_icon.lock_recover();
     apply(choice);
-}
-
-#[cfg(target_os = "macos")]
-fn set_bundle_icon(
-    bundle_path: &objc2_foundation::NSString,
-    image: &objc2_app_kit::NSImage,
-) -> Result<(), AppError> {
-    use objc2_app_kit::{NSWorkspace, NSWorkspaceIconCreationOptions};
-    if NSWorkspace::sharedWorkspace().setIcon_forFile_options(
-        Some(image),
-        bundle_path,
-        NSWorkspaceIconCreationOptions::empty(),
-    ) {
-        Ok(())
-    } else {
-        Err(AppError::new(
-            "image",
-            "Das dauerhafte App-Icon konnte nicht gesetzt werden. Ist die App schreibgeschützt?",
-        ))
-    }
 }
 
 /// Fenster-Icon für ein neu gebautes Fenster. Auf macOS ein No-op (siehe
@@ -987,50 +1017,6 @@ mod tests {
         let document = read_document(&path).unwrap();
         assert_eq!(document.windows.len(), 1);
         assert!(document.windows.contains_key("main"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn bundle_icon_bleibt_als_finder_metadaten_erhalten() {
-        use objc2::AllocAnyThread;
-        use objc2_app_kit::NSImage;
-        use objc2_foundation::{NSData, NSString};
-        use std::process::Command;
-
-        let dir = tempfile::tempdir().unwrap();
-        let bundle = dir.path().join("Iconprobe.app");
-        let contents = bundle.join("Contents");
-        std::fs::create_dir_all(&contents).unwrap();
-        let resource = contents.join("unveraendert");
-        std::fs::write(&resource, b"signierte Ressource").unwrap();
-        let bundle_path = NSString::from_str(bundle.to_str().unwrap());
-        let mut previous = Vec::new();
-        for choice in [IconChoice::Storm, IconChoice::Blue] {
-            let image =
-                NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(choice.bytes()))
-                    .unwrap();
-            set_bundle_icon(&bundle_path, &image).unwrap();
-            drop(image);
-            // Ein separater Prozess liest die dauerhaften Finder-Metadaten,
-            // nicht das NSApplication-Icon des aktuellen Prozesses.
-            let result = Command::new("/usr/bin/xattr")
-                .args(["-px", "com.apple.ResourceFork"])
-                .arg(bundle.join("Icon\r"))
-                .output()
-                .unwrap();
-            assert!(result.status.success());
-            assert!(!result.stdout.is_empty());
-            assert_ne!(previous, result.stdout);
-            previous = result.stdout;
-            assert_eq!(std::fs::read(&resource).unwrap(), b"signierte Ressource");
-        }
-        let image = NSImage::initWithData(
-            NSImage::alloc(),
-            &NSData::with_bytes(IconChoice::Blue.bytes()),
-        )
-        .unwrap();
-        let missing = NSString::from_str(dir.path().join("fehlt/App.app").to_str().unwrap());
-        assert!(set_bundle_icon(&missing, &image).is_err());
     }
 
     fn pane_state() -> WindowStartState {

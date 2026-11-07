@@ -15,9 +15,12 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Barrier};
 
+use doppeldecker_core::bidirectional::{
+    prepare_provider_bidirectional_rollback_for_queue,
+    prepare_provider_bidirectional_with_decisions_bound_for_queue,
+};
 use doppeldecker_core::{
-    error_code, prepare_sftp_bidirectional_rollback, prepare_sftp_bidirectional_with_decisions,
-    prepare_sftp_download, prepare_sftp_queue_entry, prepare_sftp_upload, ErrorCode,
+    error_code, prepare_sftp_download, prepare_sftp_queue_entry, prepare_sftp_upload, ErrorCode,
     OperationQueue, PairId, Progress, ProviderEndpoint, QueueOperation, QueueState, SecretResolver,
     SecretString, SftpAuthenticationReference, SftpConnectionConfig, SftpHostKeyPin,
     SftpQueueDirection, SftpVfs, SyncOptions, SyncPlan, Vfs,
@@ -67,13 +70,13 @@ fn sftp_ohne_fsync_erlaubt_sichtbaren_best_effort_upload() {
     let endpoint = ProviderEndpoint::sftp(vfs.clone(), Path::new("/")).unwrap();
     let capabilities = endpoint.probe_file_capabilities().unwrap();
     assert!(!capabilities.copy_new);
-    assert!(!capabilities.copy_new_best_effort);
+    assert!(capabilities.copy_new_best_effort);
     assert!(!capabilities.remove_source);
-    assert!(!capabilities.remove_source_best_effort);
+    assert!(capabilities.remove_source_best_effort);
     assert!(capabilities
         .limitations
         .iter()
-        .any(|note| note.contains("SFTP-Ordneranlage ist gesperrt")));
+        .any(|note| note.contains("SFTP · Best Effort")));
     assert!(!vfs.capabilities().best_effort_file_commit);
     assert!(!vfs.capabilities().permits_add_only());
     assert_remote_root_empty(vfs.as_ref());
@@ -107,6 +110,56 @@ fn sftp_ohne_fsync_erlaubt_sichtbaren_best_effort_upload() {
     assert_eq!(remote_root_names(vfs.as_ref()), ["probe-error-parent"]);
     guarded.assert_server_root_unchanged();
     std::fs::remove_file(error_parent).unwrap();
+    assert_remote_root_empty(vfs.as_ref());
+
+    // Die getrennte gewöhnliche Zielsicht schreibt auch ohne fsync-Erweiterung.
+    let source = tempfile::tempdir().unwrap();
+    let source_root = source.path().canonicalize().unwrap();
+    let source_path = source_root.join("best-effort-upload.txt");
+    fs::write(&source_path, b"SFTP ohne fsync, gepruefter Inhalt\n").unwrap();
+    let local = ProviderEndpoint::local(&source_root).unwrap();
+    let contexts = local
+        .interactive_file_contexts(
+            &endpoint,
+            std::slice::from_ref(&source_path),
+            false,
+            false,
+            &doppeldecker_core::Cancel::new(),
+        )
+        .unwrap();
+    let stats = doppeldecker_core::fileops::copy_items(
+        doppeldecker_core::fileops::FileOperationRequest {
+            src: contexts.source_vfs.as_ref(),
+            dst: contexts.target_vfs.as_ref(),
+            items: &[source_path],
+            dst_dir: Path::new("/"),
+            policy: doppeldecker_core::OverwritePolicy::Skip,
+            sandbox: &None,
+        },
+        &doppeldecker_core::Cancel::new(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(stats.files, 1);
+    assert!(stats.target_copy_new_best_effort);
+    assert_eq!(
+        fs::read(Path::new(&root).join("best-effort-upload.txt")).unwrap(),
+        b"SFTP ohne fsync, gepruefter Inhalt\n"
+    );
+    let plan = doppeldecker_core::plan_remote_delete(
+        contexts.target_vfs.as_ref(),
+        Path::new("/"),
+        &[PathBuf::from("/best-effort-upload.txt")],
+    )
+    .unwrap();
+    doppeldecker_core::execute_remote_delete(
+        contexts.target_vfs.as_ref(),
+        &plan,
+        doppeldecker_core::RemoteDeleteMode::Permanent,
+        &doppeldecker_core::Cancel::new(),
+        &mut |_| {},
+    )
+    .unwrap();
     assert_remote_root_empty(vfs.as_ref());
 }
 
@@ -152,6 +205,24 @@ fn echter_sftp_root_bindet_identitaet_probe_reconnect_und_streams() {
     assert_eq!(initial_listing.session_generation, vfs.session_generation());
     let read_source = Path::new(&root).join("ap04-inhalt.txt");
     fs::write(&read_source, b"AP04: gepruefter SFTP-Inhalt\n").unwrap();
+    if std::env::var("DOPPELDECKER_SFTP_EXPECT_PRINCIPAL_NAMES").as_deref() == Ok("1") {
+        // Nur dieser isolierte Runner betreibt Client und Server auf demselben
+        // Testhost. Lokale Kontonamen sind kein Produktionsmapping für Remote-IDs.
+        let local = doppeldecker_core::LocalVfs::rooted(Path::new(&canonical_root))
+            .unwrap()
+            .stat(&Path::new(&canonical_root).join("ap04-inhalt.txt"))
+            .unwrap();
+        let listing = vfs.list_interactive_best_effort(Path::new("/")).unwrap();
+        let remote = &listing
+            .entries
+            .iter()
+            .find(|row| row.entry.name == "ap04-inhalt.txt")
+            .unwrap()
+            .entry;
+        assert_eq!(remote.owner, local.owner);
+        assert_eq!(remote.group, local.group);
+        println!("SFTP-Prinzipalnamen vom tatsächlichen OpenSSH-Server bestätigt");
+    }
     let cache = tempfile::tempdir().unwrap();
     let content_endpoint = ProviderEndpoint::sftp(vfs.clone(), Path::new("/")).unwrap();
     let (content_vfs, _) = content_endpoint
@@ -402,9 +473,8 @@ fn echter_sftp_root_bindet_identitaet_probe_reconnect_und_streams() {
     fs::remove_dir(outside_dir).unwrap();
     fs::remove_file(outside_file).unwrap();
 
-    // Alle Capability-Abfragen bleiben lesend. SFTP v3 kann keine Pfadmutation bis
-    // zur Wirkung an den Elternordner binden; starke und Best-Effort-Aussagen
-    // bleiben deshalb gleichermaßen false.
+    // Striktes VFS und Quarantäne bleiben gesperrt. Gewöhnliche Dateiaktionen
+    // besitzen daneben ihren ausdrücklich akzeptierten pfadbasierten Best-Effort-Weg.
     let delete_capabilities = vfs.probe_delete_capability().unwrap();
     assert!(!delete_capabilities.permits_entry_delete());
     let add_only_capabilities = vfs.probe_add_only_capabilities().unwrap();
@@ -420,17 +490,14 @@ fn echter_sftp_root_bindet_identitaet_probe_reconnect_und_streams() {
     );
     let file_capabilities = endpoint.probe_file_capabilities().unwrap();
     assert!(!file_capabilities.remove_source);
-    assert!(!file_capabilities.remove_source_best_effort);
+    assert!(file_capabilities.remove_source_best_effort);
     assert!(!file_capabilities.copy_new);
-    assert!(!file_capabilities.copy_new_best_effort);
+    assert!(file_capabilities.copy_new_best_effort);
     assert!(file_capabilities
         .limitations
         .iter()
-        .any(|note| note.contains("SFTP-Ordneranlage ist gesperrt")));
-    assert!(file_capabilities
-        .blockers
-        .iter()
-        .any(|note| note.contains("SFTP-Dateidownload und Sync sind gesperrt")));
+        .any(|note| note == doppeldecker_core::sftp::SFTP_WRITE_LIMITATION));
+    assert!(file_capabilities.blockers.is_empty());
     assert_remote_root_empty(vfs.as_ref());
 
     let generation = vfs.session_generation();
@@ -510,13 +577,16 @@ fn echter_sftp_root_bindet_identitaet_probe_reconnect_und_streams() {
     let root_before_quarantine = remote_root_names(vfs.as_ref());
     let delete_capabilities = endpoint.probe_delete_capabilities().unwrap();
     assert!(!delete_capabilities.quarantine);
-    assert!(!delete_capabilities.permanent);
+    assert!(delete_capabilities.permanent);
     assert_eq!(root_before_quarantine, remote_root_names(vfs.as_ref()));
     assert!(!vfs.exists(Path::new("/.doppeldecker-quarantine")));
 
     // Derselbe negative Zielvertrag gilt im persistierten Upload-Queuepfad. Ein
     // Fehler bleibt terminal `Failed`; Temp-Journale und entfernte Reste fehlen.
-    let queue_area = tempfile::tempdir().unwrap();
+    let queue_area = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let queue = OperationQueue::open(queue_area.path().join("queue.json")).unwrap();
     let queued = queue
         .enqueue(QueueOperation::SftpSync {
@@ -536,7 +606,11 @@ fn echter_sftp_root_bindet_identitaet_probe_reconnect_und_streams() {
         Ok(_) => panic!("SFTP-Upload-Queue bereitete ein unzulässiges Remote-Ziel vor"),
         Err(error) => error,
     };
-    assert_eq!(error_code(&queue_error), ErrorCode::Unsupported);
+    assert_eq!(
+        error_code(&queue_error),
+        ErrorCode::Unsupported,
+        "{queue_error}"
+    );
     queue
         .fail(
             &queued.operation_id,
@@ -564,14 +638,17 @@ fn echter_sftp_root_bindet_identitaet_probe_reconnect_und_streams() {
     let bidi_local = bidi_area.path().join("lokal");
     std::fs::create_dir(&bidi_local).unwrap();
     std::fs::write(bidi_local.join("lokal.txt"), b"lokal\n").unwrap();
+    let bidi_queue = OperationQueue::open(bidi_area.path().join("config/queue.json")).unwrap();
     let bidi_baseline = bidi_area.path().join("state/pair.json");
-    let bidirectional_error = match prepare_sftp_bidirectional_with_decisions(
+    let bidirectional_error = match prepare_provider_bidirectional_with_decisions_bound_for_queue(
+        &bidi_queue,
         PairId([90; 16]),
         "SFTP-E2E-negativ",
         ProviderEndpoint::local(&bidi_local).unwrap(),
         ProviderEndpoint::sftp(vfs.clone(), Path::new("/bidirektional")).unwrap(),
         &bidi_baseline,
         &[],
+        None,
     ) {
         Ok(_) => panic!("Bidirectional-Lauf erhielt eine ungebundene SFTP-Root-Identität"),
         Err(error) => error,
@@ -588,7 +665,8 @@ fn echter_sftp_root_bindet_identitaet_probe_reconnect_und_streams() {
         .is_empty());
     assert!(!bidi_baseline.exists());
     assert!(!bidi_baseline.with_extension("run.json").exists());
-    let rollback_error = match prepare_sftp_bidirectional_rollback(
+    let rollback_error = match prepare_provider_bidirectional_rollback_for_queue(
+        &bidi_queue,
         "SFTP-E2E-negativ",
         ProviderEndpoint::local(&bidi_local).unwrap(),
         ProviderEndpoint::sftp(vfs.clone(), Path::new("/bidirektional")).unwrap(),
@@ -603,13 +681,22 @@ fn echter_sftp_root_bindet_identitaet_probe_reconnect_und_streams() {
         "Ohne jemals erzeugtes Laufjournal gibt es keinen Rollbackzustand; Unsupported gilt erst für ein vorhandenes, aber ungebundenes SFTP-Journal"
     );
 
-    // Der Provider selbst ist absichtlich read-only. Der Runner baut deshalb seine
-    // ausschließlich unter dem frischen künstlichen Serverroot erzeugten Fixtures
-    // direkt auf der lokalen Testseite wieder ab.
+    // Die bisherigen strikten Syncabsagen bleiben getrennt von gewöhnlichen
+    // Schreibaktionen. Der Runner baut ausschließlich eigene künstliche Fixtures ab.
     guarded.assert_server_root_unchanged();
     fs::remove_dir_all(Path::new(&root).join("remote-quelle")).unwrap();
     fs::remove_dir_all(Path::new(&root).join("remote-ziel")).unwrap();
     fs::remove_dir_all(Path::new(&root).join("bidirektional")).unwrap();
+    run_cycle_matrix(&vfs, &guarded);
+    run_permission_probe(&vfs, &guarded);
+    archive_upload_probe::run(
+        doppeldecker_core::BidirectionalQueueEndpoint::Sftp {
+            connection: Box::new(config),
+            root: "/".into(),
+        },
+        Path::new(&root),
+        Arc::new(NoSecrets),
+    );
     assert_remote_root_empty(vfs.as_ref());
 }
 
@@ -1119,3 +1206,418 @@ fn digest(name: &str) -> [u8; 32] {
     }
     result
 }
+
+#[test]
+#[ignore = "benötigt frischen künstlichen OpenSSH-Root über den isolierten E2E-Runner"]
+fn sftp_stapel_schreibweisen_verlangen_exakten_serverbestand() {
+    let guarded = guarded_runner_root().unwrap();
+    let config = SftpConnectionConfig {
+        host: guarded.host.clone(),
+        alternate_hosts: Vec::new(),
+        port: required("DOPPELDECKER_SFTP_TEST_PORT").parse().unwrap(),
+        username: required("DOPPELDECKER_SFTP_TEST_USER"),
+        requested_root: guarded.root.clone(),
+        host_key: SftpHostKeyPin {
+            algorithm: required("DOPPELDECKER_SFTP_TEST_HOST_KEY_ALGORITHM"),
+            sha256: digest("DOPPELDECKER_SFTP_TEST_HOST_KEY_SHA256_HEX"),
+        },
+        authentication: SftpAuthenticationReference::SshAgent {
+            public_key_sha256: digest("DOPPELDECKER_SFTP_TEST_AGENT_KEY_SHA256_HEX"),
+        },
+    };
+
+    let vfs = Arc::new(SftpVfs::connect(config, Arc::new(NoSecrets)).unwrap());
+    run_spelling_batch_matrix(&vfs, &guarded, "/batch-spelling");
+    guarded.assert_server_root_unchanged();
+}
+
+fn run_spelling_batch_matrix(
+    provider: &Arc<SftpVfs>,
+    guarded: &GuardedRunnerRoot,
+    virtual_base: &str,
+) {
+    use doppeldecker_core::batch_rename::{BatchRenameOptions, BatchRenameStatus};
+    use doppeldecker_core::sftp_batch_rename::PreparedSftpBatchRename;
+    use std::io::Write;
+    for (index, (old, new, kind)) in [
+        ("control-old", "control-new", "control"),
+        ("Foo", "foo", "file"),
+        ("Foo", "foo", "dir"),
+        ("café", "cafe\u{301}", "file"),
+        ("cafe\u{301}", "café", "file"),
+        ("Foo", "foo", "foreign_alias"),
+        ("Foo", "foo", "alias_link"),
+        ("Foo", "foo", "outside_link"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let pane = format!("{virtual_base}/case-{index}");
+        let host = Path::new(&guarded.root).join(pane.trim_start_matches('/'));
+        assert!(!host.exists());
+        fs::create_dir_all(&host).unwrap();
+        if kind == "dir" {
+            fs::create_dir(host.join(old)).unwrap();
+            fs::write(host.join(old).join("child"), b"child-original").unwrap();
+        } else {
+            fs::write(host.join(old), b"original").unwrap();
+        }
+        let setup = match kind {
+            "foreign_alias" => fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(host.join(new))
+                .and_then(|mut file| file.write_all(b"foreign")),
+            "alias_link" => fs::hard_link(host.join(old), host.join(new)),
+            "outside_link" => fs::hard_link(host.join(old), host.join("unrelated")),
+            _ => Ok(()),
+        };
+        if let Err(error) = setup {
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(host.join(old)).unwrap(), b"original");
+            eprintln!(
+                "SFTP-Stapelschreibweise {kind}/{index}: zweiter Alias hier nicht darstellbar"
+            );
+            fs::remove_dir_all(host).unwrap();
+            continue;
+        }
+        let target_present = match fs::symlink_metadata(host.join(new)) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => panic!("Zielprüfung scheiterte: {error}"),
+        };
+        let endpoint = ProviderEndpoint::sftp(provider.clone(), Path::new(&pane)).unwrap();
+        let before = spelling_host_snapshot(&host);
+        assert_spelling_snapshots(&before, &spelling_sftp_snapshot(&endpoint));
+        let options = BatchRenameOptions {
+            find: old.into(),
+            replacement: new.into(),
+            prefix: String::new(),
+            suffix: String::new(),
+            preserve_extension: false,
+            trim_outer_spaces: false,
+            numbering: None,
+        };
+        let plan = PreparedSftpBatchRename::prepare(
+            &endpoint,
+            &[old.into()],
+            &options,
+            &doppeldecker_core::Cancel::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.rows()[0].status,
+            if matches!(kind, "foreign_alias" | "alias_link") {
+                BatchRenameStatus::Blocked
+            } else {
+                BatchRenameStatus::Ready
+            }
+        );
+        let report = plan.execute(
+            &doppeldecker_core::Cancel::new(),
+            &mut || Ok(()),
+            &mut |_, _| {},
+        );
+        let after = spelling_host_snapshot(&host);
+        assert_spelling_snapshots(&after, &spelling_sftp_snapshot(&endpoint));
+        if target_present {
+            assert_eq!(report.renamed, 0, "{kind}/{old}/{new}: {report:?}");
+            assert_eq!(before, after);
+        } else {
+            assert_eq!(report.renamed, 1, "{kind}/{old}/{new}: {report:?}");
+            assert_eq!(report.outcome_unclear, 0);
+            assert!(after.iter().any(|item| item["path"] == new));
+            assert!(!after.iter().any(|item| item["path"] == old));
+            for original in &before {
+                let path = original["path"].as_str().unwrap();
+                let expected = if path == old {
+                    new.to_owned()
+                } else if let Some(suffix) = path.strip_prefix(&format!("{old}/")) {
+                    format!("{new}/{suffix}")
+                } else {
+                    path.to_owned()
+                };
+                let current = after.iter().find(|item| item["path"] == expected).unwrap();
+                for key in [
+                    "device",
+                    "inode",
+                    "directory",
+                    "mode",
+                    "uid",
+                    "gid",
+                    "bytes",
+                    "mtime",
+                    "links",
+                ] {
+                    assert_eq!(original[key], current[key], "{kind}/{key}");
+                }
+            }
+        }
+        eprintln!("SFTP-Stapelschreibweise {kind}/{index}: Zielalias={target_present}, umbenannt={}, blockiert={}, unverändert={}", report.renamed, report.rows.iter().filter(|row| row.status == BatchRenameStatus::Blocked).count(), report.failed_unchanged);
+        fs::remove_dir_all(host).unwrap();
+    }
+}
+
+fn spelling_host_snapshot(path: &Path) -> Vec<serde_json::Value> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut pending = vec![PathBuf::new()];
+    let mut result = Vec::new();
+    while let Some(relative) = pending.pop() {
+        let mut entries = fs::read_dir(path.join(&relative))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|item| item.file_name());
+        for item in entries {
+            let rel = relative.join(item.file_name());
+            let m = fs::symlink_metadata(item.path()).unwrap();
+            assert!(!m.file_type().is_symlink());
+            result.push(serde_json::json!({"path":rel.to_str().unwrap(),"raw_path":rel.as_os_str().as_bytes(),"device":m.dev(),"inode":m.ino(),"directory":m.is_dir(),"mode":m.mode(),"uid":m.uid(),"gid":m.gid(),"bytes":if m.is_file(){Some(fs::read(item.path()).unwrap())}else{None},"mtime":m.mtime(),"links":m.nlink()}));
+            if m.is_dir() {
+                pending.push(rel);
+            }
+        }
+    }
+    result.sort_by_key(|v| v["path"].as_str().unwrap().to_owned());
+    result
+}
+fn spelling_sftp_snapshot(endpoint: &ProviderEndpoint) -> Vec<serde_json::Value> {
+    use std::io::Read;
+    let (vfs, root) = endpoint.ordinary_file_context().unwrap();
+    let mut pending = vec![PathBuf::new()];
+    let mut result = Vec::new();
+    while let Some(relative) = pending.pop() {
+        let path = if relative.as_os_str().is_empty() {
+            root.clone()
+        } else {
+            root.join(&relative)
+        };
+        let listing = vfs.list_complete(&path).unwrap();
+        assert!(listing.complete);
+        for item in listing.entries {
+            assert!(item.safely_decoded);
+            assert_eq!(item.raw_name, item.entry.name.as_bytes());
+            let rel = relative.join(&item.entry.name);
+            let bytes = if item.entry.is_file {
+                let mut data = Vec::new();
+                vfs.open_read(&root.join(&rel))
+                    .unwrap()
+                    .read_to_end(&mut data)
+                    .unwrap();
+                Some(data)
+            } else {
+                None
+            };
+            result.push(serde_json::json!({"path":rel.to_str().unwrap(),"raw_name":item.raw_name,"attributes":item.entry,"bytes":bytes}));
+            if item.entry.is_dir {
+                pending.push(rel);
+            }
+        }
+    }
+    result.sort_by_key(|v| v["path"].as_str().unwrap().to_owned());
+    result
+}
+fn assert_spelling_snapshots(host: &[serde_json::Value], remote: &[serde_json::Value]) {
+    assert_eq!(host.len(), remote.len());
+    for (a, b) in host.iter().zip(remote) {
+        assert_eq!(a["path"], b["path"]);
+        assert_eq!(a["directory"], b["attributes"]["is_dir"]);
+        assert_eq!(a["bytes"], b["bytes"]);
+    }
+}
+
+fn run_cycle_matrix(provider: &Arc<SftpVfs>, guarded: &GuardedRunnerRoot) {
+    use doppeldecker_core::batch_rename::{BatchRenameOptions, BatchRenameStatus};
+    use doppeldecker_core::sftp_batch_rename::PreparedSftpBatchRename;
+    use doppeldecker_core::Cancel;
+    let base = Path::new(&guarded.root).join("batch-cycles");
+    fs::create_dir(&base).unwrap();
+    for directories in [false, true] {
+        for interrupted in [false, true] {
+            let leaf = if interrupted {
+                "interrupted"
+            } else {
+                "complete"
+            };
+            let host = base.join(leaf);
+            fs::create_dir(&host).unwrap();
+            let names = ["ab", "aab", "aaab"];
+            let content = |name: &str| {
+                let path = host.join(name);
+                if directories {
+                    path.join("inside/leaf")
+                } else {
+                    path
+                }
+            };
+            for (index, name) in names.iter().enumerate() {
+                if directories {
+                    fs::create_dir_all(host.join(name).join("inside")).unwrap();
+                }
+                fs::write(content(name), format!("Original{index}")).unwrap();
+            }
+            let endpoint = ProviderEndpoint::sftp(
+                provider.clone(),
+                Path::new(&format!("/batch-cycles/{leaf}")),
+            )
+            .unwrap();
+            let options = BatchRenameOptions {
+                find: "aaa".into(),
+                replacement: String::new(),
+                prefix: "a".into(),
+                suffix: String::new(),
+                preserve_extension: false,
+                trim_outer_spaces: false,
+                numbering: None,
+            };
+            let plan = PreparedSftpBatchRename::prepare(
+                &endpoint,
+                &names.map(str::to_string),
+                &options,
+                &Cancel::new(),
+            )
+            .unwrap();
+            assert!(plan
+                .rows()
+                .iter()
+                .all(|row| row.status == BatchRenameStatus::Ready));
+            let config = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let queue = OperationQueue::open(config.path().join("queue.json")).unwrap();
+            let cancel = Cancel::new();
+            let report = plan.execute_with_queue(
+                &cancel,
+                &mut || {
+                    if interrupted
+                        && fs::read_dir(&host).unwrap().any(|entry| {
+                            entry
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(".doppeldecker-rename-")
+                        })
+                    {
+                        cancel.cancel();
+                    }
+                    Ok(())
+                },
+                &mut |_, _| {},
+                &queue,
+            );
+            if interrupted {
+                assert_eq!(
+                    report.partially_renamed, 1,
+                    "{:?} {:?}",
+                    report.rows, report.limitations
+                );
+                let name = report.rows[0].current_name.as_ref().unwrap();
+                assert_eq!(fs::read(content(name)).unwrap(), b"Original0");
+                assert_eq!(fs::read(content("aab")).unwrap(), b"Original1");
+                assert_eq!(fs::read(content("aaab")).unwrap(), b"Original2");
+                assert_eq!(queue.snapshot().entries[0].state, QueueState::Interrupted);
+            } else {
+                assert_eq!(
+                    report.renamed, 3,
+                    "{:?} {:?}",
+                    report.rows, report.limitations
+                );
+                for (index, name) in ["aab", "aaab", "ab"].iter().enumerate() {
+                    assert_eq!(
+                        fs::read(content(name)).unwrap(),
+                        format!("Original{index}").as_bytes()
+                    );
+                }
+                assert_eq!(queue.snapshot().entries[0].state, QueueState::Completed);
+            }
+            assert_eq!(fs::read_dir(&host).unwrap().count(), 3);
+            fs::remove_dir_all(&host).unwrap();
+        }
+    }
+    fs::remove_dir(base).unwrap();
+    guarded.assert_server_root_unchanged();
+}
+
+fn run_permission_probe(provider: &Arc<SftpVfs>, guarded: &GuardedRunnerRoot) {
+    use doppeldecker_core::{file_properties::change_provider_permissions, Cancel};
+    let base = Path::new(&guarded.root).join("permission-probe");
+    fs::create_dir(&base).unwrap();
+    fs::create_dir_all(base.join("Tree/empty")).unwrap();
+    fs::write(base.join("Tree/file"), b"unchanged").unwrap();
+    fs::write(base.join("sentinel"), b"outside selection").unwrap();
+    fs::set_permissions(base.join("sentinel"), fs::Permissions::from_mode(0o644)).unwrap();
+    // /tmp kann eine geerbte Gruppe tragen, in der der Testbenutzer kein Mitglied
+    // ist. macOS würde setgid dann schon beim Aufbau still entfernen.
+    std::os::unix::fs::chown(base.join("Tree"), None, Some(unsafe { libc::getegid() })).unwrap();
+    fs::set_permissions(base.join("Tree/file"), fs::Permissions::from_mode(0o4644)).unwrap();
+    fs::set_permissions(base.join("Tree"), fs::Permissions::from_mode(0o2755)).unwrap();
+    assert_eq!(
+        fs::metadata(base.join("Tree")).unwrap().mode() & 0o7777,
+        0o2755
+    );
+    std::os::unix::fs::symlink("../sentinel", base.join("Tree/link")).unwrap();
+    let endpoint =
+        ProviderEndpoint::sftp(provider.clone(), Path::new("/permission-probe")).unwrap();
+    let rows = change_provider_permissions(
+        &endpoint,
+        &["Tree".into()],
+        0o750,
+        true,
+        &Cancel::new(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(rows.iter().filter(|row| row.changed).count(), 3, "{rows:?}");
+    assert_eq!(
+        rows.iter().filter(|row| !row.changed).count(),
+        1,
+        "{rows:?}"
+    );
+    for (name, mode) in [
+        ("Tree", 0o2750),
+        ("Tree/file", 0o4750),
+        ("Tree/empty", 0o750),
+        ("sentinel", 0o644),
+    ] {
+        assert_eq!(
+            fs::symlink_metadata(base.join(name)).unwrap().mode() & 0o7777,
+            mode,
+            "{name}"
+        );
+    }
+    assert_eq!(fs::read(base.join("Tree/file")).unwrap(), b"unchanged");
+    assert_eq!(
+        fs::read(base.join("sentinel")).unwrap(),
+        b"outside selection"
+    );
+    let cancel = Cancel::new();
+    cancel.cancel();
+    assert_eq!(
+        error_code(
+            &change_provider_permissions(
+                &endpoint,
+                &["sentinel".into()],
+                0o600,
+                false,
+                &cancel,
+                &|| Ok(())
+            )
+            .unwrap_err()
+        ),
+        ErrorCode::Interrupted
+    );
+    assert_eq!(
+        fs::metadata(base.join("sentinel")).unwrap().mode() & 0o777,
+        0o644
+    );
+    assert!(
+        !provider.supports_mode_write(),
+        "Strikte Sicht bleibt unverändert"
+    );
+    guarded.assert_server_root_unchanged();
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[path = "support/archive_upload_probe.rs"]
+mod archive_upload_probe;
