@@ -80,18 +80,10 @@ fn resource_summary(fd: &OwnedFd, cancel: &Cancel) -> io::Result<Option<BlobSumm
         Err(error) if error.raw_os_error() == libc::ENOATTR => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let mut reader: Box<dyn Read> = if FileType::from_raw_mode(fstat(fd)?.st_mode).is_file() {
-        // Der Kernel löst den benannten Fork direkt relativ zum regulären Datei-FD
-        // auf. Es wird kein Elternpfad und kein /dev/fd-Symlink erneut geöffnet.
-        Box::new(File::from(openat(
-            fd,
-            "..namedfork/rsrc",
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?))
-    } else {
-        Box::new(mac_resource_fork::Reader::open(dup(fd)?)?)
-    };
+    // macOS 15 lehnt openat(Datei-FD, "..namedfork/rsrc") mit ENOTDIR ab.
+    // Der positionierte xattr-Leser bleibt am gehaltenen Objekt gebunden und
+    // streamt den Fork ohne erneutes Öffnen eines Pfads auf allen Zielversionen.
+    let mut reader = mac_resource_fork::Reader::open(dup(fd)?)?;
     let mut hash = blake3::Hasher::new();
     let mut bytes = 0u64;
     let mut buffer = [0_u8; 128 * 1024];

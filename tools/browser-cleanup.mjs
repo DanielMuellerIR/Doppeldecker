@@ -1,5 +1,9 @@
 /** Beendet nur den eigenen Mock-Server und den eigenen Playwright-Browser. */
 export function createBrowserCleanup(server) {
+  // Ein volles, ungelesenes HTTP-Log blockiert den Python-Server und damit auch
+  // unabhängige Modulabrufe. Zusätzliche Diagnose-Listener erhalten die Daten weiter.
+  server.stdout?.resume();
+  server.stderr?.resume();
   let browserPromise;
   let closing;
   let serverClosed = false;

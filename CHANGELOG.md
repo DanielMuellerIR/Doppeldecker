@@ -7,6 +7,9 @@ folgt Keep a Changelog; Versionen verwenden Semantic Versioning.
 
 ## [0.1.125] - 2026-11-07
 
+- Ressourcen-Forks gewöhnlicher macOS-Kopien werden auch auf macOS 15 über
+  positionierte Attributzugriffe am gehaltenen Dateiobjekt vollständig geprüft.
+
 - Native Linux-Menüleisten und aufklappende Menüs folgen der Darstellung Hell,
   Dunkel oder Automatisch, einschließlich laufender Systemwechsel.
 

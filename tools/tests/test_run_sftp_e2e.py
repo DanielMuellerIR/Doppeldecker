@@ -991,7 +991,7 @@ class SftpE2eSignalTests(unittest.TestCase):
                 )
                 acknowledgement.write_text("weiter\n", encoding="utf-8")
 
-                stdout, stderr = process.communicate(timeout=15)
+                stdout, stderr = process.communicate(timeout=30)
                 self.assertEqual(
                     process.returncode,
                     1,

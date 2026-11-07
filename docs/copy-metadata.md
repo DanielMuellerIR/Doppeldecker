@@ -1,6 +1,6 @@
 # Metadaten gewöhnlicher Kopien
 
-Stand: 2026-11-01. Dateiaktionen verwenden einen eigenen Vertrag; erweiterte
+Stand: 2026-11-07. Dateiaktionen verwenden einen eigenen Vertrag; erweiterte
 Native-Syncprofile werden nicht still vorausgesetzt.
 
 Rechte und darstellbare Änderungszeiten werden übernommen; lokale Kopien auf
@@ -11,7 +11,10 @@ Tags und Finder-Informationen, Resource Forks, Verstecktmarkierung und Dateisper
 Das gilt für Dateien und neue Ordner. Beim Zusammenführen behalten bestehende
 Zielordner ihre eigenen Metadaten; ihre zusätzlichen Quell-Forks gelten als ausgelassen.
 
-Quelle und Ziel werden über gehaltene Objekte geprüft. Die native Attributkopie
+Quelle und Ziel werden über gehaltene Objekte geprüft. Ressourcen-Forks werden
+positioniert über den Datei-Deskriptor gelesen; dafür ist kein
+auf älteren macOS-Versionen unzulässiges `openat` an einer regulären Datei nötig.
+Die native Attributkopie
 endet vor dem Readback; Daten- und Resource Fork werden getrennt vollständig
 geprüft. Zeiten und einschränkende Rechte folgen danach. Eine Tempdatei gelangt
 erst nach vollständigem Datenabschluss an den Zielnamen. Die Dateisperre folgt
