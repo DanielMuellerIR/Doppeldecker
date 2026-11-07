@@ -1352,7 +1352,12 @@ fn created_directory_plan_distinguishes_unfiltered_children_and_complete_empty_s
     for case in ["empty", "excluded-child", "streams", "unobserved"] {
         let mut fixture = Fixture::new(None);
         fixture.target.created_dacl_ready = true;
+        let removed = DaclVfs::key(&fixture.source_path()).unwrap();
         fs::remove_file(fixture.source_path()).unwrap();
+        // Linux kann den Inode sofort für den Ordner wiederverwenden. Die
+        // künstlichen Beobachtungen der gelöschten Datei gehören nicht dorthin.
+        fixture.source.streams.lock().unwrap().remove(&removed);
+        fixture.source.security.lock().unwrap().remove(&removed);
         let folder = fixture.source_root.path().join("folder");
         fs::create_dir(&folder).unwrap();
         let mut options = Fixture::options();

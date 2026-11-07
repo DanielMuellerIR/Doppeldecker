@@ -7055,16 +7055,28 @@ try {
     assert.equal(await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).count(), 0);
     assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
   });
-  await runCase("Forward-Bidir zweites Fenster behält Vorbereitung nach Discard im ersten", "?forwardPrepareDelay=1", async page => {
+  await runCase("Forward-Bidir zweites Fenster behält Vorbereitung nach Discard im ersten", "", async page => {
     const other = await page.context().newPage(); const errors = []; other.on("pageerror", error => errors.push(error.message));
     try {
       await other.goto(page.url(), { waitUntil: "networkidle" });
+      await page.evaluate(() => {
+        const original = window.__TAURI__.core.invoke;
+        window.__TAURI__.core.invoke = async (command, args) => {
+          if (command === "prepare_forward_bidirectional_sync") {
+            await new Promise(resolve => { window.__RELEASE_FIRST_FORWARD_PREPARATION__ = resolve; });
+          }
+          return original(command, args);
+        };
+      });
       for (const target of [page, other]) {
         await target.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
         await target.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
         await target.getByLabel("In beide Richtungen", { exact: true }).check(); await target.locator("#btn-sync").click();
       }
       await page.locator("#btn-sync-close").click();
+      await page.waitForFunction(() => typeof window.__RELEASE_FIRST_FORWARD_PREPARATION__ === "function");
+      await page.evaluate(() => window.__RELEASE_FIRST_FORWARD_PREPARATION__());
+      await page.waitForFunction(() => window.__MOCK_FORWARD_STATE__().calls.some(call => call.command === "discard_forward_bidirectional_sync"));
       const dialog = other.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }); await dialog.waitFor();
       await dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
       await other.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
