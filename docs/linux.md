@@ -42,7 +42,7 @@ Der Paketbau entfernt diese Bibliothek vor dem abschließenden Packen und Signie
 Nach der Prüfung von Herkunft, Signatur beziehungsweise Release-Prüfsumme:
 
 ```bash
-./install.sh --appimage /pfad/Doppeldecker_0.1.124_amd64.AppImage --sha256 <SHA256>
+./install.sh --appimage /pfad/Doppeldecker_0.1.125_amd64.AppImage --sha256 <SHA256>
 ```
 
 Der Installer verwendet `~/.local/lib/doppeldecker/Doppeldecker.AppImage`, legt

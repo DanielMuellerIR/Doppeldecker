@@ -1325,6 +1325,7 @@ fn parse_multistatus(payload: &[u8]) -> io::Result<Vec<DavResource>> {
     let mut propstat_index = 0usize;
     let mut response_semantic_errors = Vec::<String>::new();
     let mut absent_length_propstats = Vec::<usize>::new();
+    let mut absent_collection_etag_propstats = Vec::<usize>::new();
     let mut multistatus_semantic_errors = Vec::<String>::new();
     loop {
         let (namespace, event) = reader
@@ -1436,6 +1437,7 @@ fn parse_multistatus(payload: &[u8]) -> io::Result<Vec<DavResource>> {
                         current = Some(DavResource::default());
                         response_semantic_errors.clear();
                         absent_length_propstats.clear();
+                        absent_collection_etag_propstats.clear();
                         propstat_index = 0;
                     }
                     b"propstat" => {
@@ -1787,11 +1789,17 @@ fn parse_multistatus(payload: &[u8]) -> io::Result<Vec<DavResource>> {
                                         && propstat_properties.iter().all(|property| property.as_slice() == b"creationdate") => {}
                                 Some(404)
                                     if !propstat_properties.is_empty()
-                                        && propstat_properties.iter().all(|property| matches!(property.as_slice(), b"creationdate" | b"getcontentlength")) => {
-                                            // RFC 4918 §15.4 bindet die Länge an GET-Inhalt.
+                                        && propstat_properties.iter().all(|property| matches!(property.as_slice(), b"creationdate" | b"getcontentlength" | b"getetag")) => {
+                                            // RFC 4918 §15.4/15.6 verlangt Länge und ETag
+                                            // nicht für jede Collection (etwa WsgiDAV).
                                             // Erst am response-Ende steht der erfolgreiche
                                             // Ressourcentyp unabhängig von der propstat-Reihenfolge fest.
-                                            absent_length_propstats.push(propstat_index);
+                                            if propstat_properties.contains(b"getcontentlength".as_slice()) {
+                                                absent_length_propstats.push(propstat_index);
+                                            }
+                                            if propstat_properties.contains(b"getetag".as_slice()) {
+                                                absent_collection_etag_propstats.push(propstat_index);
+                                            }
                                         }
                                 Some(status) => semantic_errors.push(format!(
                                     "Status {status} ist für eine Pflichtmetadatenklasse nicht erfolgreich"
@@ -1837,6 +1845,13 @@ fn parse_multistatus(payload: &[u8]) -> io::Result<Vec<DavResource>> {
                             if resource.successful_resourcetype != Some(true) {
                                 for index in &absent_length_propstats {
                                     response_semantic_errors.push(format!("propstat {index}: Status 404 für getcontentlength ist nur bei einer bestätigten Collection zulässig"));
+                                }
+                            }
+                            for index in &absent_collection_etag_propstats {
+                                if resource.successful_resourcetype != Some(true) {
+                                    response_semantic_errors.push(format!("propstat {index}: Status 404 für getetag ist nur bei einer bestätigten Collection zulässig"));
+                                } else if resource.etag.is_some() {
+                                    response_semantic_errors.push(format!("propstat {index}: getetag wird zugleich erfolgreich und als fehlend gemeldet"));
                                 }
                             }
                             if let Err(error) = validate_resource(&resource) {
@@ -2593,6 +2608,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(escaped[0].entry.name, "datei&mehr.txt");
+    }
+
+    #[test]
+    fn collection_ohne_etag_akzeptiert_wsgi_dav_propstats_in_beiden_reihenfolgen() {
+        let collection = "<D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:getlastmodified>Sun, 12 Jul 2026 20:00:00 GMT</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>";
+        for missing in [
+            "<D:getetag/>",
+            "<D:getcontentlength/><D:getetag/>",
+            "<D:creationdate/><D:getcontentlength/><D:getetag/>",
+        ] {
+            let absent = format!("<D:propstat><D:prop>{missing}</D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>");
+            for groups in [
+                format!("{collection}{absent}"),
+                format!("{absent}{collection}"),
+            ] {
+                let xml = format!("<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/dav/</D:href>{groups}</D:response></D:multistatus>");
+                let resources = parse_multistatus(xml.as_bytes()).unwrap();
+                assert_eq!(resources.len(), 1);
+                assert!(resources[0].is_collection);
+                assert_eq!(resources[0].etag, None);
+                assert_eq!(resources[0].length, None);
+            }
+        }
+    }
+
+    #[test]
+    fn fehlende_etag_bleibt_fuer_dateien_pflicht_und_403_bleibt_fehler() {
+        let success = "<D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:getcontentlength>4</D:getcontentlength><D:getlastmodified>Sun, 12 Jul 2026 20:00:00 GMT</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>";
+        let absent = "<D:propstat><D:prop><D:getetag/></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>";
+        for (success, failure) in [
+            (success.replace("<D:collection/>", ""), absent.to_owned()),
+            (
+                success.to_owned(),
+                absent.replace("404 Not Found", "403 Forbidden"),
+            ),
+            (
+                success.replace("<D:resourcetype><D:collection/></D:resourcetype>", ""),
+                absent.to_owned(),
+            ),
+        ] {
+            for groups in [format!("{success}{failure}"), format!("{failure}{success}")] {
+                let xml = format!("<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/dav/</D:href>{groups}</D:response></D:multistatus>");
+                assert!(parse_multistatus(xml.as_bytes()).is_err(), "{xml}");
+            }
+        }
     }
 
     #[test]

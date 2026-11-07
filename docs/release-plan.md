@@ -38,51 +38,57 @@ Versionswechsel nur für ausdrücklich benannte Meilensteine/Kandidaten; keine
 Versionsbumps für gewöhnliche Entwicklungs- oder Dokumentationscommits.
 Veröffentlichung, Tags und öffentliche Pakete brauchen einen konkreten Auftrag.
 
-## Abnahmestand
+## Abnahmestand des Kandidaten 0.1.125
 
-Geprüfte Basis vor den Linux-Ergänzungen: `360e3f23`, weiterhin Version `0.1.124` unter
-`Unreleased`. Core, CLI, App, Formatierung, Workspace-Clippy und Fuzz-Build sind
-auf macOS und Linux geprüft; Frontend und Werkzeuge auf macOS.
-[Reviewkorrekturen](code-review-2026-11-02.md).
+Die folgenden Paketbelege betreffen den ersten vorbereiteten Kandidaten.
+Die native WebDAV-Abnahme hat zusätzlich eine fehlerhafte Ablehnung von
+Collections ohne ETag gefunden. Nach dieser Parserkorrektur werden die Pakete
+neu gebaut und nativ erneut geprüft. Die Veröffentlichung folgt erst nach
+der vollständigen Kandidatenabnahme.
 
-Die nachfolgenden Linux-Ergänzungen bringen Polkit für lokale Metadaten und eine
-benutzereigene AppImage-Installation mit stabilem Updatepfad. Ihr gemeinsamer
-Mac-/Linux-Gegenlauf und die native AppImage-Prüfung stehen im
-[Linux-Prüfstand](linux.md#prüfstand). Diese Entwicklungsprüfung ersetzt die
-nachstehende Abnahme eines benannten öffentlichen Kandidaten nicht.
+Die vollständige [GitHub-CI](https://github.com/DanielMuellerIR/Doppeldecker/actions/runs/42386074224)
+ist für den Quellstand `4ec77e3f` auf macOS 15 und Ubuntu 24.04 erfolgreich.
+Die signierten Pakete enthalten den Laufzeitstand `b911ad6a`; die danach
+geänderten Dateien betreffen ausschließlich Tests. Version, Architektur,
+Abhängigkeiten, Signaturen, Prüfsummen und die Abwesenheit privater Buildpfade
+sind an den fertigen Paketen geprüft.
 
-Zusätzlich bestehen SFTP-Archiv- und Rechteabläufe auf beiden Plattformen sowie
-ZIP-Erzeugung und Entpacken über verschlüsseltes Samba auf Linux gegen frische
-künstliche Serverroots. Die native Kandidatenabnahme steht in der Tabelle unten.
+Die macOS-App und das DMG sind Developer-ID-signiert, notarisiert und gestapelt.
+Die App im DMG ist bytegleich zur geprüften App; das Updaterarchiv wurde erst nach
+dem Stapeln erzeugt. Der native Lauf mit dem fertigen Bundle belegt Kopieren
+(einschließlich einer Resource Fork über 6 MiB), Umbenennen, Ordneranlage und zwei
+getrennte Fensterjournale. Die Bildschirmaufnahme war auf dem Testkonto nicht
+freigegeben; Dateiwirkungen und native Fenster wurden unabhängig geprüft.
 
-Zuletzt nativ und als Paket abgenommener Laufzeitstand: `f5425300`. Die folgenden
-Paketbelege gelten für diesen Stand.
+Auf Linux starten das fertige AppImage und die entpackte DEB-App mit vollständiger
+Oberfläche. Kopieren, Umbenennen, Ordneranlage und getrennte Fensterjournale sind
+nativ geprüft. Der AppImage-Start benötigt keine testseitigen Grafik-Workarounds.
+Die zugehörigen Ansichten einschließlich des Fehlers bei beschädigtem Journal
+sind visuell geprüft.
 
-macOS: lokale Metadaten einschließlich Administratorfreigabe sowie direkte
-SFTP-Rechteänderung, Datei-/Ordnerzyklen sowie SFTP-/WebDAV-Archivuploads sind
-nativ geprüft. Die aktuelle notarisierte App ist atomar installiert; das vorhandene
-Queue-Journal bleibt unverändert. Cmd+Q und Menü erlauben auch bei unlesbaren
-Journalen ein bestätigtes Beenden. Das aktuelle private DMG erhält Signatur und
-Notarisierungsticket; alle drei Programme bleiben nach Extraktion bytegleich zur
-geprüften App.
+Das Upgrade von der öffentlichen 0.1.124 auf die Kandidaten-App beziehungsweise
+das benutzereigene AppImage erhält ein gespeichertes SFTP-Profil und die
+Konfiguration. Nach Entfernen der isolierten Installation bleiben Konfiguration
+und Testdateien erhalten. Ein beschädigtes Queue-Journal erlaubt ein bestätigtes
+Beenden und bleibt mit den Testdateien unverändert. Die DEB-Prüfung belegt echte
+Installation, Entfernung und Upgrade von 0.1.124 mit den deklarierten
+Laufzeitabhängigkeiten in einer isolierten Ubuntu-24.04-Umgebung.
 
-Linux: Beide Pakete sind auf Version, Architektur, Bibliotheken und mitgelieferte
-CLI geprüft. Die entpackte DEB-App und das regulär gestartete AppImage zeigen die
-vollständige Oberfläche. Das AppImage enthält die benötigte GStreamer-Runtime
-und portable Starthooks; der Pfadscan erfasst die gesamten Paketbäume.
+Zusätzlich bestehen echte SFTP-Gegenläufe auf macOS und Linux sowie die
+verschlüsselten Samba-Gegenläufe für Queue/Quarantäne und ZIP-Übertragung auf
+Linux. Diese automatisierten Providerprüfungen ersetzen die noch offenen
+nativen Kombinationen nicht.
 
-Für den nächsten benannten Kandidaten bleiben diese Abnahmen offen:
-
-| Prüfung | macOS | Linux |
+| Noch offene Prüfung | macOS | Linux |
 | --- | --- | --- |
 | Weitere native Anbieterabläufe | FTP-/FTPS-/SMB-Archive und rekursive entfernte Rechteänderungen; Fehler, Konflikt und Abbruch | Anbieterabläufe mit der fertigen Kandidaten-App wiederholen |
-| Installation und Deinstallation | Frische Installation aus dem DMG, Start, erhaltene Konfiguration nach Entfernung | DEB installieren/entfernen, AppImage samt Integration starten/entfernen; Konfiguration erhalten |
-| Upgrade aus der öffentlichen Preview | Kandidatenpaket über 0.1.124, Profile und Journale erhalten | DEB und AppImage getrennt von 0.1.124 aktualisieren; Profile und Journale erhalten |
-| Recovery mit Kandidatenartefakten | Queue-, Papierkorb- und Quarantäneabbrüche sowie beschädigte Persistenz | Dieselben Recoveryfälle mit beiden Paketarten |
+| Recovery mit Kandidatenartefakten | Unterbrochene Papierkorb-/Quarantäneabläufe und weitere beschädigte Persistenz | Dieselben Recoveryfälle mit beiden Paketarten |
+| Update über den veröffentlichten Kanal | Installation über das signierte GitHub-Updateangebot | Signierter Versionswechsel für AppImage und DEB |
 
-Die [Entwicklungshinweise](release-notes-next.md), Funktionsmatrix und READMEs
-beschreiben den Quellstand. Kandidatenversion, Downloadlinks und Website werden
-nach der Artefaktabnahme gemeinsam darauf bezogen.
+Der Kandidat ist vorbereitet, aber noch nicht veröffentlicht. Die offene native
+Matrix bleibt Teil der weiteren Abnahme und darf nicht als vollständig geprüft
+bezeichnet werden.
+[Historische Paketbelege](release-history-2026-10.md) bleiben getrennt erhalten.
 
 ## macOS-Paketvertrag
 

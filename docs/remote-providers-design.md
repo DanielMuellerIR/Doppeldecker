@@ -277,10 +277,16 @@ kanonischer Root und Sitzungsgeneration bilden die Reconnect-Identität.
 Jede Collection wird mit genau einem begrenzten `Depth: 1`-`PROPFIND` gelesen. Der
 eigene Parser prüft den DAV-Namensraum, XML-Struktur, jede `propstat`-Statuszeile,
 Pflichtmetadaten, direkte Kindbeziehung, eindeutige UTF-8-Namen und starke Datei-ETags;
-DTD, unbekannte Entitäten, fremde Origins, Teilfehler und schwache/fehlende ETags
+DTD, unbekannte Entitäten, fremde Origins, Teilfehler und schwache/fehlende Datei-ETags
 stoppen fail-closed. ETags fließen pro Eintrag und als Listingtoken in den
 Realmodus-Proof ein. WebDAV-Quellen erzwingen zusätzlich `ContentHash`; GET verwendet
 `If-Match`, sodass Drift auch zwischen Listing und Stream nicht committed wird.
+
+Collections benötigen keine Inhaltslänge und keinen ETag. Ein ausdrückliches
+`404` für diese Eigenschaften ist erst nach einem erfolgreich bestätigten
+Collectiontyp zulässig, unabhängig von der Reihenfolge der `propstat`-Blöcke.
+Andere Fehlerstatus und widersprüchliche ETag-Angaben bleiben Fehler.
+Siehe [RFC 4918 §15.4/15.6](https://www.rfc-editor.org/rfc/rfc4918.html#section-15.6).
 
 WebDAV→lokal unterstützt AddOnly, Update und Mirror über lokale Quarantäne.
 Strikter Sync in ein WebDAV-Ziel bleibt seit AP13R ohne gemeinsame Root-/Elternbindung
