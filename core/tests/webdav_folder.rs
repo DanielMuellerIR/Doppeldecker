@@ -182,7 +182,6 @@ fn normales_webdav_mkdir_erhaelt_kollisionen_und_bilanziert_spaeten_elterntausch
     for fault in [
         Fault::ParentSwapAfterList,
         Fault::ParentSwapAtMkdir,
-        Fault::MissingParentEtag,
         Fault::LateCollision,
     ] {
         let server = Server::new();
@@ -285,4 +284,24 @@ fn normales_webdav_mkdir_meldet_profilrootwechsel_nach_moeglicher_wirkung_als_un
             .count(),
         1
     );
+}
+
+#[test]
+fn normales_mkdir_ohne_collection_etag_prueft_namen_und_leeren_readback() {
+    let server = Server::new();
+    server.state.lock().unwrap().omit_collection_etags = true;
+    create(&server.endpoint(), "OhneETag").unwrap();
+    assert!(server.root.path().join("pane/OhneETag").is_dir());
+    assert_eq!(
+        std::fs::read_dir(server.root.path().join("pane/OhneETag"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let state = server.state.lock().unwrap();
+    assert_eq!(
+        state.requests.iter().filter(|(m, _)| m == "MKCOL").count(),
+        1
+    );
+    assert!(state.mkdir_if_headers.iter().all(String::is_empty));
 }

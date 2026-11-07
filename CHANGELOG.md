@@ -8,8 +8,9 @@ folgt Keep a Changelog; Versionen verwenden Semantic Versioning.
 ## [0.1.125] - 2026-11-07
 
 - WebDAV-Ordner bleiben lesbar, wenn der Server Länge und ETag ausdrücklich
-  als nicht vorhanden meldet. Datei-ETags und echte Serverfehler werden
-  weiterhin vollständig geprüft.
+  als nicht vorhanden meldet. Gewöhnliche additive Uploads und Ordneranlagen
+  benötigen ebenfalls keine Collection-ETag. Datei-ETags, vollständige Listings,
+  Readbacks und die getrennten strikten Schreibgrenzen bleiben erhalten.
 
 - Ressourcen-Forks gewöhnlicher macOS-Kopien werden auch auf macOS 15 über
   positionierte Attributzugriffe am gehaltenen Dateiobjekt vollständig geprüft.

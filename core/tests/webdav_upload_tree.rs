@@ -227,11 +227,7 @@ fn baum_mkcol_antwortverlust_und_readbackfehler_erhalten_ohne_delete_ihren_inten
 }
 #[test]
 fn baum_schwache_listings_stoppen_kinderwirkungen() {
-    for fault in [
-        server::Fault::PartialListing,
-        server::Fault::WeakParentEtag,
-        server::Fault::MissingParentEtag,
-    ] {
+    for fault in [server::Fault::PartialListing, server::Fault::WeakParentEtag] {
         let case = Case::new();
         let op = case.prepared(&["Baum"]);
         case.server.state.lock().unwrap().fault = fault;
@@ -1884,4 +1880,37 @@ fn content_sync_webdav_technische_ordnerskips_mit_symlink_sperren_alle_entfernun
         std::fs::read(target.join("Extra/Unter/Datei")).unwrap(),
         b"erhalten"
     );
+}
+
+#[test]
+fn baum_ohne_collection_etags_behaelt_dateibedingungen_und_strikte_sperre() {
+    let case = Case::new();
+    case.server.state.lock().unwrap().omit_collection_etags = true;
+    let op = case.prepared(&["Baum", "Direkt.txt"]);
+    let (queue, result) = case.run(op, &Cancel::new(), &mut |_| {});
+    let Ok(QueueExecutionResult::File(stats)) = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(stats.files, 3);
+    assert!(stats.target_copy_new_best_effort);
+    assert_eq!(queue.snapshot().entries[0].state, QueueState::Completed);
+    let pane = case.server.root.path().join("pane");
+    assert_eq!(std::fs::read(pane.join("Baum/A.txt")).unwrap(), b"Inhalt");
+    assert_eq!(std::fs::read(pane.join("Direkt.txt")).unwrap(), b"Direkt");
+    assert!(pane.join("Baum/Unter/Leer").is_dir());
+    assert!(pane.join("Baum/Unter/literal%2F.txt").is_file());
+    case.intact();
+    let state = case.server.state.lock().unwrap();
+    assert!(state.put_if_headers.iter().all(String::is_empty));
+    assert!(state.move_if_headers.iter().all(String::is_empty));
+    drop(state);
+    let (strict, root) = case.server.endpoint().file_context().unwrap();
+    let RootIdentity::WebDav(observed) = strict.root_identity(&root).unwrap() else {
+        panic!("WebDAV-Beleg erwartet")
+    };
+    assert!(observed.namespace_only);
+    assert!(observed.root_etag.is_empty());
+    observed.validate().unwrap();
+    assert!(strict.open_write_new(&root.join("NichtAnlegen")).is_err());
+    assert!(!pane.join("NichtAnlegen").exists());
 }

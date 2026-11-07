@@ -458,14 +458,15 @@ impl WebDavServerIdentity {
 pub struct WebDavRootIdentity {
     pub server: WebDavServerIdentity,
     pub virtual_root: String,
-    /// Starke ETag der Collection beim Plan-/Permit-Snapshot. Derselbe Pfad in
-    /// derselben Sitzung ist ohne diesen Token keine gebundene Rootidentität.
-    ///
-    /// `default` dient ausschließlich dazu, ältere Persistenzstände bis zu ihrer
-    /// versionsgebundenen Migration lesen zu können. Jede fachliche Verwendung
-    /// ruft anschließend `validate()` auf und lehnt den leeren Wert ab.
+    /// Beobachtete starke Collection-ETag, soweit der Server sie bereitstellt.
+    /// Fehlende Legacyfelder bleiben ohne expliziten Namespacevertrag ungültig.
     #[serde(default)]
     pub root_etag: String,
+    /// Beobachteter Namespace ohne Collection-ETag; keine atomare Rootbindung.
+    /// Dies erlaubt ausschließlich die vorhandenen Best-Effort-Klassen. Die
+    /// strikten WebDAV-Mutationsmethoden und Capability-Gates bleiben gesperrt.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub namespace_only: bool,
     pub session_generation: u64,
 }
 
@@ -569,18 +570,27 @@ impl WebDavRootIdentity {
     pub fn validate(&self) -> io::Result<()> {
         self.server.validate()?;
         validate_collection_root(&self.virtual_root)?;
+        let invalid_etag = if self.namespace_only {
+            !self.root_etag.is_empty()
+        } else {
+            self.root_etag.starts_with("W/")
+                || self.root_etag.len() < 2
+                || !self.root_etag.starts_with('"')
+                || !self.root_etag.ends_with('"')
+                || self.root_etag.chars().any(char::is_control)
+        };
         if (self.virtual_root != "/" && self.virtual_root.ends_with('/'))
-            || self.root_etag.starts_with("W/")
-            || self.root_etag.len() < 2
-            || !self.root_etag.starts_with('"')
-            || !self.root_etag.ends_with('"')
-            || self.root_etag.chars().any(char::is_control)
+            || invalid_etag
             || self.session_generation == 0
         {
             return Err(invalid("WebDAV-Root-Identität ist ungültig"));
         }
         Ok(())
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Verweis auf ein Geheimnis im System-Schlüsselbund. `service` und `account` sind
@@ -1318,11 +1328,13 @@ mod tests {
             },
             virtual_root: "/auswahl".into(),
             root_etag: "\"root-42\"".into(),
+            namespace_only: false,
             session_generation: 3,
         };
         identity.validate().unwrap();
         let json = serde_json::to_value(&identity).unwrap();
         assert_eq!(json["root_etag"], "\"root-42\"");
+        assert!(json.get("namespace_only").is_none());
         assert_eq!(
             serde_json::from_value::<WebDavRootIdentity>(json.clone()).unwrap(),
             identity
@@ -1335,6 +1347,29 @@ mod tests {
         missing.as_object_mut().unwrap().remove("root_etag");
         let legacy = serde_json::from_value::<WebDavRootIdentity>(missing).unwrap();
         assert!(legacy.validate().is_err());
+
+        let mut observed = identity.clone();
+        observed.root_etag.clear();
+        observed.namespace_only = true;
+        observed.validate().unwrap();
+        let encoded = serde_json::to_value(&observed).unwrap();
+        assert_eq!(
+            serde_json::from_value::<WebDavRootIdentity>(encoded.clone()).unwrap(),
+            observed
+        );
+        let mut without_contract = encoded;
+        without_contract
+            .as_object_mut()
+            .unwrap()
+            .remove("namespace_only");
+        assert!(
+            serde_json::from_value::<WebDavRootIdentity>(without_contract)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        observed.root_etag = "\"nachtraeglich\"".into();
+        assert!(observed.validate().is_err());
     }
 
     #[test]

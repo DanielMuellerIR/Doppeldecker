@@ -12394,6 +12394,7 @@ mod tests {
             },
             virtual_root: root.into(),
             root_etag: "\"root-42\"".into(),
+            namespace_only: false,
             session_generation: 3,
         });
         QueueOperation::ProviderDelete {

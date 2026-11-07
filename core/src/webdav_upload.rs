@@ -254,7 +254,8 @@ impl Upload {
                 &self.remote(path)?,
                 true,
             )?;
-            if matching[0].provider_token.as_deref() != Some(identity.etag.as_bytes()) {
+            if matching[0].provider_token.as_deref() != identity.etag.as_deref().map(str::as_bytes)
+            {
                 return Err(drift("WebDAV-Unterordner änderte sich beim Binden"));
             }
             context.check()?;
@@ -440,7 +441,10 @@ impl Upload {
             self.observe_after_effect(deadline)?;
             let identity =
                 WebDavVfs::resource_identity_bound(&self.binding.binding, &remote, true)?;
-            if expected.as_ref().is_some_and(|etag| etag != &identity.etag) {
+            if expected
+                .as_ref()
+                .is_some_and(|etag| Some(etag) != identity.etag.as_ref())
+            {
                 return Err(invalid("WebDAV-MKCOL-Readback besitzt eine andere ETag"));
             }
             if !read_children(&self.binding.binding, &remote, deadline)?.is_empty() {
@@ -457,7 +461,8 @@ impl Upload {
                 || matching[0].entry.name != name
                 || !matching[0].entry.is_dir
                 || matching[0].entry.is_symlink
-                || matching[0].provider_token.as_deref() != Some(identity.etag.as_bytes())
+                || matching[0].provider_token.as_deref()
+                    != identity.etag.as_deref().map(str::as_bytes)
             {
                 return Err(invalid(
                     "MKCOL-Elternreadback bestätigt Namen, Typ oder Version nicht",
@@ -711,7 +716,7 @@ impl Vfs for Upload {
             provider_token: context
                 .parents()?
                 .last()
-                .map(|p| p.etag.as_bytes().to_vec()),
+                .and_then(|p| p.etag.as_ref().map(|etag| etag.as_bytes().to_vec())),
             complete: true,
         })
     }

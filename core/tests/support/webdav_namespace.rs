@@ -105,6 +105,7 @@ pub(crate) struct State {
 
     pub(crate) deny_collection_probes: bool,
     pub(crate) changing_collection_tokens: bool,
+    pub(crate) omit_collection_etags: bool,
     pub(crate) mkdir_if_headers: Vec<String>,
     pub(crate) hold_after_mkdir: bool,
     pub(crate) mkdir_paused: bool,
@@ -423,8 +424,10 @@ fn resource(path: &Path, href: &str, state: &Mutex<State>) -> String {
         format!("<D:resourcetype/><D:getcontentlength>{}</D:getcontentlength><D:getlastmodified>{modified}</D:getlastmodified>", path.metadata().unwrap().len())
     };
     let fault = state.lock().unwrap().fault;
-    let token = if path.file_name().is_some_and(|name| name == "neighbor")
-        && fault == Fault::MissingSiblingEtag
+    let omit_collection_etag = path.is_dir() && state.lock().unwrap().omit_collection_etags;
+    let token = if omit_collection_etag
+        || (path.file_name().is_some_and(|name| name == "neighbor")
+            && fault == Fault::MissingSiblingEtag)
     {
         String::new()
     } else if path.file_name().is_some_and(|name| name == "neighbor")
@@ -434,7 +437,12 @@ fn resource(path: &Path, href: &str, state: &Mutex<State>) -> String {
     } else {
         format!("<D:getetag>{}</D:getetag>", etag(path, state))
     };
-    format!("<D:response><D:href>{}</D:href><D:propstat><D:prop>{kind}{token}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>", url.path())
+    let absent = if omit_collection_etag {
+        "<D:propstat><D:prop><D:getetag/></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>"
+    } else {
+        ""
+    };
+    format!("<D:response><D:href>{}</D:href><D:propstat><D:prop>{kind}{token}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>{absent}</D:response>", url.path())
 }
 
 fn respond(
@@ -794,6 +802,7 @@ fn respond(
             }
             let result = Response::builder().status(StatusCode::CREATED);
             let result = match fault {
+                _ if state.lock().unwrap().omit_collection_etags => result,
                 Fault::NoCreatedEtag | Fault::MissingCreatedToken => result,
                 Fault::WrongCreatedEtag => result.header("etag", "\"andere-collection\""),
                 _ => result.header("etag", etag(&local, state)),

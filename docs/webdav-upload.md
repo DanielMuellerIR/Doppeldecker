@@ -53,6 +53,14 @@ solche Top-Level-Quellen aus: Ein gleichnamiges vorhandenes Ziel erzeugt keinen
 Konflikt für Inhalt, der überhaupt nicht übertragen wird. Unterstützte unabhängige
 Inhalte behalten ihren normalen Upload-, Konflikt- und Readbackvertrag.
 
+Collections ohne ETag bleiben für gewöhnliche additive Uploads und Ordneranlagen
+verwendbar. Die Rootbeobachtung kennzeichnet diesen Fall ausdrücklich als
+Namespace ohne starke Objektbindung; frische vollständige Elternlistings und
+Readbacks bleiben erforderlich. Dateien benötigen weiterhin starke ETags und
+wirksame Dateibedingungen. Der strikte VFS-/Sync-Schreibvertrag erhält dadurch
+keine zusätzliche Fähigkeit. Alte persistierte Rootbelege ohne ETag und ohne
+diesen ausdrücklichen Namespacevertrag bleiben ungültig.
+
 ## Historischer Stand bis 2026-10-18
 
 Die folgenden Detailbelege dokumentieren die frühere additive Klasse. Aussagen

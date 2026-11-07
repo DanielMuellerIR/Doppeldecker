@@ -210,7 +210,7 @@ impl WebDavVfs {
                     validate_strong_etag(&etag)?;
                     Ok::<_, io::Error>(WebDavResourceIdentity {
                         remote: remote.clone(),
-                        etag,
+                        etag: Some(etag),
                     })
                 })
                 .transpose()?;

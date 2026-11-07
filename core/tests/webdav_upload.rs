@@ -377,7 +377,6 @@ fn upload_deleteverlust_und_erfolgsantwort_ohne_abwesenheit_bleiben_unklar() {
 fn upload_unvollstaendiges_listing_und_schwache_eltern_sperren_vor_put() {
     for fault in [
         server::Fault::PartialListing,
-        server::Fault::MissingParentEtag,
         server::Fault::WeakParentEtag,
         server::Fault::ParentSwapAfterList,
     ] {

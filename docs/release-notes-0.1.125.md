@@ -10,8 +10,9 @@ konkreten Protokollgrenzen. Kopieren und Verschieben, Ordneranlage, Umbenennung
 und Konfliktentscheidungen laufen über die Queue des jeweiligen Fensters.
 Entfernte Datei- und Ordnernamen lassen sich auch zyklisch vertauschen.
 
-WebDAV unterstützt auch Ordner ohne ETag oder Inhaltslänge, etwa bei WsgiDAV.
-Dateien benötigen weiterhin die geprüften Metadaten und einen starken ETag.
+WebDAV liest auch Ordner ohne ETag oder Inhaltslänge und verwendet sie als
+Ziel gewöhnlicher additiver Uploads und Ordneranlagen. Dateien benötigen
+weiterhin die geprüften Metadaten und einen starken, standardkonformen ETag.
 
 Eine lokale Auswahl lässt sich als ZIP zur entfernten Gegenpane übertragen.
 ZIP-Archive, einzelne enthaltene Dateien und Unterbäume lassen sich in lokale

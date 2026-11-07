@@ -160,7 +160,8 @@ impl InteractiveRename<'_> {
             identity: crate::RootIdentity::WebDav(WebDavRootIdentity {
                 server: self.binding.session.identity.clone(),
                 virtual_root: normalize_virtual_path(&self.parent)?,
-                root_etag: last.etag.clone(),
+                root_etag: last.etag.clone().unwrap_or_default(),
+                namespace_only: last.etag.is_none(),
                 session_generation: self.binding.generation,
             }),
             parents: parent_proof(&parents)?,
@@ -225,7 +226,9 @@ impl InteractiveRename<'_> {
         *lock(&self.parents) = fresh.clone();
         Ok(CompleteDirectoryListing {
             entries,
-            provider_token: fresh.last().map(|parent| parent.etag.as_bytes().to_vec()),
+            provider_token: fresh
+                .last()
+                .and_then(|parent| parent.etag.as_ref().map(|etag| etag.as_bytes().to_vec())),
             complete: true,
         })
     }
@@ -445,7 +448,7 @@ impl Vfs for InteractiveRename<'_> {
             entries,
             provider_token: lock(&self.parents)
                 .last()
-                .map(|p| p.etag.as_bytes().to_vec()),
+                .and_then(|p| p.etag.as_ref().map(|etag| etag.as_bytes().to_vec())),
             complete: true,
         })
     }
@@ -542,7 +545,7 @@ fn parent_proof(
             .map(|parent| {
                 (
                     parent.remote.clone(),
-                    *blake3::hash(parent.etag.as_bytes()).as_bytes(),
+                    *blake3::hash(parent.etag.as_deref().unwrap_or("").as_bytes()).as_bytes(),
                     *blake3::hash(parent.remote.as_bytes()).as_bytes(),
                 )
             })

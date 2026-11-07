@@ -10779,6 +10779,7 @@ mod tests {
             },
             virtual_root: "/daten/projekt".into(),
             root_etag: "\"root-1\"".into(),
+            namespace_only: false,
             session_generation: 1,
         });
         let mut legacy_webdav_server = match &webdav_identity {
@@ -16268,6 +16269,7 @@ mod tests {
             },
             virtual_root: "/daten".into(),
             root_etag: "\"root-1\"".into(),
+            namespace_only: false,
             session_generation: 1,
         });
         let mut legacy_root = serde_json::to_value(webdav_root).unwrap();
@@ -16319,6 +16321,7 @@ mod tests {
             },
             virtual_root: "/daten".into(),
             root_etag: "\"root-1\"".into(),
+            namespace_only: false,
             session_generation: 1,
         });
         let mut legacy_root = serde_json::to_value(webdav_root).unwrap();

@@ -111,7 +111,7 @@ struct BoundWebDavMutation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WebDavResourceIdentity {
     remote: String,
-    etag: String,
+    etag: Option<String>,
 }
 
 impl BoundWebDavMutation {
@@ -383,9 +383,15 @@ impl WebDavVfs {
         }
         let etag = proof
             .provider_token
-            .and_then(|value| String::from_utf8(value).ok())
-            .ok_or_else(|| invalid("WebDAV-Ressourcenbindung benötigt eine starke ETag"))?;
-        validate_strong_etag(&etag)?;
+            .map(|value| String::from_utf8(value).map_err(|_| invalid("Ungültige WebDAV-ETag")))
+            .transpose()?;
+        if let Some(etag) = &etag {
+            validate_strong_etag(etag)?;
+        } else if !expected_collection {
+            return Err(invalid(
+                "WebDAV-Ressourcenbindung benötigt eine starke ETag",
+            ));
+        }
         Ok(WebDavResourceIdentity {
             remote: remote.to_owned(),
             etag,
@@ -606,7 +612,8 @@ impl Vfs for WebDavVfs {
         Ok(crate::real_mode::RootIdentity::WebDav(WebDavRootIdentity {
             server: binding.session.identity,
             virtual_root: normalize_virtual_path(path)?,
-            root_etag: identity.etag,
+            root_etag: identity.etag.clone().unwrap_or_default(),
+            namespace_only: identity.etag.is_none(),
             session_generation: binding.generation,
         }))
     }
@@ -767,25 +774,30 @@ fn with_parent_condition(
     let parent = parent_server_path(child)?;
     let mut selected = None;
     for identity in identities {
-        validate_strong_etag(&identity.etag)?;
+        if let Some(etag) = &identity.etag {
+            validate_strong_etag(etag)?;
+        }
         if identity.remote == parent {
-            if selected.is_some_and(|etag| etag != identity.etag.as_str()) {
+            if selected.is_some_and(|previous| previous != identity) {
                 return Err(coded_error(
                     io::ErrorKind::Interrupted,
                     ErrorCode::PlanDrift,
                     "Widersprüchliche WebDAV-Elternversionen; keine Mutation",
                 ));
             }
-            selected = Some(identity.etag.as_str());
+            selected = Some(identity);
         }
     }
-    let etag = selected.ok_or_else(|| invalid("Der unmittelbare WebDAV-Elternbeleg fehlt"))?;
+    let identity = selected.ok_or_else(|| invalid("Der unmittelbare WebDAV-Elternbeleg fehlt"))?;
     // Gewöhnliche Wirkungen prüfen Eltern vor und nach dem Request frisch.
     // Collection-ETags sind insbesondere bei Sabre/Nextcloud keine auswertbare
     // If-Bedingung. Nur der getrennte strikte Vertrag verlangt sie weiter.
     if class != WebDavRequestClass::Strict {
         return Ok(request);
     }
+    let etag = identity.etag.as_deref().ok_or_else(|| {
+        invalid("Die strikte WebDAV-Elternbedingung benötigt eine starke Collection-ETag")
+    })?;
     // Genau eine Tagged-list: Weitere wahre Listen könnten eine falsche
     // Elternversion nach RFC 4918 §10.4.3 überdecken. Die restliche Kette bleibt
     // ausschließlich durch die getrennten Vorher-/Nachherprüfungen beobachtet.
@@ -2055,7 +2067,7 @@ fn parse_collection_listing(
 fn resource_entry(name: &str, resource: DavResource) -> io::Result<ProofListEntry> {
     let is_dir = resource.is_collection;
     let is_file = !is_dir;
-    let etag = resource.etag.unwrap_or_default();
+    let etag = resource.etag;
     Ok(ProofListEntry {
         raw_name: name.as_bytes().to_vec(),
         safely_decoded: true,
@@ -2075,7 +2087,7 @@ fn resource_entry(name: &str, resource: DavResource) -> io::Result<ProofListEntr
             inode: None,
             hard_links: None,
         },
-        provider_token: Some(etag.into_bytes()),
+        provider_token: etag.map(String::into_bytes),
     })
 }
 
@@ -2461,7 +2473,7 @@ mod tests {
         let client = Client::new();
         let parents = [WebDavResourceIdentity {
             remote: "/dav".into(),
-            etag: "\"parent\"".into(),
+            etag: Some("\"parent\"".into()),
         }];
         for class in [
             WebDavRequestClass::Strict,
@@ -2495,6 +2507,47 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn fehlende_collection_etag_ist_nur_im_ordinary_elternbeleg_zulaessig() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::new();
+        let parents = [WebDavResourceIdentity {
+            remote: "/dav".into(),
+            etag: None,
+        }];
+        for class in [
+            WebDavRequestClass::OrdinaryFile,
+            WebDavRequestClass::OrdinaryCollection,
+        ] {
+            let request = with_parent_condition(
+                client.put("https://dav.test/dav/file"),
+                "https://dav.test",
+                &parents,
+                "/dav/file",
+                class,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            assert!(!request.headers().contains_key("if"));
+        }
+        assert!(with_parent_condition(
+            client.put("https://dav.test/dav/file"),
+            "https://dav.test",
+            &parents,
+            "/dav/file",
+            WebDavRequestClass::Strict
+        )
+        .is_err());
+        let mut resources = parse_multistatus(VALID.as_bytes()).unwrap();
+        assert_eq!(
+            resource_entry("dav", resources.remove(0))
+                .unwrap()
+                .provider_token,
+            None
+        );
     }
 
     #[test]

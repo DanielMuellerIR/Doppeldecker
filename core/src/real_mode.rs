@@ -2978,12 +2978,14 @@ mod tests {
             server: server.clone(),
             virtual_root: "/daten/ziel".into(),
             root_etag: "\"ziel-1\"".into(),
+            namespace_only: false,
             session_generation: 7,
         });
         let quarantine = RootIdentity::WebDav(crate::remote::WebDavRootIdentity {
             server,
             virtual_root: "/daten/.doppeldecker-quarantine/lauf".into(),
             root_etag: "\"quarantaene-1\"".into(),
+            namespace_only: false,
             session_generation: 7,
         });
 
