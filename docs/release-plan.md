@@ -1,6 +1,6 @@
 # Release- und Plattformplan
 
-Stand: 2026-11-08. Die aktuelle öffentliche Preview ist
+Stand: 2026-11-08. Die veröffentlichte Preview ist
 [0.1.125](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.125).
 Veröffentlichung und Abnahme sind für ihre konkreten Pakete nachgewiesen.
 Künftige Änderungen bleiben unter `Unreleased`.
@@ -36,6 +36,14 @@ Historische erfolgreiche Gegenläufe ersetzen keinen aktuellen Kandidatenlauf.
 Versionswechsel nur für ausdrücklich benannte Meilensteine/Kandidaten; keine
 Versionsbumps für gewöhnliche Entwicklungs- oder Dokumentationscommits.
 Veröffentlichung, Tags und öffentliche Pakete brauchen einen konkreten Auftrag.
+
+## Kandidat 0.1.126
+
+0.1.126 korrigiert gespeicherte Fenstergrößen, Linux-mDNS-Erkennung und die
+Bereinigung entfernter wartender Archivuploads. Der Kandidat durchläuft die
+vollständigen Plattformgates und die Prüfung der signierten Endpakete.
+Die Abnahme wird vor der Veröffentlichung ergänzt; die folgenden Belege zu
+0.1.125 gelten ausschließlich dem früheren Release.
 
 ## Abnahmestand von 0.1.125
 

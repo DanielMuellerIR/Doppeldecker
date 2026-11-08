@@ -126,34 +126,38 @@ pub(crate) fn move_queue_entry(
 }
 
 #[tauri::command]
-pub(crate) fn remove_queue_entry(
+pub(crate) async fn remove_queue_entry(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     operation_id: String,
 ) -> Result<FrontendQueueSnapshot, AppError> {
-    change_queue(&app, &window, &state, |queue| {
+    let label = window.label().to_owned();
+    let window_state = state.window(&label);
+    let queue = operation_queue(&app, &window_state, &label)?;
+    tauri::async_runtime::spawn_blocking(move || {
         crate::forward_bidirectional_commands::discard_queue_slot(
-            &state.window(window.label()),
-            queue,
+            &window_state,
+            &queue,
             &operation_id,
             false,
         )?;
         queue
             .remove_pending(&operation_id)
             .map_err(AppError::from)?;
-        state
-            .window(window.label())
+        window_state
             .content_sync_runs
             .lock_recover()
             .remove(&operation_id);
-        state
-            .window(window.label())
+        window_state
             .local_sync_runs
             .lock_recover()
             .remove(&operation_id);
-        Ok(())
+        emit_queue_snapshot(&app, &label, &queue);
+        Ok(queue.snapshot().into())
     })
+    .await
+    .map_err(|_| AppError::new("outcome_unclear", "Queue-Bereinigung unterbrochen"))?
 }
 
 #[tauri::command]

@@ -14,6 +14,7 @@ Stand: 2026-11-07. Produktüberblick im [README](../README.de.md), offene Arbeit
 - [Produkt- und Performancechancen](product-opportunities.md)
 - [Release- und Plattformplan](release-plan.md)
 - [Linux: Funktionen, Installation und Updates](linux.md)
+- [Preview 0.1.126](release-notes-0.1.126.md)
 - [Preview 0.1.125](release-notes-0.1.125.md)
 - [Weitere Entwicklung](release-notes-next.md)
 - [Manueller Updatekanal](update-design.md)

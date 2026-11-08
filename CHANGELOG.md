@@ -5,6 +5,14 @@ folgt Keep a Changelog; Versionen verwenden Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.126] - 2026-11-08
+
+- Linux-LAN-Suche empfängt mDNS-Antworten auf Port 5353 neben Avahi; zufällige Antwortports konnten trotz sichtbarer Server leer bleiben.
+
+- Fenstergröße und Maximierung auch ohne Sitzungswiederherstellung merken; fehlende Fensterpositionen unter Wayland verhindern das Speichern nicht mehr.
+
+- Das Entfernen wartender Archivuploads läuft im Hintergrund. Die automatische Bereinigung erhält Dateien, die währenddessen neu hinzugefügt oder ausgetauscht werden.
+
 ## [0.1.125] - 2026-11-08
 
 - WebDAV-Ordner bleiben lesbar, wenn der Server Länge und ETag ausdrücklich

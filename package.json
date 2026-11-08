@@ -1,7 +1,7 @@
 {
   "name": "doppeldecker-ui-tests",
   "private": true,
-  "version": "0.1.125",
+  "version": "0.1.126",
   "type": "module",
   "scripts": {
     "test:ui": "node --test tools/tests/test-pane-tabs.mjs && node tools/test-mock-ui.mjs && node tools/test-name-search-ui.mjs && node tools/tests/test-duplicate-ui.mjs && node tools/tests/test-archive-pack-ui.mjs && node tools/tests/test-archive-read-ui.mjs && node tools/tests/test-archive-extract-ui.mjs",

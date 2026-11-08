@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "doppeldecker-core"
-version = "0.1.125"
+version = "0.1.126"
 dependencies = [
  "blake3",
  "filetime",
@@ -640,6 +640,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smb2",
+ "socket2",
  "suppaftp",
  "time",
  "tokio",

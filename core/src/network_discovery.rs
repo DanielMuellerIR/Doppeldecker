@@ -402,6 +402,23 @@ fn services_from(records: &DiscoveryRecords) -> Vec<DiscoveredNetworkService> {
     result
 }
 
+fn discovery_socket() -> io::Result<UdpSocket> {
+    #[cfg(target_os = "linux")]
+    {
+        // Antworten auf den zufälligen Port einer Legacy-Anfrage werden von
+        // manchen Linux-Firewalls verworfen. Multicast-Antworten auf 5353 kommen
+        // dagegen auch neben Avahi an. REUSEADDR muss vor dem Bind gesetzt sein.
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_ADDRESS.port()).into())?;
+        socket.join_multicast_v4(MDNS_ADDRESS.ip(), &Ipv4Addr::UNSPECIFIED)?;
+        socket.set_multicast_ttl_v4(255)?;
+        Ok(socket.into())
+    }
+    #[cfg(not(target_os = "linux"))]
+    UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+}
+
 /// Sendet genau drei feste mDNS-PTR-Anfragen. Fehlerhafte oder fremde Antworten
 /// werden ignoriert; echte Socketfehler bleiben sichtbar. Das Suchfenster ist auf
 /// höchstens fünf Sekunden begrenzt.
@@ -416,7 +433,7 @@ pub fn discover_network_services(window: Duration) -> io::Result<Vec<DiscoveredN
         .iter()
         .map(|(service, _)| (DnsName::from_ascii(service), PTR_RECORD))
         .collect::<Vec<_>>();
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    let socket = discovery_socket()?;
     socket.set_nonblocking(true)?;
     socket.send_to(&query(&initial_names)?, MDNS_ADDRESS)?;
 
@@ -640,6 +657,7 @@ mod tests {
     #[test]
     #[ignore = "sendet bewusst aktive mDNS-Anfragen ins aktuelle LAN"]
     fn reale_socket_suche_bleibt_auf_das_kurze_suchfenster_begrenzt() {
-        discover_network_services(Duration::from_millis(150)).unwrap();
+        let found = discover_network_services(Duration::from_millis(900)).unwrap();
+        println!("Gefundene LAN-Dienste: {found:?}");
     }
 }

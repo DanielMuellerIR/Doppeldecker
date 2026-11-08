@@ -6,6 +6,7 @@ use crate::{Cancel, ErrorCode, LocalVfs, OperationQueue, Vfs};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -423,6 +424,14 @@ impl GeneratedSourceStore {
     /// Entfernt ausschließlich einen vollständig belegten Zwischenstand. Ein
     /// weiterer Leser (auch aus einem anderen Fenster) hält die Bereinigung auf.
     pub(crate) fn remove_source(&self, reference: &GeneratedSourceReference) -> io::Result<()> {
+        self.remove_source_with_hook(reference, |_| {})
+    }
+
+    fn remove_source_with_hook(
+        &self,
+        reference: &GeneratedSourceReference,
+        before_cleanup: impl FnOnce(&Path),
+    ) -> io::Result<()> {
         reference.validate()?;
         let path = self.root.path().join(&reference.id);
         match local_fs::stat_beneath(&self.root, &path) {
@@ -430,7 +439,7 @@ impl GeneratedSourceStore {
             Err(error) => return Err(error),
             Ok(_) => {}
         }
-        let source = self.resolve(reference, &Cancel::new())?;
+        let mut source = self.resolve(reference, &Cancel::new())?;
         rustix::fs::flock(
             &source.manifest_file,
             rustix::fs::FlockOperation::NonBlockingLockExclusive,
@@ -451,10 +460,111 @@ impl GeneratedSourceStore {
         if !self.root.is_private()? || !source.directory.is_private()? {
             return Err(drift());
         }
-        // Der private Store und die vollständige Inhaltsprüfung binden den
-        // Besitz. Die Rekursion bleibt deskriptorrelativ und folgt keinen Links.
-        local_fs::remove_dir_all_beneath(&self.root, source.directory.path())?;
-        local_fs::sync_dir_beneath(&self.root, self.root.path())
+        // Der atomare Claim entfernt den sichtbaren Uploadpfad vor der letzten
+        // Inhaltsprüfung. Bereits geöffnete Elterndeskriptoren können noch wirken;
+        // deshalb löschen wir danach nur einzeln beanspruchte Manifestdateien und
+        // ausschließlich leere Verzeichnisse, niemals einen neu erfassten Baum.
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).map_err(|error| io::Error::other(error.to_string()))?;
+        let claim = self.root.path().join(format!(
+            ".cleanup-{}",
+            nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+        local_fs::rename_noreplace_beneath(&self.root, &path, &claim)?;
+        let cleanup = (|| {
+            let directory = RootHandle::open_beneath(&self.root, &claim)?;
+            if directory.identity() != source.directory.identity() {
+                return Err(drift());
+            }
+            let content = RootHandle::open_beneath(&directory, &claim.join(CONTENT))?;
+            if content.identity() != source.content.identity() {
+                return Err(drift());
+            }
+            source.directory = directory;
+            source.content = content;
+            source.ensure_current()?;
+            let (version, entries) = collect(&source.content, &Cancel::new())?;
+            if version != source.manifest.content_version || entries != source.manifest.entries {
+                return Err(drift());
+            }
+            before_cleanup(source.content.path());
+            let holding = private_child(&source.directory, ".cleanup-files", true)?;
+            for (index, (relative, expected)) in source.manifest.entries.iter().enumerate() {
+                let StoredProof::File { bytes, blake3 } = expected.proof else {
+                    continue;
+                };
+                let from = source.content.path().join(relative);
+                let held = local_fs::open_read_beneath(&source.content, &from)?;
+                let identity = held.metadata()?;
+                if FileVersion::of(&identity) != expected.version {
+                    return Err(drift());
+                }
+                let claimed = holding.path().join(index.to_string());
+                local_fs::rename_noreplace_beneath(&self.root, &from, &claimed)?;
+                let checked = (|| {
+                    let mut file = local_fs::open_read_beneath(&holding, &claimed)?;
+                    let metadata = file.metadata()?;
+                    if metadata.dev() != identity.dev() || metadata.ino() != identity.ino() {
+                        return Err(drift());
+                    }
+                    let mut hash = blake3::Hasher::new();
+                    let mut count = 0u64;
+                    let mut buffer = [0; 65536];
+                    loop {
+                        let n = file.read(&mut buffer)?;
+                        if n == 0 {
+                            break;
+                        }
+                        hash.update(&buffer[..n]);
+                        count += n as u64;
+                    }
+                    if count != bytes
+                        || hash.finalize().as_bytes() != &blake3
+                        || FileVersion::of(&metadata) != FileVersion::of(&file.metadata()?)
+                    {
+                        return Err(drift());
+                    }
+                    local_fs::remove_file_beneath(&holding, &claimed)
+                })();
+                if let Err(error) = checked {
+                    // Ein ausgetauschter oder inzwischen veränderter Inhalt bleibt
+                    // erhalten; ein neuer Inhalt am alten Namen wird nicht ersetzt.
+                    let _ = local_fs::rename_noreplace_beneath(&self.root, &claimed, &from);
+                    return Err(error);
+                }
+            }
+            let mut directories: Vec<_> = source
+                .manifest
+                .entries
+                .iter()
+                .filter(|(_, entry)| matches!(entry.proof, StoredProof::Directory))
+                .map(|(path, _)| path)
+                .collect();
+            directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+            for relative in directories {
+                local_fs::remove_dir_beneath(
+                    &source.content,
+                    &source.content.path().join(relative),
+                )?;
+            }
+            local_fs::remove_dir_beneath(&source.directory, source.content.path())?;
+            local_fs::remove_dir_beneath(&source.directory, holding.path())?;
+            local_fs::remove_file_beneath(&source.directory, &claim.join(MANIFEST))?;
+            local_fs::remove_file_beneath(&source.directory, &claim.join(OWNER))?;
+            local_fs::remove_dir_beneath(&self.root, &claim)?;
+            local_fs::sync_dir_beneath(&self.root, self.root.path())
+        })();
+        if let Err(error) = cleanup {
+            let restored = local_fs::rename_noreplace_beneath(&self.root, &claim, &path);
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "Zwischenstand mit Prüfrest erhalten unter {}: {error}",
+                    if restored.is_ok() { &path } else { &claim }.display()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn remove_empty_workspace(
@@ -810,6 +920,38 @@ mod tests {
             assert_eq!(
                 fs::read(source.join("original.txt")).unwrap(),
                 b"Originale Archivquelle\n"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_preserves_contents_inserted_after_final_verification() {
+        for replace in [false, true] {
+            let (_area, _queue, store, source) = fixture();
+            let workspace = store.begin().unwrap();
+            let path = workspace.path().to_path_buf();
+            let generated = generate(&workspace, &source);
+            let reference = workspace.seal_archive(generated, &Cancel::new()).unwrap();
+            let result = store.remove_source_with_hook(&reference, |claimed| {
+                fs::write(
+                    claimed.join(if replace {
+                        "result.zip"
+                    } else {
+                        "late-foreign"
+                    }),
+                    b"Fremde Daten",
+                )
+                .unwrap();
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                fs::read(path.join(if replace {
+                    "result.zip"
+                } else {
+                    "late-foreign"
+                }))
+                .unwrap(),
+                b"Fremde Daten"
             );
         }
     }

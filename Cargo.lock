@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "doppeldecker"
-version = "0.1.125"
+version = "0.1.126"
 dependencies = [
  "cc",
  "doppeldecker-core",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "doppeldecker-cli"
-version = "0.1.125"
+version = "0.1.126"
 dependencies = [
  "blake3",
  "cc",
@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "doppeldecker-core"
-version = "0.1.125"
+version = "0.1.126"
 dependencies = [
  "blake3",
  "filetime",
@@ -1559,6 +1559,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smb2",
+ "socket2",
  "suppaftp",
  "tempfile",
  "time",

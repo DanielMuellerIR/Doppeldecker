@@ -186,23 +186,29 @@ struct DesktopDocument {
     initialized: bool,
     preferences: Preferences,
     windows: BTreeMap<String, SavedWindow>,
+    #[serde(default)]
+    last_geometry: Option<WindowGeometry>,
 }
 
 impl Default for DesktopDocument {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: 3,
             revision: 0,
             initialized: false,
             preferences: Preferences::default(),
             windows: BTreeMap::new(),
+            last_geometry: None,
         }
     }
 }
 
 impl DesktopDocument {
     fn validate(&self) -> Result<(), AppError> {
-        if self.version != 2 || self.windows.len() > 64 {
+        if self.version != 3
+            || self.windows.len() > 64
+            || self.last_geometry.as_ref().is_some_and(|g| !g.valid())
+        {
             return Err(AppError::new(
                 "invalid_input",
                 "Unbekanntes oder zu großes Sitzungsformat",
@@ -364,6 +370,13 @@ fn read_document(path: &Path) -> Result<DesktopDocument, AppError> {
         }
         document.version = 2;
     }
+    if document.version == 2 {
+        document.last_geometry = document
+            .windows
+            .get("main")
+            .and_then(|w| w.geometry.clone());
+        document.version = 3;
+    }
     for window in document.windows.values_mut() {
         if window.tabs.is_none() {
             window.tabs = Some(crate::pane_tabs::WindowTabs::from_active(&window.panes));
@@ -462,6 +475,12 @@ pub(crate) fn initialize(app: &tauri::AppHandle) -> Result<(), AppError> {
     }
     *state.current_icon.lock_recover() = store.document.preferences.icon;
     *state.current_theme.lock_recover() = store.document.preferences.theme;
+    if let Some(geometry) = &store.document.last_geometry {
+        state
+            .startup_geometry
+            .lock_recover()
+            .insert("main".into(), geometry.clone());
+    }
     Ok(())
 }
 
@@ -704,9 +723,11 @@ pub(crate) async fn remember_window(
         .inner_size()
         .map_err(|e| AppError::new("window", e.to_string()))?
         .to_logical::<f64>(scale);
+    // Wayland stellt globale Fensterpositionen nicht bereit. Die unabhängig
+    // davon verfügbare Größe muss trotzdem gespeichert werden.
     let position = window
         .outer_position()
-        .map_err(|e| AppError::new("window", e.to_string()))?
+        .unwrap_or_default()
         .to_logical::<f64>(scale);
     let geometry = WindowGeometry {
         x: position.x,
@@ -765,10 +786,15 @@ fn remember(store: &mut DesktopStore, label: &str, mut saved: SavedWindow) -> Re
     if store.live.get(label) == Some(&saved) {
         return Ok(());
     }
-    if store.document.preferences.restore_session {
-        let mut next = store.document.clone();
+    let mut next = store.document.clone();
+    if let Some(geometry) = &saved.geometry {
+        next.last_geometry = Some(geometry.clone());
+    }
+    if next.preferences.restore_session {
         next.windows = store.live.clone();
         next.windows.insert(label.to_owned(), saved.clone());
+    }
+    if next.preferences.restore_session || next.last_geometry != store.document.last_geometry {
         // Ein gescheiterter Verzeichnis-fsync bleibt hier folgenlos: Der Sitzungsstand
         // ist geschrieben. Der Frontend-Debounce ruft diesen Weg einmal 250 ms nach
         // dem Ende einer Folge von Fensterbewegungen auf.
@@ -1052,6 +1078,79 @@ mod tests {
     }
 
     #[test]
+    fn fenstergroesse_bleibt_ohne_sitzung_und_nach_einstellungswechsel_erhalten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let state = DesktopState::default();
+        state.inner.lock_recover().path = Some(path.clone());
+        let geometry = WindowGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 1030.0,
+            height: 690.0,
+            maximized: false,
+        };
+        remember_ordered(
+            &state,
+            "main",
+            1,
+            SavedWindow {
+                panes: pane_state(),
+                tabs: None,
+                geometry: Some(geometry.clone()),
+                active_side: "right".into(),
+            },
+        )
+        .unwrap();
+        forget_closed(&mut state.inner.lock_recover(), "main").unwrap();
+        update_preferences(
+            &state,
+            PreferencePatch {
+                theme: Some(Theme::Dark),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+        let loaded = read_document(&path).unwrap();
+        assert!(!loaded.preferences.restore_session);
+        assert!(loaded.windows.is_empty());
+        assert_eq!(loaded.last_geometry, Some(geometry));
+    }
+
+    #[test]
+    fn format_zwei_uebernimmt_geometrie_ohne_lesenden_dateiersatz() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let geometry = WindowGeometry {
+            x: 20.0,
+            y: 30.0,
+            width: 1030.0,
+            height: 690.0,
+            maximized: true,
+        };
+        let mut document = DesktopDocument::default();
+        document.windows.insert(
+            "main".into(),
+            SavedWindow {
+                panes: pane_state(),
+                tabs: None,
+                geometry: Some(geometry.clone()),
+                active_side: "left".into(),
+            },
+        );
+        let mut json = serde_json::to_value(document).unwrap();
+        json["version"] = 2.into();
+        json.as_object_mut().unwrap().remove("lastGeometry");
+        let bytes = serde_json::to_vec(&json).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let loaded = read_document(&path).unwrap();
+        assert_eq!(loaded.version, 3);
+        assert_eq!(loaded.last_geometry, Some(geometry));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
     fn einstellungen_und_zwei_fenster_ueberleben_neustart_und_abschalten_loescht_sitzung() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -1125,7 +1224,7 @@ mod tests {
         let original = serde_json::to_vec_pretty(&json).unwrap();
         std::fs::write(&path, &original).unwrap();
         let migrated = read_document(&path).unwrap();
-        assert_eq!(migrated.version, 2);
+        assert_eq!(migrated.version, 3);
         assert_eq!(migrated.revision, 19);
         assert!(migrated.initialized);
         assert_eq!(migrated.preferences.theme, Theme::Dark);
@@ -1140,7 +1239,7 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()
                 ["version"],
-            2
+            3
         );
     }
 

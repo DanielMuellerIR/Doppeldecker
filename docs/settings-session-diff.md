@@ -1,6 +1,12 @@
 # Einstellungen, Sitzungswiederherstellung und Dateivergleich
 
-Stand: 2026-10-28.
+Stand: 2026-11-08.
+
+Die zuletzt verwendete Fenstergröße und Maximierung werden unabhängig von der
+optionalen Sitzungswiederherstellung gespeichert. Ohne diese Option bleiben
+Pane-Ziele und zusätzliche Fenster ungespeichert. Unter Wayland verhindert die
+nicht verfügbare globale Fensterposition das Speichern der Größe nicht.
+Das Einstellungsformat 3 übernimmt vorhandene Sitzungen der Formate 1 und 2.
 
 ## Globale Einstellungen
 

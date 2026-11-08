@@ -57,6 +57,25 @@ Die CLI liegt in beiden Paketformaten unter `usr/bin/doppeldecker-cli`; das DEB
 installiert sie unmittelbar als Terminalbefehl. Beim AppImage kann sie aus einer
 mit `--appimage-extract` entpackten Kopie aufgerufen werden.
 
+## LAN-Suche
+
+Die Seitenleiste sucht per mDNS nach angekündigten SMB-, SFTP- und WebDAV-Diensten.
+Unter Linux empfängt sie über den mit dem Systemresolver geteilten UDP-Port 5353.
+Ein zufälliger Antwortport konnte bei aktiver Firewall ohne Treffer bleiben,
+obwohl Avahi dieselben Server fand. Die App ändert keine Firewallregeln.
+Nicht angekündigte Dienste und die einzelnen Freigaben eines SMB-Servers werden
+von dieser Suche nicht aufgezählt; der Fund öffnet den Verbindungseditor.
+
+## Gespeicherte Passwörter
+
+Doppeldecker speichert Passwörter im Secret Service der Desktop-Sitzung, etwa
+KWallet unter KDE oder GNOME Keyring. Der Dienst muss verfügbar und entsperrt
+sein. Profildateien enthalten ausschließlich die Referenz auf diesen Eintrag;
+es gibt keinen stillen Rückfall auf Klartextdateien. Eine Übertragung der
+Profildatei von macOS übernimmt deshalb nicht automatisch das Passwort aus dem
+Mac-Schlüsselbund: Es muss getrennt in den Linux-Schlüsselbund übernommen oder
+auf Linux erneut über die sichere Passworteingabe gespeichert werden.
+
 ## Darstellung
 
 Die Wahl Hell, Dunkel oder Automatisch gilt auch für die native Menüleiste und
