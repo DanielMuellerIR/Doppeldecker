@@ -3,10 +3,6 @@
 Stand: 2026-11-08. Nur offene Arbeit; Reihenfolge und Releaseumfang stehen in der
 [Roadmap](docs/roadmap.md). Verfügbares Verhalten: [Funktionsmatrix](docs/function-audit.md).
 
-| Priorität | Aufgabe | Fertigkriterium / Vertrag |
-| --- | --- | --- |
-| 2 | Öffentlichen Kandidatenstand abschließen | Kandidatenversion, Downloadlinks, Releasehinweise und Website auf dieselben abgenommenen Artefakte beziehen; den echten GitHub-Updatewechsel nach Freischaltung belegen. [Entwicklungsstand](docs/release-notes-next.md). |
-
 ## Später, ohne Releasepflicht
 
 - Weitergehende SMB-ACE-/Vererbungsmodelle, SID-/Domänenmigration, vollständiger

@@ -1,10 +1,9 @@
 # Release- und Plattformplan
 
-Stand: 2026-11-08. Der im Repo dokumentierte erste öffentliche Previewstand ist
-[0.1.124](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.124).
-Der nächste benannte Kandidat ist **0.1.125**; Veröffentlichung und Abnahme
-werden für seine konkreten Pakete getrennt nachgewiesen. Künftige Änderungen
-bleiben unter `Unreleased`.
+Stand: 2026-11-08. Die aktuelle öffentliche Preview ist
+[0.1.125](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.125).
+Veröffentlichung und Abnahme sind für ihre konkreten Pakete nachgewiesen.
+Künftige Änderungen bleiben unter `Unreleased`.
 
 ## Unterstützte Ziele
 
@@ -38,10 +37,10 @@ Versionswechsel nur für ausdrücklich benannte Meilensteine/Kandidaten; keine
 Versionsbumps für gewöhnliche Entwicklungs- oder Dokumentationscommits.
 Veröffentlichung, Tags und öffentliche Pakete brauchen einen konkreten Auftrag.
 
-## Abnahmestand des Kandidaten 0.1.125
+## Abnahmestand von 0.1.125
 
-Die vollständige [GitHub-CI](https://github.com/DanielMuellerIR/Doppeldecker/actions/runs/42400641730)
-ist für den Laufzeitquellstand `c13e484b` auf macOS 15 und Ubuntu 24.04 erfolgreich.
+Die vollständige [GitHub-CI](https://github.com/DanielMuellerIR/Doppeldecker/actions/runs/42431365412)
+ist für den Releasequellstand `a11cfc11` auf macOS 15 und Ubuntu 24.04 erfolgreich.
 Die native Abnahme wurde nach den Korrekturen für WebDAV-Collections ohne ETag
 mit der fertigen macOS-App sowie den endgültigen AppImage- und DEB-Nutzlasten
 wiederholt. Die macOS-App und das DMG sind Developer-ID-signiert, notarisiert
@@ -70,12 +69,18 @@ Testbereichen. Die genannten Anbieter- und Recoveryfälle sind abgeschlossen.
 Die Updater-Signaturen für das endgültige macOS-Archiv, AppImage und DEB sowie
 die hashgebundene Linux-Attestation sind geprüft. Die abschließenden macOS-/Linux-
 Paketprüfungen bestehen; das Manifest enthält die drei getrennten Updatekanäle,
-und die Prüfsummen erfassen alle veröffentlichten Dateien. Der echte Versionswechsel
-über das veröffentlichte GitHub-Angebot wird unmittelbar nach dessen Freischaltung
-geprüft.
+und die Prüfsummen erfassen alle veröffentlichten Dateien. Der echte Versionswechsel von 0.1.124 auf 0.1.125 über das veröffentlichte
+GitHub-Angebot ist für das benutzereigene AppImage nativ bestanden: vor der
+Bestätigung unveränderte Installation, geprüfte Signatur, exakt die veröffentlichte
+Nutzlast, erfolgreicher Neustart und bytegleich erhaltene Profile und Konfiguration.
 
-Der Kandidat ist noch nicht veröffentlicht. Die früheren Paketbelege werden
-getrennt aufbewahrt und ersetzen keine der hier genannten Wiederholungen.
+Der Release enthält elf Dateien einschließlich der getrennten Nutzlastsignaturen,
+Linux-Attestation, Update-Manifest und flacher Prüfsummenliste. Alle hochgeladenen
+Dateien wurden zurückgeladen und bytegleich bestätigt. Der öffentliche Latest-Kanal
+liefert das geprüfte Manifest. Beide READMEs und die Projektseite beziehen sich auf
+0.1.125; die Website ist nach dem Upload per HTTPS bytegleich geprüft.
+Frühere Paketbelege werden getrennt aufbewahrt und ersetzen keine der hier
+genannten Wiederholungen.
 [Historische Paketbelege](release-history-2026-10.md) bleiben getrennt erhalten.
 
 ## macOS-Paketvertrag
