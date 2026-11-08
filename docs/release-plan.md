@@ -1,7 +1,7 @@
 # Release- und Plattformplan
 
-Stand: 2026-11-08. Die veröffentlichte Preview ist
-[0.1.125](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.125).
+Stand: 2026-11-08. Die aktuelle öffentliche Preview ist
+[0.1.126](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.126).
 Veröffentlichung und Abnahme sind für ihre konkreten Pakete nachgewiesen.
 Künftige Änderungen bleiben unter `Unreleased`.
 
@@ -37,13 +37,37 @@ Versionswechsel nur für ausdrücklich benannte Meilensteine/Kandidaten; keine
 Versionsbumps für gewöhnliche Entwicklungs- oder Dokumentationscommits.
 Veröffentlichung, Tags und öffentliche Pakete brauchen einen konkreten Auftrag.
 
-## Kandidat 0.1.126
+## Abnahmestand von 0.1.126
 
 0.1.126 korrigiert gespeicherte Fenstergrößen, Linux-mDNS-Erkennung und die
-Bereinigung entfernter wartender Archivuploads. Der Kandidat durchläuft die
-vollständigen Plattformgates und die Prüfung der signierten Endpakete.
-Die Abnahme wird vor der Veröffentlichung ergänzt; die folgenden Belege zu
-0.1.125 gelten ausschließlich dem früheren Release.
+Bereinigung entfernter wartender Archivuploads. Die vollständige
+[GitHub-CI](https://github.com/DanielMuellerIR/Doppeldecker/actions/runs/42483101211)
+besteht für den Releasequellstand `1eebba25` auf macOS 15 und Ubuntu 24.04.
+Die lokalen Plattformgates sind ebenfalls abgeschlossen. Ein einzelner Linux-
+Browser-Timeout bestand in der gezielten Wiederholung; die restlichen Teilsuiten
+bestanden anschließend ohne Codeänderung.
+
+Die endgültige macOS-App und das DMG sind Developer-ID-signiert, notarisiert und
+gestapelt; das Updaterarchiv entstand danach aus dieser App. Paketversion,
+Architektur, Signaturen, Ticket, Gatekeeper, Pfadprüfung und die bytegleiche App
+im DMG sind geprüft. Die native Abnahme bindet genau die ausgelieferte Nutzlast.
+
+| Native Prüfung | macOS-App | Linux-AppImage und DEB |
+| --- | --- | --- |
+| Fenstergröße und Upgrade von 0.1.125 | Größe ohne Sitzungswiederherstellung, Profil und Konfiguration erhalten | Echter Größenwechsel mit Neustart sowie erhaltene Profile und Konfiguration bestanden |
+| Dateiaktionen und mehrere Fenster | Kopieren einschließlich großer Resource Fork, Umbenennen, Ordneranlage und getrennte Journale bestanden | Kopieren, Umbenennen, Ordneranlage und getrennte Journale bestanden |
+| Entfernte ZIP-Dateiarbeit | SFTP, FTP, FTPS, WebDAV und verschlüsseltes SMB 3.1.1; Inhalt, leere Ordner und unveränderter Profilroot geprüft | Dieselben fünf Anbieter mit beiden Paketformen bestanden |
+| Rekursive entfernte Rechte | SFTP, FTP und FTPS einschließlich Sonderbits, Abbruch und Teilfehler bestanden | Dieselben Anbieter und Fehlerpfade mit beiden Paketformen bestanden |
+| Abbruch, Konflikte und Wiederherstellung | Vorschauabbruch, unveränderte Konfliktdateien, kein mutierender Blind-Retry sowie Papierkorb-, Quarantäne- und Queue-Recovery bestanden | Dieselben Zustände mit beiden Paketformen bestanden |
+| Installation, Upgrade und Entfernung | Isolierter Austausch und Entfernung mit unveränderter Testkonfiguration bestanden | Benutzereigenes AppImage sowie DEB mit tatsächlichen Abhängigkeiten in Ubuntu 24.04 bestanden |
+| Darstellung | Native Fenster- und Bedienungsbelege; keine Bildschirmaufnahme als Abnahmenachweis | Hell, Dunkel und Automatisch einschließlich dunkler Menüleiste und geöffneter Menüs visuell geprüft |
+
+Alle Wirkungen verwendeten künstliche Daten in markierten Testbereichen. Beide
+Linux-Pakete und die hashgebundene AppImage-Attestation sind signiert; das
+Update-Manifest prüft die drei getrennten Nutzlastkanäle. Die flache Prüfsummenliste
+erfasst alle veröffentlichten Nutzlasten und Metadaten. Die Paketabläufe benötigen
+keine zusätzlichen Grafik-Workarounds. Die folgenden Belege zu 0.1.125 bleiben
+getrennt und gelten ausschließlich dem früheren Release.
 
 ## Abnahmestand von 0.1.125
 

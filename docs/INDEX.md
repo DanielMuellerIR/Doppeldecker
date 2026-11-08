@@ -1,6 +1,6 @@
 # Dokumentationsindex
 
-Stand: 2026-11-07. Produktüberblick im [README](../README.de.md), offene Arbeit im
+Stand: 2026-11-08. Produktüberblick im [README](../README.de.md), offene Arbeit im
 [Backlog](../backlog.md). Dieser Index führt zu den jeweiligen Verträgen.
 
 ## Produkt- und Releaseplanung
