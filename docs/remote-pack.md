@@ -47,9 +47,9 @@ Dateiinhalte und leere Zielordner bleiben erhalten. Der echte Linux-Fensterlauf 
 unveränderten Archivbytes und Zwischenstand-Navigation; alle Testprozesse wurden
 beendet. Der native macOS-Lauf bestätigt ZIP-Erzeugung und Entpacken zur
 SFTP- und HTTPS-WebDAV-Gegenpane, exakte Inhalte, Leerordner und jeweils beide
-abgeschlossenen Queueeinträge nach Neustart. Weitere native Anbieterläufe bleiben
-Teil der
-[Kandidatenabnahme](release-plan.md).
+abgeschlossenen Queueeinträge nach Neustart. Die vollständige native Matrix mit SFTP, FTP, FTPS, HTTPS-WebDAV und
+verschlüsseltem SMB3 ist für macOS-App, AppImage und DEB abgeschlossen.
+[Abnahme der endgültigen Pakete](release-plan.md).
 
 [Lokales Packen](archive-pack.md) und [Entpacken](archive-extract.md) beschreiben
 Formatgrenzen und Auslassungen. Der Upload erbt die Ausführungsklasse des Ziels.

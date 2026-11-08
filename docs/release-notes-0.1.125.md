@@ -1,6 +1,6 @@
 # Preview 0.1.125
 
-Stand: 2026-11-07. Diese Preview erweitert die entfernte Dateiarbeit, Archive,
+Stand: 2026-11-08. Diese Preview erweitert die entfernte Dateiarbeit, Archive,
 Dateieigenschaften und die Linux-Integration gegenüber 0.1.124.
 
 ## Entfernte Dateiarbeit und Archive
@@ -59,4 +59,4 @@ laufende Arbeit zu übergehen.
 Die Abnahme und die jeweils belegten Plattformgrenzen stehen im Releaseplan.
 ZIP bleibt das unterstützte Archivformat; Finder-Funktionen benötigen macOS. Zusätzliche
 Protokoll- und Metadatengrenzen stehen in der [Funktionsmatrix](function-audit.md).
-[Alle Änderungen](../CHANGELOG.md#01125---2026-11-07) · [Kandidatenabnahme](release-plan.md).
+[Alle Änderungen](../CHANGELOG.md#01125---2026-11-08) · [Kandidatenabnahme](release-plan.md).

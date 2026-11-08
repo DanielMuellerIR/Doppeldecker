@@ -1,6 +1,6 @@
 # Funktionsaudit: Datei- und Sync-Operationen
 
-Stand: 2026-11-07. Diese Matrix beschreibt das implementierte Verhalten;
+Stand: 2026-11-08. Diese Matrix beschreibt das implementierte Verhalten;
 [Roadmap](roadmap.md) und [Backlog](../backlog.md) nennen die offene Arbeit.
 Frühere Prüfberichte gelten für ihren datierten Stand. Grundlage bleiben die
 [Produktprinzipien](product-principles.md) und das
@@ -93,7 +93,9 @@ Verstecktmarkierung, Dateisperre und Erweiterungsanzeige.
 Ein Eigentümerwechsel kann Sonderbits entfernen; die Bilanz nennt das Ergebnis.
 Links und Spezialdateien werden ausgelassen. Lokale macOS-Editoren einschließlich
 App-Neustart sind nativ geprüft; direkte SFTP-Rechteänderungen und Anzeigenamen
-ebenfalls. Weitere entfernte macOS-Abläufe folgen mit dem Kandidaten.
+ebenfalls. Rekursive SFTP-/FTP-/FTPS-Rechte einschließlich Sonderbits, Abbruch und
+Teilfehler sind mit den endgültigen macOS-/Linux-Paketen nativ abgenommen.
+[Prüfstand](release-plan.md).
 
 Lokale macOS-Kopien erhalten Erstellungszeit, Tags, lesbare xattrs, Finder-
 Informationen, Resource Forks, Verstecktmarkierung und Dateisperre. Fehlende Klassen werden

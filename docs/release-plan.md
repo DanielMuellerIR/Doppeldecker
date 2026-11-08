@@ -1,6 +1,6 @@
 # Release- und Plattformplan
 
-Stand: 2026-11-07. Der im Repo dokumentierte erste öffentliche Previewstand ist
+Stand: 2026-11-08. Der im Repo dokumentierte erste öffentliche Previewstand ist
 [0.1.124](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.124).
 Der nächste benannte Kandidat ist **0.1.125**; Veröffentlichung und Abnahme
 werden für seine konkreten Pakete getrennt nachgewiesen. Künftige Änderungen
@@ -40,54 +40,42 @@ Veröffentlichung, Tags und öffentliche Pakete brauchen einen konkreten Auftrag
 
 ## Abnahmestand des Kandidaten 0.1.125
 
-Die folgenden Paketbelege betreffen den ersten vorbereiteten Kandidaten.
-Die native WebDAV-Abnahme hat zusätzlich eine fehlerhafte Ablehnung von
-Collections ohne ETag gefunden. Nach dieser Parserkorrektur werden die Pakete
-neu gebaut und nativ erneut geprüft. Die Veröffentlichung folgt erst nach
-der vollständigen Kandidatenabnahme.
+Die vollständige [GitHub-CI](https://github.com/DanielMuellerIR/Doppeldecker/actions/runs/42400641730)
+ist für den Laufzeitquellstand `c13e484b` auf macOS 15 und Ubuntu 24.04 erfolgreich.
+Die native Abnahme wurde nach den Korrekturen für WebDAV-Collections ohne ETag
+mit der fertigen macOS-App sowie den endgültigen AppImage- und DEB-Nutzlasten
+wiederholt. Die macOS-App und das DMG sind Developer-ID-signiert, notarisiert
+und gestapelt. Das inhaltlich geprüfte Updaterarchiv entstand danach aus genau
+dieser App.
 
-Die vollständige [GitHub-CI](https://github.com/DanielMuellerIR/Doppeldecker/actions/runs/42386074224)
-ist für den Quellstand `4ec77e3f` auf macOS 15 und Ubuntu 24.04 erfolgreich.
-Die signierten Pakete enthalten den Laufzeitstand `b911ad6a`; die danach
-geänderten Dateien betreffen ausschließlich Tests. Version, Architektur,
-Abhängigkeiten, Signaturen, Prüfsummen und die Abwesenheit privater Buildpfade
-sind an den fertigen Paketen geprüft.
-
-Die macOS-App und das DMG sind Developer-ID-signiert, notarisiert und gestapelt.
-Die App im DMG ist bytegleich zur geprüften App; das Updaterarchiv wurde erst nach
-dem Stapeln erzeugt. Der native Lauf mit dem fertigen Bundle belegt Kopieren
-(einschließlich einer Resource Fork über 6 MiB), Umbenennen, Ordneranlage und zwei
-getrennte Fensterjournale. Die Bildschirmaufnahme war auf dem Testkonto nicht
-freigegeben; Dateiwirkungen und native Fenster wurden unabhängig geprüft.
-
-Auf Linux starten das fertige AppImage und die entpackte DEB-App mit vollständiger
-Oberfläche. Kopieren, Umbenennen, Ordneranlage und getrennte Fensterjournale sind
-nativ geprüft. Der AppImage-Start benötigt keine testseitigen Grafik-Workarounds.
-Die zugehörigen Ansichten einschließlich des Fehlers bei beschädigtem Journal
-sind visuell geprüft.
-
-Das Upgrade von der öffentlichen 0.1.124 auf die Kandidaten-App beziehungsweise
-das benutzereigene AppImage erhält ein gespeichertes SFTP-Profil und die
-Konfiguration. Nach Entfernen der isolierten Installation bleiben Konfiguration
-und Testdateien erhalten. Ein beschädigtes Queue-Journal erlaubt ein bestätigtes
-Beenden und bleibt mit den Testdateien unverändert. Die DEB-Prüfung belegt echte
-Installation, Entfernung und Upgrade von 0.1.124 mit den deklarierten
-Laufzeitabhängigkeiten in einer isolierten Ubuntu-24.04-Umgebung.
-
-Zusätzlich bestehen echte SFTP-Gegenläufe auf macOS und Linux sowie die
-verschlüsselten Samba-Gegenläufe für Queue/Quarantäne und ZIP-Übertragung auf
-Linux. Diese automatisierten Providerprüfungen ersetzen die noch offenen
-nativen Kombinationen nicht.
-
-| Noch offene Prüfung | macOS | Linux |
+| Native Prüfung | macOS-App | Linux-AppImage und DEB |
 | --- | --- | --- |
-| Weitere native Anbieterabläufe | FTP-/FTPS-/SMB-Archive und rekursive entfernte Rechteänderungen; Fehler, Konflikt und Abbruch | Anbieterabläufe mit der fertigen Kandidaten-App wiederholen |
-| Recovery mit Kandidatenartefakten | Unterbrochene Papierkorb-/Quarantäneabläufe und weitere beschädigte Persistenz | Dieselben Recoveryfälle mit beiden Paketarten |
-| Update über den veröffentlichten Kanal | Installation über das signierte GitHub-Updateangebot | Signierter Versionswechsel für AppImage und DEB |
+| ZIP erstellen und in die Gegenpane entpacken | SFTP, FTP, FTPS, WebDAV und verschlüsseltes SMB3 bestanden; Inhalte, leere Ordner und unveränderter Profilroot unabhängig geprüft | Dieselben fünf Anbieter mit beiden Paketarten bestanden |
+| Rekursive entfernte Unix-Rechte | SFTP, FTP und FTPS einschließlich Sonderbits bestanden | Dieselben Anbieter mit beiden Paketarten bestanden |
+| Abbruch, Konflikt und Serverfehler | Abgebrochene Vorschau ohne Upload, vorhandenes Archiv erhalten, bewusstes Verwerfen, abgewiesener Upload mit erhaltenem Zwischenstand und ohne Blind-Retry nach Neustart; Rechte-Abbruch und Teilfehler bestanden | Dieselben Zustände mit beiden Paketarten bestanden |
+| Papierkorb, Quarantäne und Queue-Recovery | Echte Prozessabbrüche, jede alte Version genau einmal erhalten, keine blinde Wiederholung, Restore-Konflikt und ausdrücklicher Restore sowie beschädigte Journale und Manifeste bestanden | Dieselben Recoveryfälle mit beiden Paketarten bestanden |
+| Installation, Upgrade und Entfernung | Start der öffentlichen 0.1.124, Upgrade mit unverändertem Profil und Konfiguration, Entfernung der isolierten App mit erhaltenen Testdaten bestanden | Benutzereigenes AppImage-Upgrade und Entfernung sowie DEB-Installation, Upgrade und Entfernung in einer isolierten Ubuntu-24.04-Umgebung bestanden |
 
-Der Kandidat ist vorbereitet, aber noch nicht veröffentlicht. Die offene native
-Matrix bleibt Teil der weiteren Abnahme und darf nicht als vollständig geprüft
-bezeichnet werden.
+Kopieren, Umbenennen, Ordneranlage und getrennte Fensterjournale sind an den
+fertigen Kandidaten nativ geprüft. Auf macOS blieb auch eine Resource Fork über
+6 MiB erhalten. Die macOS-Funktionsabnahme verwendet native Fenster-/Bedienungs-
+und Dateibelege; eine Bildschirmaufnahme wird dafür nicht als Nachweis gezählt.
+Auf Linux sind Oberfläche, Informationsdialoge und Fehlerzustände visuell geprüft.
+Hell, Dunkel und Automatisch sowie die dunkle native Menüleiste und aufklappende
+Menüs sind mit beiden Paketarten geprüft. Der AppImage-Start benötigt keine
+zusätzlichen Grafik-Workarounds.
+
+Alle Wirkungen liefen ausschließlich mit künstlichen Daten in markierten
+Testbereichen. Die genannten Anbieter- und Recoveryfälle sind abgeschlossen.
+Die Updater-Signaturen für das endgültige macOS-Archiv, AppImage und DEB sowie
+die hashgebundene Linux-Attestation sind geprüft. Die abschließenden macOS-/Linux-
+Paketprüfungen bestehen; das Manifest enthält die drei getrennten Updatekanäle,
+und die Prüfsummen erfassen alle veröffentlichten Dateien. Der echte Versionswechsel
+über das veröffentlichte GitHub-Angebot wird unmittelbar nach dessen Freischaltung
+geprüft.
+
+Der Kandidat ist noch nicht veröffentlicht. Die früheren Paketbelege werden
+getrennt aufbewahrt und ersetzen keine der hier genannten Wiederholungen.
 [Historische Paketbelege](release-history-2026-10.md) bleiben getrennt erhalten.
 
 ## macOS-Paketvertrag

@@ -1,6 +1,6 @@
 # Roadmap bis Version 1.0
 
-Stand: 2026-11-02. Ziel ist ein komfortabler, umfassender und effizienter
+Stand: 2026-11-08. Ziel ist ein komfortabler, umfassender und effizienter
 Two-Pane-Dateimanager für macOS und Linux. Offene Einzelaufgaben stehen nur im
 [Backlog](../backlog.md); die [Funktionsmatrix](function-audit.md) beschreibt das
 aktuell implementierte Verhalten.
@@ -9,19 +9,19 @@ aktuell implementierte Verhalten.
 
 1. **Metadatenumfang umgesetzt:** Die belegten Alltagsfunktionen einschließlich
    macOS-Administratorfreigabe sind implementiert. Über die belegte ForkLift-Parität
-   hinausgehende Spezialfähigkeiten sind keine Releasepflicht. Verbleibende
-   Kandidatenprüfungen stehen beim [Vergleich und Prüfstand](forklift-parity.md).
+   hinausgehende Spezialfähigkeiten sind keine Releasepflicht. Der
+   [Vergleich und Prüfstand](forklift-parity.md) begrenzt diesen Umfang.
 2. **Komfort umgesetzt:** Entfernte Namenzyklen sowie ZIP-Erzeugung und Entpacken
    zu Remotezielen sind implementiert und gegen reale Provider geprüft.
-   Nativ auf macOS geprüft sind SFTP-Namenzyklen und SFTP-/WebDAV-Archive.
-   Weitere Anbieterläufe folgen beim Kandidaten. [Prüfstand](remote-pack.md).
+   Die native Archivmatrix ist für alle fünf Anbieter auf beiden Plattformen
+   abgenommen. [Prüfstand](remote-pack.md).
 3. **Kandidaten stabilisieren:** Neue Funktionen gezielt prüfen, anschließend den
    aktuellen Kandidaten auf beiden unterstützten Plattformen als echte App und
    Paket abnehmen. [Release- und Plattformplan](release-plan.md).
 4. **Auslieferung vorbereiten:** Funktionsmatrix, READMEs, Release Notes und Website
    auf denselben abgenommenen Kandidaten beziehen. Die
    [Entwicklungshinweise](release-notes-next.md) beschreiben den Umfang nach
-   0.1.124; die Website beschreibt weiterhin den verfügbaren Previewdownload.
+   0.1.125; die Website beschreibt weiterhin den verfügbaren Previewdownload.
    Eine Veröffentlichung braucht einen eigenen konkreten Auftrag.
 
 ## Was „fertig“ bedeutet

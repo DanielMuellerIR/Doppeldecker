@@ -5,7 +5,7 @@ folgt Keep a Changelog; Versionen verwenden Semantic Versioning.
 
 ## [Unreleased]
 
-## [0.1.125] - 2026-11-07
+## [0.1.125] - 2026-11-08
 
 - WebDAV-Ordner bleiben lesbar, wenn der Server Länge und ETag ausdrücklich
   als nicht vorhanden meldet. Gewöhnliche additive Uploads und Ordneranlagen
