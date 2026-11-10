@@ -5,6 +5,20 @@ folgt Keep a Changelog; Versionen verwenden Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.127] - 2026-11-10
+
+- Unterbrochene Bereinigungen erzeugter Uploadquellen behalten einen dauerhaft an
+  Fensterqueue und Quelle gebundenen Claim. Queue-Neustart zeigt den tatsächlichen
+  Prüfrest auch bei bereits teilweise gelöschtem Inhalt; kein falscher Cleanup-Erfolg
+  und kein erneuter Upload. Wartende Aufträge verschwinden erst nach erfolgreicher
+  Bereinigung aus dem Journal. Recoveryreste abgeschlossener Nebenfenster öffnen
+  ebenfalls wieder ein Recoveryfenster.
+
+- Das Entfernen wartender Queueaufträge hält Schließen und Beenden bis zum Ende
+  des Cleanupworkers samt Ergebnis-/Recoverymeldung auf. Die fenstereigene
+  Registrierung wird auch bei Fehlern freigegeben und sperrt keine anderen
+  gewöhnlichen Dateiaktionen.
+
 ## [0.1.126] - 2026-11-08
 
 - Linux-LAN-Suche empfängt mDNS-Antworten auf Port 5353 neben Avahi; zufällige Antwortports konnten trotz sichtbarer Server leer bleiben.

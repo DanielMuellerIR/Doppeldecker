@@ -31,6 +31,15 @@ als Ziel wählen. Die Originale bleiben erhalten.
   oder einem Cleanupfehler bleibt der Prüfpfad sichtbar; ein erfolgreicher Upload
   wird dadurch nicht wieder ausführbar. Beim erneuten Öffnen der Queue wird nur
   die Bereinigung bereits abgeschlossener, belegter Quellen nachgeholt.
+- Vor dem Löschen erhält der private Rest einen dauerhaften, an Fensterjournal und
+  Quelle gebundenen Claimnamen; dessen Rename wird im Store synchronisiert. Ein
+  unterbrochener Claim wird nicht automatisch weiter gelöscht. Queue-Neuöffnung
+  zeigt den tatsächlichen Claimpfad auch ohne Inhalt, Manifest oder Ownerdatei;
+  offene Aufträge werden zur nicht wiederholbaren manuellen Recovery. Erfolgreiche
+  Uploads bleiben abgeschlossen. Auch solche Cleanupreste öffnen ein zugehöriges
+  Nebenfenster wieder. **Zwischenstand zeigen** führt dann zum Claimordner.
+- Beim Entfernen bleibt der wartende Auftrag bis zum erfolgreichen Cleanup im
+  Journal. Bei einem Fehler wird er nicht entfernt; der Prüfrest bleibt erreichbar.
 - Ältere Zwischenstände ohne gespeicherte Fensterbindung und nicht zugeordnete
   Crashreste bleiben zur manuellen Prüfung erhalten. Ein passender Ordnername
   allein erlaubt keine automatische Löschung.

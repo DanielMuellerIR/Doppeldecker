@@ -16,19 +16,19 @@ local and remote files. The interface is currently German-only.
 
 ## Download
 
-**Public preview: 0.1.126.** Use a second copy of your data while evaluating it.
+**Public preview: 0.1.127.** Use a second copy of your data while evaluating it.
 
 | System | Package |
 | --- | --- |
-| macOS 14+, Apple Silicon | [Signed and notarized DMG](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.126/Doppeldecker_0.1.126_aarch64.dmg) |
-| Linux Mint 22.2 / Ubuntu 24.04, x86_64 | [DEB](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.126/Doppeldecker_0.1.126_amd64.deb) · [AppImage](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.126/Doppeldecker_0.1.126_amd64.AppImage) |
+| macOS 14+, Apple Silicon | [Signed and notarized DMG](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.127/Doppeldecker_0.1.127_aarch64.dmg) |
+| Linux Mint 22.2 / Ubuntu 24.04, x86_64 | [DEB](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.127/Doppeldecker_0.1.127_amd64.deb) · [AppImage](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.127/Doppeldecker_0.1.127_amd64.AppImage) |
 
 On macOS, drag the app from the DMG to Applications. Other distributions and Intel
 Macs are not yet verified. **Doppeldecker → Nach Updates suchen …** checks on
 request; downloading and installing require a separate confirmation.
 
-[Release notes and checksums](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.126).
-[Changes in this preview (German)](docs/release-notes-0.1.126.md).
+[Release notes and checksums](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.127).
+[Changes in this preview (German)](docs/release-notes-0.1.127.md).
 
 ## Features
 

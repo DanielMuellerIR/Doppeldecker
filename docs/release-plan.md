@@ -37,6 +37,14 @@ Versionswechsel nur für ausdrücklich benannte Meilensteine/Kandidaten; keine
 Versionsbumps für gewöhnliche Entwicklungs- oder Dokumentationscommits.
 Veröffentlichung, Tags und öffentliche Pakete brauchen einen konkreten Auftrag.
 
+## Kandidat 0.1.127
+
+0.1.127 korrigiert die Wiederherstellung unterbrochener Uploadbereinigungen und
+hält Schließen sowie Beenden während des Cleanupworkers auf. Die nativen
+Prozessabbruch-, Queue-Recovery- und Exit-Barriere-Regressionen bestehen für den
+Fix. Plattformgates und neu gebaute Pakete werden für diesen Kandidaten separat
+geprüft; die folgenden 0.1.126-Belege gelten ausschließlich dem früheren Release.
+
 ## Abnahmestand von 0.1.126
 
 0.1.126 korrigiert gespeicherte Fenstergrößen, Linux-mDNS-Erkennung und die
@@ -66,7 +74,14 @@ Alle Wirkungen verwendeten künstliche Daten in markierten Testbereichen. Beide
 Linux-Pakete und die hashgebundene AppImage-Attestation sind signiert; das
 Update-Manifest prüft die drei getrennten Nutzlastkanäle. Die flache Prüfsummenliste
 erfasst alle veröffentlichten Nutzlasten und Metadaten. Die Paketabläufe benötigen
-keine zusätzlichen Grafik-Workarounds. Die folgenden Belege zu 0.1.125 bleiben
+keine zusätzlichen Grafik-Workarounds. Die elf GitHub-Dateien wurden vor der
+Freigabe zurückgeladen und bytegleich geprüft. Der öffentliche Latest-Kanal
+liefert das geprüfte Manifest. Der echte AppImage-Updateweg von 0.1.125 auf
+0.1.126 bestand mit ausdrücklicher Installationsbestätigung, exakt der
+veröffentlichten Nutzlast, nativem Neustart und erhaltenem Profil; das
+Einstellungsformat wurde dabei erwartungsgemäß auf Version 3 migriert. Beide
+READMEs und die Projektseite verlinken 0.1.126; die drei geänderten Website-Seiten
+sind live per HTTPS bytegleich bestätigt. Die folgenden Belege zu 0.1.125 bleiben
 getrennt und gelten ausschließlich dem früheren Release.
 
 ## Abnahmestand von 0.1.125
