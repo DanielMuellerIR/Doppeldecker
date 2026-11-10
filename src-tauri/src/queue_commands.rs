@@ -135,26 +135,36 @@ pub(crate) async fn remove_queue_entry(
     let label = window.label().to_owned();
     let window_state = state.window(&label);
     let queue = operation_queue(&app, &window_state, &label)?;
+    let cleanup = crate::queue_runtime::reserve_queue_cleanup(&state, &window_state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        crate::forward_bidirectional_commands::discard_queue_slot(
-            &window_state,
-            &queue,
-            &operation_id,
-            false,
-        )?;
-        queue
-            .remove_pending(&operation_id)
-            .map_err(AppError::from)?;
-        window_state
-            .content_sync_runs
-            .lock_recover()
-            .remove(&operation_id);
-        window_state
-            .local_sync_runs
-            .lock_recover()
-            .remove(&operation_id);
-        emit_queue_snapshot(&app, &label, &queue);
-        Ok(queue.snapshot().into())
+        let _cleanup = cleanup;
+        let result = (|| {
+            crate::forward_bidirectional_commands::discard_queue_slot(
+                &window_state,
+                &queue,
+                &operation_id,
+                false,
+            )?;
+            queue
+                .remove_pending(&operation_id)
+                .map_err(AppError::from)?;
+            window_state
+                .content_sync_runs
+                .lock_recover()
+                .remove(&operation_id);
+            window_state
+                .local_sync_runs
+                .lock_recover()
+                .remove(&operation_id);
+            emit_queue_snapshot(&app, &label, &queue);
+            Ok(queue.snapshot().into())
+        })();
+        // Vor Freigabe der Barriere auch den Fehler samt Recoverypfaden melden.
+        // Das Command-Future könnte inzwischen vom Aufrufer verworfen worden sein.
+        if let Err(error) = &result {
+            let _ = crate::emit_to_window_label(&app, &label, "queue-error", error);
+        }
+        result
     })
     .await
     .map_err(|_| AppError::new("outcome_unclear", "Queue-Bereinigung unterbrochen"))?

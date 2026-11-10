@@ -280,7 +280,7 @@ fn main() {
             let state = app_state.window(window.label());
             let _barrier = app_state.exit_barrier.lock_recover();
             state.closing.store(true, Ordering::Release);
-            let active = state.active_cancel.lock_recover().is_some();
+            let active = state.has_active_operation();
             let pending = state.pending_preparation_kinds();
             let unfinished = match operation_queue(app, &state, window.label()) {
                 Ok(queue) => queue

@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "doppeldecker-core"
-version = "0.1.126"
+version = "0.1.127"
 dependencies = [
  "blake3",
  "filetime",

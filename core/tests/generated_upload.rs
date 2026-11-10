@@ -81,6 +81,101 @@ fn execute(queue: &OperationQueue, calls: &Arc<AtomicUsize>) -> io::Result<Queue
     )
 }
 #[test]
+fn generated_cleanup_restart_keeps_exact_claim_visible_and_blocks_retry() {
+    for completed in [false, true] {
+        for partial in [false, true] {
+            let server = server::Server::new();
+            let (area, queue, reference, path, bytes) = fixture();
+            let entry = queue
+                .enqueue_generated_upload(
+                    reference.clone(),
+                    target(&server),
+                    vec![],
+                    &Cancel::new(),
+                )
+                .unwrap();
+            let workspace = path.parent().unwrap().parent().unwrap();
+            if completed {
+                // Ein aktiver Leser hält den ersten Completed-Cleanup auf.
+                let store = GeneratedSourceStore::for_queue(&queue).unwrap();
+                let reader = store.resolve(&reference, &Cancel::new()).unwrap();
+                queue.claim_next().unwrap().unwrap();
+                queue.mark_running(&entry.operation_id).unwrap();
+                queue
+                    .complete(&entry.operation_id, Default::default())
+                    .unwrap();
+                drop(reader);
+            }
+            let claim = workspace.parent().unwrap().join(format!(
+                ".cleanup-{}-{}",
+                blake3::hash(b"queue.json").to_hex(),
+                workspace.file_name().unwrap().to_str().unwrap()
+            ));
+            fs::rename(workspace, &claim).unwrap();
+            if partial {
+                fs::remove_file(claim.join("content/result.zip")).unwrap();
+                fs::remove_dir(claim.join("content")).unwrap();
+                fs::remove_file(claim.join("manifest.json")).unwrap();
+                fs::remove_file(claim.join("queue-owner.json")).unwrap();
+                fs::write(claim.join("foreign"), b"Pruefrest").unwrap();
+            }
+            drop(queue);
+            let queue = OperationQueue::open(area.path().join("config/queue.json")).unwrap();
+            let recovered = &queue.snapshot().entries[0];
+            assert_eq!(recovered.operation_id, entry.operation_id);
+            assert_eq!(
+                recovered.state,
+                if completed {
+                    QueueState::Completed
+                } else {
+                    QueueState::Failed
+                }
+            );
+            assert!(recovered
+                .temp_recovery_paths
+                .contains(&claim.to_string_lossy().into_owned()));
+            assert!(!recovered
+                .temp_recovery_paths
+                .contains(&workspace.join("content").to_string_lossy().into_owned()));
+            assert!(queue.retry(&entry.operation_id).is_err());
+            assert!(queue.claim_next().unwrap().is_none());
+            let store = GeneratedSourceStore::for_queue(&queue).unwrap();
+            let error = store.resolve(&reference, &Cancel::new()).err().unwrap();
+            assert!(
+                error.kind() == io::ErrorKind::NotFound || error.kind() == io::ErrorKind::Other
+            );
+            if partial {
+                assert_eq!(fs::read(claim.join("foreign")).unwrap(), b"Pruefrest");
+            } else {
+                assert_eq!(fs::read(claim.join("content/result.zip")).unwrap(), bytes);
+            }
+            assert!(server.state.lock().unwrap().requests.is_empty());
+        }
+    }
+}
+
+#[test]
+fn generated_remove_failure_keeps_queue_entry_until_cleanup_succeeds() {
+    let server = server::Server::new();
+    let (area, queue, reference, path, bytes) = fixture();
+    let entry = queue
+        .enqueue_generated_upload(reference, target(&server), vec![], &Cancel::new())
+        .unwrap();
+    let foreign = path.parent().unwrap().parent().unwrap().join("foreign");
+    fs::write(&foreign, b"Erhalten").unwrap();
+    assert!(queue.remove_pending(&entry.operation_id).is_err());
+    assert_eq!(queue.snapshot().entries.len(), 1);
+    drop(queue);
+    let queue = OperationQueue::open(area.path().join("config/queue.json")).unwrap();
+    assert_eq!(queue.snapshot().entries[0].operation_id, entry.operation_id);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    fs::remove_file(&foreign).unwrap();
+    queue.remove_pending(&entry.operation_id).unwrap();
+    assert!(queue.snapshot().entries.is_empty());
+    assert!(!path.parent().unwrap().exists());
+}
+
+#[test]
 fn generated_zip_upload_uses_exact_bytes_after_queue_restart() {
     let server = server::Server::new();
     let (area, queue, reference, _path, bytes) = fixture();

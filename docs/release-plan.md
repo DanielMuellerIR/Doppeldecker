@@ -1,7 +1,7 @@
 # Release- und Plattformplan
 
-Stand: 2026-11-08. Die aktuelle öffentliche Preview ist
-[0.1.126](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.126).
+Stand: 2026-11-10. Die aktuelle öffentliche Preview ist
+[0.1.127](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.127).
 Veröffentlichung und Abnahme sind für ihre konkreten Pakete nachgewiesen.
 Künftige Änderungen bleiben unter `Unreleased`.
 
@@ -36,6 +36,41 @@ Historische erfolgreiche Gegenläufe ersetzen keinen aktuellen Kandidatenlauf.
 Versionswechsel nur für ausdrücklich benannte Meilensteine/Kandidaten; keine
 Versionsbumps für gewöhnliche Entwicklungs- oder Dokumentationscommits.
 Veröffentlichung, Tags und öffentliche Pakete brauchen einen konkreten Auftrag.
+
+## Abnahmestand von 0.1.127
+
+0.1.127 korrigiert die Wiederherstellung unterbrochener Uploadbereinigungen und
+hält Schließen sowie Beenden während des Cleanupworkers auf. Die vollständigen
+lokalen Plattformgates einschließlich Core, CLI, App, Frontend/CSP, Clippy,
+Formatierung und Fuzz-Lockfile bestehen auf macOS und Linux. Die
+[GitHub-CI](https://github.com/DanielMuellerIR/Doppeldecker/actions/runs/42806185251)
+prüft den gleichen Programmstand `4be7368b` auf macOS 15 und Ubuntu 24.04.
+Die Änderungen nach diesem Quellstand betreffen ausschließlich diese
+Release-Dokumentation; die geprüften Programmquellen bleiben unverändert.
+
+Die Prozessabbruch-, Queue-Neustart-, Cleanupfehler- und Exit-Barriere-Regressionen
+bestehen. Die macOS-App und das DMG sind Developer-ID-signiert, notarisiert und
+gestapelt; das anschließend erzeugte Updaterarchiv enthält dieselbe geprüfte App.
+Signatur, Ticket, Gatekeeper, Architektur, Version, Sidecars, Pfadneutralität und
+die bytegleiche App im fertigen DMG sind geprüft. Die Linux-Paketprüfer bestätigen
+DEB und AppImage einschließlich der tatsächlich enthaltenen CLI-Versionen,
+Laufzeitbibliotheken, detached Signaturen und hashgebundener AppImage-Attestation.
+Das Update-Manifest bindet die drei getrennten Nutzlastkanäle; die flache
+Prüfsummenliste erfasst alle zehn Nutzlast-, Signatur- und Metadatendateien.
+
+Die native Baseline verwendet auf beiden Plattformen die neue Nutzlast und ein
+isoliertes Upgrade von der öffentlichen 0.1.126. Profil und Konfiguration bleiben
+erhalten; Kopieren, Umbenennen, Ordneranlage, getrennte Fensterjournale,
+beschädigte Queue-Daten und die Entfernung der isolierten Installation mit
+Konfigurationserhalt bestehen. Auf macOS bleibt die große Resource Fork erhalten;
+auf Linux sind der Größenwechsel mit Neustart und der native DEB-Start geprüft.
+Die Linux-Oberfläche ist in einer privaten Xvfb-Sitzung visuell geprüft. Alle
+Dateiwirkungen verwenden künstliche Daten in markierten Testbereichen.
+
+Die vollständige fünf-Provider-Matrix sowie alle drei Erscheinungsmodi aus
+0.1.126 wurden für diese reine Cleanup-/Exit-Korrektur nicht erneut nativ
+abgenommen; der Providercode und die Gestaltung sind unverändert. Die früheren
+Belege bleiben ausdrücklich dem früheren Release zugeordnet.
 
 ## Abnahmestand von 0.1.126
 

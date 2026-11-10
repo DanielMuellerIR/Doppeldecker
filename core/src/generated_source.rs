@@ -350,6 +350,37 @@ impl GeneratedSourceStore {
             _process_lock: process_lock,
         })
     }
+    fn cleanup_path(&self, reference: &GeneratedWorkspaceReference) -> io::Result<PathBuf> {
+        reference.validate()?;
+        Ok(self.root.path().join(format!(
+            ".cleanup-{}-{}",
+            blake3::hash(self.queue_name.as_bytes()).to_hex(),
+            reference.id
+        )))
+    }
+
+    pub(crate) fn cleanup_recovery_path(
+        &self,
+        reference: &GeneratedWorkspaceReference,
+    ) -> io::Result<Option<PathBuf>> {
+        let path = self.cleanup_path(reference)?;
+        match local_fs::stat_beneath(&self.root, &path) {
+            Ok(_) => Ok(Some(path)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn require_no_cleanup_claim(&self, reference: &GeneratedWorkspaceReference) -> io::Result<()> {
+        if let Some(path) = self.cleanup_recovery_path(reference)? {
+            return Err(crate::error::with_recovery_paths(
+                io::Error::other("Unterbrochene Bereinigung; privaten Rest manuell prüfen"),
+                &[path.to_string_lossy().into_owned()],
+            ));
+        }
+        Ok(())
+    }
+
     pub fn begin(&self) -> io::Result<GeneratedWorkspace> {
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).map_err(|error| io::Error::other(error.to_string()))?;
@@ -433,6 +464,7 @@ impl GeneratedSourceStore {
         before_cleanup: impl FnOnce(&Path),
     ) -> io::Result<()> {
         reference.validate()?;
+        self.require_no_cleanup_claim(&reference.workspace_reference())?;
         let path = self.root.path().join(&reference.id);
         match local_fs::stat_beneath(&self.root, &path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -464,14 +496,12 @@ impl GeneratedSourceStore {
         // Inhaltsprüfung. Bereits geöffnete Elterndeskriptoren können noch wirken;
         // deshalb löschen wir danach nur einzeln beanspruchte Manifestdateien und
         // ausschließlich leere Verzeichnisse, niemals einen neu erfassten Baum.
-        let mut nonce = [0u8; 16];
-        getrandom::fill(&mut nonce).map_err(|error| io::Error::other(error.to_string()))?;
-        let claim = self.root.path().join(format!(
-            ".cleanup-{}",
-            nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        ));
+        // Der Name bindet den Rest dauerhaft an Fensterjournal und Quelle, auch
+        // wenn der Crash bereits Manifest oder Ownerdatei entfernt hat.
+        let claim = self.cleanup_path(&reference.workspace_reference())?;
         local_fs::rename_noreplace_beneath(&self.root, &path, &claim)?;
         let cleanup = (|| {
+            local_fs::sync_dir_beneath(&self.root, self.root.path())?;
             let directory = RootHandle::open_beneath(&self.root, &claim)?;
             if directory.identity() != source.directory.identity() {
                 return Err(drift());
@@ -556,12 +586,22 @@ impl GeneratedSourceStore {
         })();
         if let Err(error) = cleanup {
             let restored = local_fs::rename_noreplace_beneath(&self.root, &claim, &path);
-            return Err(io::Error::new(
-                error.kind(),
-                format!(
-                    "Zwischenstand mit Prüfrest erhalten unter {}: {error}",
-                    if restored.is_ok() { &path } else { &claim }.display()
+            let recovery = if restored.is_ok() { &path } else { &claim };
+            local_fs::sync_dir_beneath(&self.root, self.root.path()).map_err(|sync_error| {
+                crate::error::with_recovery_paths(
+                    sync_error,
+                    &[recovery.to_string_lossy().into_owned()],
+                )
+            })?;
+            return Err(crate::error::with_recovery_paths(
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "Zwischenstand mit Prüfrest erhalten unter {}: {error}",
+                        recovery.display()
+                    ),
                 ),
+                &[recovery.to_string_lossy().into_owned()],
             ));
         }
         Ok(())
@@ -571,6 +611,13 @@ impl GeneratedSourceStore {
         &self,
         reference: &GeneratedWorkspaceReference,
     ) -> io::Result<()> {
+        self.require_no_cleanup_claim(reference)?;
+        let path = self.root.path().join(&reference.id);
+        match local_fs::stat_beneath(&self.root, &path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
         let work = self.open_workspace(reference)?;
         if !self.owns_workspace(&work.directory)?
             || !local_fs::list_complete_beneath(&work.content, work.path())?.is_empty()
@@ -578,10 +625,22 @@ impl GeneratedSourceStore {
         {
             return Err(drift());
         }
-        local_fs::remove_dir_beneath(&work.directory, work.path())?;
-        local_fs::remove_file_beneath(&work.directory, &work.directory.path().join(OWNER))?;
-        local_fs::remove_dir_beneath(&self.root, work.directory.path())?;
-        local_fs::sync_dir_beneath(&self.root, self.root.path())
+        let claim = self.cleanup_path(reference)?;
+        local_fs::rename_noreplace_beneath(&self.root, &path, &claim)?;
+        (|| {
+            local_fs::sync_dir_beneath(&self.root, self.root.path())?;
+            let directory = RootHandle::open_beneath(&self.root, &claim)?;
+            if directory.identity() != work.directory.identity() {
+                return Err(drift());
+            }
+            local_fs::remove_dir_beneath(&directory, &claim.join(CONTENT))?;
+            local_fs::remove_file_beneath(&directory, &claim.join(OWNER))?;
+            local_fs::remove_dir_beneath(&self.root, &claim)?;
+            local_fs::sync_dir_beneath(&self.root, self.root.path())
+        })()
+        .map_err(|error| {
+            crate::error::with_recovery_paths(error, &[claim.to_string_lossy().into_owned()])
+        })
     }
 
     pub fn resolve(
@@ -884,6 +943,100 @@ mod tests {
         .unwrap()
         .execute_generated(None, &mut |_| {})
         .unwrap()
+    }
+
+    #[test]
+    fn generated_cleanup_crash_must_not_report_an_orphan_as_cleaned() {
+        let (area, queue, store, source) = fixture();
+        let workspace = store.begin().unwrap();
+        let generated = generate(&workspace, &source);
+        let reference = workspace.seal_archive(generated, &Cancel::new()).unwrap();
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.remove_source_with_hook(&reference, |_| panic!("Crash nach Claim-Rename"))
+        }));
+        assert!(interrupted.is_err());
+        let leftovers: Vec<_> = fs::read_dir(store.root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with(".cleanup-")
+            })
+            .collect();
+        assert_eq!(leftovers.len(), 1);
+        assert!(leftovers[0].join("content/result.zip").is_file());
+        drop(store);
+        drop(queue);
+        let queue = OperationQueue::open(
+            area.path()
+                .canonicalize()
+                .unwrap()
+                .join("config/queue.json"),
+        )
+        .unwrap();
+        let store = GeneratedSourceStore::for_queue(&queue).unwrap();
+        let result = store.remove_source(&reference);
+        assert!(
+            result.is_err(),
+            "offener Claim wurde fälschlich als bereinigt gemeldet"
+        );
+    }
+
+    #[test]
+    fn generated_cleanup_process_restart_preserves_partial_claims() {
+        const CHILD: &str = "DOPPELDECKER_GENERATED_CLEANUP_CHILD";
+        if let Some(config) = std::env::var_os(CHILD) {
+            let config = PathBuf::from(config);
+            let queue = OperationQueue::open(config.join("queue.json")).unwrap();
+            let store = GeneratedSourceStore::for_queue(&queue).unwrap();
+            let reference: GeneratedSourceReference =
+                serde_json::from_slice(&fs::read(config.join("test-reference.json")).unwrap())
+                    .unwrap();
+            store
+                .remove_source_with_hook(&reference, |content| {
+                    fs::remove_file(content.join("result.zip")).unwrap();
+                    let directory = content.parent().unwrap();
+                    fs::remove_file(directory.join(MANIFEST)).unwrap();
+                    fs::remove_file(directory.join(OWNER)).unwrap();
+                    // Kein Unwind/Drop: echter Prozessabbruch mitten im Claim.
+                    std::process::exit(86);
+                })
+                .unwrap();
+            panic!("Crashhook wurde nicht erreicht");
+        }
+        let (area, queue, store, source) = fixture();
+        let workspace = store.begin().unwrap();
+        let generated = generate(&workspace, &source);
+        let reference = workspace.seal_archive(generated, &Cancel::new()).unwrap();
+        let claim = store
+            .cleanup_path(&reference.workspace_reference())
+            .unwrap();
+        let config = area.path().canonicalize().unwrap().join("config");
+        fs::write(
+            config.join("test-reference.json"),
+            serde_json::to_vec(&reference).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+        drop(queue);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "generated_source::tests::generated_cleanup_process_restart_preserves_partial_claims", "--nocapture"])
+            .env(CHILD, &config).status().unwrap();
+        assert_eq!(status.code(), Some(86));
+        let queue = OperationQueue::open(config.join("queue.json")).unwrap();
+        let store = GeneratedSourceStore::for_queue(&queue).unwrap();
+        let error = store.remove_source(&reference).unwrap_err();
+        assert_eq!(
+            crate::error::recovery_paths(&error),
+            vec![claim.to_string_lossy().into_owned()]
+        );
+        assert!(claim.is_dir());
+        assert!(!claim.join(MANIFEST).exists());
+        assert!(!claim.join(OWNER).exists());
+        assert!(source.join("original.txt").is_file());
     }
 
     #[test]

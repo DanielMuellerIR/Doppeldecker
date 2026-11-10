@@ -24,16 +24,38 @@ impl OperationQueue {
             .path_in(self._process_lock.root.path())
             .map(|path| path.to_string_lossy().into_owned());
         if let Ok(path) = path {
+            let mut recovery = result
+                .as_ref()
+                .err()
+                .map(crate::error::recovery_paths)
+                .unwrap_or_default();
+            if result.is_err() && recovery.is_empty() {
+                recovery.push(path.clone());
+            }
             let failed = result.is_err();
-            if failed == entry.temp_recovery_paths.contains(&path) {
+            if failed
+                && recovery
+                    .iter()
+                    .all(|path| entry.temp_recovery_paths.contains(path))
+            {
+                return;
+            }
+            if !failed && !entry.temp_recovery_paths.contains(&path) {
                 return;
             }
             // Ein Cleanupfehler macht den Upload nicht wieder ausführbar. Sein
             // Prüfpfad bleibt getrennt vom belegten erfolgreichen Transfer.
             let _ = self.update(operation_id, |entry| {
-                if failed && !entry.temp_recovery_paths.contains(&path) {
-                    entry.temp_recovery_paths.push(path.clone());
-                } else if !failed {
+                if failed {
+                    entry
+                        .temp_recovery_paths
+                        .retain(|item| item != &path || recovery.contains(item));
+                    for path in &recovery {
+                        if !entry.temp_recovery_paths.contains(path) {
+                            entry.temp_recovery_paths.push(path.clone());
+                        }
+                    }
+                } else {
                     entry.temp_recovery_paths.retain(|item| item != &path);
                 }
                 Ok(())
@@ -60,20 +82,56 @@ impl OperationQueue {
             store.remove_empty_workspace(&reference)
         };
         result.map_err(|error| {
+            let mut paths = crate::error::recovery_paths(&error);
+            if paths.is_empty() {
+                paths.push(reference.path_in(self._process_lock.root.path())
+                    .unwrap_or_default().to_string_lossy().into_owned());
+            }
             crate::error::with_recovery_paths(
                 io::Error::new(
                     error.kind(),
                     format!(
-                        "Auftrag entfernt; lokaler Zwischenstand zur Prüfung erhalten: {error}"
+                        "Auftrag nicht entfernt; lokaler Zwischenstand zur Prüfung erhalten: {error}"
                     ),
                 ),
-                &[reference
-                    .path_in(self._process_lock.root.path())
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()],
+                &paths,
             )
         })
+    }
+
+    pub(super) fn recover_generated_cleanup(&self) -> io::Result<()> {
+        let entries = self.snapshot().entries;
+        for entry in entries {
+            let reference = entry
+                .generated_source
+                .as_ref()
+                .map(|source| source.workspace_reference())
+                .or_else(|| match &entry.operation {
+                    QueueOperation::ArchiveUpload { workspace, .. } => Some(workspace.clone()),
+                    _ => None,
+                });
+            let Some(reference) = reference else {
+                continue;
+            };
+            let store = GeneratedSourceStore::for_queue(self)?;
+            let Some(path) = store.cleanup_recovery_path(&reference)? else {
+                continue;
+            };
+            let path = path.to_string_lossy().into_owned();
+            self.update(&entry.operation_id, |entry| {
+                if !entry.temp_recovery_paths.contains(&path) {
+                    entry.temp_recovery_paths.push(path.clone());
+                }
+                if entry.state != QueueState::Completed {
+                    entry.state = QueueState::Failed;
+                    entry.attention = None;
+                    entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+                    entry.error = Some("Unterbrochene Bereinigung; privaten Rest manuell prüfen, kein erneuter Upload".into());
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     pub fn prepare_generated_upload(
@@ -217,7 +275,11 @@ impl OperationQueue {
                 "Kein erzeugter Zwischenstand",
             ));
         };
-        let workspace = GeneratedSourceStore::for_queue(self)?.open_workspace(&reference)?;
+        let store = GeneratedSourceStore::for_queue(self)?;
+        if let Some(path) = store.cleanup_recovery_path(&reference)? {
+            return Ok(path);
+        }
+        let workspace = store.open_workspace(&reference)?;
         Ok(workspace.path().to_path_buf())
     }
 }

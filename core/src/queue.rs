@@ -2053,6 +2053,7 @@ impl OperationQueue {
                 recovery.created_directory_dacl_acknowledged,
             )?;
         }
+        queue.recover_generated_cleanup()?;
         for entry in queue.snapshot().entries {
             if entry.state == QueueState::Completed && entry.generated_source.is_some() {
                 queue.cleanup_completed_generated_source(&entry.operation_id);
@@ -4624,7 +4625,7 @@ impl OperationQueue {
     }
 
     pub fn remove_pending(&self, operation_id: &str) -> io::Result<()> {
-        let removed = self.transact(|journal| {
+        self.transact(|journal| {
             let index = journal
                 .entries
                 .iter()
@@ -4633,9 +4634,12 @@ impl OperationQueue {
             if journal.entries[index].state != QueueState::Pending {
                 return Err(invalid_transition(journal.entries[index].state));
             }
-            Ok(journal.entries.remove(index))
-        })?;
-        self.cleanup_removed_generated_source(&removed)
+            // Der Auftrag bleibt dauerhaft erreichbar, bis sein privater Rest
+            // beseitigt ist. Ein Crash im Cleanup darf ihn nicht verwaisen lassen.
+            self.cleanup_removed_generated_source(&journal.entries[index])?;
+            journal.entries.remove(index);
+            Ok(())
+        })
     }
 
     /// Nur mit dem nächsten/vorherigen ebenfalls wartenden Eintrag tauschen. So kann

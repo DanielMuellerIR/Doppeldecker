@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -912,6 +912,9 @@ pub(crate) struct WindowState {
     /// Danach lebt der aktuelle Pane-Zustand ausschließlich im jeweiligen Fenster.
     pub(crate) initial_panes: Mutex<Option<crate::window_commands::WindowStartState>>,
     pub(crate) active_cancel: Mutex<Option<Cancel>>,
+    /// Auch ein bereits entfernter Queueeintrag kann noch lokale Daten bereinigen.
+    /// Dieser Zähler blockiert nur Schließen/Beenden, nicht andere Dateiaktionen.
+    queue_cleanups: AtomicUsize,
     pub(crate) property_edits: Mutex<crate::file_property_commands::PropertyEditCache>,
     pub(crate) remote_edits: Mutex<HashMap<String, crate::remote_edit_commands::RemoteEdit>>,
     /// Nicht serialisierbare Realmodus-Vorbereitung samt gehaltenen Deskriptoren. Ein
@@ -984,7 +987,32 @@ impl AppState {
     }
 }
 
+/// Lebt im Worker, nicht im wartenden Command-Future: Auch dessen Abbruch darf
+/// den noch laufenden Cleanup nicht aus der Beenden-Erfassung entfernen.
+pub(crate) struct QueueCleanupGuard(Arc<WindowState>);
+
+impl Drop for QueueCleanupGuard {
+    fn drop(&mut self) {
+        self.0.queue_cleanups.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn reserve_queue_cleanup(
+    state: &AppState,
+    window: &Arc<WindowState>,
+) -> Result<QueueCleanupGuard, AppError> {
+    with_queue_extension(state, window, || {
+        window.queue_cleanups.fetch_add(1, Ordering::AcqRel);
+        Ok(QueueCleanupGuard(window.clone()))
+    })
+}
+
 impl WindowState {
+    pub(crate) fn has_active_operation(&self) -> bool {
+        self.active_cancel.lock_recover().is_some()
+            || self.queue_cleanups.load(Ordering::Acquire) != 0
+    }
+
     fn operations_are_closing(&self) -> bool {
         self.exit_in_progress.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire)
     }
@@ -2073,6 +2101,69 @@ fn path_safe_token(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_waits_for_removed_queue_entry_cleanup_and_error_reporting() {
+        let app = AppState::default();
+        let window = app.window("main");
+        let other = app.window("window-zwei");
+        let inspect = || {
+            crate::app_commands::assess_exit(&["main".into()], false, |_| {
+                (window.has_active_operation(), Ok(Vec::new()))
+            })
+        };
+        assert!(!inspect().must_prevent_exit());
+        let guard = reserve_queue_cleanup(&app, &window).unwrap();
+        let second = reserve_queue_cleanup(&app, &window).unwrap();
+        drop(second);
+        let (at_cleanup, reached_cleanup) = std::sync::mpsc::channel();
+        let (finish, may_finish) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _guard = guard;
+            at_cleanup.send(()).unwrap();
+            may_finish.recv().unwrap();
+            // Simulierter Fehler: Die Recoverymeldung liegt noch im Worker.
+            Err::<(), _>(AppError::new("io", "Cleanup fehlgeschlagen"))
+        });
+        reached_cleanup.recv().unwrap();
+        let during = inspect();
+        assert!(during.must_prevent_exit());
+        assert!(!during.can_confirm_exit());
+        assert!(!other.has_active_operation());
+        // Keine zusätzliche Single-Flight-Sperre für normale Arbeit.
+        reserve_operation(&window).unwrap();
+        window.active_cancel.lock_recover().take();
+        finish.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap_err().code, "io");
+        assert!(!inspect().must_prevent_exit());
+
+        window.closing.store(true, Ordering::Release);
+        assert_eq!(
+            reserve_queue_cleanup(&app, &window).err().unwrap().code,
+            "busy"
+        );
+        window.closing.store(false, Ordering::Release);
+        app.exit_in_progress.store(true, Ordering::Release);
+        assert_eq!(
+            reserve_queue_cleanup(&app, &window).err().unwrap().code,
+            "busy"
+        );
+        assert!(!window.has_active_operation());
+    }
+
+    #[test]
+    fn exit_cleanup_guard_is_released_on_worker_panic() {
+        let app = AppState::default();
+        let window = app.window("main");
+        let guard = reserve_queue_cleanup(&app, &window).unwrap();
+        let result = std::thread::spawn(move || {
+            let _guard = guard;
+            panic!("künstliche Cleanupunterbrechung");
+        })
+        .join();
+        assert!(result.is_err());
+        assert!(!window.has_active_operation());
+    }
 
     #[test]
     fn direkter_download_nutzt_fenstercancel_und_erhaelt_andere_fenster() {

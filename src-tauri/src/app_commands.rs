@@ -176,7 +176,7 @@ pub(crate) fn assess_app_exit(app: &tauri::AppHandle, state: &AppState) -> ExitS
         state.profile_transaction_active.load(Ordering::Acquire),
         |label| {
             let window_state = state.window(label);
-            let active = window_state.active_cancel.lock_recover().is_some();
+            let active = window_state.has_active_operation();
             let pending = window_state.pending_preparation_kinds();
             let queue = operation_queue(app, &window_state, label).map(|queue| {
                 queue

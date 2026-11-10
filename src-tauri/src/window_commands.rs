@@ -460,10 +460,12 @@ pub(crate) fn prepare_incomplete_queue_windows(
         // beschränkt und wird für das betroffene Fenster gemeldet.
         let queue = operation_queue(app, &state, label)?;
         Ok(queue.snapshot().entries.iter().any(|entry| {
-            !matches!(
-                entry.state,
-                doppeldecker_core::QueueState::Completed | doppeldecker_core::QueueState::Cancelled
-            )
+            !entry.temp_recovery_paths.is_empty()
+                || !matches!(
+                    entry.state,
+                    doppeldecker_core::QueueState::Completed
+                        | doppeldecker_core::QueueState::Cancelled
+                )
         }))
     })
 }
