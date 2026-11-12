@@ -5,6 +5,9 @@ folgt Keep a Changelog; Versionen verwenden Semantic Versioning.
 
 ## [Unreleased]
 
+- Upload-Recovery gleicht Content-, Workspace- und Cleanup-Pfade ab. Manuell geschlossene Aufträge bleiben nach einem Neustart geschlossen; erhaltene Zwischenstände abgeschlossener Uploads sind direkt erreichbar.
+- Das Entfernen wartender Archivaufträge reserviert zuerst einen dauerhaften Entfernungsintent und bereinigt außerhalb des Journal-Mutex. Queue-Abfragen und Fenster-Schließhinweise bleiben währenddessen bedienbar.
+
 ## [0.1.127] - 2026-11-10
 
 - Unterbrochene Bereinigungen erzeugter Uploadquellen behalten einen dauerhaft an

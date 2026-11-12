@@ -1856,12 +1856,15 @@ impl OperationQueue {
                 }
             }
             if matches!(entry.state, QueueState::Validating | QueueState::Running) {
-                entry.state = QueueState::Interrupted;
-                entry.error = Some(
-                    "Der vorherige Prozess endete während dieser Operation; vor Wiederholung erneut prüfen"
-                        .into(),
-                );
-                entry.error_code = Some(crate::ErrorCode::Interrupted);
+                if entry.progress.phase == "generated_cleanup" {
+                    entry.state = QueueState::Failed;
+                    entry.error = Some("Entfernung wurde unterbrochen; Zwischenstand prüfen und Bereinigung erneut anfordern".into());
+                    entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+                } else {
+                    entry.state = QueueState::Interrupted;
+                    entry.error = Some("Der vorherige Prozess endete während dieser Operation; vor Wiederholung erneut prüfen".into());
+                    entry.error_code = Some(crate::ErrorCode::Interrupted);
+                }
                 recovered = true;
             } else if entry.state == QueueState::AwaitingConfirmation
                 && matches!(entry.attention, Some(QueueAttention::RemoteRun { .. }))
@@ -4625,18 +4628,71 @@ impl OperationQueue {
     }
 
     pub fn remove_pending(&self, operation_id: &str) -> io::Result<()> {
+        self.remove_pending_with_cleanup(operation_id, |entry| {
+            self.cleanup_removed_generated_source(entry)
+        })
+    }
+
+    pub(crate) fn remove_pending_with_cleanup(
+        &self,
+        operation_id: &str,
+        cleanup: impl FnOnce(&QueueEntry) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let reserved = self.transact(|journal| {
+            let index = journal
+                .entries
+                .iter()
+                .position(|entry| entry.operation_id == operation_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Queue-Eintrag fehlt"))?;
+            let entry = &mut journal.entries[index];
+            if entry.state != QueueState::Pending
+                && !(entry.state == QueueState::Failed
+                    && entry.progress.phase == "generated_cleanup")
+            {
+                return Err(invalid_transition(entry.state));
+            }
+            if entry.generated_source.is_none()
+                && !matches!(entry.operation, QueueOperation::ArchiveUpload { .. })
+            {
+                journal.entries.remove(index);
+                return Ok(None);
+            }
+            // Dauerhafter Entfernungsintent: nicht ausführbar, bis Cleanup und
+            // Abschluss getrennt bestätigt sind. Große Datei-I/O hält keinen Journal-Mutex.
+            entry.state = QueueState::Validating;
+            entry.progress.phase = "generated_cleanup".into();
+            entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+            Ok(Some(entry.clone()))
+        })?;
+        let Some(reserved) = reserved else {
+            return Ok(());
+        };
+        if let Err(error) = cleanup(&reserved) {
+            self.update(operation_id, |entry| {
+                require_state(entry, QueueState::Validating)?;
+                entry.state = QueueState::Failed;
+                entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+                entry.error = Some(error.to_string());
+                for path in crate::error::recovery_paths(&error) {
+                    if !entry.temp_recovery_paths.contains(&path) {
+                        entry.temp_recovery_paths.push(path);
+                    }
+                }
+                Ok(())
+            })?;
+            return Err(error);
+        }
         self.transact(|journal| {
             let index = journal
                 .entries
                 .iter()
                 .position(|entry| entry.operation_id == operation_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Queue-Eintrag fehlt"))?;
-            if journal.entries[index].state != QueueState::Pending {
-                return Err(invalid_transition(journal.entries[index].state));
+            if journal.entries[index] != reserved {
+                return Err(crate::real_mode::plan_drift(
+                    "Entfernungsintent wurde zwischenzeitlich verändert",
+                ));
             }
-            // Der Auftrag bleibt dauerhaft erreichbar, bis sein privater Rest
-            // beseitigt ist. Ein Crash im Cleanup darf ihn nicht verwaisen lassen.
-            self.cleanup_removed_generated_source(&journal.entries[index])?;
             journal.entries.remove(index);
             Ok(())
         })

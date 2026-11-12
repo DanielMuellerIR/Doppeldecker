@@ -18,49 +18,55 @@ impl OperationQueue {
         let Some(reference) = &entry.generated_source else {
             return;
         };
-        let result =
-            GeneratedSourceStore::for_queue(self).and_then(|store| store.remove_source(reference));
-        let path = reference
-            .path_in(self._process_lock.root.path())
-            .map(|path| path.to_string_lossy().into_owned());
-        if let Ok(path) = path {
-            let mut recovery = result
-                .as_ref()
-                .err()
-                .map(crate::error::recovery_paths)
-                .unwrap_or_default();
-            if result.is_err() && recovery.is_empty() {
-                recovery.push(path.clone());
+        let store = GeneratedSourceStore::for_queue(self);
+        let Ok(content) = reference.path_in(self._process_lock.root.path()) else {
+            return;
+        };
+        let mut related = vec![content.clone(), content.parent().unwrap().to_path_buf()];
+        if let Ok(store) = &store {
+            if let Ok(claim) = store.cleanup_path(&reference.workspace_reference()) {
+                related.push(claim);
             }
-            let failed = result.is_err();
-            if failed
-                && recovery
-                    .iter()
-                    .all(|path| entry.temp_recovery_paths.contains(path))
-            {
-                return;
-            }
-            if !failed && !entry.temp_recovery_paths.contains(&path) {
-                return;
-            }
-            // Ein Cleanupfehler macht den Upload nicht wieder ausführbar. Sein
-            // Prüfpfad bleibt getrennt vom belegten erfolgreichen Transfer.
-            let _ = self.update(operation_id, |entry| {
-                if failed {
-                    entry
-                        .temp_recovery_paths
-                        .retain(|item| item != &path || recovery.contains(item));
-                    for path in &recovery {
-                        if !entry.temp_recovery_paths.contains(path) {
-                            entry.temp_recovery_paths.push(path.clone());
-                        }
-                    }
-                } else {
-                    entry.temp_recovery_paths.retain(|item| item != &path);
-                }
-                Ok(())
-            });
         }
+        let result = store.and_then(|store| store.remove_source(reference));
+        let mut recovery = result
+            .as_ref()
+            .err()
+            .map(crate::error::recovery_paths)
+            .unwrap_or_default();
+        if result.is_err() && recovery.is_empty() {
+            recovery.push(content.to_string_lossy().into_owned());
+        }
+        let related: Vec<_> = related
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let mut desired: Vec<_> = entry
+            .temp_recovery_paths
+            .iter()
+            .filter(|path| !related.contains(path))
+            .cloned()
+            .collect();
+        for path in recovery {
+            if !desired.contains(&path) {
+                desired.push(path);
+            }
+        }
+        if desired == entry.temp_recovery_paths {
+            return;
+        }
+        // Nur die Pfade dieser Quelle abgleichen; fremde Prüfpfade bleiben erhalten.
+        let _ = self.update(operation_id, |entry| {
+            entry
+                .temp_recovery_paths
+                .retain(|path| !related.contains(path));
+            for path in &desired {
+                if !entry.temp_recovery_paths.contains(path) {
+                    entry.temp_recovery_paths.push(path.clone());
+                }
+            }
+            Ok(())
+        });
     }
 
     pub(super) fn cleanup_removed_generated_source(&self, entry: &QueueEntry) -> io::Result<()> {
@@ -119,10 +125,13 @@ impl OperationQueue {
             };
             let path = path.to_string_lossy().into_owned();
             self.update(&entry.operation_id, |entry| {
+                let content = reference.path_in(self._process_lock.root.path())?;
+                let workspace = content.parent().unwrap();
+                entry.temp_recovery_paths.retain(|item| Path::new(item) != content && Path::new(item) != workspace);
                 if !entry.temp_recovery_paths.contains(&path) {
                     entry.temp_recovery_paths.push(path.clone());
                 }
-                if entry.state != QueueState::Completed {
+                if !matches!(entry.state, QueueState::Completed | QueueState::Cancelled) {
                     entry.state = QueueState::Failed;
                     entry.attention = None;
                     entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);

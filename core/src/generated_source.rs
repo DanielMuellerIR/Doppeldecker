@@ -350,7 +350,10 @@ impl GeneratedSourceStore {
             _process_lock: process_lock,
         })
     }
-    fn cleanup_path(&self, reference: &GeneratedWorkspaceReference) -> io::Result<PathBuf> {
+    pub(crate) fn cleanup_path(
+        &self,
+        reference: &GeneratedWorkspaceReference,
+    ) -> io::Result<PathBuf> {
         reference.validate()?;
         Ok(self.root.path().join(format!(
             ".cleanup-{}-{}",
@@ -983,6 +986,64 @@ mod tests {
             result.is_err(),
             "offener Claim wurde fälschlich als bereinigt gemeldet"
         );
+    }
+
+    #[test]
+    fn generated_removal_keeps_snapshots_available_during_real_cleanup() {
+        let (_area, queue, store, source) = fixture();
+        let workspace = store.begin().unwrap();
+        let generated = generate(&workspace, &source);
+        let reference = workspace.seal_archive(generated, &Cancel::new()).unwrap();
+        let entry = queue
+            .enqueue_generated_upload(
+                reference,
+                crate::BidirectionalQueueEndpoint::WebDav {
+                    root: "/fixture".into(),
+                    connection: Box::new(crate::WebDavConnectionConfig {
+                        origin: "https://dav.example.test".into(),
+                        username: "fixture".into(),
+                        requested_root: "/fixture".into(),
+                        certificate: crate::FtpsCertificatePin { sha256: [4; 32] },
+                        certificate_policy: crate::FtpsCertificatePolicy::WebPkiAndPin,
+                        password_reference: crate::KeychainSecretReference::new(
+                            "fixture", "fixture",
+                        )
+                        .unwrap(),
+                    }),
+                },
+                vec![],
+                &Cancel::new(),
+            )
+            .unwrap();
+        let queue = std::sync::Arc::new(queue);
+        let worker_queue = queue.clone();
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let id = entry.operation_id.clone();
+        let worker = std::thread::spawn(move || {
+            worker_queue.remove_pending_with_cleanup(&id, |entry| {
+                store.remove_source_with_hook(entry.generated_source.as_ref().unwrap(), |_| {
+                    entered.send(()).unwrap();
+                    resume
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                })
+            })
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (ready, snapshot) = std::sync::mpsc::channel();
+        let observer_queue = queue.clone();
+        let observer = std::thread::spawn(move || ready.send(observer_queue.snapshot()).unwrap());
+        let observed = snapshot.recv_timeout(std::time::Duration::from_secs(1));
+        release.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        observer.join().unwrap();
+        let observed = observed.expect("Snapshot blockiert während der echten Quellenbereinigung");
+        assert_eq!(observed.entries[0].state, crate::QueueState::Validating);
+        assert_eq!(observed.entries[0].progress.phase, "generated_cleanup");
+        assert!(queue.snapshot().entries.is_empty());
     }
 
     #[test]

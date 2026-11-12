@@ -99,11 +99,10 @@ fn generated_cleanup_restart_keeps_exact_claim_visible_and_blocks_retry() {
                 // Ein aktiver Leser hält den ersten Completed-Cleanup auf.
                 let store = GeneratedSourceStore::for_queue(&queue).unwrap();
                 let reader = store.resolve(&reference, &Cancel::new()).unwrap();
-                queue.claim_next().unwrap().unwrap();
-                queue.mark_running(&entry.operation_id).unwrap();
-                queue
-                    .complete(&entry.operation_id, Default::default())
-                    .unwrap();
+                execute(&queue, &Arc::new(AtomicUsize::new(0))).unwrap();
+                assert!(queue.snapshot().entries[0]
+                    .temp_recovery_paths
+                    .contains(&workspace.join("content").to_string_lossy().into_owned()));
                 drop(reader);
             }
             let claim = workspace.parent().unwrap().join(format!(
@@ -137,6 +136,10 @@ fn generated_cleanup_restart_keeps_exact_claim_visible_and_blocks_retry() {
             assert!(!recovered
                 .temp_recovery_paths
                 .contains(&workspace.join("content").to_string_lossy().into_owned()));
+            assert_eq!(
+                queue.generated_source_path(&entry.operation_id).unwrap(),
+                claim
+            );
             assert!(queue.retry(&entry.operation_id).is_err());
             assert!(queue.claim_next().unwrap().is_none());
             let store = GeneratedSourceStore::for_queue(&queue).unwrap();
@@ -149,7 +152,23 @@ fn generated_cleanup_restart_keeps_exact_claim_visible_and_blocks_retry() {
             } else {
                 assert_eq!(fs::read(claim.join("content/result.zip")).unwrap(), bytes);
             }
-            assert!(server.state.lock().unwrap().requests.is_empty());
+            if !completed {
+                queue
+                    .acknowledge_unclear_outcome(&entry.operation_id, true)
+                    .unwrap();
+                drop(store);
+                drop(queue);
+                let queue = OperationQueue::open(area.path().join("config/queue.json")).unwrap();
+                assert_eq!(queue.snapshot().entries[0].state, QueueState::Cancelled);
+                assert!(claim.exists());
+            } else {
+                drop(store);
+                drop(queue);
+                fs::remove_dir_all(&claim).unwrap();
+                let queue = OperationQueue::open(area.path().join("config/queue.json")).unwrap();
+                assert!(queue.snapshot().entries[0].temp_recovery_paths.is_empty());
+                assert_eq!(queue.snapshot().entries[0].state, QueueState::Completed);
+            }
         }
     }
 }

@@ -330,9 +330,10 @@ export function createQueueUi({
         ${entry.operation.type === "ArchiveExtract" || parent && archive.kind === "extract" ? '<button class="btn ghost small" data-queue-action="extract-preview">Entpackhinweise</button>' : ""}
         ${entry.operation.type === "ArchivePack" || parent && archive.kind === "pack" ? '<button class="btn ghost small" data-queue-action="archive-preview">ZIP-Hinweise</button>' : ""}
         ${generated && entry.generated_source.issues?.length ? '<button class="btn ghost small" data-queue-action="generated-hints">Archivhinweise</button>' : ""}
-        ${(generated || parent) && (entry.state !== "Completed" || entry.temp_recovery_paths?.includes(entry.operation.source?.root)) && showGeneratedSource ? '<button class="btn ghost small" data-queue-action="generated-show">Zwischenstand zeigen</button>' : ""}
+        ${(generated || parent) && (entry.state !== "Completed" || entry.generated_source_recovery) && showGeneratedSource ? '<button class="btn ghost small" data-queue-action="generated-show">Zwischenstand zeigen</button>' : ""}
         ${generatedConflict ? '<button class="btn primary small" data-queue-action="generated-conflicts">Konflikte prüfen …</button>' : ""}
         ${pending ? '<button class="btn ghost small" data-queue-action="up" aria-label="Nach oben" title="Nach oben">↑</button><button class="btn ghost small" data-queue-action="down" aria-label="Nach unten" title="Nach unten">↓</button><button class="btn ghost small" data-queue-action="remove">Entfernen</button>' : ""}
+        ${entry.state === "Failed" && progress.phase === "generated_cleanup" ? '<button class="btn ghost small" data-queue-action="remove">Bereinigung erneut versuchen</button>' : ""}
         ${createdDaclRecovery ? '<button class="btn primary small" data-queue-action="created-dacl-recovery">Rechte neuer Ordner prüfen</button>' : ""}
         ${fileDaclRecovery ? '<button class="btn primary small" data-queue-action="file-dacl-recovery">Objektweite Dateirechte prüfen</button>' : ""}
         ${daclRecovery ? '<button class="btn primary small" data-queue-action="dacl-recovery">Zugriffsrechte prüfen</button>' : ""}

@@ -152,6 +152,10 @@ try {
    queue.entries=[{operation_id:"generated-upload",operation:{type:"ProviderFile",kind:"Copy",source:{provider:"Local",root:"/private/generated/content"},target:{provider:"WebDav",root:"/remote/Ein-langes-Zielverzeichnis",connection:{origin:"https://artificial.example.invalid"}},items:["/private/generated/content/Ergebnis.zip"],destination:"/remote/Ein-langes-Zielverzeichnis"},generated_source:{kind:"zip",label:"Ergebnis.zip",files:1,directories:0,bytes:42,issues:[{path:"source",reason:"Metadaten ausgelassen",content_omitted:false}]},state:"AwaitingConfirmation",attempts:1,progress:{},attention:{type:"ConflictsChanged",current_conflicts:["Ergebnis.zip"],current_conflict_proofs:[],reason:"Zielkonflikt",confirmation:"backend-only"}}];
    window.__ZIP_GENERATED_CALLS__=[];const original=window.__TAURI__.core.invoke;
    window.__TAURI__.core.invoke=async(command,args)=>{
+    if(command==="generated_source_path") {
+     window.__ZIP_GENERATED_CALLS__.push({command,args:structuredClone(args)});
+     return queue.entries[0].temp_recovery_paths[0] || "/private/generated/content";
+    }
     if(command==="check_provider_file_operation"||command==="enqueue_provider_file_operation") {
      window.__ZIP_GENERATED_CALLS__.push({command,args:structuredClone(args)});
      if(command==="enqueue_provider_file_operation"){queue.entries[0].state="Pending";queue.entries[0].attention=null;queue.revision++;window.__MOCK_EMIT__("queue-updated",structuredClone(queue));return "generated-upload";}
@@ -174,12 +178,24 @@ try {
   const enqueued=calls.find(call=>call.command==="enqueue_provider_file_operation");
   if(choice === "cancel")assert.equal(enqueued,undefined);else {assert.equal(enqueued.args.request.generatedOperationId,"generated-upload");assert.equal(enqueued.args.request.overwrite,choice === "overwrite");assert.equal(enqueued.args.request.keepBothPreparationId,choice === "both" ? "keep-bound" : null);}
   const entries=await page.evaluate(()=>window.__DOPPELDECKER_MOCK_QUEUE__.entries);assert.equal(entries.length,1);assert.equal(entries[0].operation_id,"generated-upload");assert.equal(entries[0].generated_source.label,"Ergebnis.zip");
-  for(const state of ["Cancelled", "Completed", "retained"]) {
-   await page.evaluate(state=>{const queue=window.__DOPPELDECKER_MOCK_QUEUE__;queue.entries[0].state=state === "retained" ? "Completed" : state;queue.entries[0].attention=null;queue.entries[0].temp_recovery_paths=state === "retained" ? [queue.entries[0].operation.source.root] : [];queue.revision++;window.__MOCK_EMIT__("queue-updated",structuredClone(queue));},state);
+  for(const state of ["Cancelled", "Completed", "retained", "claim", "workspace"]) {
+   await page.evaluate(state=>{
+    const queue=window.__DOPPELDECKER_MOCK_QUEUE__;const entry=queue.entries[0];
+    entry.state=["retained","claim","workspace"].includes(state) ? "Completed" : state;
+    entry.attention=null;entry.generated_source_recovery=["retained","claim","workspace"].includes(state);
+    entry.temp_recovery_paths=state==="retained" ? [entry.operation.source.root] : state==="claim" ? ["/private/generated/.cleanup-fixture-id"] : state==="workspace" ? ["/private/generated"] : [];
+    queue.revision++;window.__MOCK_EMIT__("queue-updated",structuredClone(queue));
+   },state);
    const show=row.getByRole("button",{name:"Zwischenstand zeigen",exact:true});
    if(state === "Completed")await show.waitFor({state:"detached"});else await show.waitFor();
    assert.equal(await row.evaluate(element=>element.scrollWidth<=element.clientWidth),true);
    if(evidence && choice === "overwrite")await page.screenshot({path:evidence+"/generated-cleanup-"+state+"-390.png"});
+   if(state==="claim" || state==="workspace") {
+    await show.click();
+    const expected=await page.evaluate(()=>window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].temp_recovery_paths[0]);
+    await page.waitForFunction(expected=>[...document.querySelectorAll('.pane .path')].some(input=>input.value===expected),expected);
+    assert.equal((await page.evaluate(()=>window.__ZIP_GENERATED_CALLS__)).at(-1).command,"generated_source_path");
+   }
   }
   assert.deepEqual(errors,[]);await page.close();
  }

@@ -22,6 +22,31 @@ impl<T: Serialize> Serialize for FrontendPayload<T> {
 fn project_reports(value: &mut Value) {
     match value {
         Value::Object(fields) => {
+            if let (Some(source), Some(paths)) = (
+                fields.get("generated_source"),
+                fields.get("temp_recovery_paths").and_then(Value::as_array),
+            ) {
+                let id = source.get("id").and_then(Value::as_str).unwrap_or("");
+                let root = fields
+                    .get("operation")
+                    .and_then(|op| op.get("source"))
+                    .and_then(|source| source.get("root"))
+                    .and_then(Value::as_str);
+                let available = !id.is_empty()
+                    && paths.iter().filter_map(Value::as_str).any(|path| {
+                        let path = std::path::Path::new(path);
+                        root.is_some_and(|root| {
+                            path == std::path::Path::new(root)
+                                || Some(path) == std::path::Path::new(root).parent()
+                        }) || path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with(".cleanup-") && name.ends_with(&format!("-{id}"))
+                            })
+                    });
+                fields.insert("generated_source_recovery".into(), Value::Bool(available));
+            }
             for (name, child) in fields {
                 if name == "created_directory_dacl_report" {
                     project_report(child);
@@ -73,6 +98,22 @@ mod tests {
         CreatedDirectoryDaclOutcome, CreatedDirectoryDaclReport, CreatedDirectoryEffectKey,
         CreatedDirectoryObservation, CreatedDirectoryOrigin,
     };
+
+    #[test]
+    fn generated_recovery_projection_recognizes_content_workspace_and_claim() {
+        for (path, expected) in [
+            ("/store/generated-id/content", true),
+            ("/store/generated-id", true),
+            ("/store/.cleanup-queue-generated-id", true),
+            ("/unrelated/temp", false),
+        ] {
+            let value = serde_json::json!({"entries": [{"generated_source": {"id": "generated-id"},
+                "operation": {"source": {"root": "/store/generated-id/content"}},
+                "temp_recovery_paths": [path]}]});
+            let wire = serde_json::to_value(FrontendPayload(value)).unwrap();
+            assert_eq!(wire["entries"][0]["generated_source_recovery"], expected);
+        }
+    }
 
     fn report() -> CreatedDirectoryDaclReport {
         let key = CreatedDirectoryEffectKey {

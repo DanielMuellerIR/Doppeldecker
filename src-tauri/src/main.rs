@@ -282,6 +282,17 @@ fn main() {
             state.closing.store(true, Ordering::Release);
             let active = state.has_active_operation();
             let pending = state.pending_preparation_kinds();
+            if active {
+                api.prevent_close();
+                queue_runtime::reopen_window_operation_gate(app, window.label(), &state);
+                let _ = crate::emit_to_window_label(
+                    app,
+                    window.label(),
+                    "window-close-blocked",
+                    "In diesem Fenster läuft noch eine Dateioperation oder Bereinigung.",
+                );
+                return;
+            }
             let unfinished = match operation_queue(app, &state, window.label()) {
                 Ok(queue) => queue
                     .snapshot()

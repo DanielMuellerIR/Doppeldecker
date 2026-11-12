@@ -121,6 +121,7 @@ export function createOperationUi({ planSummaryHtml, setRunning, captureEndpoint
       archive_finalize: "Schließe ZIP-Archiv ab",
       archive_verify: "Prüfe ZIP-Archiv",
       archive_commit: "Übernehme ZIP-Zielnamen",
+      generated_cleanup: "Bereinige lokalen Zwischenstand",
       quarantine: "Sichere",
       delete: "Lösche",
       done: "Fertig",
