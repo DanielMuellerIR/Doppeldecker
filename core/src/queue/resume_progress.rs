@@ -168,6 +168,7 @@ impl OperationQueue {
 mod tests {
     use super::*;
     use crate::resumable_copy::prepare_resume_copies;
+    use std::os::unix::fs::DirBuilderExt;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[test]
@@ -176,7 +177,10 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let source = root.join("probe");
         let destination = root.join("ziel");
-        std::fs::create_dir(&destination).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&destination)
+            .unwrap();
         const MIB: u64 = 1024 * 1024;
         let payload = vec![23; (10 * MIB) as usize];
         std::fs::write(&source, &payload).unwrap();
