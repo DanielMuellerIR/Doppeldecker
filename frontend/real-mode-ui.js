@@ -1,6 +1,7 @@
 import { confirmContentSync, contentSyncPlanPresentation, identityDisplay } from "./content-sync-ui.js";
 import { fingerprint } from "./connections-ui.js";
 import { hideModal, showOwnedModal } from "./modal.js";
+import { syncExclusionReportHtml } from "./plan-view.js";
 import { invoke } from "./tauri-api.js";
 import { $, digestHex, escapeHtml, fmtTransferBytes } from "./ui-utils.js";
 
@@ -306,6 +307,7 @@ export function createRealModeUi({
           <div class="real-card"><strong>Schutzprüfungen</strong><small>Listing Quelle/Ziel vollständig · Restore-Probe ${restoreText} · Platz ${spaceText}</small></div>
           ${capabilityHtml}
         </div>
+        ${syncExclusionReportHtml(preview.plan)}
         <div class="real-card"><strong>Plan-Digest</strong><code>${digestHex(preview.plan_digest)}</code></div>
 `;
       $("#modal-body").onclick = null;

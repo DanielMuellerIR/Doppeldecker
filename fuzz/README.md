@@ -5,7 +5,7 @@ Kernvalidierung von Baseline, Laufjournal und Metadatenmanifest. Das vierte Targ
 `finder_favorites` prüft den Finder-Favoriten-Parser für Plist- und Bookmark-Daten.
 Diese vier Targets öffnen keine Dateien und verbinden kein Netzwerk.
 
-Das fünfte Target `archive_read` prüft den lokalen ZIP-Katalog, virtuelle Ordner
+Das fünfte Target `archive_read` prüft lokale ZIP- und TAR-Kataloge, virtuelle Ordner
 und Stored-/Deflate-Inhaltsstreams. Es schreibt ausschließlich maximal 64 KiB
 Eingabe in eine reguläre Datei in einem eigenen `tempfile`-Verzeichnis; der Reader
 selbst verändert nichts. Das temporäre Verzeichnis wird nach jedem Aufruf
@@ -46,7 +46,7 @@ Inhaltsaufruf erhält höchstens 64 KiB Ausgabe, 256 KiB Eingabe-I/O und 512
 Leseaufrufe. Die Grenzen gelten pro Aufruf; das Target besitzt zusätzlich die
 feste Obergrenze von acht Inhaltsaufrufen.
 
-Beliebige beschädigte ZIP-Daten dürfen Fehler oder Teilkataloge ergeben. Nur bei
+Beliebige beschädigte Archivdaten dürfen Fehler oder Teilkataloge ergeben. Nur bei
 `VerifiedArchiveRead` prüft das Target Erfolgsinvarianten: regulärer problemloser
 Eintrag, exakt angekündigte Ausgabemenge und eingehaltene Ausgabe-/I/O-Grenzen.
 Vollständige ZIP-Strukturvalidität wird damit nicht behauptet.

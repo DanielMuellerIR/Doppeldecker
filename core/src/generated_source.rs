@@ -1413,6 +1413,7 @@ mod tests {
         .unwrap();
         let workspace = store.begin().unwrap();
         let generated = crate::archive_extract::ArchiveExtractRequest {
+            format: Default::default(),
             source_root: archive_root.clone(),
             source_path: archive_root.join("input.zip"),
             snapshot: None,

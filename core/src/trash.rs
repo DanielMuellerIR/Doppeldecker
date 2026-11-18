@@ -126,9 +126,17 @@ pub fn trash_items(
     native::trash(items, sandbox, journal_dir)
 }
 
-/// Verarbeitet alle verbliebenen Journale. Ein Claim wird nur dann zurueckbenannt,
-/// wenn seine Identitaet exakt passt und der urspruengliche Name frei ist.
-pub fn recover_trash_journals(journal_dir: &Path) -> io::Result<RecoveryStats> {
+/// Der Befund beschreibt ausschließlich den gespeicherten Zustand. Die
+/// tatsächliche Lage von Claim, Original und Papierkorb prüft die Recovery.
+#[derive(Debug, Serialize)]
+pub struct TrashJournalReview {
+    pub name: String,
+    pub entry_count: Option<usize>,
+    pub effects_unclear: bool,
+    pub error: Option<String>,
+}
+
+fn trash_journal_names(journal_dir: &Path) -> io::Result<Vec<OsString>> {
     match std::fs::symlink_metadata(journal_dir) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => {
@@ -138,7 +146,7 @@ pub fn recover_trash_journals(journal_dir: &Path) -> io::Result<RecoveryStats> {
             ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(RecoveryStats::default());
+            return Ok(Vec::new());
         }
         Err(error) => return Err(error),
     }
@@ -152,6 +160,39 @@ pub fn recover_trash_journals(journal_dir: &Path) -> io::Result<RecoveryStats> {
         }
     }
 
+    Ok(names)
+}
+
+pub fn inspect_trash_journals(journal_dir: &Path) -> io::Result<Vec<TrashJournalReview>> {
+    let mut names = trash_journal_names(journal_dir)?;
+    names.sort();
+    Ok(names
+        .into_iter()
+        .map(|name| {
+            let path = journal_dir.join(&name);
+            let name = name.to_string_lossy().into_owned();
+            match inspect_trash_journal(&path) {
+                Ok((entry_count, effects_unclear)) => TrashJournalReview {
+                    name,
+                    entry_count: Some(entry_count),
+                    effects_unclear,
+                    error: None,
+                },
+                Err(error) => TrashJournalReview {
+                    name,
+                    entry_count: None,
+                    effects_unclear: false,
+                    error: Some(error.to_string()),
+                },
+            }
+        })
+        .collect())
+}
+
+/// Verarbeitet alle verbliebenen Journale. Ein Claim wird nur dann zurueckbenannt,
+/// wenn seine Identitaet exakt passt und der urspruengliche Name frei ist.
+pub fn recover_trash_journals(journal_dir: &Path) -> io::Result<RecoveryStats> {
+    let names = trash_journal_names(journal_dir)?;
     let mut report = RecoveryStats::default();
     for name in names {
         let path = journal_dir.join(&name);
@@ -167,7 +208,7 @@ pub fn recover_trash_journals(journal_dir: &Path) -> io::Result<RecoveryStats> {
     Ok(report)
 }
 
-fn recover_journal(path: &Path, report: &mut RecoveryStats) -> io::Result<()> {
+fn read_trash_journal(path: &Path) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
     let (parent, name) = open_parent(path)?;
     let file = openat(
@@ -191,23 +232,48 @@ fn recover_journal(path: &Path, report: &mut RecoveryStats) -> io::Result<()> {
             "Papierkorb-Journal überschreitet die Größenbegrenzung",
         ));
     }
+    Ok(data)
+}
+
+fn trash_journal_version(data: &[u8]) -> io::Result<u32> {
     #[derive(Deserialize)]
     struct Version {
         version: u32,
     }
-    let version: Version = serde_json::from_slice(&data)
+    let version: Version = serde_json::from_slice(data)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if version.version == 2 {
+    match version.version {
+        JOURNAL_VERSION | 2 => Ok(version.version),
+        version => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unbekannte Journal-Version {version}"),
+        )),
+    }
+}
+
+fn decode_legacy_trash_journal(data: &[u8]) -> io::Result<TrashJournal> {
+    serde_json::from_slice(data).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn inspect_trash_journal(path: &Path) -> io::Result<(usize, bool)> {
+    let data = read_trash_journal(path)?;
+    if trash_journal_version(&data)? == 2 {
+        return Ok(journal_v2::decode(&data)?.review());
+    }
+    let journal = decode_legacy_trash_journal(&data)?;
+    let effects_unclear = journal
+        .entries
+        .iter()
+        .any(|entry| entry.status == JournalStatus::Claimed && entry.failure.is_some());
+    Ok((journal.entries.len(), effects_unclear))
+}
+
+fn recover_journal(path: &Path, report: &mut RecoveryStats) -> io::Result<()> {
+    let data = read_trash_journal(path)?;
+    if trash_journal_version(&data)? == 2 {
         return journal_v2::claim::recover(path, &data, report);
     }
-    if version.version != JOURNAL_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unbekannte Journal-Version {}", version.version),
-        ));
-    }
-    let mut journal: TrashJournal = serde_json::from_slice(&data)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut journal = decode_legacy_trash_journal(&data)?;
     let mut store = journal_v2::claim::LegacyJournal::bind(path, &data).map_err(|error| {
         crate::error::with_recovery_paths(error, &[path.to_string_lossy().into_owned()])
     })?;
@@ -491,6 +557,27 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    #[test]
+    fn papierkorb_befund_erhaelt_unlesbare_journale_bytegleich() {
+        let config = tempfile::tempdir().unwrap();
+        let root = config.path().canonicalize().unwrap();
+        let bad = root.join("trash-broken.json");
+        let unrelated = root.join("ignore.json");
+        let bytes = b"{broken";
+        std::fs::write(&bad, bytes).unwrap();
+        std::fs::write(unrelated, b"ignored").unwrap();
+
+        let results = inspect_trash_journals(&root).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "trash-broken.json");
+        assert!(results[0].error.is_some());
+        assert_eq!(std::fs::read(&bad).unwrap(), bytes);
+
+        let absent = root.join("uncreated");
+        assert!(inspect_trash_journals(&absent).unwrap().is_empty());
+        assert!(!absent.exists());
+    }
 
     struct TestLayout {
         root: PathBuf,

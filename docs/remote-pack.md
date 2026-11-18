@@ -18,6 +18,8 @@ als Ziel wählen. Die Originale bleiben erhalten.
   oder Beide behalten. Ordner werden zusammengeführt. Eine Konfliktfortsetzung
   erhält Auftrag, Ziel und versiegelte Quelle.
 - Die Queue zeigt beide Phasen, Archivhinweise und **Zwischenstand zeigen**.
+  Der Prüf-Tab schließt sich nach nachgewiesener Bereinigung. Die vorherige
+  Dateiliste mit ihrer Auswahl wird wieder aktiv, wenn der Prüf-Tab noch offen ist.
   Lokaler Abschluss bedeutet noch keinen erfolgreichen Upload. Teilwirkungen und
   unklare Serverantworten bleiben sichtbar; kein blinder mutierender Retry.
 - Ein Absturz während der Archivphase verlangt Prüfung des lokalen Zwischenstands.

@@ -105,8 +105,9 @@ export function createContextMenu(actions) {
       if (single) items.push({ label: "Öffnen", action: () => actions.open(side) });
       if (single && entries[0].is_file && !entries[0].is_symlink) {
         items.push({ label: "Vorschau (F3)", action: () => actions.preview(side) });
-        items.push({ label: "ZIP-Inhalt anzeigen …", action: () => actions.archiveRead(side) });
-        items.push({ label: "ZIP entpacken …", action: () => actions.archiveExtract(side) });
+        const tar = /\.(?:tar(?:\.gz)?|tgz)$/i.test(entries[0].name);
+        items.push({ label: tar ? "TAR-Inhalt anzeigen …" : "ZIP-Inhalt anzeigen …", action: () => actions.archiveRead(side) });
+        items.push({ label: tar ? "Archiv entpacken …" : "ZIP entpacken …", action: () => actions.archiveExtract(side) });
       }
       if (single && pane.provider !== "local" && entries[0].is_file && !entries[0].is_symlink) {
         items.push({ label: "Mit Vollprüfung öffnen", action: () => actions.open(side, "original", "full_readback") });
@@ -126,6 +127,10 @@ export function createContextMenu(actions) {
       items.push({ label: "Duplizieren", action: () => actions.duplicate(side) });
       items.push({ label: "ZIP-Archiv erstellen …", action: () => actions.archivePack(side) });
       items.push({ label: "Ins andere Pane kopieren  (F5)", action: () => actions.transfer("copy") });
+      if (actions.resumableCopy && entries.every(entry => entry.is_file && !entry.is_symlink)
+        && ["local", "webdav"].includes(pane.provider) && actions.pane(side === "left" ? "right" : "left").provider === "local") {
+        items.push({ label: "Dateiinhalt fortsetzbar kopieren", action: () => actions.resumableCopy(side) });
+      }
       items.push({ label: "Ins andere Pane verschieben  (F6)", action: () => actions.transfer("move") });
       if (pane.provider === "local") {
         items.push({ label: "Kopieren", action: () => actions.clipboardCopy(side) });

@@ -45,7 +45,7 @@ use crate::{
 mod forward;
 pub use forward::*;
 
-pub const QUEUE_JOURNAL_VERSION: u32 = 40;
+pub const QUEUE_JOURNAL_VERSION: u32 = 45;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 const LEGACY_UNBOUND_WEBDAV_ETAG: &str = "__doppeldecker_legacy_unbound__";
 const LEGACY_WEBDAV_REPLAN_ERROR: &str = "Dieser ältere WebDAV-Löschplan besitzt keine eindeutig gebundene Server- oder Root-Identität. Er wurde nicht ausgeführt und darf nicht wiederholt werden; Zielzustand neu laden und die Auswahl neu bestätigen.";
@@ -188,6 +188,11 @@ impl BidirectionalQueueEndpoint {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum QueueOperation {
+    ResumableCopy {
+        plan: Box<crate::resumable_copy::ResumeCopyPlan>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint: Option<Box<crate::resumable_copy::CopyCheckpoint>>,
+    },
     /// Rein manuelle Recovery eines entfernten Namenstauschs; nie ausführbar.
     RenameCycleRecovery {
         record: Box<crate::remote_rename_cycle::RenameCycleRecord>,
@@ -535,6 +540,50 @@ pub struct QueueEntry {
     /// In beiden Fällen ist ausschließlich Cleanup erlaubt, nie neue Dateiwirkung.
     #[serde(default)]
     pub bidirectional_completion_recovery: Option<BidirectionalCompletionRecovery>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueRecoveryReason {
+    OutcomeUnclear,
+    SettlementPending,
+    DecisionRequired,
+    Interrupted,
+    Failed,
+    Retained,
+    Incomplete,
+}
+
+impl QueueEntry {
+    /// Anzeigegrund, ohne eine Freigabe für eine weitere Wirkung abzuleiten.
+    pub fn recovery_reason(&self) -> Option<QueueRecoveryReason> {
+        use QueueRecoveryReason as Reason;
+        if self.error_code == Some(crate::ErrorCode::OutcomeUnclear) {
+            return Some(Reason::OutcomeUnclear);
+        }
+        if self.bidirectional_completion_recovery.is_some() {
+            return Some(Reason::SettlementPending);
+        }
+        match self.state {
+            QueueState::AwaitingConfirmation => Some(Reason::DecisionRequired),
+            QueueState::Interrupted => Some(Reason::Interrupted),
+            QueueState::Failed => Some(Reason::Failed),
+            QueueState::Completed | QueueState::Cancelled => {
+                if !self.temp_recovery_paths.is_empty()
+                    || !self.retained_backup_paths.is_empty()
+                    || self.recovery_available
+                    || (self.state == QueueState::Cancelled && self.generated_source.is_some())
+                {
+                    Some(Reason::Retained)
+                } else if self.file_incomplete {
+                    Some(Reason::Incomplete)
+                } else {
+                    None
+                }
+            }
+            QueueState::Pending | QueueState::Validating | QueueState::Running => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1193,6 +1242,47 @@ impl OperationQueue {
                 ));
             }
         }
+        if source_version < 41
+            && snapshot
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.operation, QueueOperation::ResumableCopy { .. }))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fortsetzbare Kopien benötigen Journalversion 41",
+            ));
+        }
+        if source_version < 42
+            && snapshot.entries.iter().any(|entry| match &entry.operation {
+                QueueOperation::ArchiveExtract { request, .. } => !request.format.is_zip(),
+                QueueOperation::ArchiveUpload { generation, .. } => matches!(
+                    generation.as_ref(),
+                    crate::archive_upload::ArchiveGeneration::Extract { request, .. } if !request.format.is_zip()
+                ),
+                _ => false,
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TAR-Entpackaufträge benötigen Journalversion 42",
+            ));
+        }
+        if source_version < 43 && snapshot.entries.iter().any(|entry| {
+            matches!(&entry.operation, QueueOperation::ResumableCopy { plan, .. } if plan.webdav_endpoint().is_some())
+        }) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Fortsetzbare WebDAV-Downloads benötigen Journalversion 43"));
+        }
+        if source_version < 44 && snapshot.entries.iter().any(|entry| {
+            matches!(&entry.operation, QueueOperation::ResumableCopy { plan, .. } if plan.ftps_endpoint().is_some())
+        }) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Fortsetzbare FTPS-Downloads benötigen Journalversion 44"));
+        }
+        if source_version < 45 && snapshot.entries.iter().any(|entry| {
+            matches!(&entry.operation, QueueOperation::ResumableCopy { plan, .. } if plan.sftp_endpoint().is_some())
+        }) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Fortsetzbare SFTP-Downloads benötigen Journalversion 45"));
+        }
         let migrated = if matches!(source_version, 1..=39) {
             for entry in &mut snapshot.entries {
                 if let QueueOperation::File {
@@ -1465,6 +1555,9 @@ impl OperationQueue {
                     }
                 }
             }
+            snapshot.version = QUEUE_JOURNAL_VERSION;
+            true
+        } else if matches!(source_version, 40..=44) {
             snapshot.version = QUEUE_JOURNAL_VERSION;
             true
         } else {
@@ -1856,7 +1949,10 @@ impl OperationQueue {
                 }
             }
             if matches!(entry.state, QueueState::Validating | QueueState::Running) {
-                if entry.progress.phase == "generated_cleanup" {
+                if matches!(
+                    entry.progress.phase.as_str(),
+                    "generated_cleanup" | "resumable_discard"
+                ) {
                     entry.state = QueueState::Failed;
                     entry.error = Some("Entfernung wurde unterbrochen; Zwischenstand prüfen und Bereinigung erneut anfordern".into());
                     entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
@@ -2281,10 +2377,52 @@ impl OperationQueue {
     }
 
     pub fn enqueue(&self, operation: QueueOperation) -> io::Result<QueueEntry> {
+        self.enqueue_reconciled(operation)
+    }
+
+    pub fn enqueue_resumable_copies(
+        &self,
+        plans: Vec<crate::resumable_copy::ResumeCopyPlan>,
+        profile_bindings: &[crate::RemoteProfileBinding],
+    ) -> io::Result<Vec<String>> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries = plans
+            .into_iter()
+            .map(|plan| {
+                self.pending_entry(
+                    QueueOperation::ResumableCopy {
+                        plan: Box::new(plan),
+                        checkpoint: None,
+                    },
+                    profile_bindings.to_vec(),
+                    None,
+                )
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let ids = entries
+            .iter()
+            .map(|entry| entry.operation_id.clone())
+            .collect();
+        self.transact(|journal| {
+            journal.entries.extend(entries);
+            Ok(ids)
+        })
+    }
+
+    fn pending_entry(
+        &self,
+        operation: QueueOperation,
+        profile_bindings: Vec<crate::RemoteProfileBinding>,
+        generated_source: Option<crate::generated_source::GeneratedSourceReference>,
+    ) -> io::Result<QueueEntry> {
         validate_enqueue_operation(&operation)?;
+        validate_profile_bindings(&profile_bindings)?;
+        validate_resumable_copy_profiles(&operation, &profile_bindings)?;
         let entry = QueueEntry {
             file_incomplete: false,
-            generated_source: None,
+            generated_source,
             directory_stream_report: Default::default(),
             directory_dacl_report: Default::default(),
             file_dacl_report: Default::default(),
@@ -2295,7 +2433,7 @@ impl OperationQueue {
             created_directory_dacl_recovery: false,
             operation_id: new_operation_id()?,
             operation,
-            profile_bindings: Vec::new(),
+            profile_bindings,
             created_unix_ms: unix_millis()?,
             state: QueueState::Pending,
             attempts: 0,
@@ -2309,10 +2447,7 @@ impl OperationQueue {
             bidirectional_completion_recovery: None,
         };
         validate_generated_entry(&entry, self._process_lock.root.path())?;
-        self.transact(|journal| {
-            journal.entries.push(entry.clone());
-            Ok(entry)
-        })
+        Ok(entry)
     }
 
     /// Persistiert die genaue Namenslage vor jedem Schritt. Der Eintrag bleibt
@@ -2462,35 +2597,7 @@ impl OperationQueue {
         generated_source: Option<crate::generated_source::GeneratedSourceReference>,
         write: impl FnOnce(&Path, &QueueSnapshot) -> io::Result<()>,
     ) -> io::Result<QueueEntry> {
-        validate_enqueue_operation(&operation)?;
-        validate_profile_bindings(&profile_bindings)?;
-        let entry = QueueEntry {
-            file_incomplete: false,
-            generated_source,
-            directory_stream_report: Default::default(),
-            directory_dacl_report: Default::default(),
-            file_dacl_report: Default::default(),
-            created_directory_dacl_report: Default::default(),
-            archive_extract_report: None,
-            directory_dacl_recovery: false,
-            file_dacl_recovery: false,
-            created_directory_dacl_recovery: false,
-            operation_id: new_operation_id()?,
-            operation,
-            profile_bindings,
-            created_unix_ms: unix_millis()?,
-            state: QueueState::Pending,
-            attempts: 0,
-            progress: Progress::default(),
-            attention: None,
-            error: None,
-            error_code: None,
-            temp_recovery_paths: Vec::new(),
-            retained_backup_paths: Vec::new(),
-            recovery_available: false,
-            bidirectional_completion_recovery: None,
-        };
-        validate_generated_entry(&entry, self._process_lock.root.path())?;
+        let entry = self.pending_entry(operation, profile_bindings, generated_source)?;
         self.transact_using(
             |journal| {
                 journal.entries.push(entry.clone());
@@ -2924,6 +3031,7 @@ impl OperationQueue {
             if !matches!(
                 entry.operation,
                 QueueOperation::File { .. }
+                    | QueueOperation::ResumableCopy { .. }
                     | QueueOperation::ProviderFile { .. }
                     | QueueOperation::ArchiveUpload { .. }
                     | QueueOperation::ArchivePack { .. }
@@ -2949,6 +3057,10 @@ impl OperationQueue {
             entry.attention = None;
             entry.recovery_available = false;
             entry.bidirectional_completion_recovery = None;
+            if let QueueOperation::ResumableCopy { checkpoint, .. } = &mut entry.operation {
+                *checkpoint = None;
+                entry.temp_recovery_paths.clear();
+            }
             for path in temp_recovery_paths {
                 if !entry.temp_recovery_paths.contains(path) {
                     entry.temp_recovery_paths.push(path.clone());
@@ -3263,7 +3375,12 @@ impl OperationQueue {
             if require_file_operation
                 && !matches!(
                     entry.operation,
-                    QueueOperation::File { .. } | QueueOperation::ProviderFile { .. } | QueueOperation::ArchiveUpload { .. } | QueueOperation::ArchivePack { .. } | QueueOperation::ArchiveExtract { .. }
+                    QueueOperation::File { .. }
+                        | QueueOperation::ResumableCopy { .. }
+                        | QueueOperation::ProviderFile { .. }
+                        | QueueOperation::ArchiveUpload { .. }
+                        | QueueOperation::ArchivePack { .. }
+                        | QueueOperation::ArchiveExtract { .. }
                 )
             {
                 return Err(invalid_transition(entry.state));
@@ -4133,8 +4250,11 @@ impl OperationQueue {
             ) {
                 return Err(invalid_transition(entry.state));
             }
+            if entry.progress.phase == "resumable_discarded" {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "Die Teilkopie wurde verworfen. Eine neue Kopie muss von der Datei gestartet werden."));
+            }
             if matches!(entry.operation, QueueOperation::ArchiveExtract { .. } | QueueOperation::ArchiveUpload { .. }) {
-                return Err(crate::coded_error(io::ErrorKind::Other, crate::ErrorCode::ReplanRequired,"ZIP-Entpacken wird nach Abschluss, Abbruch oder Fehler nicht automatisch wiederholt; sichtbaren Zielbestand prüfen und bei Bedarf eine neue Absicht erstellen"));
+                return Err(crate::coded_error(io::ErrorKind::Other, crate::ErrorCode::ReplanRequired,"Entpacken wird nach Abschluss, Abbruch oder Fehler nicht automatisch wiederholt; sichtbaren Zielbestand prüfen und bei Bedarf eine neue Absicht erstellen"));
             }
             if entry.directory_dacl_recovery || !entry.directory_dacl_report.is_empty() {
                 return Err(crate::error::with_directory_dacl_report(
@@ -4627,6 +4747,88 @@ impl OperationQueue {
         })
     }
 
+    pub fn discard_resumable_copy(
+        &self,
+        operation_id: &str,
+        sandbox: Option<&Path>,
+    ) -> io::Result<()> {
+        let mut reserved = None;
+        self.update(operation_id, |entry| {
+            if !matches!(entry.operation, QueueOperation::ResumableCopy { .. }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Auftrag ist keine fortsetzbare Kopie",
+                ));
+            }
+            if !matches!(
+                entry.state,
+                QueueState::Pending | QueueState::Interrupted | QueueState::Failed
+            ) {
+                return Err(invalid_transition(entry.state));
+            }
+            if entry.error_code == Some(crate::ErrorCode::OutcomeUnclear)
+                && entry.progress.phase != "resumable_discard"
+            {
+                return Err(crate::coded_error(
+                    io::ErrorKind::WouldBlock,
+                    crate::ErrorCode::OutcomeUnclear,
+                    "Vor dem Schließen die mögliche Wirkung am Ziel prüfen.",
+                ));
+            }
+            entry.state = QueueState::Validating;
+            entry.progress.phase = "resumable_discard".into();
+            entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
+            entry.error = None;
+            reserved = Some(entry.clone());
+            Ok(())
+        })?;
+        let reserved = reserved.expect("Verwerfen reserviert immer einen Auftrag");
+        if let QueueOperation::ResumableCopy {
+            plan,
+            checkpoint: Some(checkpoint),
+        } = &reserved.operation
+        {
+            if let Err(error) =
+                crate::resumable_copy::discard(plan, operation_id, checkpoint, sandbox)
+            {
+                self.update(operation_id, |entry| {
+                    require_state(entry, QueueState::Validating)?;
+                    entry.state = QueueState::Failed;
+                    entry.error = Some(error.to_string());
+                    if crate::error_code(&error) == crate::ErrorCode::OutcomeUnclear {
+                        entry.progress.phase = "resumable_outcome_check".into();
+                    }
+                    for path in crate::error::recovery_paths(&error) {
+                        if !entry.temp_recovery_paths.contains(&path) {
+                            entry.temp_recovery_paths.push(path);
+                        }
+                    }
+                    Ok(())
+                })?;
+                return Err(error);
+            }
+        }
+        self.update(operation_id, |entry| {
+            if *entry != reserved {
+                return Err(crate::real_mode::plan_drift(
+                    "Auftrag zum Verwerfen der Teilkopie hat sich geändert",
+                ));
+            }
+            let QueueOperation::ResumableCopy { checkpoint, .. } = &mut entry.operation else {
+                unreachable!()
+            };
+            *checkpoint = None;
+            entry.state = QueueState::Cancelled;
+            entry.error_code = None;
+            entry.progress = Progress {
+                phase: "resumable_discarded".into(),
+                ..Default::default()
+            };
+            entry.temp_recovery_paths.clear();
+            Ok(())
+        })
+    }
+
     pub fn remove_pending(&self, operation_id: &str) -> io::Result<()> {
         self.remove_pending_with_cleanup(operation_id, |entry| {
             self.cleanup_removed_generated_source(entry)
@@ -4650,6 +4852,18 @@ impl OperationQueue {
                     && entry.progress.phase == "generated_cleanup")
             {
                 return Err(invalid_transition(entry.state));
+            }
+            if matches!(
+                entry.operation,
+                QueueOperation::ResumableCopy {
+                    checkpoint: Some(_),
+                    ..
+                }
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Teilkopie erst über ihren eigenen Verwerfen-Befehl entfernen",
+                ));
             }
             if entry.generated_source.is_none()
                 && !matches!(entry.operation, QueueOperation::ArchiveUpload { .. })
@@ -6472,6 +6686,7 @@ pub fn execute_local_queue_entry_detailed_with_snapshot_store(
     let is_file_operation = matches!(
         &entry.operation,
         QueueOperation::File { .. }
+            | QueueOperation::ResumableCopy { .. }
             | QueueOperation::ArchivePack { .. }
             | QueueOperation::ArchiveExtract { .. }
     );
@@ -6534,6 +6749,19 @@ fn execute_local_queue_entry_inner(
     validate_operation(&entry.operation)?;
     let operation_id = entry.operation_id;
     match entry.operation {
+        QueueOperation::ResumableCopy { plan, checkpoint } => execute_resumable_copy(
+            queue,
+            &operation_id,
+            &plan,
+            checkpoint.as_deref(),
+            crate::resumable_copy::RunContext {
+                sandbox: execution.sandbox.as_deref(),
+                cancel,
+                provider: None,
+            },
+            on_progress,
+            pending_completion,
+        ),
         QueueOperation::ArchiveExtract { request, expected } => archive_extract_queue::execute(
             queue,
             &operation_id,
@@ -6625,6 +6853,144 @@ fn execute_local_queue_entry_inner(
             "Remote-Queue-Einträge benötigen den Remote-Executor",
         )),
     }
+}
+
+fn execute_resumable_copy(
+    queue: &OperationQueue,
+    id: &str,
+    plan: &crate::resumable_copy::ResumeCopyPlan,
+    checkpoint: Option<&crate::resumable_copy::CopyCheckpoint>,
+    execution: crate::resumable_copy::RunContext<'_>,
+    on_progress: &mut dyn FnMut(&Progress),
+    pending_completion: &mut Option<Box<PendingFileCompletion>>,
+) -> io::Result<QueueExecutionResult> {
+    use crate::resumable_copy::{CopyCheckpoint, ResumeProvider};
+    queue.mark_running(id)?;
+    let (source_provider, audit_operation) = match execution.provider {
+        Some(ResumeProvider::WebDav(_)) => {
+            (crate::ProviderKind::WebDav, "webdav_resumable_download")
+        }
+        Some(ResumeProvider::Ftps(_)) => (crate::ProviderKind::Ftps, "ftps_resumable_download"),
+        Some(ResumeProvider::Sftp(_)) => (crate::ProviderKind::Sftp, "sftp_resumable_download"),
+        None => (crate::ProviderKind::Local, "local_resumable_copy"),
+    };
+    let context = ProviderAuditContext {
+        source_provider: Some(source_provider),
+        target_provider: crate::ProviderKind::Local,
+        execution_class: if execution.provider.is_some() {
+            ProviderAuditExecutionClass::BestEffort
+        } else {
+            ProviderAuditExecutionClass::Assured
+        },
+        source_removal_best_effort_expected: false,
+        target_copy_new_best_effort_expected: false,
+        target_replace_best_effort_expected: false,
+        source_removal_best_effort_actual: None,
+        target_copy_new_best_effort_actual: None,
+        target_replace_best_effort_actual: None,
+    };
+    let mut latest = Progress {
+        files_total: 1,
+        bytes_total: plan.bytes,
+        current: plan
+            .target
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        phase: "copy".into(),
+        ..Default::default()
+    };
+    queue.append_file_audit(id, audit_operation, "started", &latest, &context, None)?;
+    let stage = crate::resumable_copy::stage_path(plan, id)?
+        .to_string_lossy()
+        .into_owned();
+    let result = crate::resumable_copy::execute_with_source(
+        plan,
+        id,
+        checkpoint,
+        execution,
+        |next| {
+            queue.update(id, |entry| {
+                require_state(entry, QueueState::Running)?;
+                let QueueOperation::ResumableCopy {
+                    plan: current,
+                    checkpoint,
+                } = &mut entry.operation
+                else {
+                    return Err(crate::real_mode::plan_drift(
+                        "Teilkopieauftrag hat sich geändert",
+                    ));
+                };
+                if current.as_ref() != plan {
+                    return Err(crate::real_mode::plan_drift(
+                        "Plan für Teilkopie hat sich geändert",
+                    ));
+                }
+                entry.progress.bytes_done = next.bytes();
+                if matches!(&next, CopyCheckpoint::Bytes { .. })
+                    && !entry.temp_recovery_paths.contains(&stage)
+                {
+                    entry.temp_recovery_paths.push(stage.clone());
+                }
+                *checkpoint = Some(Box::new(next));
+                Ok(())
+            })
+        },
+        &mut |progress| {
+            latest = progress.clone();
+            on_progress(progress);
+        },
+    )?;
+    latest.files_done = u64::from(!result.paused);
+    latest.bytes_done = result.bytes;
+    let stats = OpStats {
+        cancelled: result.paused,
+        files: latest.files_done,
+        bytes: result.bytes,
+        temp_recovery_paths: result.recovery.into_iter().collect(),
+        ..Default::default()
+    };
+    if result.paused {
+        latest.phase = "resumable_paused".into();
+        queue.update(id, |entry| {
+            require_state(entry, QueueState::Running)?;
+            entry.state = QueueState::Interrupted;
+            entry.progress = latest.clone();
+            Ok(())
+        })?;
+        queue.append_file_audit_with_temp_paths(
+            id,
+            audit_operation,
+            "paused",
+            &latest,
+            &context,
+            FileAuditRecovery {
+                provider: None,
+                temp_paths: &stats.temp_recovery_paths,
+                retained_backups: &[],
+            },
+        )?;
+        latest.phase = "cancelled".into();
+        on_progress(&latest);
+        return Ok(QueueExecutionResult::File(stats));
+    }
+    latest.phase = "done".into();
+    let completion = PendingFileCompletion {
+        cancelled: false,
+        progress: latest.clone(),
+        temp_recovery_paths: stats.temp_recovery_paths.clone(),
+        audit_operation,
+        audit_context: context,
+        stats,
+    };
+    if let Err(error) = queue.retry_file_completion(id, &completion) {
+        *pending_completion = Some(Box::new(completion));
+        return Err(error);
+    }
+    queue.append_file_completion_audit(id, &completion)?;
+    on_progress(&latest);
+    Ok(QueueExecutionResult::File(completion.stats))
 }
 
 fn require_local_file_commit_confirmation(
@@ -7152,6 +7518,61 @@ fn execute_provider_file_queue_entry_inner(
     // Netzwerk oder eine Capability-Probe überhaupt möglich werden.
     validate_operation(&entry.operation)?;
     validate_generated_entry(&entry, queue._process_lock.root.path())?;
+    if let QueueOperation::ResumableCopy { plan, checkpoint } = &entry.operation {
+        use crate::resumable_copy::ResumeProvider;
+        validate_resumable_copy_profiles(&entry.operation, &entry.profile_bindings)?;
+        let webdav;
+        let ftps;
+        let sftp;
+        let provider = match plan.remote_endpoint() {
+            Some(BidirectionalQueueEndpoint::WebDav { connection, .. }) => {
+                crate::webdav::ensure_file_profile_current(
+                    &queue.path,
+                    &entry.profile_bindings,
+                    connection,
+                )?;
+                webdav = WebDavVfs::connect((**connection).clone(), secrets)?;
+                ResumeProvider::WebDav(&webdav)
+            }
+            Some(BidirectionalQueueEndpoint::Ftps { connection, .. }) => {
+                crate::ftps::resume::ensure_profile_current(
+                    &queue.path,
+                    &entry.profile_bindings,
+                    connection,
+                )?;
+                ftps = FtpsVfs::connect((**connection).clone(), secrets)?;
+                ResumeProvider::Ftps(&ftps)
+            }
+            Some(BidirectionalQueueEndpoint::Sftp { connection, .. }) => {
+                crate::sftp::ensure_resume_profile_current(
+                    &queue.path,
+                    &entry.profile_bindings,
+                    connection,
+                )?;
+                sftp = Arc::new(SftpVfs::connect((**connection).clone(), secrets)?);
+                ResumeProvider::Sftp(&sftp)
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Provider-Teilkopie benötigt ein WebDAV-, FTPS- oder SFTP-Profil",
+                ))
+            }
+        };
+        return execute_resumable_copy(
+            queue,
+            &entry.operation_id,
+            plan,
+            checkpoint.as_deref(),
+            crate::resumable_copy::RunContext {
+                sandbox: execution.sandbox.as_deref(),
+                cancel,
+                provider: Some(provider),
+            },
+            on_progress,
+            pending_completion,
+        );
+    }
     let generated_source = entry
         .generated_source
         .as_ref()
@@ -7209,7 +7630,7 @@ fn execute_provider_file_queue_entry_inner(
         && matches!(source.as_ref(), BidirectionalQueueEndpoint::Local { .. })
     {
         if let BidirectionalQueueEndpoint::WebDav { connection, .. } = target.as_ref() {
-            crate::webdav::ensure_ordinary_upload_profile_current(
+            crate::webdav::ensure_file_profile_current(
                 &queue.path,
                 &entry.profile_bindings,
                 connection,
@@ -9498,6 +9919,7 @@ fn resolve_generated_operation_source(
 }
 
 fn validate_persisted_entry_state(entry: &QueueEntry, config: &Path) -> io::Result<()> {
+    validate_resumable_copy_profiles(&entry.operation, &entry.profile_bindings)?;
     validate_generated_entry(entry, config)?;
     if let QueueOperation::RenameCycleRecovery { record } = &entry.operation {
         let valid_state = if record.finished {
@@ -9577,6 +9999,18 @@ fn validate_enqueue_operation(operation: &QueueOperation) -> io::Result<()> {
             "FTPS-Recovery kann nur aus einem dauerhaften Intent entstehen",
         ));
     }
+    if matches!(
+        operation,
+        QueueOperation::ResumableCopy {
+            checkpoint: Some(_),
+            ..
+        }
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Neuer Auftrag darf keinen alten Teilkopiebeleg übernehmen",
+        ));
+    }
     validate_operation(operation)
 }
 
@@ -9589,6 +10023,7 @@ fn validate_operation(operation: &QueueOperation) -> io::Result<()> {
         ));
     }
     match operation {
+        QueueOperation::ResumableCopy { plan, checkpoint } => plan.validate(checkpoint.as_deref()),
         QueueOperation::ArchiveUpload {
             generation,
             workspace,
@@ -9622,6 +10057,7 @@ fn validate_operation(operation: &QueueOperation) -> io::Result<()> {
             request.validate()?;
             if expected.digest == [0; 32]
                 || expected.preview.selection != request.selection
+                || expected.preview.format != request.format
                 || expected.preview.source_root != request.source_root
                 || expected.preview.source_path != request.source_path
                 || expected.preview.snapshot != request.snapshot
@@ -9630,7 +10066,7 @@ fn validate_operation(operation: &QueueOperation) -> io::Result<()> {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "ZIP-Entpackabsicht und bestätigter Umfang passen nicht zusammen",
+                    "Entpackabsicht und bestätigter Umfang passen nicht zusammen",
                 ));
             }
             Ok(())
@@ -10126,6 +10562,34 @@ fn binary_relative_path_contains(
     child: &crate::BinaryRelativePath,
 ) -> bool {
     parent != child && parent.0.len() < child.0.len() && child.0.starts_with(parent.0.as_slice())
+}
+
+fn validate_resumable_copy_profiles(
+    operation: &QueueOperation,
+    bindings: &[crate::RemoteProfileBinding],
+) -> io::Result<()> {
+    if let QueueOperation::ResumableCopy { plan, .. } = operation {
+        let valid = match plan.remote_endpoint() {
+            Some(BidirectionalQueueEndpoint::WebDav { .. }) => {
+                matches!(bindings, [binding] if binding.protocol == crate::RemoteProfileProtocol::Webdav)
+            }
+            Some(BidirectionalQueueEndpoint::Ftps { .. }) => {
+                matches!(bindings, [binding] if binding.protocol == crate::RemoteProfileProtocol::Ftps)
+            }
+            Some(BidirectionalQueueEndpoint::Sftp { .. }) => {
+                matches!(bindings, [binding] if binding.protocol == crate::RemoteProfileProtocol::Sftp)
+            }
+            None => bindings.is_empty(),
+            _ => false,
+        };
+        if !valid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Auftrag für Teilkopie besitzt keine passende Profilbindung",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_profile_bindings(bindings: &[crate::RemoteProfileBinding]) -> io::Result<()> {

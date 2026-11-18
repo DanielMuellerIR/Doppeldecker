@@ -1365,6 +1365,13 @@ pub(crate) fn create_remote_folder(
     })
 }
 
+pub(crate) fn ready_queue_snapshot(
+    state: &WindowState,
+) -> Option<doppeldecker_core::QueueSnapshot> {
+    let queue = state.operation_queue.lock_recover().clone()?;
+    Some(queue.snapshot())
+}
+
 pub(crate) fn operation_queue(
     app: &tauri::AppHandle,
     state: &WindowState,
@@ -1716,17 +1723,19 @@ fn execute_queue_entry(
     let local_file = matches!(
         entry.operation,
         QueueOperation::File { .. }
+            | QueueOperation::ResumableCopy { .. }
             | QueueOperation::ArchivePack { .. }
             | QueueOperation::ArchiveExtract { .. }
     );
     let local_sync = matches!(entry.operation, QueueOperation::LocalSync { .. });
     let content_sync = matches!(entry.operation, QueueOperation::ContentSync { .. });
+    let resumable_copy = matches!(entry.operation, QueueOperation::ResumableCopy { .. });
     let forward_bidirectional =
         matches!(entry.operation, QueueOperation::BidirectionalForward { .. });
     let provider_file = matches!(
         entry.operation,
         QueueOperation::ProviderFile { .. } | QueueOperation::ArchiveUpload { .. }
-    );
+    ) || matches!(&entry.operation, QueueOperation::ResumableCopy { plan, .. } if plan.remote_endpoint().is_some());
     let provider_delete = matches!(entry.operation, QueueOperation::ProviderDelete { .. });
     if matches!(entry.operation, QueueOperation::SftpSync { .. }) {
         return sftp_commands::prepare_remote_queue_entry(app, label, queue, entry);
@@ -1760,6 +1769,7 @@ fn execute_queue_entry(
         QueueOperation::RenameCycleRecovery { .. }
         | QueueOperation::FtpsRecovery { .. }
         | QueueOperation::File { .. }
+        | QueueOperation::ResumableCopy { .. }
         | QueueOperation::ArchivePack { .. }
         | QueueOperation::ArchiveExtract { .. }
         | QueueOperation::ArchiveUpload { .. }
@@ -1985,10 +1995,26 @@ fn execute_queue_entry(
             }
         }
         Err(error) => {
-            let mut app_error = AppError::new(
-                doppeldecker_core::error_code(&error).as_str(),
-                error.to_string(),
-            );
+            let code = doppeldecker_core::error_code(&error);
+            let message = if resumable_copy && code != doppeldecker_core::ErrorCode::OutcomeUnclear
+            {
+                // Die bestätigte Queuebilanz enthält den handlungsbezogenen
+                // Fehler. Der Wrapper enthält zusätzlich technische Diagnosedaten.
+                queue
+                    .snapshot()
+                    .entries
+                    .into_iter()
+                    .find(|entry| {
+                        entry.operation_id == operation_id
+                            && entry.state == doppeldecker_core::QueueState::Failed
+                            && entry.error_code == Some(code)
+                    })
+                    .and_then(|entry| entry.error)
+            } else {
+                None
+            };
+            let mut app_error =
+                AppError::new(code.as_str(), message.unwrap_or_else(|| error.to_string()));
             if forward_bidirectional {
                 app_error.recovery_paths = doppeldecker_core::error::recovery_paths(&error);
             }

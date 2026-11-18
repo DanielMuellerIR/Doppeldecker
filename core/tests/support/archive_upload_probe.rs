@@ -73,6 +73,7 @@ pub fn run(target: BidirectionalQueueEndpoint, remote: &Path, secrets: Arc<dyn S
     }
     let workspace = store.begin().unwrap();
     let request = ArchiveExtractRequest {
+        format: Default::default(),
         source_root: source,
         source_path: with_empty,
         snapshot: None,

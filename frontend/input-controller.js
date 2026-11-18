@@ -8,8 +8,8 @@ import { isTextTarget, isMac } from "./file-clipboard.js";
 // ändern. Darstellungseinstellungen und die Updateprüfung bleiben unabhängig.
 const PANE_MENU_ACTIONS = new Set([
   "open", "toggle_hidden", "refresh", "sort_name", "sort_size", "sort_date",
-  "swap_panes", "back", "forward", "up", "home", "goto", "quarantine",
-  "duplicate", "archive_pack", "archive_extract", "sync_mode", "new_folder", "copy_over", "move_over", "rename", "trash",
+  "swap_panes", "back", "forward", "up", "home", "goto", "saved_connections", "quarantine",
+  "duplicate", "archive_pack", "archive_extract", "sync_mode", "new_folder", "copy_over", "resumable_copy", "move_over", "rename", "trash",
   "information", "view_options",
   "compare_files", "file_preview", "archive_read", "batch_rename",
   "paste_move",
@@ -58,6 +58,11 @@ export function createInputController(actions) {
       return;
     }
 
+    if ((isMac ? event.metaKey : event.ctrlKey) && !event.altKey && !event.shiftKey
+      && !event.isComposing && event.code === "KeyK" && !isTextTarget(event.target)) {
+      actions.focusConnections();
+      return event.preventDefault();
+    }
     if (modifier && event.shiftKey && !event.altKey && event.code === "KeyF") {
       actions.showNameSearch(actions.activeSide());
       return event.preventDefault();
@@ -287,7 +292,9 @@ export function createInputController(actions) {
       case "up": return actions.goUp(side);
       case "home": return actions.goHome(side);
       case "goto": return actions.focusPath(side);
+      case "saved_connections": return actions.focusConnections();
       case "quarantine": return actions.openQuarantineManager();
+      case "recovery": return actions.openRecovery();
       case "import_finder_favorites": return actions.importFinderFavorites();
       case "sync_mode": return actions.syncView.open();
       case "new_folder": return actions.newFolder();
@@ -295,6 +302,7 @@ export function createInputController(actions) {
       case "archive_pack": return actions.archivePackSelection();
       case "archive_extract": return actions.archiveExtractSelection(side);
       case "copy_over": return actions.transferToOther("copy");
+      case "resumable_copy": return actions.resumableCopy(side);
       case "move_over": return actions.transferToOther("move");
       case "files_copy": return actions.clipboard.copy();
       case "files_cut": return actions.clipboard.copy(true);

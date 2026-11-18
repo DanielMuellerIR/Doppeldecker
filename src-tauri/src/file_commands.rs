@@ -1497,6 +1497,79 @@ pub(crate) async fn copy_paths(
 }
 
 #[tauri::command]
+pub(crate) async fn enqueue_resumable_copy(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    source_root: String,
+    source_paths: Vec<String>,
+    target_root: String,
+    remote_source: Option<crate::bidirectional_commands::BidirectionalEndpointRequest>,
+) -> Result<Vec<String>, AppError> {
+    for path in &source_paths {
+        crate::browser_commands::validate_diff_path(&source_root, path)?;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let label = window.label();
+        let state = app.state::<AppState>();
+        let window_state = state.window(label);
+        let sandbox = sandbox_root()?;
+        let target = expand_home_path(&target_root);
+        let (plans, bindings) = if let Some(request) = &remote_source {
+            if !matches!(
+                request,
+                crate::bidirectional_commands::BidirectionalEndpointRequest::Webdav { .. }
+                    | crate::bidirectional_commands::BidirectionalEndpointRequest::Ftps { .. }
+                    | crate::bidirectional_commands::BidirectionalEndpointRequest::Sftp { .. }
+            ) || request.root() != source_root
+            {
+                return Err(AppError::new(
+                    "invalid_input",
+                    "Fortsetzbarer Download benötigt das aktuelle WebDAV-, FTPS- oder SFTP-Pane",
+                ));
+            }
+            let (source, endpoint, bindings) =
+                crate::bidirectional_commands::resolve_endpoint(&app, &state, request)?;
+            let sources = source_paths
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            let plans = source
+                .prepare_remote_resumable_copies(
+                    endpoint.as_ref(),
+                    &sources,
+                    &target,
+                    sandbox.as_deref(),
+                    &doppeldecker_core::Cancel::new(),
+                )
+                .map_err(AppError::from)?;
+            crate::queue_runtime::ensure_profile_bindings_current(&app, &bindings)?;
+            (plans, bindings)
+        } else {
+            let sources: Vec<_> = source_paths.iter().map(expand_home_path).collect();
+            let plans = doppeldecker_core::resumable_copy::prepare_resume_copies(
+                &sources,
+                &target,
+                sandbox.as_deref(),
+            )
+            .map_err(AppError::from)?;
+            (plans, Vec::new())
+        };
+        let (queue, ids) = with_queue_extension(&state, &window_state, || {
+            let queue = crate::operation_queue(&app, &window_state, label)?;
+            let ids = queue
+                .enqueue_resumable_copies(plans, &bindings)
+                .map_err(AppError::from)?;
+            Ok((queue, ids))
+        })?;
+        emit_queue_snapshot(&app, label, &queue);
+        start_queue_worker(app, label.to_owned());
+        Ok(ids)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
+}
+
+#[tauri::command]
 pub(crate) async fn move_paths(
     app: tauri::AppHandle,
     window: WebviewWindow,

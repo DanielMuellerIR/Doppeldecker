@@ -2,10 +2,11 @@ import { createdDirectoryDaclReportHtml, createdDirectoryBeforeChildrenPendingHt
 import { fileDaclReportHtml } from "./file-dacl-effects.js";
 import { directoryDaclReportHtml } from "./directory-dacl-effects.js";
 import { directoryStreamReportHtml } from "./directory-stream-effects.js";
-import { archiveExtractSourceLabel, archiveExtractFailureMessage, archiveExtractScope, archiveExtractSummary, confirmArchiveExtractPreview } from "./archive-extract-ui.js";
+import { archiveExtractFormatLabel, archiveExtractSourceLabel, archiveExtractFailureMessage, archiveExtractScope, archiveExtractSummary, confirmArchiveExtractPreview } from "./archive-extract-ui.js";
 import { archivePackSummary, confirmArchivePackPreview, bindArchivePackPages, archiveIssuesHtml } from "./archive-pack-ui.js";
 import {
   cancelOwnedModal,
+  choiceModal,
   confirmModal,
   hideModal,
   showLatestOwnedModal,
@@ -63,7 +64,14 @@ function endpointLabel(endpoint, includeServer = false) {
 function archiveOperation(entry) {
   return entry.operation.type === "ArchiveUpload" ? entry.operation.generation : entry.operation;
 }
-function operationLabel(entry) {
+function resumableProtocol(plan) {
+  if (plan.webdav) return "WebDAV";
+  if (plan.ftps) return "FTPS";
+  if (plan.sftp) return "SFTP";
+  return null;
+}
+
+export function operationLabel(entry) {
   const operation = entry.operation;
   if (operation.type === "RenameCycleRecovery") {
     const record = operation.record;
@@ -75,14 +83,14 @@ function operationLabel(entry) {
     return `${record.finished ? "Dateinamenzyklus abgeschlossen" : "Entfernten Namenstausch prüfen"} · ${provider} · ${serverLabel} · ${record.root}`;
   }
   if (operation.type === "ArchiveUpload") {
-    return `${operation.generation.kind === "pack" ? "ZIP erstellen" : "ZIP entpacken"} und hochladen → ${endpointLabel(operation.target,true)}`;
+    return `${operation.generation.kind === "pack" ? "ZIP erstellen" : `${archiveExtractFormatLabel(operation.generation.expected.preview)} entpacken`} und hochladen → ${endpointLabel(operation.target,true)}`;
   }
   if (entry.generated_source) {
     return `${entry.generated_source.kind === "zip" ? "ZIP erstellt" : "ZIP lokal entpackt"} · Upload ${entry.generated_source.label} → ${endpointLabel(operation.target,true)}`;
   }
   if (operation.type === "ArchiveExtract") {
     const preview = (entry.attention?.type === "ArchiveExtractChanged" ? entry.attention.current : operation.expected).preview;
-    return `ZIP entpacken · ${archiveExtractScope(preview)} · ${archiveExtractSourceLabel(preview)} → ${operation.request.target_dir}${preview.relative_root ? ` · Zielname: ${preview.relative_root}` : ""}`;
+    return `${archiveExtractFormatLabel(preview)} entpacken · ${archiveExtractScope(preview)} · ${archiveExtractSourceLabel(preview)} → ${operation.request.target_dir}${preview.relative_root ? ` · Zielname: ${preview.relative_root}` : ""}`;
   }
   if (operation.type === "ArchivePack") {
     return `ZIP erstellen · ${operation.request.options.compression === "stored" ? "Stored" : "Deflate"} · ${operation.expected.preview.target}`;
@@ -91,6 +99,11 @@ function operationLabel(entry) {
     const identity = operation.identity;
     const provider = identity.server.transport_security === "plaintext" ? "FTP" : "FTPS";
     return `${provider}-Vorbereitung prüfen · ${identity.server.host}:${identity.server.port} · ${identity.virtual_root}`;
+  }
+  if (operation.type === "ResumableCopy") {
+    const protocol = resumableProtocol(operation.plan);
+    const source = protocol ? `${protocol} · ${operation.plan.source}` : operation.plan.source.split("/").at(-1);
+    return `Fortsetzbare Kopie · ${source} → ${operation.plan.target}`;
   }
   if (operation.type === "File" || operation.type === "ProviderFile") {
     const verb = operation.kind === "Copy" ? "Kopieren" : "Verschieben";
@@ -149,6 +162,7 @@ export function createQueueUi({
   startSyncProgress,
   resumeGeneratedUpload,
   showGeneratedSource,
+  closeCleanedGeneratedSources,
 }) {
   let snapshot = { revision: 0, paused: false, stop_on_error: false, entries: [] };
   let activeOperationId = null;
@@ -169,6 +183,13 @@ export function createQueueUi({
       // desselben Workers zurückgesetzt werden.
       return false;
     }
+    if (closeCleanedGeneratedSources) {
+      const remaining = new Set(next.entries.map(entry => entry.operation_id));
+      const cleaned = new Set(snapshot.entries.filter(entry => (
+        entry.generated_source || entry.operation.type === "ArchiveUpload"
+      ) && !remaining.has(entry.operation_id)).map(entry => entry.operation_id));
+      closeCleanedGeneratedSources(cleaned);
+    }
     snapshot = next;
     const count = openCount(next);
     // Ein beim Start gefundenes beschädigtes Journal ist ein eigener Befund. Ein
@@ -178,7 +199,9 @@ export function createQueueUi({
     $("#btn-queue").title = `${count} offene/zu prüfende Operation(en) · ${next.paused ? "pausiert" : "aktiv"}`;
 
     const active = next.entries.find(entry => entry.state === "Running"
-      || entry.state === "Validating" && ["ArchivePack", "ArchiveExtract", "ArchiveUpload"].includes(entry.operation.type));
+      || entry.state === "Validating"
+        && !["generated_cleanup", "resumable_discard"].includes(entry.progress?.phase)
+        && ["ArchivePack", "ArchiveExtract", "ArchiveUpload", "ResumableCopy"].includes(entry.operation.type));
     const activeRun = active ? `${active.operation_id}/${active.attempts || 0}/${active.operation.type}` : null;
     if (active && activeRun !== activeOperationId && !realRunActive()) {
       activeOperationId = activeRun;
@@ -194,11 +217,15 @@ export function createQueueUi({
         startFileProgress(active.operation.type === "BidirectionalForward" ? "Bidirektionaler Sync als Best Effort aus Queue …" : "Bidirektionaler Sync aus Queue …", context);
       } else {
         if (active.operation.type === "ArchiveUpload") {
-          startFileProgress(active.operation.generation.kind === "pack" ? "Erstelle ZIP vor dem Upload …" : "Entpacke ZIP vor dem Upload …", context);
+          startFileProgress(active.operation.generation.kind === "pack" ? "Erstelle ZIP vor dem Upload …" : "Entpacke Archiv vor dem Upload …", context);
         } else if (active.operation.type === "ArchiveExtract") {
-          startFileProgress(active.state === "Validating" ? "Prüfe ZIP und Entpackziel …" : "Entpacke ZIP aus Queue …", context);
+          const format = archiveExtractFormatLabel(active.operation.expected?.preview);
+          startFileProgress(active.state === "Validating" ? `Prüfe ${format} und Entpackziel …` : `Entpacke ${format} aus Queue …`, context);
         } else if (active.operation.type === "ArchivePack") {
           startFileProgress(active.state === "Validating" ? "Prüfe ZIP-Quellen aus Queue …" : "Erstelle ZIP-Archiv aus Queue …", context);
+        } else if (active.operation.type === "ResumableCopy") {
+          const protocol = resumableProtocol(active.operation.plan);
+          startFileProgress(protocol ? `Fortsetzbarer ${protocol}-Download …` : "Fortsetzbare Kopie …", { ...context, pausable: true });
         } else if (active.operation.type === "ProviderDelete") {
           // `RemoteDeleteMode` serialisiert snake_case ("quarantine"/"permanent").
           startFileProgress(active.operation.mode === "quarantine"
@@ -214,6 +241,15 @@ export function createQueueUi({
       activeOperationId = null;
     }
     if (!$("#queue-popover").hidden) renderPopover();
+  }
+
+  function settleGeneratedSource(operationId) {
+    const entry = snapshot.entries.find(entry => entry.operation_id === operationId);
+    // Der terminale Datei-Event folgt dem Snapshot nach dem Cleanup. Ein früher
+    // Journalabruf kann bereits Completed zeigen, während die Bereinigung läuft.
+    if (entry?.generated_source && entry.state === "Completed" && entry.generated_source_recovery === false) {
+      closeCleanedGeneratedSources?.(new Set([operationId]));
+    }
   }
 
   async function refresh() {
@@ -237,6 +273,12 @@ export function createQueueUi({
 
   function entryHtml(entry) {
     const progress = entry.progress || {};
+    const resumable = entry.operation.type === "ResumableCopy";
+    const partialStateLabel = resumable ? {
+      resumable_paused: "pausiert",
+      resumable_discarded: "Teilkopie verworfen",
+    }[progress.phase] : null;
+    const stateLabel = partialStateLabel || STATE_LABELS[entry.state] || entry.state;
     const detail = progress.bytes_total
       ? ` · ${fmtTransferBytes(progress.bytes_done || 0)}/${fmtTransferBytes(progress.bytes_total)}`
       : "";
@@ -257,13 +299,19 @@ export function createQueueUi({
     const backupRecovery = retainedBackups.map(path => `<div class="quarantine-meta queue-attention">${backupLabel}: <code>${escapeHtml(path)}</code></div>`).join("");
     const tempRecovery = backupRecovery + (entry.temp_recovery_paths || [])
       .filter(path => !retainedBackups.includes(path))
-      .map(path => `<div class="quarantine-meta queue-attention">${(entry.directory_dacl_recovery || entry.file_dacl_recovery || entry.created_directory_dacl_recovery) ? "Prüfpfad der Rechteänderung, nicht automatisch löschen:" : "Temp-Recoverypfad prüfen, nicht automatisch löschen:"} <code>${escapeHtml(path)}</code></div>`)
+      .map(path => `<div class="quarantine-meta queue-attention">${resumable && !entry.error ? "Arbeitsordner der Teilkopie:" : (entry.directory_dacl_recovery || entry.file_dacl_recovery || entry.created_directory_dacl_recovery) ? "Prüfpfad der Rechteänderung, nicht automatisch löschen:" : "Temp-Recoverypfad prüfen, nicht automatisch löschen:"} <code>${escapeHtml(path)}</code></div>`)
       .join("");
     const createdDaclRecovery=entry.created_directory_dacl_recovery === true && ["Failed", "Interrupted"].includes(entry.state);
     const fileDaclRecovery = entry.file_dacl_recovery === true && ["Failed", "Interrupted"].includes(entry.state);
     const daclRecovery = entry.directory_dacl_recovery === true && ["Failed", "Interrupted"].includes(entry.state);
     const hasDaclEffects = [entry.directory_dacl_report, progress.directory_dacl_report, entry.file_dacl_report, progress.file_dacl_report,entry.created_directory_dacl_report,progress.created_directory_dacl_report].some(report => report?.completed?.length || report?.uncertain?.length);
     const pending = entry.state === "Pending";
+    const checkpoint = resumable ? entry.operation.checkpoint : null;
+    const discardPartial = resumable
+      && (entry.error_code !== "outcome_unclear" || progress.phase === "resumable_discard")
+      && (["Failed", "Interrupted"].includes(entry.state) || pending && checkpoint);
+    const saved = checkpoint?.phase === "bytes"
+      ? `<div class="quarantine-meta">Gesichert: ${fmtTransferBytes(checkpoint.written)} von ${fmtTransferBytes(entry.operation.plan.bytes)}.</div>` : "";
     const legacyDelete = legacyWebdavDelete(entry);
     const completionMarker = entry.bidirectional_completion_recovery;
     const completionRecovery = ["Bidirectional", "BidirectionalForward"].includes(entry.operation.type)
@@ -281,6 +329,7 @@ export function createQueueUi({
       && entry.operation.type !== "ArchiveExtract"
       && entry.operation.type !== "ArchiveUpload"
       && entry.operation.type !== "RenameCycleRecovery"
+      && progress.phase !== "resumable_discarded"
       && entry.error_code !== "outcome_unclear"
       && entry.error_code !== "replan_required"
       && ["Failed", "Cancelled", "Interrupted"].includes(entry.state);
@@ -293,6 +342,7 @@ export function createQueueUi({
       && !legacyDelete
       && entry.operation.type !== "ArchiveExtract"
       && entry.operation.type !== "ArchiveUpload"
+      && progress.phase !== "resumable_discard"
       && entry.error_code === "outcome_unclear"
       && ["Failed", "Interrupted"].includes(entry.state);
     const approve = entry.state === "AwaitingConfirmation";
@@ -310,8 +360,8 @@ export function createQueueUi({
     return `<div class="quarantine-row queue-row${["ArchivePack", "ArchiveExtract", "ArchiveUpload"].includes(entry.operation.type) || generated ? " queue-archive-row" : ""}${cycleRecovery ? " queue-cycle-row" : ""}" data-queue-id="${escapeHtml(entry.operation_id)}">
       <div class="quarantine-main">
         <div class="quarantine-name" title="${escapeHtml(label)}">${escapeHtml(label)}</div>
-        <div class="quarantine-meta">${entry.operation.type === "RenameCycleRecovery" && entry.state === "Interrupted" ? "manuell prüfen" : entry.file_incomplete && entry.state === "Completed" ? "mit Auslassungen abgeschlossen" : STATE_LABELS[entry.state] || entry.state} · Versuch ${entry.attempts}${detail}</div>
-        ${attention}${incompleteNotice}
+        <div class="quarantine-meta">${entry.operation.type === "RenameCycleRecovery" && entry.state === "Interrupted" ? "manuell prüfen" : entry.file_incomplete && entry.state === "Completed" ? "mit Auslassungen abgeschlossen" : stateLabel} · Versuch ${entry.attempts}${detail}</div>
+        ${attention}${incompleteNotice}${saved}
         ${generated ? `<div class="quarantine-meta">Lokale ${entry.generated_source.kind === "zip" ? "ZIP-Erzeugung" : "Entpackphase"} abgeschlossen · ${entry.generated_source.files} Datei(en), ${entry.generated_source.directories} Ordner, ${fmtTransferBytes(entry.generated_source.bytes)}. ${entry.state === "Completed" ? "Upload abgeschlossen." : "Upload noch nicht vollständig abgeschlossen."}</div>` : ""}
         ${parent ? `<div class="quarantine-meta">Zuerst lokal ${archive.kind === "pack" ? "packen" : "entpacken"}, anschließend denselben Zwischenstand hochladen. Der Upload hat noch nicht begonnen.</div>` : ""}
         ${sourceTreeDetail}
@@ -332,12 +382,14 @@ export function createQueueUi({
         ${generated && entry.generated_source.issues?.length ? '<button class="btn ghost small" data-queue-action="generated-hints">Archivhinweise</button>' : ""}
         ${(generated || parent) && (entry.state !== "Completed" || entry.generated_source_recovery) && showGeneratedSource ? '<button class="btn ghost small" data-queue-action="generated-show">Zwischenstand zeigen</button>' : ""}
         ${generatedConflict ? '<button class="btn primary small" data-queue-action="generated-conflicts">Konflikte prüfen …</button>' : ""}
-        ${pending ? '<button class="btn ghost small" data-queue-action="up" aria-label="Nach oben" title="Nach oben">↑</button><button class="btn ghost small" data-queue-action="down" aria-label="Nach unten" title="Nach unten">↓</button><button class="btn ghost small" data-queue-action="remove">Entfernen</button>' : ""}
+        ${pending ? '<button class="btn ghost small" data-queue-action="up" aria-label="Nach oben" title="Nach oben">↑</button><button class="btn ghost small" data-queue-action="down" aria-label="Nach unten" title="Nach unten">↓</button>' : ""}
+        ${pending && !checkpoint ? '<button class="btn ghost small" data-queue-action="remove">Entfernen</button>' : ""}
         ${entry.state === "Failed" && progress.phase === "generated_cleanup" ? '<button class="btn ghost small" data-queue-action="remove">Bereinigung erneut versuchen</button>' : ""}
         ${createdDaclRecovery ? '<button class="btn primary small" data-queue-action="created-dacl-recovery">Rechte neuer Ordner prüfen</button>' : ""}
         ${fileDaclRecovery ? '<button class="btn primary small" data-queue-action="file-dacl-recovery">Objektweite Dateirechte prüfen</button>' : ""}
         ${daclRecovery ? '<button class="btn primary small" data-queue-action="dacl-recovery">Zugriffsrechte prüfen</button>' : ""}
-        ${retry ? '<button class="btn primary small" data-queue-action="retry">Neu prüfen</button>' : ""}
+        ${retry ? `<button class="btn primary small" data-queue-action="retry">${resumable ? "Fortsetzen" : "Neu prüfen"}</button>` : ""}
+        ${discardPartial ? '<button class="btn ghost small" data-queue-action="discard-partial">Teilkopie verwerfen …</button>' : ""}
         ${replanRequired ? '<button class="btn danger small" data-queue-action="replan-discard">Altplan verwerfen</button>' : ""}
         ${["ArchiveExtract", "ArchiveUpload"].includes(entry.operation.type) && ["Failed", "Interrupted"].includes(entry.state) ? '<button class="btn ghost small" data-queue-action="extract-ack">Bilanz geprüft und schließen</button>' : ""}
         ${unclearOutcome ? '<button class="btn danger small" data-queue-action="unclear-ack">Wirkung geprüft und schließen</button>' : ""}
@@ -459,7 +511,13 @@ export function createQueueUi({
       await restoreAfterQueueModal(selectedFocus); return;
     }
     if (selectedAction === "generated-show") {
-      try { await showGeneratedSource(await invoke("generated_source_path", { operationId })); }
+      try {
+        const path = await invoke("generated_source_path", { operationId });
+        const current = snapshot.entries.find(candidate => candidate.operation_id === operationId);
+        if (current && (current.state !== "Completed" || current.generated_source_recovery)) {
+          await showGeneratedSource(operationId, path);
+        }
+      }
       catch (error) { showError("Zwischenstand", error); }
       return;
     }
@@ -494,6 +552,13 @@ export function createQueueUi({
       succeeded = await action("remove_queue_entry", { operationId });
     } else if (selectedAction === "retry") {
       succeeded = await action("retry_queue_entry", { operationId });
+    } else if (selectedAction === "discard-partial") {
+      const choice = await choiceModal("Teilkopie verwerfen?",
+        "<p>Doppeldecker löscht den gesicherten Abschnitt und schließt den Auftrag. Die Quelldatei und der endgültige Zielname bleiben erhalten.</p>",
+        [{ label: "Abbrechen", value: false }, { label: "Teilkopie löschen", value: true, cls: "danger" }]);
+      if (choice) await action("discard_resumable_copy", { operationId });
+      await restoreAfterQueueModal(selectedFocus);
+      return;
     } else if (selectedAction === "replan-discard") {
       succeeded = await action("discard_replan_required_queue_entry", { operationId });
     } else if (selectedAction === "created-dacl-recovery") {
@@ -642,7 +707,7 @@ export function createQueueUi({
     }
     if (attention?.type === "ArchiveExtractChanged") {
       if (!attention.current.preview.catalog_complete && !archiveOperation(entry).request.options.allow_partial) {
-        showError("ZIP entpacken", new Error("Das Archiv ist jetzt unvollständig lesbar. Bitte diesen Auftrag verwerfen und den bekannten Teil ausdrücklich neu auswählen."));
+        showError("Archiv entpacken", new Error("Das Archiv ist jetzt unvollständig lesbar. Bitte diesen Auftrag verwerfen und den bekannten Teil ausdrücklich neu auswählen."));
         await restoreAfterQueueModal(selectedFocus); return false;
       }
       const confirmed = await confirmArchiveExtractPreview(attention.current.preview, { overwrite: archiveOperation(entry).request.options.overwrite, ...(entry.operation.type === "ArchiveUpload" ? {upload:true,targetLabel:endpointLabel(entry.operation.target,true)} : {}) });
@@ -780,5 +845,5 @@ export function createQueueUi({
     close({ restoreFocus: false });
   });
 
-  return { applySnapshot, open, refresh, warnBeforeExit };
+  return { applySnapshot, close, open, refresh, settleGeneratedSource, warnBeforeExit };
 }

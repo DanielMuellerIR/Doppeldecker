@@ -37,7 +37,7 @@ const mock=`
   if(window.__ARCHIVE_CONFIG__.pages&&directoryId==='root')rows=Array.from({length:103},(_,i)=>row('page-'+i,'Datei-'+i+'.txt'));
   const crumbs=[{directoryId:'root',label:'Archiv'}];
   if(directoryId!=='root')crumbs.push({directoryId,label:directoryId==='same-dir'?'same/':directoryId});
-  return {sessionId,directoryId,breadcrumbs:crumbs,page,pageSize:100,totalRows:rows.length,rows:rows.slice(page*100,(page+1)*100),catalog:{complete:!window.__ARCHIVE_CONFIG__.partial&&!window.__ARCHIVE_CONFIG__.viewLimit,entryCount:22,displayedEntryCount:window.__ARCHIVE_CONFIG__.viewLimit?18:22,problemCount:3,stopReason:window.__ARCHIVE_CONFIG__.viewLimit?{code:'resource_limit',message:'Ansichtsbudget erreicht: 18 abgebildet, 4 nicht dargestellt.'}:window.__ARCHIVE_CONFIG__.partial?{code:'invalid_input',message:'Metadatenbudget erreicht.'}:null}};
+  return {sessionId,directoryId,breadcrumbs:crumbs,page,pageSize:100,totalRows:rows.length,rows:rows.slice(page*100,(page+1)*100),catalog:{format:window.__ARCHIVE_CONFIG__.tar?'tar':'zip',complete:!window.__ARCHIVE_CONFIG__.partial&&!window.__ARCHIVE_CONFIG__.viewLimit,entryCount:22,displayedEntryCount:window.__ARCHIVE_CONFIG__.viewLimit?18:22,problemCount:3,stopReason:window.__ARCHIVE_CONFIG__.viewLimit?{code:'resource_limit',message:'Ansichtsbudget erreicht: 18 abgebildet, 4 nicht dargestellt.'}:window.__ARCHIVE_CONFIG__.partial?{code:'invalid_input',message:'Metadatenbudget erreicht.'}:null}};
  };
  const hold=async(kind,args)=>{if(window.__ARCHIVE_CONFIG__['hold'+kind[0].toUpperCase()+kind.slice(1)])await new Promise(resolve=>window.__ARCHIVE_HOLDS__[kind].push({args,resolve}));};
  window.__TAURI__.core.invoke=async(command,args)=>{
@@ -80,11 +80,11 @@ try {
    const {setTheme}=await import('/theme.js');setTheme(theme);Object.assign(window.__ARCHIVE_CONFIG__,config);
    const {createArchiveReadUi}=await import('/archive-read-ui.js');
    window.__ARCHIVE_PANES__={l:{provider:config.provider||'local',profileId:config.provider?'artificial-profile':undefined,profileRevision:config.provider?17:undefined,path:'/artificial/quelle',navigationRevision:1,tabs:{active:{id:'tab-a'}}}};
-   window.__ARCHIVE_SELECTION__=[{name:'Archiv.zip',is_file:true,is_symlink:false}];
+   window.__ARCHIVE_SELECTION__=[{name:config.tar?'Archiv.tar':'Archiv.zip',is_file:true,is_symlink:false}];
    window.__ARCHIVE_UI__=createArchiveReadUi({panes:window.__ARCHIVE_PANES__,selectedEntries:()=>window.__ARCHIVE_SELECTION__,showDock:()=>{},extractSelectionReady:config.extractActions?()=>window.__ARCHIVE_EXTRACT_ATTEMPTS__++:null});window.__ARCHIVE_EXTRACT_ATTEMPTS__=0;
   },{theme,config});return {page,errors};
  }
- const dialog=page=>page.getByRole('dialog',{name:/ZIP-Inhalt ·/});
+ const dialog=page=>page.getByRole('dialog',{name:/(?:ZIP|TAR(?:\.GZ)?)-Inhalt ·/});
  const list=page=>page.getByRole('listbox',{name:'Archiveinträge',exact:true});
  async function open(page){await page.getByRole('listbox',{name:/Linke Dateiliste/}).focus();await page.evaluate(()=>window.__ARCHIVE_UI__.open('l'));await dialog(page).waitFor();}
  async function ready(page){await dialog(page).getByText(/Archiveinträge ·/).waitFor();}
@@ -98,6 +98,17 @@ try {
   await page.evaluate(()=>window.__MOCK_EMIT__('menu','archive_read'));await ready(page);assert.match(await dialog(page).innerText(),/Alpha.txt/);await page.keyboard.press('Escape');
   assert.equal(await page.locator('#context-menu').count(),0);assert.equal(await page.evaluate(()=>document.activeElement.getAttribute('role')),'listbox');
   await page.getByRole('listbox',{name:/Linke Dateiliste/}).getByRole('option',{name:/Alpha.txt/}).click({button:'right'});await page.getByRole('menuitem',{name:'ZIP-Inhalt anzeigen …',exact:true}).click();await ready(page);await finish(page,errors);
+ });
+ await test('TAR-Vorschau nennt die tatsächliche Prüfung und bleibt lesend',async()=>{
+  const {page,errors}=await pageFor({config:{tar:true,denyExtract:true}});
+  await open(page);
+  const tar=page.getByRole('dialog',{name:'TAR-Inhalt · Archiv.tar',exact:true});
+  await tar.locator('[data-row-id="text"]').click();
+  await page.keyboard.press('F3');
+  await tar.getByText(/Dateilänge und Archivquelle geprüft/).waitFor();
+  assert.equal(await tar.getByRole('button',{name:/entpacken/}).count(),0);
+  assert.equal(await page.evaluate(()=>window.__ARCHIVE_CALLS__[0].args.request.path),'/artificial/quelle/Archiv.tar');
+  await finish(page,errors);
  });
  await test('Katalog, virtuelle und leere Ordner, explizite Duplikate und unverändertes NFD',async()=>{
   const {page,errors}=await pageFor();await open(page);await ready(page);assert.equal(await list(page).getByRole('option').count(),17);

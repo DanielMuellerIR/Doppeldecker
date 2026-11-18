@@ -1930,10 +1930,9 @@ impl SecretResolver for TestSecrets {
     }
 }
 
-/// Dieser minimale Klartext-FTP-Server bildet zwei reale Kompatibilitätsgrenzen
-/// unabhängig vom Doppeldecker-Parser nach: MLST-Fakten sind zwar verfügbar, aber
-/// zunächst nicht aktiviert, und MLSD akzeptiert ausschließlich die in RFC 3659
-/// definierte argumentlose Form für das zuvor per CWD gewählte Verzeichnis.
+/// Der Server kündigt bereits aktives UTF-8 an und lehnt OPTS UTF8 wie
+/// pyftpdlib 1.5.9 ab. Er verlangt eine MLST-Faktenwahl und argumentloses MLSD
+/// im zuvor per CWD gewählten Verzeichnis.
 fn strict_mlsd_server() -> (u16, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1962,7 +1961,7 @@ fn strict_mlsd_server() -> (u16, JoinHandle<()>) {
                 "FEAT" => {
                     "211-Features\r\n MLST Type;Size;Modify;UNIX.mode;\r\n UTF8\r\n211 End\r\n"
                 }
-                "OPTS UTF8 ON" => "200 UTF8 enabled\r\n",
+                "OPTS UTF8 ON" => "501 Invalid argument.\r\n",
                 "OPTS MLST Type;Size;Modify;" => {
                     facts_selected = true;
                     "200 MLST OPTS Type;Size;Modify;\r\n"
@@ -1986,7 +1985,8 @@ fn strict_mlsd_server() -> (u16, JoinHandle<()>) {
                     control.flush().unwrap();
                     let (mut data, _) = data_listener.take().unwrap().accept().unwrap();
                     data.write_all(
-                        b"Type=file;Size=12;Modify=20260728060000;UNIX.mode=0644; test.txt\r\n",
+                        "Type=file;Size=12;Modify=20260728060000;UNIX.mode=0644; Größe.txt\r\n"
+                            .as_bytes(),
                     )
                     .unwrap();
                     data.flush().unwrap();
@@ -4352,7 +4352,7 @@ fn ftp_waehlt_mlst_fakten_und_listet_das_aktuelle_verzeichnis() {
     let listing = vfs.list_complete(Path::new("/")).unwrap();
     assert!(listing.complete);
     assert_eq!(listing.entries.len(), 1);
-    assert_eq!(listing.entries[0].entry.name, "test.txt");
+    assert_eq!(listing.entries[0].entry.name, "Größe.txt");
     assert_eq!(listing.entries[0].entry.size, 12);
     server.join().unwrap();
 }

@@ -810,7 +810,7 @@ fn nicht_utf8_namen_werden_konservativ_ausgelassen() {
 }
 
 #[test]
-fn ausschluesse_sind_beidseitig_unsichtbar_und_sperren_mirror_nicht() {
+fn ausschluesse_werden_beobachtet_und_sperren_mirror_nicht() {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
 
@@ -859,6 +859,36 @@ fn ausschluesse_sind_beidseitig_unsichtbar_und_sperren_mirror_nicht() {
         "bleibt.txt, neu.txt und der sichtbare Ordner a"
     );
     assert_eq!(p.target_count, 5, "ausgeschlossene Einträge zählen nicht");
+    assert_eq!(
+        serde_json::to_value(&p).unwrap()["exclusions"],
+        serde_json::json!({
+            "source_count": 4,
+            "target_count": 4,
+            "source_paths": [".env", "a/datei.tmp", "build", "cache"],
+            "target_paths": [".env", "a/datei.tmp", "cache", "container/.env"],
+        })
+    );
+    for mode in [SyncMode::AddOnly, SyncMode::Update] {
+        let additive = plan(
+            &vfs,
+            src.path(),
+            &vfs,
+            dst.path(),
+            &SyncOptions {
+                mode,
+                ..options.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(additive.exclusions.source_paths, p.exclusions.source_paths);
+        assert_eq!(additive.exclusions.source_count, 4);
+        assert_eq!(additive.exclusions.target_count, 3);
+        assert_eq!(
+            additive.exclusions.target_paths,
+            [".env", "a/datei.tmp", "cache"]
+        );
+        assert_eq!(additive.skip_count, 0);
+    }
     for hidden in [".env", "cache", ".tmp", "build"] {
         assert!(p
             .comparison

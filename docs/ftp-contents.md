@@ -1,6 +1,6 @@
 # Additive FTP-/FTPS-Downloads
 
-Stand: 2026-10-24.
+Stand: 2026-11-18.
 
 Gewöhnliche additive Kopien einer FTP-/FTPS-Auswahl in einen lokalen Ordner
 verwenden eine private Best-Effort-Lesequelle. Sie umfasst reguläre Dateien,
@@ -8,6 +8,27 @@ Verzeichnisbäume und direkte Mehrfachauswahl. Vorhandene lokale Ordner werden
 zusammengeführt, vorhandene Blätter nach der konkreten Konfliktentscheidung
 übersprungen. Ersetzen, Verschieben, Remote-Ziele, Snapshots und strikter Sync
 behalten ihre bisherigen Quellenverträge.
+
+## Fortsetzbarer Download
+
+**Befehle → Dateiinhalt fortsetzbar kopieren** nimmt reguläre Dateien aus einem
+verifizierten FTPS-Profil und einen lokalen Zielordner an. Ein kompatibler
+Server meldet `REST STREAM` und `HASH SHA-256` und liefert eine Prüfsumme für
+die komplette Datei samt passendem Pfad und Byteumfang. FTPS schützt dabei den
+Kontroll- und den Datenkanal. Der Server muss die ganze Datei für die
+Prüfsummenabfrage lesen können. Getestet ist der Antwortvertrag von ProFTPD
+`mod_digest`. [REST STREAM nach RFC 3659](https://www.rfc-editor.org/rfc/rfc3659.html#section-5),
+[ProFTPD mod_digest](https://github.com/proftpd/proftpd/blob/master/doc/contrib/mod_digest.html).
+
+Nach einer Pause oder einem Neustart prüft die App Profil, Serveridentität,
+Dateigröße, Änderungszeit, Server-SHA-256 und den gespeicherten lokalen
+Abschnitt. `REST` fordert anschließend den fehlenden Inhalt über `RETR` an.
+Erst der erfolgreiche Transferabschluss und der SHA-256-Vergleich der
+zusammengesetzten Datei erlauben den atomaren lokalen Abschluss unter dem
+Zielnamen. Änderungen oder ein falsch gelieferter Rest bleiben als
+Teilkopiefehler in der Queue sichtbar. Ein falsch zusammengesetzter Inhalt
+benötigt einen neuen Lauf. Unverschlüsseltes FTP, ungeprüfte Zertifikate und Server ohne die
+beiden Protokollfähigkeiten verwenden weiterhin die normale Kopieraktion.
 
 ## Namensgruppen und beobachteter Umfang
 

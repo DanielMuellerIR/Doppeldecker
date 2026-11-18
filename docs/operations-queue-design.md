@@ -1,6 +1,6 @@
 # Operations-Queue
 
-Stand: 2026-11-01
+Stand: 2026-11-18
 
 ## Ziel
 
@@ -93,6 +93,58 @@ Journalen werden abgelehnt. [ZIP-Übergabe](remote-pack.md).
 Journalversion 40 ergänzt `ArchiveUpload`: lokale Archivphase und Upload laufen
 im selben Eintrag. Die Übergabe speichert die versiegelte Quelle vor Providerkontakt.
 Ein laufender Absturz startet die Erzeugung nicht automatisch neu.
+
+## Dateiinhalt fortsetzbar kopieren
+
+**Befehle → Dateiinhalt fortsetzbar kopieren** und das Kontextmenü arbeiten mit
+regulären lokalen Dateien aus einem Ordner. Die Gegenpane zeigt einen lokalen
+Ordner mit eigenem Namensraum und atomarem Neuanlegen. Jeder Name wird vor dem
+Einreihen geprüft. Ein belegter Name verhindert das Einreihen der Auswahl. Die
+Queue übernimmt die Auswahl in einem Journalcommit und führt jede Datei als
+eigenen Auftrag. Es werden Dateiinhalt, Änderungszeit und Unix-Basisrechte
+übernommen. Gemeinsam beschreibbare Ziele und Ziele ohne atomare
+Neuanlage nutzen den gewöhnlichen Kopierweg.
+Erweiterte Metadaten wie ACLs, Resource Forks und Hardlink-Beziehungen gehören
+zum gewöhnlichen Kopierweg.
+
+**Kopie pausieren** sichert den bestätigten Abschnitt. In der Fensterqueue zeigen
+**Fortsetzen** und **Teilkopie verwerfen …** die Entscheidungen auch nach einem
+Neustart. Die Queue wartet bei einer Pause auf diese Entscheidung. Fertige
+Dateien bleiben erhalten. Ein geänderter Quellbestand, eine abweichende
+Teilkopie oder eine neue Namenskollision werden am betroffenen Auftrag angezeigt.
+
+Journalversion 41 persistiert Quellversion, beide lokale Roots und den privaten
+Arbeitsordner. Nach je 8 MiB und bei einer Pause bestätigt die Queue die dauerhaft
+geschriebene Bytezahl samt BLAKE3. Fortsetzen prüft den bestätigten Abschnitt an
+beiden offenen Dateien und kopiert ab der belegten Grenze. Der endgültige
+Zielname erhält nur den geprüften Inhalt per atomarem No-Replace. Nach dem
+Prozessende zwischen Commit und Queue-Abschluss belegt die App die vorhandene
+Fassung anhand ihrer Dateiidentität und Prüfsumme. Verwerfen entfernt nur
+identifizierte Arbeitsdaten. Ist der mögliche Zielcommit ungeklärt, zeigt die
+Queue Arbeits- und Zielpfad zur Prüfung und hält den Auftrag bis zur Bestätigung
+offen.
+
+Der reservierte Arbeitsname `.doppeldecker-teilkopie-<32 Hexzeichen>` bleibt im
+Einweg-Sync auf beiden Seiten ausgenommen. Beim Spiegeln bleibt auch der
+übergeordnete Ordner erhalten. Bidirektionaler Sync kann einen solchen Teilbaum
+erst nach geklärtem Kopierauftrag vollständig binden.
+
+Journalversion 42 bindet bei Entpackaufträgen das Archivformat in Absicht und
+Vorschau. Bestehende ZIP-Journale ohne Formatfeld bleiben lesbar. Die
+gleiche Bindung gilt für einen archivbasierten Upload.
+
+Journalversion 43 ergänzt fortsetzbare WebDAV-Downloads. Quellversion,
+Profilrevision und Serveridentität bleiben über Wiederanläufe gebunden. Der
+[WebDAV-Vertrag](webdav-contents.md#fortsetzbarer-download) beschreibt die
+Byteprüfung und den normalen Kopierweg für andere Server.
+
+Journalversion 44 ergänzt [fortsetzbare FTPS-Downloads](ftp-contents.md#fortsetzbarer-download).
+Die Queue bindet zusätzlich den vollständigen SHA-256 der Quelle und übernimmt
+ältere lokale und WebDAV-Kopiervorbereitungen.
+
+Journalversion 45 bindet den Inhaltsbeleg bei [fortsetzbaren SFTP-Downloads](sftp-contents.md#fortsetzbarer-download)
+an den gepinnten Host und ein geöffnetes Dateihandle. Ältere Aufträge bleiben
+lesbar.
 
 ## Scheduler und Persistenz
 

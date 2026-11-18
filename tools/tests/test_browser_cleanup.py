@@ -17,6 +17,23 @@ NODE = shutil.which("node")
 
 @unittest.skipUnless(NODE, "Node fehlt")
 class BrowserCleanupTests(unittest.TestCase):
+    def test_fallauswahl_funktioniert_ohne_browser_und_mockserver(self) -> None:
+        for arguments, expected_code in [
+            (["--list", "Scan-Race"], 0),
+            (["kein-solcher-browserfall"], 1),
+        ]:
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    [NODE, "tools/test-mock-ui.mjs", *arguments], cwd=ROOT,
+                    env={**os.environ, "PATH": "", "DOPPELDECKER_PLAYWRIGHT_EXECUTABLE": "/no-browser"},
+                    text=True, capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, expected_code, result.stderr)
+                if expected_code == 0:
+                    self.assertEqual(result.stdout.splitlines(), ["Scan-Race, Scanfehler und Konfliktdialog"])
+                else:
+                    self.assertIn("Kein UI-Test", result.stderr)
+
     def run_fixture(self, mode: str, signum: int | None = None) -> None:
         with tempfile.TemporaryDirectory() as raw:
             directory = Path(raw)

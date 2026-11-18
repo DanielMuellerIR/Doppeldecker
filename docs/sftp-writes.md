@@ -144,3 +144,12 @@ Antwortverlust und genau einmal gesendete Mutationen sind durch Pakettests beleg
 nicht durch diese nativen GUI-Läufe. Ein nativer Lauf im hellen Theme und im
 schmalen Fenster wurde für diesen Schnitt nicht durchgeführt. Die vorhandenen
 Browserfälle decken Darstellung und Konfliktdialoge zusätzlich ab.
+
+Am 2026-11-18 wurde der zusammenhängende Arbeitsweg nativ unter Linux mit
+künstlichem OpenSSH geprüft. `Strg+K` fokussierte das Profil, `Enter` öffnete die
+Verbindung und gab den Fokus an die Dateiliste. Bei der Tastaturauswahl übertrug
+`F5` drei Dateien mit bestätigter dauerhafter Ersetzung. Über die sichtbare
+Kopieraktion wurden zwei Dateien übertragen und die kollidierende Altversion
+blieb durch **Überspringen** erhalten. `Strg+Tab` beziehungsweise ein Klick auf
+den [ursprünglichen Tab](pane-tabs.md#bedienung) führten zurück zum genauen
+lokalen Ausgangsordner.

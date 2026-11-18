@@ -87,6 +87,16 @@ impl OperationViewContext {
                 local(&request.source_root.to_string_lossy());
                 local(&request.target_dir.to_string_lossy());
             }
+            QueueOperation::ResumableCopy { plan, .. } => {
+                if let Some(parent) = plan.target.parent().and_then(Path::to_str) {
+                    local(parent);
+                }
+                if let Some(endpoint) = plan.remote_endpoint() {
+                    append_endpoint(&mut endpoints, config, bindings, endpoint);
+                } else if let Some(parent) = plan.source.parent().and_then(Path::to_str) {
+                    local(parent);
+                }
+            }
             QueueOperation::File {
                 items, destination, ..
             } => {
@@ -190,8 +200,20 @@ impl OperationViewContext {
         Self {
             operation_id: entry.operation_id.clone(),
             attempt: entry.attempts,
-            operation_kind: matches!(entry.operation, QueueOperation::ArchiveExtract { .. })
-                .then_some("archive_extract"),
+            operation_kind: match &entry.operation {
+                QueueOperation::ArchiveExtract { .. } => Some("archive_extract"),
+                QueueOperation::ResumableCopy { plan, .. } if plan.webdav_endpoint().is_some() => {
+                    Some("resumable_webdav_copy")
+                }
+                QueueOperation::ResumableCopy { plan, .. } if plan.ftps_endpoint().is_some() => {
+                    Some("resumable_ftps_copy")
+                }
+                QueueOperation::ResumableCopy { plan, .. } if plan.sftp_endpoint().is_some() => {
+                    Some("resumable_sftp_copy")
+                }
+                QueueOperation::ResumableCopy { .. } => Some("resumable_copy"),
+                _ => None,
+            },
             affected_endpoints: endpoints,
         }
     }

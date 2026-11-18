@@ -1,4 +1,4 @@
-//! ZIP-Entpacken verwendet denselben Dateiabschluss wie Copy und ZIP-Erzeugung.
+//! Archiv-Entpacken verwendet denselben Dateiabschluss wie Copy und ZIP-Erzeugung.
 use super::*;
 use crate::archive_extract::{
     ArchiveExtractBinding, ArchiveExtractOwner, ArchiveExtractRequest, ArchiveExtractStatus,
@@ -17,7 +17,9 @@ pub(super) fn execute(
     pending_completion: &mut Option<Box<PendingFileCompletion>>,
 ) -> io::Result<QueueExecutionResult> {
     if request.sandbox != execution.sandbox {
-        return Err(crate::real_mode::plan_drift("ZIP-Testbereich änderte sich"));
+        return Err(crate::real_mode::plan_drift(
+            "Testbereich des Entpackauftrags änderte sich",
+        ));
     }
     let context = ProviderAuditContext {
         source_provider: Some(crate::ProviderKind::Local),
@@ -75,7 +77,11 @@ pub(super) fn execute(
             operation_id,
             QueueAttention::ArchiveExtractChanged {
                 reason: reason.clone(),
-                confirmation: format!("ZIP ENTPACKEN {}", short_id(operation_id)),
+                confirmation: format!(
+                    "{} ENTPACKEN {}",
+                    request.format.name(),
+                    short_id(operation_id)
+                ),
                 current: Box::new(current),
             },
         )?;
@@ -130,7 +136,7 @@ pub(super) fn execute(
         .iter()
         .map(|i| format!("{}: {}", i.path, i.reason))
         .collect();
-    queue.record_archive_extract_report(operation_id,report).map_err(|error|if report.has_effect {crate::coded_error(io::ErrorKind::Other,crate::ErrorCode::OutcomeUnclear,format!("ZIP-Teilwirkung vorhanden, ihre Queuebilanz konnte nicht gespeichert werden: {error}"))}else{error})?;
+    queue.record_archive_extract_report(operation_id,report).map_err(|error|if report.has_effect {crate::coded_error(io::ErrorKind::Other,crate::ErrorCode::OutcomeUnclear,format!("Entpack-Teilwirkung vorhanden, ihre Queuebilanz konnte nicht gespeichert werden: {error}"))}else{error})?;
     if let Some(error) = persistence_error {
         return Err(possible_mutation_progress_error(
             error,
@@ -243,6 +249,7 @@ mod tests {
         }
         drop(zip.finish().unwrap());
         let request = ArchiveExtractRequest {
+            format: Default::default(),
             snapshot: None,
             source_root: root.join("src"),
             source_path: root.join("src/a.zip"),

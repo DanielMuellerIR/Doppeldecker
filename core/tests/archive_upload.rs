@@ -491,6 +491,7 @@ fn archive_upload_extracts_local_and_snapshot_scopes_through_the_same_parent() {
             };
             drop(reader);
             let mut request = ArchiveExtractRequest {
+                format: Default::default(),
                 source_root,
                 source_path: source_path.clone(),
                 snapshot: None,

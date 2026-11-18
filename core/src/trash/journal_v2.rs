@@ -268,6 +268,16 @@ pub(super) fn decode(data: &[u8]) -> io::Result<Journal> {
 }
 
 impl Journal {
+    pub(super) fn review(&self) -> (usize, bool) {
+        let effects_unclear = self.entries.iter().any(|entry| {
+            matches!(
+                entry.phase,
+                EntryPhase::TransferIntent | EntryPhase::RestoreIntent | EntryPhase::Unclear
+            )
+        });
+        (self.entries.len(), effects_unclear)
+    }
+
     fn validate(&self) -> io::Result<()> {
         if self.version != 2
             || self.run_id.len() != 32

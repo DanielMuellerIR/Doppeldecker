@@ -1,4 +1,5 @@
 import { hideModal, showOwnedModal } from "./modal.js";
+import { syncExclusionReportHtml } from "./plan-view.js";
 import { invoke } from "./tauri-api.js";
 import { $, escapeHtml, fmtTransferBytes } from "./ui-utils.js";
 
@@ -29,6 +30,7 @@ export function confirmLocalSync(preview) {
         `<div class="real-grid">${root("Quelle", preview.source_identity, preview.source_listing)}${root("Ziel", preview.target_identity, preview.target_listing)}</div>` +
         `<div class="real-card"><strong>${preview.options.mode === "AddOnly" ? "Fehlendes hinzufügen" : "Hinzufügen und aktualisieren"}</strong>` +
         `<small>${impact.new_files} neue Dateien (${fmtTransferBytes(impact.new_bytes)}) · ${impact.replacements} Ersetzungen · ${impact.metadata_changes} Metadatenänderungen. Keine Mirror-Entfernung.</small></div>` +
+        syncExclusionReportHtml(preview.plan) +
         (!irreversible && impact.replacements > 0 ? `<p>Die alten Dateiversionen werden vor dem Ersetzen in der Doppeldecker-Quarantäne gesichert.</p>` : "") +
         (impact.metadata_changes > 0 ? `<p>Bestehende Metadaten werden wie in der Vorschau angepasst.</p>` : "") +
         (changes.length ? `<ul>${changes.map(action => `<li><code>${escapeHtml(action.path)}</code></li>`).join("")}</ul>` : "") +

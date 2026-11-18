@@ -158,7 +158,7 @@ struct BoundFile {
     cancel: Cancel,
 }
 
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileVersion {
     device: u64,

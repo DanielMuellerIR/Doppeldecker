@@ -94,7 +94,7 @@ pub struct SyncOptions {
     /// Toleranz beim Zeitvergleich in Sekunden. Nötig, weil Dateisysteme
     /// unterschiedliche Zeitauflösung haben (FAT z. B. 2 s).
     pub mtime_tolerance: i64,
-    /// Bewusst unsichtbare relative Pfade. Muster ohne `/` gelten für Namen auf
+    /// Relative Pfade, die von der Dateiwirkung ausgenommen sind. Muster ohne `/` gelten für Namen auf
     /// jeder Ebene; `*`/`?` gelten innerhalb einer Ebene, `**` über mehrere Ebenen.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
@@ -712,6 +712,21 @@ pub struct MetadataObservation {
     pub target_digest: Option<[u8; 32]>,
 }
 
+/// Beobachtete Ausschlüsse je Seite, mit einer begrenzten Auswahl relativer Pfade.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SyncExclusionReport {
+    pub source_count: u64,
+    pub target_count: u64,
+    pub source_paths: Vec<String>,
+    pub target_paths: Vec<String>,
+}
+
+impl SyncExclusionReport {
+    fn is_empty(&self) -> bool {
+        self.source_count == 0 && self.target_count == 0
+    }
+}
+
 /// Ergebnis der Dry-Run-Berechnung: alle Aktionen plus eine Zusammenfassung fürs UI.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SyncPlan {
@@ -727,15 +742,17 @@ pub struct SyncPlan {
     /// Feld liegt im Plan und ist damit Bestandteil von Driftvergleich und Digest.
     #[serde(default)]
     pub comparison: SyncComparison,
+    #[serde(default, skip_serializing_if = "SyncExclusionReport::is_empty")]
+    pub exclusions: SyncExclusionReport,
     pub copy_count: u64,
     pub update_count: u64,
     /// Vorhandene Dateien/Ordner, deren POSIX-Rechte ohne Inhaltskopie angepasst werden.
     pub metadata_count: u64,
     pub delete_count: u64,
     pub skip_count: u64,
-    /// Rekursive Zahl aller in der Quelle gesehenen Einträge.
+    /// Rekursive Zahl der für Mirror berücksichtigten Quelleinträge.
     pub source_count: u64,
-    /// Rekursive Zahl aller vor dem Lauf im Ziel vorhandenen Einträge.
+    /// Rekursive Zahl der für Mirror berücksichtigten Zieleinträge vor dem Lauf.
     pub target_count: u64,
     /// Gesamtgröße der regulären Dateien, die aus dem Ziel entfernt würden.
     pub delete_bytes: u64,

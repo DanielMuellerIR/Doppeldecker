@@ -138,6 +138,14 @@ pub(crate) fn app_config_dir(app: &tauri::AppHandle) -> Result<PathBuf, AppError
     app.path().app_config_dir().map_err(AppError::from)
 }
 
+/// Liefert den Ablagepfad für eine reine Wiederherstellungsübersicht.
+pub(crate) fn app_config_dir_for_inspection(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
+    match sandbox_root()? {
+        Some(root) => Ok(root.join("app-config")),
+        None => app.path().app_config_dir().map_err(AppError::from),
+    }
+}
+
 fn prepare_isolated_config_dir(sandbox: &Path) -> io::Result<PathBuf> {
     // Produktiv kommt hier bereits die validierte kanonische Sandbox an. Die
     // erneute Bindung hält den kleinen Helfer auch in Tests und bei späteren
@@ -246,6 +254,8 @@ fn safe_context(raw: &str) -> String {
         | "Realmodus-Fehler"
         | "Lokaler Sync"
         | "Dateisync"
+        | "Sync-Auftrag öffnen"
+        | "Sync-Auftrag speichern"
         | "Bidirektionaler Sync"
         | "Bidirektionale Queue"
         | "Bidirektionalen Abschluss prüfen"
@@ -259,7 +269,7 @@ fn safe_context(raw: &str) -> String {
         | "Datei-Zwischenablage"
         | "Duplizieren"
         | "ZIP-Archiv"
-        | "ZIP entpacken"
+        | "Archiv entpacken"
         | "Zwischenstand"
         | "Einstellungen"
         | "Projektinformationen"

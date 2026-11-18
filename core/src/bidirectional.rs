@@ -846,6 +846,11 @@ pub fn build_tree_snapshot(
     metadata_profile: MetadataProfile,
     limits: SnapshotLimits,
 ) -> io::Result<TreeSnapshot> {
+    if crate::resumable_copy::is_stage_path(root) {
+        return Err(invalid_data(
+            "Arbeitsordner einer fortsetzbaren Kopie sind keine Sync-Endpunkte",
+        ));
+    }
     if metadata_profile != MetadataProfile::Portable {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1059,6 +1064,12 @@ fn validate_listed_entry(listed: &ProofListEntry) -> io::Result<()> {
     if listed.entry.is_symlink || listed.entry.is_dir == listed.entry.is_file {
         return Err(invalid_data(
             "Symlink, Spezialdatei oder mehrdeutiger Dateityp im Baum",
+        ));
+    }
+    if crate::resumable_copy::is_stage_name(&listed.entry.name) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "Ein Sync-Ordner enthält eine Teilkopie. Kopie abschließen oder in der Queue prüfen.",
         ));
     }
     Ok(())

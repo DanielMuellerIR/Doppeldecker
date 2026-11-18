@@ -76,6 +76,7 @@ pub mod remote_rename;
 pub mod remote_rename_cycle;
 pub mod remote_snapshot;
 mod rename_interaction;
+pub mod resumable_copy;
 pub mod sftp;
 pub mod sftp_batch_rename;
 pub mod smb;
@@ -257,7 +258,10 @@ pub use sync::{
 pub use system_mounts::{
     apply_macos_diskutil_info, list_system_mounts, SystemMount, SystemMountKind, SystemUnmount,
 };
-pub use trash::{recover_trash_journals, trash_items, RecoveryStats, TrashStats};
+pub use trash::{
+    inspect_trash_journals, recover_trash_journals, trash_items, RecoveryStats, TrashJournalReview,
+    TrashStats,
+};
 pub use vfs::{Entry, LocalMountIdentity, LocalRootIdentity, LocalVfs, Vfs};
 pub use webdav::{discover_webdav_certificate, WebDavInteractiveDirectoryListing, WebDavVfs};
 

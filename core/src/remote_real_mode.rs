@@ -1614,6 +1614,55 @@ impl ProviderEndpoint {
         Self::remote(ProviderEndpointInner::WebDav(vfs, root.to_path_buf()), root)
     }
 
+    pub fn prepare_remote_resumable_copies(
+        &self,
+        endpoint: &crate::BidirectionalQueueEndpoint,
+        sources: &[PathBuf],
+        target_root: &Path,
+        sandbox: Option<&Path>,
+        cancel: &Cancel,
+    ) -> io::Result<Vec<crate::resumable_copy::ResumeCopyPlan>> {
+        if self.root() != Path::new(endpoint.root()) {
+            return Err(crate::real_mode::plan_drift("Quellpane wurde gewechselt"));
+        }
+        match &self.inner {
+            ProviderEndpointInner::WebDav(vfs, _) => {
+                crate::resumable_copy::prepare_webdav_resume_copies(
+                    vfs,
+                    endpoint,
+                    sources,
+                    target_root,
+                    sandbox,
+                    cancel,
+                )
+            }
+            ProviderEndpointInner::Ftps(vfs, _) => {
+                crate::resumable_copy::prepare_ftps_resume_copies(
+                    vfs,
+                    endpoint,
+                    sources,
+                    target_root,
+                    sandbox,
+                    cancel,
+                )
+            }
+            ProviderEndpointInner::Sftp(vfs, _) => {
+                crate::resumable_copy::prepare_sftp_resume_copies(
+                    vfs,
+                    endpoint,
+                    sources,
+                    target_root,
+                    sandbox,
+                    cancel,
+                )
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fortsetzbarer Download benötigt WebDAV, FTPS oder SFTP",
+            )),
+        }
+    }
+
     pub fn smb(vfs: Arc<SmbVfs>, root: &Path) -> io::Result<Self> {
         Self::remote(ProviderEndpointInner::Smb(vfs, root.to_path_buf()), root)
     }

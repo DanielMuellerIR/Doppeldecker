@@ -28,6 +28,49 @@ Vorbereitung und höchstens zehn Minuten. Über 1.000 dauerhaft entfernte Eintr�
 oder 10 GiB endgültiger Entfernung benötigen zusätzlich die angezeigte exakte
 Phrase. Große Quarantäneverschiebungen sind davon getrennt.
 
+### Ausschlüsse im Assistenten
+
+Unter **Ausschlüsse** gilt ein Muster pro Zeile. Die Regeln entsprechen
+[den CLI-Ausschlussmustern](headless-cli.md#ausschlussmuster). Änderungen
+verwerfen die vorige Vorschau. Lokal wird automatisch neu geplant, bei Servern
+lädt **Vorschau laden** den aktuellen Plan.
+
+Vorschau und Bestätigung zeigen die beobachteten Treffer nach Quelle und Ziel.
+Die Liste zeigt bis zu 32 relative Pfade je Seite. Ein ausgeschlossener Ordner
+steht für seinen ganzen Teilbaum. AddOnly und Update melden Treffer aus den beim
+Vergleich gelesenen Ordnern. Mirror erfasst sie bei seinen vorhandenen Vollscans.
+Ausgeschlossene Zieldateien bleiben erhalten. Enthält ein zusätzlicher Zielordner
+einen ausgeschlossenen Eintrag, bleibt die Ordnerhülle ebenfalls erhalten. Sichtbare
+Geschwister können weiterhin entfernt werden. Der bidirektionale Assistent hat
+keine Ausschlussoption.
+
+### Gespeicherte Sync-Aufträge
+
+**Auswahl speichern** übernimmt beide Pane-Ordner, Richtung, Wirkung, Vergleich,
+Metadatenprofil und Ausschlüsse. **Auftrag öffnen** lädt diese Auswahl in den
+Assistenten. Lokale Ziele werden direkt neu verglichen. Bei Servern startet
+**Vorschau laden** den Vergleich. Die Ausführungsbestätigung bezieht sich auf den
+aktuellen Bestand und die daraus neu ermittelte Wirkung.
+
+Nach dem Öffnen übernimmt **Auftrag bearbeiten** die aktuellen Optionen und
+erlaubt auch einen neuen Namen. Andere Endpunkte werden in der Dateiansicht
+gewählt und anschließend über denselben Assistenten gespeichert. **Als neuen
+Auftrag speichern** lässt den geöffneten Auftrag bestehen.
+
+Serverordner verweisen über ihre Profil-ID auf das vorhandene Verbindungsprofil.
+Die Datei `saved-sync-jobs.json` im App-Konfigurationsordner enthält die Auswahlen.
+Zugangsdaten bleiben im jeweiligen Verbindungsprofil beziehungsweise im
+System-Schlüsselbund. Vorbereitungen, Bestätigungen und Pläne gehören zum
+jeweiligen Lauf. Bei konkurrierenden Bearbeitungen muss ein veralteter Stand vor
+dem Speichern erneut geöffnet werden.
+
+In der nativen Linux-Prüfung vom 2026-11-18 kopierten lokaler Mirror und Mirror
+gegen künstliches OpenSSH je eine Datei und erhielten den ausgeschlossenen Zielinhalt.
+Die zusätzliche Datei landete lokal in Quarantäne und wurde auf SFTP dauerhaft
+entfernt. Ein erneut geöffneter SFTP-Auftrag zeigte nach einem App-Neustart die
+zwischenzeitlich geänderte Entfernung. Kopie und Entfernung erfolgten erst nach
+der neuen Bestätigung. Geänderte Auftragsdaten wurden anschließend gespeichert.
+
 ## Quellen, Transfer und lokale Wiederherstellung
 
 Beide Bäume werden vollständig und lesend beobachtet. SFTP benutzt dafür seine

@@ -635,6 +635,7 @@ fn generated_extraction_uploads_all_entry_or_subtree_without_reopening_the_zip()
             .begin()
             .unwrap();
         let generated = ArchiveExtractRequest {
+            format: Default::default(),
             source_root: archives.clone(),
             source_path: archives.join("input.zip"),
             snapshot: None,

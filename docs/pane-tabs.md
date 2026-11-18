@@ -58,6 +58,12 @@ Während eines Queue-Transfers bleiben Tab-Wechsel, Öffnen und Schließen errei
 der Auftrag behält seine gebundenen Endpunkte. Eine exklusive App-Aktivität sperrt
 diese Bedienung weiterhin. Der letzte Tab und die Grenze von 32 Tabs bleiben geschützt.
 
+Für eine Serververbindung kann der aktuelle Ordner in seinem Tab offen bleiben.
+Zuerst über **Neuer Tab** oder `Cmd+T` beziehungsweise `Ctrl+T` einen weiteren
+Tab anlegen. **Gehe zu → Gespeicherte Verbindungen** oder `Cmd+K` beziehungsweise
+`Ctrl+K` fokussiert die Profilliste. Das gewählte Profil öffnet sich per Klick
+oder `Enter` im aktiven Tab. Der ursprüngliche Tab führt zum Ausgangsordner zurück.
+
 ## Sitzungsdatei
 
 `desktop-settings.json` verwendet Format 2. Je Fenster enthält `tabs` getrennte

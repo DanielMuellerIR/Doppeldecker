@@ -5,14 +5,14 @@ use std::io;
 use std::path::Path;
 
 use crate::metadata::{Capability, MetadataCapabilities, MetadataManifest, MetadataProfile};
-use crate::tree_measure::measure_entry;
 use crate::vfs::{Entry, ProofListEntry, Vfs};
 
 use super::exclude::ExcludeMatcher;
 use super::{
     complete_listing, hash_tree, optional_stat, Action, Compare, ComparisonAction, ComparisonEntry,
     ComparisonRow, ComparisonSide, MetadataClass, MetadataClassStats, MetadataIssue,
-    MetadataIssueKind, MetadataReport, MetadataTransfer, SyncMode, SyncOptions, SyncPlan,
+    MetadataIssueKind, MetadataReport, MetadataTransfer, SyncExclusionReport, SyncMode,
+    SyncOptions, SyncPlan,
 };
 
 // ---------------------------------------------------------------------------
@@ -75,6 +75,15 @@ fn plan_with_class(
     // Die Optionssyntax wird vor jedem Providerzugriff geprüft. CLI-Aufrufer tun das
     // zusätzlich noch früher, damit ungültige Muster nicht einmal Verbindungen öffnen.
     opts.validate()?;
+    if [src_root, dst_root]
+        .into_iter()
+        .any(crate::resumable_copy::is_stage_path)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Arbeitsordner einer fortsetzbaren Kopie sind keine Sync-Endpunkte.",
+        ));
+    }
     let exclusions = ExcludeMatcher::new(&opts.exclude)?;
     let metadata = MetadataPlanPolicy::for_roots(
         src,
@@ -92,14 +101,27 @@ fn plan_with_class(
     // Mirror kann überhaupt Entfernungen planen. Für AddOnly/Update entfallen die
     // zwei zusätzlichen Volltraversierungen deshalb ersatzlos; über ein Netzwerk
     // wären sie pro Lauf hunderte unnötige Listing-Round-Trips.
-    let mut plan = match opts.mode {
-        SyncMode::Mirror => SyncPlan {
-            source_count: measure_contents(src, src_root, Path::new(""), &exclusions, cancel)?.0,
-            target_count: measure_contents(dst, dst_root, Path::new(""), &exclusions, cancel)?.0,
-            ..Default::default()
-        },
-        SyncMode::AddOnly | SyncMode::Update => SyncPlan::default(),
-    };
+    let mut plan = SyncPlan::default();
+    if opts.mode == SyncMode::Mirror {
+        plan.source_count = measure_contents(
+            src,
+            src_root,
+            Path::new(""),
+            &exclusions,
+            cancel,
+            &mut |path| plan.exclusions.record_source(path),
+        )?
+        .0;
+        plan.target_count = measure_contents(
+            dst,
+            dst_root,
+            Path::new(""),
+            &exclusions,
+            cancel,
+            &mut |path| plan.exclusions.record_target(path),
+        )?
+        .0;
+    }
     let mut hardlinks = SourceMetadataPlanState::default();
     let request = DiffRequest {
         src,
@@ -1299,7 +1321,13 @@ fn diff_dir(
     } = *request;
     check_cancel(cancel)?;
     let mut src_entries = complete_listing(src, &src_root.join(rel))?;
-    src_entries.retain(|item| !is_excluded(exclusions, rel, item));
+    // Mirror bilanziert Ausschlüsse bereits in den beiden Vollscans.
+    let report_exclusions = opts.mode != SyncMode::Mirror;
+    retain_included_entries(&mut src_entries, exclusions, rel, |path| {
+        if report_exclusions {
+            plan.exclusions.record_source(path);
+        }
+    });
     src_entries.sort_by(|a, b| a.entry.name.cmp(&b.entry.name));
 
     // Ziel-Verzeichnis auflisten — aber NUR, wenn es dort tatsächlich ein Verzeichnis
@@ -1329,7 +1357,11 @@ fn diff_dir(
             None => Vec::new(),
         },
     };
-    dst_entries.retain(|item| !is_excluded(exclusions, rel, item));
+    retain_included_entries(&mut dst_entries, exclusions, rel, |path| {
+        if report_exclusions {
+            plan.exclusions.record_target(path);
+        }
+    });
     dst_entries.sort_by(|a, b| a.entry.name.cmp(&b.entry.name));
     // Ziel-Einträge nach Namen greifbar machen — nur sicher dekodierte: ein lossy
     // Ziel-Name darf nie mit einem (gültigen) Quellnamen gleichen Strings matchen,
@@ -2107,113 +2139,27 @@ fn diff_dir(
                 continue;
             }
             let child_rel = rel.join(&de.name);
-            let child_str = rel_to_string(&child_rel);
-
             // Ein ganzes Zielverzeichnis darf nur dann als eine DeleteDir-Aktion in
             // die Quarantäne wandern, wenn darin kein bewusst ausgeschlossener
             // Nachfahre liegt. Andernfalls bleibt der Ordner als Hülle stehen und nur
             // seine sichtbaren Kinder werden granular geplant.
-            if !exclusions.is_empty()
-                || (request.ordinary_content
-                    && de.is_dir
-                    && dst.best_effort_permanent_delete_blocker(true).is_some())
-            {
-                let node = scan_target_only_node(
-                    dst,
-                    dst_root,
-                    child_rel,
-                    de_item.clone(),
-                    exclusions,
-                    cancel,
-                )?;
-                plan_target_only_node(
-                    dst,
-                    dst_root,
-                    opts,
-                    &node,
-                    plan,
-                    cancel,
-                    request.ordinary_content,
-                )?;
-                continue;
-            }
-
-            // Nicht sicher dekodierbare Ziel-Namen nie zum Löschen einplanen: der
-            // String-Pfad träfe im Dateisystem nicht den echten Eintrag.
-            if !de_item.safely_decoded {
-                push_planned_action(
-                    plan,
-                    Action::SkipUnsupported { path: child_str },
-                    None,
-                    Some(de),
-                );
-                plan.skip_count = plan.skip_count.saturating_add(1);
-            } else if de.is_symlink {
-                push_planned_action(
-                    plan,
-                    Action::SkipSymlink { path: child_str },
-                    None,
-                    Some(de),
-                );
-                plan.skip_count = plan.skip_count.saturating_add(1);
-            } else if !de.is_dir && !de.is_file {
-                push_planned_action(
-                    plan,
-                    Action::SkipUnsupported { path: child_str },
-                    None,
-                    Some(de),
-                );
-                plan.skip_count = plan.skip_count.saturating_add(1);
-            } else if de.is_dir {
-                let (entries, bytes) = measure_entry(dst, &dst_root.join(rel).join(&de.name), de)?;
-                let target_tree_hash = if opts.compare == Compare::ContentHash {
-                    let (hash, files, hashed_bytes) =
-                        hash_tree(dst, &dst_root.join(rel).join(&de.name))?;
-                    plan.hashed_files = plan.hashed_files.saturating_add(files);
-                    plan.bytes_hashed = plan.bytes_hashed.saturating_add(hashed_bytes);
-                    Some(hash)
-                } else {
-                    None
-                };
-                push_planned_action(
-                    plan,
-                    Action::DeleteDir {
-                        path: child_str,
-                        entries,
-                        bytes,
-                        target_proof: super::SyncTargetProof::from_listed(de_item)?,
-                        target_tree_hash,
-                    },
-                    None,
-                    Some(de),
-                );
-                plan.delete_count = plan.delete_count.saturating_add(entries);
-                plan.delete_bytes = plan.delete_bytes.saturating_add(bytes);
-            } else {
-                let target_hash = plan_file_hash(
-                    dst,
-                    &dst_root.join(rel).join(&de.name),
-                    de,
-                    opts,
-                    plan,
-                    cancel,
-                )?;
-                push_planned_action(
-                    plan,
-                    Action::DeleteFile {
-                        path: child_str,
-                        size: de.size,
-                        target_mtime: de.mtime,
-                        target_mode: de.mode,
-                        target_proof: super::SyncTargetProof::from_listed(de_item)?,
-                        target_hash,
-                    },
-                    None,
-                    Some(de),
-                );
-                plan.delete_count = plan.delete_count.saturating_add(1);
-                plan.delete_bytes = plan.delete_bytes.saturating_add(de.size);
-            }
+            let node = scan_target_only_node(
+                dst,
+                dst_root,
+                child_rel,
+                de_item.clone(),
+                exclusions,
+                cancel,
+            )?;
+            plan_target_only_node(
+                dst,
+                dst_root,
+                opts,
+                &node,
+                plan,
+                cancel,
+                request.ordinary_content,
+            )?;
         }
     }
 
@@ -2260,7 +2206,7 @@ fn scan_target_only_node(
     if traverse {
         let listing = complete_listing(dst, &dst_root.join(&node.relative))?;
         for child in listing {
-            if is_excluded(exclusions, &node.relative, &child) {
+            if excluded_path(exclusions, &node.relative, &child).is_some() {
                 node.contains_excluded = true;
                 continue;
             }
@@ -2803,8 +2749,61 @@ fn rel_to_string(rel: &Path) -> String {
 /// Ausschlüsse gelten nur für Namen, deren Stringpfad den echten Providernamen
 /// eindeutig bezeichnet. Ein nicht sicher dekodierbarer Name bleibt deshalb ein
 /// normaler Skip und kann Mirror weiterhin sperren.
-fn is_excluded(exclusions: &ExcludeMatcher, parent: &Path, item: &ProofListEntry) -> bool {
-    item.safely_decoded && exclusions.matches(&rel_to_string(&parent.join(&item.entry.name)))
+fn excluded_path(
+    exclusions: &ExcludeMatcher,
+    parent: &Path,
+    item: &ProofListEntry,
+) -> Option<String> {
+    if !item.safely_decoded {
+        return None;
+    }
+    let reserved = crate::resumable_copy::is_stage_name(&item.entry.name);
+    if !reserved && exclusions.is_empty() {
+        return None;
+    }
+    let path = rel_to_string(&parent.join(&item.entry.name));
+    (reserved || exclusions.matches(&path)).then_some(path)
+}
+
+fn retain_included_entries(
+    entries: &mut Vec<ProofListEntry>,
+    exclusions: &ExcludeMatcher,
+    parent: &Path,
+    mut observe: impl FnMut(String),
+) {
+    entries.retain(|item| {
+        let Some(path) = excluded_path(exclusions, parent, item) else {
+            return true;
+        };
+        observe(path);
+        false
+    });
+}
+
+impl SyncExclusionReport {
+    fn record_source(&mut self, path: String) {
+        record_exclusion(&mut self.source_count, &mut self.source_paths, path);
+    }
+
+    fn record_target(&mut self, path: String) {
+        record_exclusion(&mut self.target_count, &mut self.target_paths, path);
+    }
+}
+
+fn record_exclusion(count: &mut u64, paths: &mut Vec<String>, path: String) {
+    const MAX_REPORTED_PATHS: usize = 32;
+    *count = count.saturating_add(1);
+    // Die kleinsten Pfade liefern dieselbe Auswahl unabhängig von der Listing-Reihenfolge.
+    let Err(index) = paths.binary_search(&path) else {
+        return;
+    };
+    if index >= MAX_REPORTED_PATHS {
+        return;
+    }
+    if paths.len() == MAX_REPORTED_PATHS {
+        paths.pop();
+    }
+    paths.insert(index, path);
 }
 
 /// Rekursive Zahl und Dateigröße aller Einträge UNTERHALB eines Wurzelordners.
@@ -2816,6 +2815,7 @@ fn measure_contents(
     rel: &Path,
     exclusions: &ExcludeMatcher,
     cancel: &crate::Cancel,
+    observe: &mut impl FnMut(String),
 ) -> io::Result<(u64, u64)> {
     check_cancel(cancel)?;
     let entries = match complete_listing(vfs, &root.join(rel)) {
@@ -2826,7 +2826,8 @@ fn measure_contents(
     let mut count = 0u64;
     let mut bytes = 0u64;
     for item in &entries {
-        if is_excluded(exclusions, rel, item) {
+        if let Some(path) = excluded_path(exclusions, rel, item) {
+            observe(path);
             continue;
         }
         let entry = &item.entry;
@@ -2834,7 +2835,7 @@ fn measure_contents(
         count = count.saturating_add(1);
         if item.safely_decoded && entry.is_dir && !entry.is_symlink {
             let (child_count, child_bytes) =
-                measure_contents(vfs, root, &child_rel, exclusions, cancel)?;
+                measure_contents(vfs, root, &child_rel, exclusions, cancel, observe)?;
             count = count.saturating_add(child_count);
             bytes = bytes.saturating_add(child_bytes);
         } else if entry.is_file {

@@ -1,6 +1,8 @@
-//! Lokales ZIP-Entpacken über die vorhandenen Temp-, Commit- und Recoveryverträge.
-//! Provisorische Sinkbytes werden erst nach CRC/EOF/Quellprüfung sichtbar gemacht.
-use crate::archive_read::{ArchiveEntryKind, ArchiveRead, CatalogBudget, ReadBudget};
+//! Lokales Entpacken von Archiven über die vorhandenen Temp-, Commit- und Recoveryverträge.
+//! Temporäre Daten werden erst nach Format-, Inhalts- und Quellprüfung sichtbar.
+use crate::archive_read::{
+    ArchiveEntryKind, ArchiveRead, ArchiveReadFormat, CatalogBudget, ReadBudget,
+};
 use crate::atomic_file::finish_staging_scope;
 use crate::error::{coded_error, error_code, with_recovery_context, ErrorCode};
 use crate::fileops::{self, FileConflictProof, TargetCommitEffect, TempCommitFailure};
@@ -53,7 +55,7 @@ impl ArchiveExtractSelection {
             {
                 Ok(())
             }
-            _ => Err(invalid("Ungültige ZIP-Entpackauswahl")),
+            _ => Err(invalid("Ungültige Entpackauswahl")),
         }
     }
 }
@@ -90,6 +92,8 @@ pub struct ArchiveExtractRequest {
     pub source_path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<ArchiveSnapshotSource>,
+    #[serde(default, skip_serializing_if = "ArchiveReadFormat::is_zip")]
+    pub format: ArchiveReadFormat,
     pub target_dir: PathBuf,
     pub options: ArchiveExtractOptions,
     #[serde(default, skip_serializing_if = "ArchiveExtractSelection::is_all")]
@@ -116,6 +120,8 @@ pub struct ArchiveExtractPreview {
     pub source_path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<ArchiveSnapshotSource>,
+    #[serde(default, skip_serializing_if = "ArchiveReadFormat::is_zip")]
+    pub format: ArchiveReadFormat,
     pub target_dir: PathBuf,
     #[serde(default, skip_serializing_if = "ArchiveExtractSelection::is_all")]
     pub selection: ArchiveExtractSelection,
@@ -248,14 +254,14 @@ fn cancelled(cancel: &Cancel) -> io::Result<()> {
         Err(coded_error(
             io::ErrorKind::Interrupted,
             ErrorCode::Interrupted,
-            "ZIP-Entpacken abgebrochen",
+            "Entpacken abgebrochen",
         ))
     } else {
         Ok(())
     }
 }
 fn budget() -> io::Error {
-    invalid("ZIP-Entpackindex überschreitet sein Metadaten-/Knotenbudget; noch nichts entpackt")
+    invalid("Entpackindex überschreitet sein Metadaten-/Knotenbudget; noch nichts entpackt")
 }
 struct TargetNameGroup {
     count: usize,
@@ -349,7 +355,7 @@ impl ArchiveExtractRequest {
         self.selection.validate()?;
         if fileops::validate_file_operation_root(&self.target_dir)? != self.target_dir {
             return Err(invalid(
-                "ZIP-Entpackabsicht benötigt einen unveränderten absoluten Zielpfad",
+                "Entpackabsicht benötigt einen unveränderten absoluten Zielpfad",
             ));
         }
         if let Some(snapshot) = &self.snapshot {
@@ -366,7 +372,7 @@ impl ArchiveExtractRequest {
             || !self.source_path.starts_with(&self.source_root)
         {
             return Err(invalid(
-                "ZIP-Entpackabsicht benötigt unveränderte absolute Pane-/Quellpfade",
+                "Entpackabsicht benötigt unveränderte absolute Pane-/Quellpfade",
             ));
         }
         Ok(())
@@ -423,11 +429,11 @@ fn selection_mapping(
         ArchiveExtractSelection::All => return Ok((String::new(), String::new(), String::new())),
         ArchiveExtractSelection::Entry { ordinal, raw_name } => {
             let entry = reader.entries().get(*ordinal).filter(|entry| entry.raw_name == *raw_name && entry.kind == ArchiveEntryKind::File)
-                .ok_or_else(|| drift("ZIP-Auswahlordinal oder exakter Eintragsname änderte sich; Datei erneut im Archiv auswählen"))?;
+                .ok_or_else(|| drift("Archiv-Auswahlordinal oder exakter Eintragsname änderte sich; Datei erneut im Archiv auswählen"))?;
             entry
                 .name
                 .as_deref()
-                .ok_or_else(|| invalid("ZIP-Dateiauswahl benötigt einen UTF-8-Namen"))?
+                .ok_or_else(|| invalid("Die Dateiauswahl benötigt einen UTF-8-Namen"))?
         }
         ArchiveExtractSelection::Subtree { prefix } => {
             if !reader.entries().iter().any(|entry| {
@@ -440,14 +446,14 @@ fn selection_mapping(
                 })
             }) {
                 return Err(drift(
-                    "Virtueller ZIP-Unterordner fehlt; Ordner erneut im Archiv auswählen",
+                    "Virtueller Archivunterordner fehlt; Ordner erneut im Archiv auswählen",
                 ));
             }
             prefix
         }
     };
     if !crate::archive_read::path_is_safe(root) {
-        return Err(invalid("ZIP-Auswahl hat keinen sicheren Namen"));
+        return Err(invalid("Archivauswahl hat keinen sicheren Namen"));
     }
     let (base, leaf) = root.rsplit_once('/').unwrap_or(("", root));
     Ok((
@@ -469,17 +475,23 @@ fn prepare(
     cancelled(cancel)?;
     fileops::guard(&request.sandbox, &request.target_dir)?;
     let reader = if let Some(snapshot) = &snapshot {
-        ArchiveRead::open_snapshot(snapshot.clone(), CatalogBudget::default(), cancel)?
+        ArchiveRead::open_snapshot_as(
+            snapshot.clone(),
+            request.format,
+            CatalogBudget::default(),
+            cancel,
+        )?
     } else {
         for path in [&request.source_root, &request.source_path] {
             fileops::guard(&request.sandbox, path)?;
         }
-        ArchiveRead::open(
+        ArchiveRead::open_as(
             &request.source_root,
             request
                 .source_path
                 .strip_prefix(&request.source_root)
-                .map_err(|_| invalid("Ungültige ZIP-Quelle"))?,
+                .map_err(|_| invalid("Ungültige Archivquelle"))?,
+            request.format,
             CatalogBudget::default(),
             cancel,
         )?
@@ -501,6 +513,7 @@ fn prepare(
         source_root: request.source_root.clone(),
         source_path: request.source_path.clone(),
         snapshot: request.snapshot.clone(),
+        format: request.format,
         target_dir: request.target_dir.clone(),
         selection: request.selection.clone(),
         relative_root,
@@ -635,7 +648,7 @@ fn prepare(
         let original_relative = entry
             .name
             .as_ref()
-            .ok_or_else(|| invalid("ZIP-Eintrag ohne UTF-8-Namen"))?
+            .ok_or_else(|| invalid("Archiveintrag ohne UTF-8-Namen"))?
             .trim_end_matches('/');
         if prefixes(original_relative)
             .iter()
@@ -646,9 +659,9 @@ fn prepare(
         }
         let relative = original_relative
             .strip_prefix(&selection_base)
-            .ok_or_else(|| invalid("ZIP-Auswahl verlässt ihre relative Wurzel"))?;
+            .ok_or_else(|| invalid("Archivauswahl verlässt ihre relative Wurzel"))?;
         if !crate::archive_read::path_is_safe(relative) {
-            return Err(invalid("Ungültige relative ZIP-Zielabbildung"));
+            return Err(invalid("Ungültige relative Zielabbildung des Archivs"));
         }
         let paths = prefixes(relative);
         let dst_path = request.target_dir.join(relative);
@@ -769,7 +782,7 @@ fn prepare(
             preview.source_bytes = preview
                 .source_bytes
                 .checked_add(entry.uncompressed_bytes)
-                .ok_or_else(|| invalid("Summe der ZIP-Inhaltsgrößen läuft über"))?;
+                .ok_or_else(|| invalid("Summe der Archiv-Inhaltsgrößen läuft über"))?;
             let mut existing_parent = dst_path
                 .parent()
                 .ok_or_else(|| invalid("Ziel ohne Eltern"))?;
@@ -919,7 +932,7 @@ impl PreparedArchiveExtract {
             || dst.file_flush_guarantees_at(&self.request.target_dir)?
                 != (self.root_capabilities.1, self.root_capabilities.2)
         {
-            return Err(drift("ZIP-Zielroot oder Fähigkeiten änderten sich"));
+            return Err(drift("Zielwurzel oder Fähigkeiten änderten sich"));
         }
         Ok(())
     }
@@ -933,7 +946,7 @@ impl PreparedArchiveExtract {
                 let actual = dst.stat(parent)?;
                 if actual.is_symlink || !actual.is_dir || &(actual.device, actual.inode) != expected
                 {
-                    return Err(drift("ZIP-Ziel-Elternordner wurde ausgetauscht"));
+                    return Err(drift("Ziel-Elternordner wurde ausgetauscht"));
                 }
             }
         }
@@ -1011,7 +1024,7 @@ impl PreparedArchiveExtract {
                             && proof.size == actual.size
                             && proof.mtime == actual.mtime => {}
                     (None, None) => {}
-                    _ => return Err(drift("ZIP-Zielbestand änderte sich seit der Vorbereitung")),
+                    _ => return Err(drift("Zielbestand änderte sich seit der Vorbereitung")),
                 }
             }
             for path in &self.directories {
@@ -1129,7 +1142,7 @@ impl PreparedArchiveExtract {
             || dst.file_flush_guarantees_at(parent)? != item.flush
         {
             return Err(drift(
-                "ZIP-Ziel-Elternvolume oder Commit-/Flushklasse änderte sich",
+                "Ziel-Elternvolume oder Commit-/Flushklasse änderte sich",
             ));
         }
         if let Ok(available) = dst.available_bytes(parent) {
@@ -1137,7 +1150,7 @@ impl PreparedArchiveExtract {
                 return Err(coded_error(
                     io::ErrorKind::StorageFull,
                     ErrorCode::StorageFull,
-                    "Nicht genug verfügbarer Platz für den angekündigten ZIP-Eintrag",
+                    "Nicht genug verfügbarer Platz für den angekündigten Archiveintrag",
                 ));
             }
         }
@@ -1159,13 +1172,13 @@ impl PreparedArchiveExtract {
             let io = item
                 .compressed
                 .checked_add(256 * 1024)
-                .ok_or_else(|| invalid("ZIP-Lesebudget läuft über"))?;
+                .ok_or_else(|| invalid("Lesebudget läuft über"))?;
             let calls = item
                 .compressed
                 .checked_add(8191)
                 .and_then(|n| n.checked_div(8192))
                 .and_then(|n| n.checked_add(1024))
-                .ok_or_else(|| invalid("ZIP-Aufrufbudget läuft über"))?;
+                .ok_or_else(|| invalid("Aufrufbudget läuft über"))?;
             let receipt = self.reader.read_entry_to(
                 self.reader.entries()[item.index].id,
                 ReadBudget {
@@ -1210,7 +1223,7 @@ impl PreparedArchiveExtract {
             }
             if count != receipt.output_bytes || check.finalize().as_bytes() != &hash {
                 return Err(invalid(
-                    "ZIP-Tempdatei besteht BLAKE3-/Größenreadback nicht",
+                    "Temporäre Datei besteht BLAKE3-/Größenreadback nicht",
                 ));
             }
             self.reader.verify_source(&self.cancel)?;
@@ -1236,7 +1249,7 @@ impl PreparedArchiveExtract {
                     &path,
                     proof.as_ref(),
                     error,
-                    "ZIP-Inhaltsprüfung vor Commit scheiterte",
+                    "Inhaltsprüfung vor Commit scheiterte",
                 )
                 .error)
             }
@@ -1280,7 +1293,7 @@ impl PreparedArchiveExtract {
                     &path,
                     proof.as_ref(),
                     error,
-                    "ZIP-Zielcommit scheiterte",
+                    "Zielcommit scheiterte",
                 )
                 .error)
             }

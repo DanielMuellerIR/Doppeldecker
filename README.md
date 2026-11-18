@@ -16,19 +16,19 @@ local and remote files. The interface is currently German-only.
 
 ## Download
 
-**Public preview: 0.1.127.** Use a second copy of your data while evaluating it.
+**Current release: 1.0.0.**
 
 | System | Package |
 | --- | --- |
-| macOS 14+, Apple Silicon | [Signed and notarized DMG](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.127/Doppeldecker_0.1.127_aarch64.dmg) |
-| Linux Mint 22.2 / Ubuntu 24.04, x86_64 | [DEB](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.127/Doppeldecker_0.1.127_amd64.deb) · [AppImage](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.127/Doppeldecker_0.1.127_amd64.AppImage) |
+| macOS 14+, Apple Silicon | [Signed and notarized DMG](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.0/Doppeldecker_1.0.0_aarch64.dmg) |
+| Linux Mint 22.2 / Ubuntu 24.04, x86_64 | [DEB](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.0/Doppeldecker_1.0.0_amd64.deb) · [AppImage](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.0/Doppeldecker_1.0.0_amd64.AppImage) |
 
 On macOS, drag the app from the DMG to Applications. Other distributions and Intel
 Macs are not yet verified. **Doppeldecker → Nach Updates suchen …** checks on
 request; downloading and installing require a separate confirmation.
 
-[Release notes and checksums](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.127).
-[Changes in this preview (German)](docs/release-notes-0.1.127.md).
+[Release downloads and checksums](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v1.0.0).
+[Release notes (German)](docs/release-notes-1.0.0.md).
 
 ## Features
 
@@ -42,15 +42,18 @@ request; downloading and installing require a separate confirmation.
   Navigation remains available during transfers.
 - **Preview:** F3 displays local and remote UTF-8 text and PNG/JPEG images.
 - **Batch work and archives:** preview batch renames, including name cycles;
-  create ZIPs from local selections and upload them to the remote pane; browse ZIPs
-  and extract whole archives or individual entries to local or remote destinations.
+  create ZIPs from local selections and upload them to the remote pane.
+  Browse ZIP, TAR, TAR.GZ and TGZ, and extract whole archives or selected contents
+  to local or remote destinations.
 - **File properties:** edit ordinary Unix permissions locally or over SFTP/FTP,
   including recursively; edit local owner/group, optionally with administrator
   authorization on macOS and Linux. Edit Finder tags, comments, visibility and locks on macOS.
-- **Synchronization:** Add only, Update and Mirror with a concrete preview;
-  one-way or bidirectional with a stored baseline.
-- **Queue and recovery:** pause and cancel jobs; recheck endpoints and effects
-  after restarting. Local deletion uses the system trash.
+- **Synchronization:** Add only, Update and Mirror with a concrete preview.
+  Save one-way jobs with exclusion patterns, or sync in both directions against
+  a stored baseline.
+- **Queue and recovery:** continue paused local copies and compatible WebDAV,
+  FTPS and SFTP downloads after restarting. Open pending jobs, quarantine
+  findings and trash journals from the recovery overview.
 
 ## Limits and data integrity
 

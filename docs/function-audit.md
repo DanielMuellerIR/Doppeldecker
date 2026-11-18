@@ -1,6 +1,6 @@
 # Funktionsaudit: Datei- und Sync-Operationen
 
-Stand: 2026-11-08. Diese Matrix beschreibt das implementierte Verhalten;
+Stand: 2026-11-18. Diese Matrix beschreibt das implementierte Verhalten;
 [Roadmap](roadmap.md) und [Backlog](../backlog.md) nennen die offene Arbeit.
 Frühere Prüfberichte gelten für ihren datierten Stand. Grundlage bleiben die
 [Produktprinzipien](product-principles.md) und das
@@ -26,13 +26,13 @@ sperren. Simulierte Browserantworten geben keine Serverfähigkeit frei.
 | Listing, Refresh, Verlauf, Sortierung | A | BE | A | A | A |
 | Mehrere Tabs je Pane | A | A | A | A | A |
 | Reguläre Datei öffnen / geprüfter Nur-Lese-Snapshot | A | BE | A | A | A |
-| ZIP-Inhalt anzeigen / passive Inhaltsvorschau | A | BE | A | A | A |
+| ZIP-, TAR-, TAR.GZ- und TGZ-Inhalt anzeigen / passive Inhaltsvorschau | A | BE | A | A | A |
 | Ordnerreferenz als Favorit speichern | A | A | A | A | A |
 
 [Tabs](pane-tabs.md) halten Verlauf, Auswahl, Sortierung und Scrollposition.
 Favoriten speichern Navigationsreferenzen, keine Serverberechtigung.
-[ZIP-Ansicht](archive-read.md) und [Entpacken](archive-extract.md) verwenden bei
-entfernten Quellen eine geprüfte lokale Momentaufnahme. ZIP-Erzeugung und Entpacken
+[Archivansicht](archive-read.md) und [Entpacken](archive-extract.md) verwenden bei
+entfernten Quellen eine geprüfte lokale Momentaufnahme. ZIP-Erzeugung und das Entpacken von ZIP oder TAR
 zu entfernten Zielen übertragen denselben versiegelten Zwischenstand auch nach
 Konfliktpause oder Neustart. Nach dauerhaftem Erfolg werden belegte lokale
 Ergebnisdaten freigegeben; Abbruch und unklare Ausgänge behalten sie.
@@ -54,6 +54,7 @@ doppelte Namen und Protokollfehler bleiben Fehler. [Listing](sftp-listing.md).
 | Finder-Tags/Farben, Kommentare und Dateiflags bearbeiten | A (macOS) | — | — | — | — |
 | Umbenennen im selben Ordner | A | BE | BE | BE | BE |
 | Neue Datei / rekursive Kopie / Upload | A | BE | A / BE | BE | A |
+| [Dateiinhalt fortsetzbar kopieren, einzeln oder als Auswahl](operations-queue-design.md#dateiinhalt-fortsetzbar-kopieren) | A | BE (Download mit SHA-256) | BE (FTPS-Download mit SHA-256) | BE (Download) | — |
 | Reguläre Zieldatei bestätigt ersetzen | A / BE | BE | BE | BE | BE |
 | Download in einen lokalen Ordner | A | BE | BE | BE | BE |
 | Vorhandene Ordner zusammenführen | A | BE | A / BE | BE | A |
@@ -136,6 +137,13 @@ Bereits eingereihte Gruppen bleiben in der Teilbilanz. [Prüfbericht](finder-ftp
 
 ## 3. Löschen und Wiederherstellen
 
+**Gehe zu → Wiederherstellung …** ist auch in der Operations-Queue erreichbar.
+Die Ansicht liest Befunde aus der Queue dieses Fensters, der Quarantäne am
+gewählten Sync-Ziel und dem gemeinsamen Papierkorb-Journalordner. Sie zeigt
+unlesbare Journale und unklare Ausgänge als offene Befunde. **Auftrag öffnen**
+führt zum betroffenen Queueeintrag. Restore, Fortsetzen, Rollback und das
+bewusste Schließen verwenden weiterhin ihre jeweiligen Dialoge und Prüfungen.
+
 | Funktion | Lokal | SFTP | FTP/FTPS | WebDAV | SMB |
 | --- | --- | --- | --- | --- | --- |
 | Systempapierkorb | A | — | — | — | — |
@@ -176,6 +184,10 @@ Starke lokale Ziele behalten Quarantäne. Fehlt sie, nennt die Vorschau dauerhaf
 Ersetzungen und Entfernungen. Mirror lässt bei Konflikten, Symlinks oder
 Auslassungen sämtliche Entfernungen aus. Neustart verlangt frische Vorbereitung.
 Verträge: [Inhaltssync](content-sync.md), [bidirektionaler Alltagssync](bidirectional-forward.md).
+
+Der Einweg-Assistent zeigt [Ausschlusstreffer](content-sync.md#ausschlüsse-im-assistenten)
+in Vorschau und Bestätigung. [Gespeicherte Sync-Aufträge](content-sync.md#gespeicherte-sync-aufträge)
+stellen Ordner und Optionen wieder her. Der Assistent plant die Ausführung jedes Mal frisch.
 
 Einseitiger nativer SMB-Inhaltssync erhält bei geeigneten Endpunkten benannte
 Dateiströme; Verzeichnisströme besitzen einen getrennten NativeBestEffort-Vertrag

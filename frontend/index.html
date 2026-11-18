@@ -89,7 +89,7 @@
             <ul class="fav-list" id="fav-list"></ul>
             <div class="side-subhead">
               <span class="side-subtitle">Gespeicherte Verbindungen</span>
-              <button class="icon-btn" id="conn-add" title="Server-Verbindung hinzufügen (SFTP, FTP/FTPS, WebDAV oder SMB)">+</button>
+              <button class="icon-btn" id="conn-add" aria-label="Server-Verbindung hinzufügen" title="Server-Verbindung hinzufügen (SFTP, FTP/FTPS, WebDAV oder SMB)">+</button>
             </div>
             <ul class="connection-list" id="connection-list"></ul>
           </section>
@@ -255,11 +255,17 @@
               <span class="sync-chip-proto" id="sync-target-proto"></span>
             </div>
           </div>
+          <div class="sync-jobs-bar" aria-label="Sync-Aufträge">
+            <button class="btn ghost small" id="sync-job-open" type="button">Auftrag öffnen …</button>
+            <button class="btn ghost small" id="sync-job-save" type="button">Auswahl speichern …</button>
+            <span id="sync-job-current" aria-live="polite" hidden></span>
+          </div>
           <div class="sync-plan">
             <div class="sync-hint" id="sync-hint" hidden>
               <p id="sync-hint-text"></p>
               <button class="btn ghost small" id="sync-preview-remote" hidden>Vorschau laden</button>
             </div>
+            <div class="sync-plan-exclusions" id="sync-plan-exclusions" hidden></div>
             <section class="sync-comparison" id="sync-comparison" hidden aria-label="Planvergleich">
               <div class="sync-comparison-head" aria-hidden="true">
                 <span>Quelle · aktueller Bestand</span>
@@ -310,6 +316,17 @@
             <label><input type="radio" name="sync-metadata" value="NativeBestEffort" /><span>Nativ (Best Effort)</span></label>
             <label><input type="radio" name="sync-metadata" value="NativeStrict" /><span>Strikt</span></label>
           </fieldset>
+          <fieldset class="sync-group" id="sync-exclude-group">
+            <legend>Ausschlüsse</legend>
+            <label for="sync-exclude">Dateien und Ordner auslassen</label>
+            <textarea id="sync-exclude" rows="3" aria-describedby="sync-exclude-help" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+            <small id="sync-exclude-help">Ein Muster pro Zeile. Treffer auf beiden Seiten bleiben beim Sync unberührt.</small>
+            <details class="sync-exclude-help">
+              <summary>Muster und Beispiele</summary>
+              <p><code>*.tmp</code> trifft auf jeder Ebene. <code>cache/**</code> erfasst den Ordner <code>cache</code> samt Inhalt direkt unter der gewählten Wurzel.</p>
+              <p><code>*</code> steht für beliebig viele Zeichen, <code>?</code> für ein Zeichen und <code>**</code> für beliebig viele Ordnerebenen. Groß- und Kleinschreibung zählen.</p>
+            </details>
+          </fieldset>
           <!-- Klartext statt Dauerwarnung (früher „Noch kein Vollbackup" in der
                Seitenleiste): Die erste Zeile folgt der Profilwahl und benennt, was
                ein Lauf wirklich überträgt; die zweite erinnert genau dort, wo
@@ -339,6 +356,7 @@
         <div class="queue-popover-controls">
           <button class="btn ghost small" id="queue-toggle-pause" type="button"></button>
           <button class="btn ghost small" id="queue-toggle-stop" type="button"></button>
+          <button class="btn ghost small" id="queue-recovery" type="button">Wiederherstellung …</button>
         </div>
         <div class="queue-popover-pinned" id="queue-popover-pinned" hidden>
           <small class="queue-popover-section-title">Läuft gerade</small>

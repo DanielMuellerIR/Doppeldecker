@@ -16,6 +16,8 @@ export function createSyncView({
   let mode = "AddOnly";
   let compare = "SizeAndTime";
   let metadata = "Portable";
+  let exclude = [];
+  let mtimeTolerance = 2;
   let wiredActions = null;
   let previewTimer = null;
   let revision = 0;
@@ -74,12 +76,13 @@ export function createSyncView({
     fast.parentElement.title = fast.disabled ? "Update und native Profile benötigen den vollständigen Inhaltsvergleich." : "";
     const remote = remoteSyncContext();
     const both = direction === "both";
+    $("#sync-job-save").disabled = both;
     $("#sync-metadata-group").title = remote?.protocol === "content" ? "Portable überträgt Inhalte und am Ziel darstellbare Metadaten. Die Vorschau bilanziert nicht darstellbare Merkmale mit konkretem Grund." : "Portable überträgt Daten, mtime und normale Rechte. Native Profile prüfen zusätzlich alle unterstützten Metadatenklassen.";
     $("#sync-mirror").nextElementSibling.textContent = remote?.protocol === "content" ? "Zusätzliche Zieldateien entfernen" : "Verwaiste in Quarantäne verschieben";
     $("#sync-effects-group").title = remote?.protocol === "content" ? "Ergänzen verändert vorhandene Dateien nicht. Aktualisieren und Mirror können vorhandene Versionen dauerhaft ersetzen oder entfernen; die konkrete Wirkung folgt in der Vorschau." : "Ergänzen verändert Vorhandenes nie; Aktualisieren ersetzt ältere Dateien; Verwaiste werden in die Quarantäne verschoben.";
     // Der bidirektionale Request besitzt keine Einwegoptionen. Seine festen
     // Inhalts-/Metadatenbelege dürfen keine hier wirkungslose Auswahl vortäuschen.
-    for (const id of ["sync-effects-group", "sync-compare-group", "sync-metadata-group", "sync-metadata-note-title", "btn-real"]) {
+    for (const id of ["sync-effects-group", "sync-compare-group", "sync-metadata-group", "sync-exclude-group", "sync-metadata-note-title", "btn-real"]) {
       $(`#${id}`).hidden = both;
     }
     const normalLocal = !both && !remote && mode !== "Mirror";
@@ -118,6 +121,8 @@ export function createSyncView({
   // ---------------------------------------------------------------------
   function clearPlanArea() {
     $("#sync-summary").innerHTML = "";
+    $("#sync-plan-exclusions").hidden = true;
+    $("#sync-plan-exclusions").innerHTML = "";
     $("#sync-actions").innerHTML = "";
     $("#sync-actions").hidden = false;
     $("#sync-comparison").hidden = true;
@@ -164,6 +169,7 @@ export function createSyncView({
   function optionChanged() {
     revision += 1;
     renderExecution();
+    showHint("Die Vorschau wird für die aktuelle Auswahl neu geplant.");
     discardPreparation();
     schedulePreview();
   }
@@ -190,6 +196,18 @@ export function createSyncView({
     $("#app").classList.remove("sync-mode");
     discardPreparation();
     if (restoreFocus) $(".pane.active .listing")?.focus();
+  }
+
+  function reopenForJob(job) {
+    direction = job.direction;
+    ({ mode, compare, metadata, mtime_tolerance: mtimeTolerance, exclude = [] } = job.options);
+    $(`#sync-direction-group [value=${direction}]`).checked = true;
+    $(`#sync-compare-group [value=${compare}]`).checked = true;
+    $("#sync-exclude").value = exclude.join("\n");
+    applyMode();
+    applyMetadata();
+    onDirectionChanged();
+    open();
   }
 
   // ---------------------------------------------------------------------
@@ -247,6 +265,11 @@ export function createSyncView({
       optionChanged();
     });
 
+    $("#sync-exclude").addEventListener("input", event => {
+      exclude = event.target.value.split("\n").filter(pattern => pattern !== "");
+      optionChanged();
+    });
+
     $("#sync-preview-remote").addEventListener("click", () => actions.preview());
 
     $("#btn-sync-close").addEventListener("click", () => close());
@@ -279,8 +302,9 @@ export function createSyncView({
     metadata: () => metadata,
     mode: () => mode,
     open,
+    reopenForJob,
     revision: () => revision,
-    options: () => ({ mode, compare, metadata, mtime_tolerance: 2 }),
+    options: () => ({ mode, compare, metadata, mtime_tolerance: mtimeTolerance, exclude: direction === "both" ? [] : [...exclude] }),
     toggle: () => (isOpen() ? close() : open()),
     wire,
   };

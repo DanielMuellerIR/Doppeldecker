@@ -44,6 +44,7 @@ mod queue_commands;
 mod queue_runtime;
 mod read_endpoint;
 mod remote_edit_commands;
+mod saved_sync_jobs;
 mod sftp_commands;
 mod smb_commands;
 mod system_mount_commands;
@@ -458,6 +459,8 @@ fn main() {
             directory_size_commands::start_directory_sizes,
             directory_size_commands::cancel_directory_sizes,
             local_sync_commands::plan_sync,
+            saved_sync_jobs::list_saved_sync_jobs,
+            saved_sync_jobs::save_sync_job,
             normal_sync_commands::prepare_local_sync,
             normal_sync_commands::discard_local_sync,
             normal_sync_commands::enqueue_local_sync,
@@ -477,10 +480,12 @@ fn main() {
             local_sync_commands::run_sync,
             queue_commands::cancel_sync,
             queue_commands::list_operation_queue,
+            queue_commands::inspect_recovery,
             queue_commands::set_queue_paused,
             queue_commands::set_queue_stop_on_error,
             queue_commands::move_queue_entry,
             queue_commands::remove_queue_entry,
+            queue_commands::discard_resumable_copy,
             queue_commands::retry_queue_entry,
             queue_commands::discard_replan_required_queue_entry,
             queue_commands::discard_queue_confirmation,
@@ -603,6 +608,7 @@ fn main() {
             duplicate_commands::confirm_duplicate,
             duplicate_commands::discard_duplicate,
             file_commands::copy_paths,
+            file_commands::enqueue_resumable_copy,
             file_commands::move_paths,
             file_commands::enqueue_provider_file_operation,
             file_clipboard::write_file_clipboard,

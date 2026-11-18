@@ -4,6 +4,20 @@
 import { $, escapeHtml, fmtBytes, fmtTransferBytes } from "./ui-utils.js";
 import { createSyncComparisonView } from "./sync-comparison.js";
 
+export function syncExclusionReportHtml(plan) {
+  const report = plan.exclusions;
+  if (!report?.source_count && !report?.target_count) return "";
+  const entries = (role, count, paths) => !count ? "" :
+    `<p>${role}</p><ul>` +
+    paths.map(path => `<li><code>${escapeHtml(path)}</code></li>`).join("") +
+    (count > paths.length ? `<li>${count - paths.length} weitere</li>` : "") + "</ul>";
+  return `<details class="sync-exclusion-report"><summary>` +
+    `Ausgelassen · Quelle ${report.source_count} · Ziel ${report.target_count}</summary>` +
+    `<p>Ausschlussmuster und Arbeitsordner von Teilkopien sind ausgenommen. Ausgeschlossene Ordner stehen für ihren gesamten Inhalt. Treffer im Ziel bleiben erhalten.</p>` +
+    entries("Quelle", report.source_count, report.source_paths) +
+    entries("Ziel", report.target_count, report.target_paths) + "</details>";
+}
+
 export function createPlanView({ metadataClassLabels, metadataReportHtml, updateMetadataNote, showDock }) {
   const comparisonView = createSyncComparisonView({
     root: $("#sync-comparison"),
@@ -79,6 +93,9 @@ export function createPlanView({ metadataClassLabels, metadataReportHtml, update
     if (syncView && !syncView.hidden) {
       $("#sync-hint").hidden = true;
       $("#sync-summary").innerHTML = planSummaryHtml(plan);
+      const exclusions = $("#sync-plan-exclusions");
+      exclusions.innerHTML = syncExclusionReportHtml(plan);
+      exclusions.hidden = !exclusions.firstElementChild;
       const hasComparison = Array.isArray(plan.comparison?.rows) && plan.comparison.rows.length > 0;
       $("#sync-actions").hidden = hasComparison;
       if (hasComparison) {

@@ -1,6 +1,6 @@
 # Additive WebDAV-Downloads
 
-Stand: 2026-10-24.
+Stand: 2026-11-18.
 
 Gewöhnliche additive WebDAV-Kopien in einen lokalen Ordner verwenden eine private
 Best-Effort-Lesequelle. Sie umfasst direkte Mehrfachauswahl, reguläre Dateien und
@@ -58,3 +58,30 @@ bestehende Parserabsage. Die neue Klasse behauptet deshalb keine allgemeine
 Symlink- oder Metadatenfreigabe. GUI und CLI erhalten den konkreten
 Best-Effort-Lesehinweis. Der lokale Temp-, No-Replace- und Abschlussvertrag bleibt
 erhalten. [Prüfstand](roadmap-2026-10-24.md#additive-webdav-downloads).
+
+
+## Fortsetzbarer Download
+
+**Befehle → Dateiinhalt fortsetzbar kopieren** unterstützt reguläre Dateien aus
+einem WebDAV-Ordner in einen lokalen Ordner mit atomarem Neuanlegen. Die App
+prüft vor dem Einreihen die starke ETag und eine kurze bedingte GET-Antwort.
+Server, die keine überprüfbaren Teilantworten liefern, bleiben über F5 erreichbar.
+
+Die Queue speichert die Profilrevision, Serveridentität, Dateilänge und starke
+ETag. Jeder GET fordert bis zu 8 MiB mit `Range` und `If-Match` an. Status 206,
+Antwort-ETag, `Content-Range`, Inhaltskodierung und tatsächlicher EOF müssen
+passen. Der Client speichert einen bestätigten Abschnitt erst nach vollständig
+gelesener Antwort und dauerhaftem lokalen Schreiben. Beim Wiederanlauf prüft
+er die vorhandene lokale Teilkopie per BLAKE3 und fordert den fehlenden Abschnitt
+an. Eine neuere WebDAV-Version oder andere Serveridentität fordert eine
+Entscheidung und lässt den Arbeitsstand erhalten.
+
+WebDAV bindet die Darstellung über die vom Server gelieferte Version. Der
+Server muss auch Änderungen außerhalb des WebDAV-Protokolls als neue Version
+melden. Veraltete Server-Caches können die Beobachtung verzögern.
+Gleichzeitige Änderungen serverseitiger Elternpfade bleiben in der beschriebenen
+Best-Effort-Lesegrenze. Die fertige lokale Datei erhält private Basisrechte,
+gegebenenfalls die gelieferte Änderungszeit und einen BLAKE3-Readback. Der
+Zielname wird atomar neu angelegt. Pausieren, Fortsetzen und Verwerfen bleiben
+über die Fensterqueue erreichbar.
+[RFC 9110 zu If-Match und Teilantworten](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.1).

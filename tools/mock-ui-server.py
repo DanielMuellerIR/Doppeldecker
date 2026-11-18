@@ -29,8 +29,8 @@ MOCK_TAURI = r"""
     recordError(`CSP-Verstoß: ${event.violatedDirective} blockierte ${event.blockedURI || "Inline-Inhalt"}`);
   });
   const mockParams = new URLSearchParams(location.search);
-  // Zwei Wettlauf-Gegenfälle halten die Antwort bis zur beobachteten Navigation
-  // beziehungsweise zum sichtbaren Editor. Millisekundenfristen würden unter
+  // Wettlauf-Gegenfälle halten die Antwort bis zur beobachteten Navigation
+  // oder zum sichtbaren Editor. Millisekundenfristen würden unter
   // Last gerade die zu prüfende Reihenfolge wieder dem Scheduler überlassen.
   const heldRequests = new Map();
   const requestPhases = {};
@@ -117,10 +117,6 @@ MOCK_TAURI = r"""
     ? Math.max(0, Math.min(requestedFileActionPreviewDelay, 1000))
     : 0;
   const updateMode = mockParams.get("update") || "none";
-  const requestedUpdateDelay = Number.parseInt(mockParams.get("updateDelay") || "0", 10);
-  const updateDelayMs = Number.isFinite(requestedUpdateDelay)
-    ? Math.max(0, Math.min(requestedUpdateDelay, 1000))
-    : 0;
   const requestedInstallDelay = Number.parseInt(mockParams.get("installDelay") || "0", 10);
   const installDelayMs = Number.isFinite(requestedInstallDelay)
     ? Math.max(0, Math.min(requestedInstallDelay, 1000))
@@ -965,7 +961,6 @@ MOCK_TAURI = r"""
     if (command === "app_version") return "0.1.124";
     if (command === "check_for_update") {
       updateCalls.push({ command });
-      if (updateDelayMs) await wait(updateDelayMs);
       if (updateMode === "error") {
         throw { code: "update_failed", message: "Mock-Updatekanal nicht erreichbar" };
       }
@@ -1997,7 +1992,9 @@ MOCK_TAURI = r"""
     }
     if (command === "list_quarantine_entries") {
       if (quarantineRace) {
-        await wait(args.runId === "run-langsam" ? 160 : 10);
+        if (args.runId === "run-langsam") {
+          await holdRequest("quarantineRace", { runId: args.runId });
+        }
         return [{
           relative_path: `${args.runId}.txt`, reason: "replaced", available: true,
           restored: false, entries: 1, bytes: 8,

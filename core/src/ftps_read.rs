@@ -287,7 +287,7 @@ impl InteractiveFiles {
         // und Metadaten. Eine feste Kurzliste würde z. B. UNIX.mode abwählen.
         if let Some(selection) = state.session.read_mlst_facts.clone() {
             if let Err(error) = state.session.stream.opts("MLST", Some(&selection)) {
-                if !opts_mlst_rejection_is_tolerable(&error) {
+                if !optional_opts_rejection(&error) {
                     return Err(ftp_error(error));
                 }
             }

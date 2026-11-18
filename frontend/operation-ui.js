@@ -53,7 +53,7 @@ export function createOperationUi({ planSummaryHtml, setRunning, captureEndpoint
     $("#app").classList.toggle("operation-running", locked);
     // Der Lauf besitzt seinen vorbereiteten Plan. Nur dessen Bedienelemente
     // bleiben gesperrt; sichtbare Panes und weitere Queueaufträge sind unabhängig.
-    const auswahl = $$(".sync-view button:not(#btn-sync-close), .sync-view input:not(#sync-add), #btn-quarantine");
+    const auswahl = $$(".sync-view button:not(#btn-sync-close), .sync-view input:not(#sync-add), .sync-view textarea, #btn-quarantine");
     $("#btn-sync-close").textContent = locked ? "Dateiansicht" : "Schließen";
     if (locked) {
       // Beim Sperren merken, was schon aus fachlichen Gründen gesperrt war.
@@ -85,6 +85,7 @@ export function createOperationUi({ planSummaryHtml, setRunning, captureEndpoint
       || { operationId: context?.operationId, attempt: context?.attempt || 0, affectedEndpoints: captureEndpoints() };
     setRunning(true);
     setLocked(true);
+    $("#btn-cancel").textContent = context?.pausable ? "Kopie pausieren" : "Abbrechen";
     $("#btn-cancel").hidden = false;
     $("#progress").hidden = false;
     $("#bar-fill").style.width = "0%";
@@ -111,10 +112,11 @@ export function createOperationUi({ planSummaryHtml, setRunning, captureEndpoint
     $("#bar-fill").style.width = percent.toFixed(1) + "%";
     const phase = {
       copy: "Kopiere",
+      resumable_verify: "Prüfe Teilkopie",
       move: "Verschiebe",
       metadata: "Übertrage Metadaten",
       archive_pack: "Erstelle ZIP-Archiv",
-      archive_extract_extracting: "Entpacke ZIP-Archiv",
+      archive_extract_extracting: "Entpacke Archiv",
       archive_extract_verifying: "Prüfe entpackten Inhalt",
       archive_extract_committing: "Übernehme entpackte Datei",
       archive_upload_ready: "Bereite Archivupload vor",

@@ -94,7 +94,7 @@ export function createEventController(actions) {
       const unclear = errCode(event.payload) === "outcome_unclear";
       if (event.payload.operationKind === "archive_extract" && event.payload.operationId
         && errCode(event.payload) !== "queue_confirmation_required") {
-        void invoke("record_app_error", { context: "ZIP entpacken", code: errCode(event.payload) }).catch(() => {});
+        void invoke("record_app_error", { context: "Archiv entpacken", code: errCode(event.payload) }).catch(() => {});
         actions.showDock(archiveExtractFailureHtml(event.payload), { closable: true });
       } else {
         actions.showError(unclear ? "Ausgang unklar" : "Fehler", event.payload, { foldDetails: unclear });
@@ -220,7 +220,22 @@ export function createEventController(actions) {
     $("#bar-fill").style.width = "100%";
     const context = actions.endProgress();
     $("#progress").hidden = true;
-    const parts = [`${summary.files}${summary.source_tree ? " Datei(en)" : ""} übertragen`];
+    const resumable = ["resumable_copy", "resumable_webdav_copy", "resumable_ftps_copy", "resumable_sftp_copy"].includes(summary.operationKind);
+    if (resumable && summary.cancelled) {
+      actions.showDock(
+        `<span class="pill none">Kopie pausiert</span> ${fmtTransferBytes(summary.bytes)} gesichert. <button type="button" class="btn small" data-dock-action="open-queue" data-operation-id="${escapeHtml(summary.operationId)}">Fortsetzbare Kopie anzeigen</button>`,
+        { closable: true },
+      );
+      actions.refreshPanes(context);
+      return;
+    }
+    const countsFiles = summary.source_tree || resumable || summary.operationKind === "archive_extract";
+    const unit = countsFiles ? summary.files === 1 ? " Datei" : " Dateien" : "";
+    const parts = [`${summary.files}${unit} übertragen`];
+    if (summary.operationKind === "resumable_copy") parts.push("Dateiinhalt, Änderungszeit und Basisrechte übernommen");
+    if (summary.operationKind === "resumable_webdav_copy") parts.push("WebDAV-Inhalt übertragen und lokale Zielbytes geprüft");
+    if (summary.operationKind === "resumable_ftps_copy") parts.push("FTPS-Inhalt anhand der Serverprüfsumme geprüft");
+    if (summary.operationKind === "resumable_sftp_copy") parts.push("SFTP-Inhalt anhand der Serverprüfsumme geprüft");
     if (summary.skipped) parts.push(`${summary.skipped} übersprungen`);
     if (summary.symlinks_skipped) parts.push(`${summary.symlinks_skipped} Symlink(s) ausgelassen`);
     if (summary.incomplete_resource_forks > 0) parts.push(`${summary.incomplete_resource_forks} Resource Fork(s) nicht vollständig`);

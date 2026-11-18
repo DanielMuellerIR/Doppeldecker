@@ -1,8 +1,7 @@
 # Release- und Plattformplan
 
-Stand: 2026-11-10. Die aktuelle öffentliche Preview ist
-[0.1.127](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.127).
-Veröffentlichung und Abnahme sind für ihre konkreten Pakete nachgewiesen.
+Stand: 2026-11-18. Die aktuelle Version ist
+[1.0.0](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v1.0.0).
 Künftige Änderungen bleiben unter `Unreleased`.
 
 ## Unterstützte Ziele
@@ -36,6 +35,75 @@ Historische erfolgreiche Gegenläufe ersetzen keinen aktuellen Kandidatenlauf.
 Versionswechsel nur für ausdrücklich benannte Meilensteine/Kandidaten; keine
 Versionsbumps für gewöhnliche Entwicklungs- oder Dokumentationscommits.
 Veröffentlichung, Tags und öffentliche Pakete brauchen einen konkreten Auftrag.
+
+## Abnahmestand von 1.0.0
+
+Die 1.0-Pakete verwenden dieselben Programmquellen wie der Release-Tag.
+DMG, DEB und AppImage übernehmen beim nativen Wechsel von 0.1.127 die
+gespeicherten Tabs oder Pane-Ziele. Die Apple-Silicon-App und das DMG tragen
+Developer-ID-Signaturen und Apple-Tickets. Das AppImage startet über FUSE.
+Die Datenschutzprüfung der Pakete sowie die Produktionssignaturen der
+drei Updater-Nutzlasten und der hashgebundenen AppImage-Attestation bestehen.
+
+- Unter macOS bleiben beide gespeicherten Tabs samt aktivem Tab erhalten.
+  Spiegeln und anschließendes Wiederherstellen aus der Quarantäne erhalten
+  die geprüften Dateiinhalte. Ein beschädigtes Queue-Journal bleibt beim
+  bestätigten Beenden unverändert.
+- Unter Linux prüft der gespeicherte Spiegelauftrag nach Programmneustart
+  den veränderten SFTP-Bestand. Die tatsächlichen Zielinhalte entsprechen
+  der bestätigten Vorschau, ausgeschlossene Dateien bleiben erhalten.
+  Nach einem getrennten Prozessabbruch lädt die App den gesicherten
+  ZIP-Zwischenstand bytegleich hoch und räumt den Prüf-Tab auf.
+- Ein isolierter macOS-Updater von 0.1.127 installiert das korrigierte,
+  mit dem Produktionsschlüssel signierte Archiv. Die installierte App
+  startet als 1.0.0. GUI und CLI entsprechen bytegleich dem Paket.
+
+## Privater Prüfstand vom 2026-11-18
+
+Die privaten Pakete verwenden den Programmstand `63ebe1b4` mit der
+bestehenden Versionsnummer 0.1.127. Der Paketwechsel von der veröffentlichten
+0.1.126 übernimmt im DMG beide gespeicherten Tabs und deren aktive Auswahl.
+DEB und AppImage übernehmen den aktiven Tab und seinen Ordner. Das AppImage
+startet direkt über FUSE. Auf beiden Plattformen bestehen alle neun Gates
+einschließlich der Browsertests. Paketstruktur, Architektur, Abhängigkeiten,
+mitgelieferte CLI-Versionen und Datenschutzprüfung sind geprüft.
+
+- Developer-ID-App und DMG sind notarisiert und gestapelt. Gatekeeper und
+  der Vergleich von GUI und CLI aus dem DMG bestehen. Die App stellt eine
+  beim Spiegeln verschobene Datei über die Wiederherstellungsansicht
+  bytegleich wieder her. Der verschachtelte Teilkopieordner bleibt erhalten.
+- Im DEB erreicht die Wiederherstellungsansicht nach erzwungenem Neustart
+  den wartenden SFTP-Archivupload. Das am Ziel nach bestätigter Kollision
+  installierte ZIP ist bytegleich mit dem gesicherten Zwischenstand, auch
+  nachdem die Originaldatei geändert wurde. Der Prüf-Tab schließt nach
+  der Bereinigung. Ein separat beschädigtes Queue-Journal bleibt
+  unverändert. Kleine SFTP-, FTPS- und WebDAV-Downloads über die
+  fortsetzbare Kopie sind bytegleich geprüft.
+- Im AppImage plant der gespeicherte Spiegelauftrag nach einem Neustart
+  erneut. Der zwischenzeitlich hinzugekommene Zieleintrag erscheint in
+  der Vorschau und wird nach Bestätigung in die Quarantäne verschoben.
+  Die Quelldatei wird kopiert und die ausgeschlossene Zieldatei bleibt
+  bytegleich erhalten. Die Entfernung der isolierten Linux-Installationen
+  erhält Konfiguration und Testdateien. In der TAR.GZ-Ansicht funktionieren
+  F3 und das Entpacken des geöffneten Ordners. Die extrahierte Datei ist
+  bytegleich, der Archivlink wird sichtbar ausgelassen.
+
+Die vorherigen Paketläufe an `ad89d468` belegen zusätzlich gewöhnliche
+FTP-/FTPS-Kopien mit UTF-8-Namen, WebDAV-Kopien in beide Richtungen,
+SMB-Kollision mit „Beide behalten“, Testpapierkorb und getrennte
+Fensterjournale. Die nativen Wiederanläufe großer lokaler, WebDAV-, FTPS-
+und SFTP-Kopien wurden in den jeweiligen Entwicklungsständen geprüft.
+
+Der öffentliche Linux-AppImage-Updater installiert die signierte 0.1.127
+aus 0.1.126. Im öffentlichen macOS-Archiv dieser Version scheitert der
+Updater an einem AppleDouble-Eintrag. Ein isolierter nativer Tauri-Updater
+mit lokalem Prüfschlüssel installiert das korrigierte Archiv aus
+`63ebe1b4`. Die darin enthaltene App startet als 0.1.127 und besteht
+Bytevergleich, Codesign-, Ticket- und Gatekeeper-Prüfung.
+
+Offen sind die separaten Produktionssignaturen der neuen Updater-Nutzlasten,
+die signierte AppImage-Attestation und die abschließende Release-Prüfung mit
+diesen Signaturen. Der damals öffentliche Stand blieb 0.1.127.
 
 ## Abnahmestand von 0.1.127
 

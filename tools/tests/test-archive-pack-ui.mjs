@@ -147,6 +147,10 @@ try {
  }
  for(const choice of ["overwrite","both","cancel"]) {
   const {page,errors}=await pageFor(choice === "both" ? "dark" : "light",{locale:"en-US",timezoneId:"UTC"});await page.setViewportSize({width:390,height:850});
+  const left=page.locator('.pane[data-side="left"]');
+  const origin=await left.locator(".path").inputValue();
+  const selected=left.getByRole("option",{name:/Alpha\.txt/});
+  await selected.click();
   await page.evaluate(()=>{
    const queue=window.__DOPPELDECKER_MOCK_QUEUE__;queue.paused=true;queue.revision++;
    queue.entries=[{operation_id:"generated-upload",operation:{type:"ProviderFile",kind:"Copy",source:{provider:"Local",root:"/private/generated/content"},target:{provider:"WebDav",root:"/remote/Ein-langes-Zielverzeichnis",connection:{origin:"https://artificial.example.invalid"}},items:["/private/generated/content/Ergebnis.zip"],destination:"/remote/Ein-langes-Zielverzeichnis"},generated_source:{kind:"zip",label:"Ergebnis.zip",files:1,directories:0,bytes:42,issues:[{path:"source",reason:"Metadaten ausgelassen",content_omitted:false}]},state:"AwaitingConfirmation",attempts:1,progress:{},attention:{type:"ConflictsChanged",current_conflicts:["Ergebnis.zip"],current_conflict_proofs:[],reason:"Zielkonflikt",confirmation:"backend-only"}}];
@@ -196,6 +200,69 @@ try {
     await page.waitForFunction(expected=>[...document.querySelectorAll('.pane .path')].some(input=>input.value===expected),expected);
     assert.equal((await page.evaluate(()=>window.__ZIP_GENERATED_CALLS__)).at(-1).command,"generated_source_path");
    }
+  }
+  if(choice === "overwrite") {
+   await page.waitForFunction(origin=>{
+    const saved=window.__MOCK_DESKTOP__().rememberedWindows.at(-1);
+    return saved?.panes.left.path===origin && saved.tabs.left.tabs.length===1;
+   },origin);
+   // Ein Command-Abruf kann den Journalabschluss vor dem Cleanup-Worker sehen.
+   await page.evaluate(()=>{
+    const queue=window.__DOPPELDECKER_MOCK_QUEUE__;
+    const entry=queue.entries[0];
+    window.__ZIP_WORKSPACE_PATH__=entry.temp_recovery_paths[0];
+    entry.generated_source_recovery=false;
+    entry.temp_recovery_paths=[];
+    window.__MOCK_EMIT__("queue-updated",structuredClone({...queue,revision:++queue.revision}));
+   });
+   assert.equal(await left.locator(".path").inputValue(),"/private/generated");
+   await page.evaluate(()=>{
+    const queue=window.__DOPPELDECKER_MOCK_QUEUE__;
+    const entry=queue.entries[0];
+    const path=window.__ZIP_WORKSPACE_PATH__;
+    const previous=window.__TAURI__.core.invoke;
+    window.__ZIP_STALE_LISTINGS__=0;
+    window.__TAURI__.core.invoke=(command,args)=>{
+     if(command==="scan_dir" && args.path===path){
+      window.__ZIP_STALE_LISTINGS__++;
+      throw {code:"not_found",message:"Bereinigter Zwischenstand"};
+     }
+     return previous(command,args);
+    };
+    window.__MOCK_EMIT__("fileop-done",{
+     operationId:entry.operation_id,attempt:entry.attempts,files:1,bytes:42,
+     affectedEndpoints:[{provider:"local",profileId:null,profileRevision:null,path}],
+    });
+   });
+   await page.waitForFunction(origin=>document.querySelector('.pane[data-side="left"] .path').value===origin,origin);
+   await selected.waitFor();
+   assert.equal(await selected.getAttribute("aria-selected"),"true");
+   assert.equal(await left.getByRole("tab").count(),1);
+   assert.equal(await page.evaluate(()=>window.__ZIP_STALE_LISTINGS__),0);
+   assert.match(await page.locator("#dock-summary").innerText(),/Fertig.*1 übertragen/);
+   await page.evaluate(()=>{
+    const queue=window.__DOPPELDECKER_MOCK_QUEUE__;const entry=queue.entries[0];
+    entry.state="Failed";entry.generated_source_recovery=true;entry.temp_recovery_paths=["/private/generated/content"];
+    window.__MOCK_EMIT__("queue-updated",structuredClone({...queue,revision:++queue.revision}));
+   });
+   await row.getByRole("button",{name:"Zwischenstand zeigen",exact:true}).click();
+   await page.locator("#queue-popover-close").click();
+   const saves=await page.evaluate(()=>window.__MOCK_DESKTOP__().rememberedWindows.length);
+   await left.locator(".pane-tab-close").first().click();
+   await page.waitForFunction(({origin,saves})=>{
+    const remembered=window.__MOCK_DESKTOP__().rememberedWindows;
+    const saved=remembered.at(-1);
+    return remembered.length>saves && saved?.panes.left.path===origin && saved.tabs.left.tabs.length===1
+      && saved.tabs.left.tabs[0].location.path===origin;
+   },{origin,saves});
+   assert.equal(await left.locator(".path").inputValue(),"/private/generated/content");
+   await page.evaluate(()=>{
+    const queue=window.__DOPPELDECKER_MOCK_QUEUE__;const entry=queue.entries[0];
+    entry.operation={type:"ArchiveUpload",generation:{kind:"pack"}};
+    entry.generated_source=null;entry.state="Validating";entry.progress={phase:"generated_cleanup"};
+    window.__MOCK_EMIT__("queue-updated",structuredClone({...queue,revision:++queue.revision}));
+   });
+   assert.doesNotMatch(await page.locator("#dock-summary").innerText(),/Erstelle ZIP vor dem Upload/);
   }
   assert.deepEqual(errors,[]);await page.close();
  }

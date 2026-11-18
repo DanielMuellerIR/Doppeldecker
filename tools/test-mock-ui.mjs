@@ -20,13 +20,6 @@ import { once } from "node:events";
 import { createBrowserCleanup } from "./browser-cleanup.mjs";
 
 const require = createRequire(import.meta.url);
-let playwright;
-try {
-  playwright = require("playwright");
-} catch (error) {
-  throw new Error("Playwright fehlt. Zuerst `pnpm install` und `pnpm exec playwright install chromium` ausführen.", { cause: error });
-}
-
 async function freePort() {
   const probe = createServer();
   probe.listen(0, "127.0.0.1");
@@ -52,25 +45,18 @@ async function waitForServer(url, cleanup) {
   throw new Error("Mock-Server wurde nicht rechtzeitig erreichbar.");
 }
 
-const port = await freePort();
-const baseUrl = `http://127.0.0.1:${port}`;
-const server = spawn("python3", ["tools/mock-ui-server.py", "--port", String(port)], {
-  cwd: new URL("..", import.meta.url),
-  stdio: ["ignore", "pipe", "pipe"],
-});
-let serverStderr = "";
-server.stderr.setEncoding("utf8");
-server.stderr.on("data", chunk => { serverStderr += chunk; });
-const cleanup = createBrowserCleanup(server);
-
+let baseUrl;
 let browser;
+let cleanup;
+let serverStderr = "";
 let failed = false;
-const results = [];
 const caseArguments = process.argv.slice(2);
 // pnpm reicht den üblichen Argumenttrenner `--` an das Skript selbst weiter.
 // Er gehört nicht zum Namensausschnitt; weitere Bindestriche bleiben dagegen
 // unverändert Teil des ausdrücklich angeforderten Filters.
 if (caseArguments[0] === "--") caseArguments.shift();
+const listOnly = caseArguments[0] === "--list";
+if (listOnly) caseArguments.shift();
 const requestedCase = caseArguments.join(" ").trim();
 let matchedRequestedCase = false;
 
@@ -79,6 +65,11 @@ async function runCase(name, query, test) {
   // ausführbar. Ohne Argument läuft unverändert die vollständige Suite.
   if (requestedCase && !name.includes(requestedCase)) return;
   if (requestedCase) matchedRequestedCase = true;
+  if (listOnly) {
+    console.log(name);
+    return;
+  }
+  if (!browser) await startBrowser();
   const context = await browser.newContext({ colorScheme: "light" });
   const page = await context.newPage();
   const browserErrors = [];
@@ -93,13 +84,32 @@ async function runCase(name, query, test) {
     const mockErrors = await page.evaluate(() => window.__DOPPELDECKER_MOCK_ERRORS__ || []);
     assert.deepEqual(mockErrors, [], "Die Mockbrücke meldete Laufzeitfehler.");
     assert.deepEqual(browserErrors, [], "Der Browser meldete Konsolen- oder Seitenfehler.");
-    results.push(`ok  ${name}`);
+    console.log(`ok  ${name}`);
   } catch (error) {
     failed = true;
-    results.push(`FEHLER  ${name}\n${error.stack || error}`);
+    console.error(`FEHLER  ${name}\n${error.stack || error}`);
   } finally {
     await context.close();
   }
+}
+
+async function holdUpdateResponse(page) {
+  await page.evaluate(() => {
+    const invoke = window.__TAURI__.core.invoke;
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    window.__MOCK_RELEASE_UPDATE_RESPONSE__ = async () => {
+      release();
+      await new Promise(resolve => requestAnimationFrame(resolve));
+    };
+    window.__TAURI__.core.invoke = async (command, args) => {
+      const response = await invoke(command, args);
+      if (command === "check_for_update") await gate;
+      return response;
+    };
+    void window.__MOCK_EMIT__("menu", "check_updates");
+  });
+  await page.waitForFunction(() => window.__MOCK_UPDATES__().length === 1);
 }
 
 async function captureNativeSecret(dialog) {
@@ -122,21 +132,37 @@ async function openFtpsConflict(page, theme, key) {
   await page.getByRole("dialog").getByRole("button", { name: "Überspringen", exact: true }).waitFor();
 }
 
-try {
+async function startBrowser() {
+  let playwright;
+  try {
+    playwright = require("playwright");
+  } catch (error) {
+    throw new Error("Playwright fehlt. Zuerst `pnpm install` und `pnpm exec playwright install chromium` ausführen.", { cause: error });
+  }
+  const port = await freePort();
+  baseUrl = `http://127.0.0.1:${port}`;
+  const server = spawn("python3", ["tools/mock-ui-server.py", "--port", String(port)], {
+    cwd: new URL("..", import.meta.url),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  server.stderr.setEncoding("utf8");
+  server.stderr.on("data", chunk => { serverStderr = (serverStderr + chunk).slice(-8192); });
+  cleanup = createBrowserCleanup(server);
   await waitForServer(baseUrl, cleanup);
   const cspResponse = await fetch(baseUrl);
   assert.equal(
     cspResponse.headers.get("content-security-policy"),
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'",
   );
-  results.push("ok  Mock-Server verwendet die produktionsgleiche Content-Security-Policy");
+  console.log("ok  Mock-Server verwendet die produktionsgleiche Content-Security-Policy");
   // Normalerweise verwendet Playwright sein reproduzierbar installiertes Chromium.
   // Entwickler können für einen schnellen lokalen Gegenlauf bewusst einen vorhandenen
   // Chromium-Pfad setzen, ohne ihn in Projektdateien festzuschreiben.
   const executablePath = process.env.DOPPELDECKER_PLAYWRIGHT_EXECUTABLE || undefined;
   browser = await cleanup.launch(playwright.chromium, { headless: true, executablePath });
+}
 
-
+try {
   for (const theme of ["light", "dark"]) {
     await runCase(`Neuordnerrechte exakte große V7-IDs · ${theme}`, "", async page => {
       const fixtureFile = process.env.DOPPELDECKER_TEST_FRONTEND_REPORT_FIXTURE;
@@ -2286,15 +2312,15 @@ try {
     await page.getByText(/Update installiert/).waitFor();
   });
 
-  await runCase("Verspätete Updateantwort wartet hinter einem F2-Dialog", "?update=available&updateDelay=120", async page => {
+  await runCase("Verspätete Updateantwort wartet hinter einem F2-Dialog", "?update=available", async page => {
     const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
     await list.getByRole("option", { name: /Beispiel\.txt/ }).click();
-    await page.evaluate(() => { void window.__MOCK_EMIT__("menu", "check_updates"); });
+    await holdUpdateResponse(page);
     await list.focus();
     await page.keyboard.press("F2");
     const input = page.locator("#modal-input");
     await input.waitFor();
-    await page.waitForTimeout(180);
+    await page.evaluate(() => window.__MOCK_RELEASE_UPDATE_RESPONSE__());
     assert.match(await page.locator("#modal-title").innerText(), /Umbenennen/,
       "Die Updateantwort darf den offenen F2-Dialog nicht verdrängen.");
     await input.fill("nach-update.txt");
@@ -2304,15 +2330,15 @@ try {
     await update.getByRole("button", { name: "Später" }).click();
   });
 
-  await runCase("Verspätete Updateantwort wartet hinter einem Konfliktdialog", "?update=available&updateDelay=120&conflicts=replace", async page => {
+  await runCase("Verspätete Updateantwort wartet hinter einem Konfliktdialog", "?update=available&conflicts=replace", async page => {
     const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
     await list.getByRole("option", { name: /Beispiel\.txt/ }).click();
-    await page.evaluate(() => { void window.__MOCK_EMIT__("menu", "check_updates"); });
+    await holdUpdateResponse(page);
     await list.focus();
     await page.keyboard.press("F5");
     const conflict = page.getByRole("dialog", { name: "Konflikte beim Kopieren" });
     await conflict.waitFor();
-    await page.waitForTimeout(180);
+    await page.evaluate(() => window.__MOCK_RELEASE_UPDATE_RESPONSE__());
     assert.match(await page.locator("#modal-title").innerText(), /Konflikte beim Kopieren/);
     await conflict.getByRole("button", { name: "Überspringen" }).click();
     const update = page.getByRole("dialog", { name: "Update 0.1.124 verfügbar" });
@@ -2322,13 +2348,13 @@ try {
     await update.getByRole("button", { name: "Später" }).click();
   });
 
-  await runCase("Verspätete Updateantwort wartet hinter dem Realmodusdialog", "?update=available&updateDelay=120", async page => {
-    await page.evaluate(() => { void window.__MOCK_EMIT__("menu", "check_updates"); });
+  await runCase("Verspätete Updateantwort wartet hinter dem Realmodusdialog", "?update=available", async page => {
+    await holdUpdateResponse(page);
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
     await page.getByRole("button", { name: "Realmodus" }).click();
     const realMode = page.getByRole("dialog", { name: "Sync ausführen" });
     await realMode.waitFor();
-    await page.waitForTimeout(180);
+    await page.evaluate(() => window.__MOCK_RELEASE_UPDATE_RESPONSE__());
     assert.match(await page.locator("#modal-title").innerText(), /Sync ausführen/);
     await realMode.getByRole("button", { name: "Vorbereitung verwerfen" }).click();
     const update = page.getByRole("dialog", { name: "Update 0.1.124 verfügbar" });
@@ -4538,6 +4564,121 @@ try {
     await page.keyboard.press("Escape");
     await view.waitFor({ state: "hidden" });
     assert.equal(await page.locator(".panes").isVisible(), true);
+  });
+
+  for (const remote of [false, true]) {
+    await runCase(`Sync-Ausschlüsse aktualisieren Vorschau und Bestätigung · ${remote ? "SFTP" : "lokal"}`, "", async page => {
+      await page.setViewportSize({ width: 800, height: 600 });
+      if (remote) await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+      await page.evaluate(() => {
+        const invoke = window.__TAURI__.core.invoke;
+        window.__EXCLUDE_REQUESTS__ = [];
+        window.__TAURI__.core.invoke = async (command, args) => {
+          const result = await invoke(command, args);
+          if (!["plan_sync", "prepare_real_sync", "prepare_content_sync"].includes(command)) return result;
+          const patterns = (args.request || args).options.exclude;
+          window.__EXCLUDE_REQUESTS__.push({ command, patterns });
+          if (patterns.includes("*.keep")) {
+            const plan = result.plan || result;
+            plan.exclusions = { source_count: 0, target_count: 1, source_paths: [], target_paths: ["Ziel & Unterordner/bleibt.keep"] };
+          }
+          return result;
+        };
+        window.__MOCK_EMIT__("menu", "sync_mode");
+      });
+      const field = page.getByRole("textbox", { name: "Dateien und Ordner auslassen" });
+      const preview = page.getByRole("button", { name: "Vorschau laden" });
+      const report = page.locator("#sync-plan-exclusions");
+      await page.locator("#sync-mirror").check();
+      await field.fill("*.keep\n\ncache/**\n Name ");
+      if (remote) await preview.click();
+      await report.locator("summary").click();
+      assert.match(await report.innerText(), /Quelle 0 · Ziel 1.*Treffer im Ziel bleiben erhalten.*Ziel & Unterordner\/bleibt\.keep/s);
+      await field.fill("*.tmp");
+      assert.equal(await report.isVisible(), false);
+      if (remote) await preview.click();
+      await page.waitForFunction(() => window.__EXCLUDE_REQUESTS__.at(-1)?.patterns[0] === "*.tmp");
+      await page.getByLabel("In beide Richtungen", { exact: true }).check();
+      assert.equal(await field.isVisible(), false);
+      await page.getByLabel("Von links nach rechts", { exact: true }).check();
+      assert.equal(await field.inputValue(), "*.tmp");
+      await field.fill("*.keep");
+      await page.locator(remote ? "#btn-sync" : "#btn-real").click();
+      const dialog = page.getByRole("dialog", { name: remote ? "Dateisync ausführen" : "Sync ausführen" });
+      await dialog.locator(".sync-exclusion-report summary").click();
+      await dialog.getByText("Ziel & Unterordner/bleibt.keep", { exact: true }).waitFor();
+      await page.keyboard.press("Escape");
+      const requests = await page.evaluate(() => window.__EXCLUDE_REQUESTS__);
+      assert.ok(requests.some(({ patterns }) => JSON.stringify(patterns) === JSON.stringify(["*.keep", "cache/**", " Name "])));
+      assert.deepEqual(requests.at(-1), { command: remote ? "prepare_content_sync" : "prepare_real_sync", patterns: ["*.keep"] });
+    });
+  }
+
+  await runCase("Gespeicherte Sync-Aufträge öffnen, bearbeiten und frisch planen", "", async page => {
+    await page.evaluate(() => {
+      const invoke = window.__TAURI__.core.invoke;
+      const requests = [];
+      const jobs = [{ id: "job-1", revision: 1, name: "Wöchentlich", direction: "rl",
+        left: { provider: "local", path: "/mock/ablage" }, right: { provider: "local", path: "/mock/ziel" },
+        options: { mode: "Update", compare: "ContentHash", metadata: "Portable", mtime_tolerance: 2, exclude: ["*.keep"] } }];
+      window.__SAVED_JOB_REQUESTS__ = requests;
+      window.__TAURI__.core.invoke = async (command, args) => {
+        if (command === "list_saved_sync_jobs") return structuredClone(jobs);
+        if (command === "save_sync_job") {
+          requests.push({ command, ...args.request });
+          jobs[0] = { ...args.request, revision: 2 };
+          return structuredClone(jobs[0]);
+        }
+        if (command === "plan_sync") requests.push({ command, ...args });
+        return invoke(command, args);
+      };
+      window.__MOCK_EMIT__("menu", "sync_mode");
+    });
+    await page.getByRole("button", { name: "Auftrag öffnen …", exact: true }).click();
+    const open = page.getByRole("dialog", { name: "Gespeicherte Sync-Aufträge" });
+    assert.match(await open.innerText(), /Wöchentlich.*Quelle.*\/mock\/ziel.*Ziel.*\/mock\/ablage/s);
+    await open.getByRole("button", { name: "Auftrag öffnen", exact: true }).click();
+    await page.locator("#sync-job-current").filter({ hasText: "Wöchentlich" }).waitFor();
+    assert.equal(await page.getByLabel("Von rechts nach links", { exact: true }).isChecked(), true);
+    const filter = page.getByRole("textbox", { name: "Dateien und Ordner auslassen" });
+    assert.equal(await filter.inputValue(), "*.keep");
+    await page.waitForFunction(() => window.__SAVED_JOB_REQUESTS__.some(request => request.command === "plan_sync"
+      && request.source === "/mock/ziel" && request.target === "/mock/ablage" && request.options.exclude[0] === "*.keep"));
+    await page.keyboard.press("Escape");
+    const path = page.locator('[data-side="left"] .path');
+    await path.fill("/mock/andere-ablage"); await path.press("Enter");
+    await page.waitForFunction(() => document.querySelector('[data-side="left"] .path')?.title.includes("andere-ablage"));
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+    await filter.fill("*.tmp");
+    await page.getByRole("button", { name: "Auftrag bearbeiten …", exact: true }).click();
+    const edit = page.getByRole("dialog", { name: "Sync-Auftrag bearbeiten" });
+    await edit.getByRole("textbox", { name: "Name", exact: true }).fill("Am Freitag");
+    await edit.getByRole("button", { name: "Änderungen speichern" }).click();
+    await page.locator("#sync-job-current").filter({ hasText: "Am Freitag" }).waitFor();
+    const saved = await page.evaluate(() => window.__SAVED_JOB_REQUESTS__.find(request => request.command === "save_sync_job"));
+    assert.equal(saved.id, "job-1"); assert.equal(saved.revision, 1);
+    assert.equal(saved.left.path, "/mock/andere-ablage"); assert.equal(saved.direction, "rl");
+    assert.deepEqual(saved.options.exclude, ["*.tmp"]);
+  });
+
+  await runCase("Gespeicherte Sync-Aufträge starten bei fehlendem Ordner keine Planung", "", async page => {
+    await page.evaluate(() => {
+      const invoke = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = (command, args) => {
+        if (command === "list_saved_sync_jobs") return Promise.resolve([{ id: "job-1", revision: 1, name: "Fehlender Ordner", direction: "lr",
+          left: { provider: "local", path: "/mock/vorgesehen" }, right: { provider: "local", path: "/mock/fehlt" },
+          options: { mode: "AddOnly", compare: "SizeAndTime", metadata: "Portable", mtime_tolerance: 2 } }]);
+        if (command === "scan_dir" && args.path === "/mock/fehlt") return Promise.reject({ code: "not_found", message: "Ordner wurde entfernt" });
+        return invoke(command, args);
+      };
+      window.__MOCK_EMIT__("menu", "sync_mode");
+    });
+    await page.getByRole("button", { name: "Auftrag öffnen …", exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Auftrag öffnen", exact: true }).click();
+    await page.locator("#dock-summary").filter({ hasText: /Rechter Ordner.*Ordner wurde entfernt/ }).waitFor();
+    assert.equal(await page.locator("#sync-view").isVisible(), false);
+    assert.equal(await page.locator('[data-side="left"] .path').inputValue(), "/mock/quelle");
+    assert.equal(await page.locator('[data-side="right"] .path').inputValue(), "/mock/ziel");
   });
 
   await runCase("Sync ignoriert alte Planantwort nach Optionswechsel", "", async page => {
@@ -7570,6 +7711,143 @@ try {
     await page.waitForFunction(() => document.documentElement.dataset.realConfirmation === "true");
   });
 
+  for (const [provider, name, message] of [
+    ["webdav", "WebDAV", "Der WebDAV-Server liefert keinen bedingten Bytebereich."],
+    ["ftps", "FTPS", "Fortsetzen braucht verifiziertes FTPS mit REST STREAM und HASH SHA-256."],
+    ["sftp", "SFTP", "SFTP-Server liefert keinen SHA-256-Beleg für offene Dateien."],
+  ]) await runCase(`Fortsetzbare Kopie reicht den gewählten ${name}-Profilbeleg ein`, "?webdavUpload=1&remoteFile=1", async page => {
+    await page.evaluate(message => {
+      const invoke = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = (command, args) => {
+        if (command !== "enqueue_resumable_copy") return invoke(command, args);
+        window.__RESUME_REMOTE_REQUEST__ = args;
+        throw { code: "unsupported", message };
+      };
+    }, message);
+    const left = page.getByRole("listbox", { name: "Linke Dateiliste" });
+    await left.click();
+    await page.locator(`#connection-list [data-protocol="${provider}"][data-id="mock_${provider}"]`).click();
+    await left.getByRole("option", { name: /remote\.txt/ }).click();
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "resumable_copy"));
+    await page.locator("#dock-summary").getByText(message).waitFor();
+    const args = await page.evaluate(() => window.__RESUME_REMOTE_REQUEST__);
+    assert.equal(args.remoteSource.provider, provider);
+    assert.equal(args.remoteSource.profileId, `mock_${provider}`);
+    assert.equal(typeof args.remoteSource.profileRevision, "number");
+    assert.equal(args.remoteSource.root, args.sourceRoot);
+    assert.equal(args.targetRoot, "/mock/ziel");
+    assert.equal(args.sourcePaths.length, 1);
+  });
+
+  await runCase("Fortsetzbare Kopie zeigt während des SFTP-Laufs den Pauseknopf", "", async page => {
+    await page.evaluate(() => {
+      const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
+      queue.entries = [{
+        operation_id: "sftp-teilkopie",
+        state: "Validating",
+        attempts: 1,
+        progress: {},
+        operation: {
+          type: "ResumableCopy",
+          plan: { sftp: {}, source: "/probe.bin", target: "/mock/ziel/probe.bin", bytes: 16384 },
+        },
+      }];
+      queue.revision += 1;
+      window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
+    });
+    await page.getByRole("button", { name: "Kopie pausieren", exact: true }).waitFor();
+    await page.locator("#dock-summary").getByText("Fortsetzbarer SFTP-Download …", { exact: true }).waitFor();
+  });
+
+  await runCase("Fortsetzbare Kopie übernimmt die Tastatur-Mehrfachauswahl gemeinsam", "?keyboard=1", async page => {
+    await page.evaluate(() => {
+      const invoke = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = (command, args) => {
+        if (command !== "enqueue_resumable_copy") return invoke(command, args);
+        window.__RESUMABLE_MULTI_CALLS__ ??= [];
+        window.__RESUMABLE_MULTI_CALLS__.push(args);
+        return Promise.resolve(["part-1", "part-2"]);
+      };
+    });
+    const list = page.getByRole("listbox", { name: "Linke Dateiliste" });
+    await list.getByRole("option", { name: /Alpha\.txt/ }).click();
+    await page.keyboard.press("Shift+ArrowDown");
+    await page.keyboard.press("Shift+F10");
+    await page.getByRole("menuitem", { name: "Dateiinhalt fortsetzbar kopieren" }).click();
+    await page.locator("#dock-summary").getByText(/2 Dateien eingereiht/).waitFor();
+    assert.deepEqual(await page.evaluate(() => window.__RESUMABLE_MULTI_CALLS__), [{
+      sourceRoot: "/mock/quelle", sourcePaths: ["/mock/quelle/Alpha.txt", "/mock/quelle/Beta.txt"], targetRoot: "/mock/ziel",
+    }]);
+    assert.equal(await list.evaluate(node => document.activeElement === node), true);
+  });
+
+  await runCase("Fortsetzbare Kopie zeigt gesicherte Bytes und schützt Verwerfen", "", async page => {
+    await page.evaluate(() => {
+      const invoke = window.__TAURI__.core.invoke;
+      const state = window.__DOPPELDECKER_MOCK_QUEUE__;
+      const context = { operationId: "teilkopie-probe", attempt: 1,
+        operationKind: "resumable_copy", affectedEndpoints: [] };
+      const emit = () => window.__MOCK_EMIT__("queue-updated", structuredClone(state));
+      window.__RESUME_COPY_CALLS__ = [];
+      window.__TAURI__.core.invoke = async (command, args) => {
+        if (["enqueue_resumable_copy", "cancel_sync", "retry_queue_entry", "discard_resumable_copy"].includes(command)) {
+          window.__RESUME_COPY_CALLS__.push({ command, args });
+        }
+        if (command === "enqueue_resumable_copy") {
+          state.entries = [{
+            operation_id: context.operationId, attempts: 1, state: "Running",
+            progress: { phase: "copy", bytes_done: 0, bytes_total: 16384 },
+            operation: { type: "ResumableCopy", plan: { source: args.sourcePaths[0],
+              target: args.targetRoot + "/Beispiel.txt", bytes: 16384 } },
+          }];
+          window.__MOCK_EMIT__("operation-context", context);
+          emit();
+          return [context.operationId];
+        }
+        if (command === "cancel_sync") {
+          const entry = state.entries[0];
+          entry.state = "Interrupted";
+          entry.progress = { phase: "resumable_paused", bytes_done: 8192, bytes_total: 16384 };
+          entry.operation.checkpoint = { phase: "bytes", written: 8192 };
+          emit();
+          window.__MOCK_EMIT__("fileop-done", { ...context, cancelled: true, files: 0, bytes: 8192 });
+          return null;
+        }
+        if (command === "discard_resumable_copy") {
+          const entry = state.entries[0];
+          entry.state = "Cancelled";
+          entry.progress = { phase: "resumable_discarded" };
+          delete entry.operation.checkpoint;
+          emit();
+          return structuredClone(state);
+        }
+        return invoke(command, args);
+      };
+    });
+    const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
+    await list.getByRole("option", { name: /Beispiel\.txt/ }).click();
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "resumable_copy"));
+    await page.getByRole("button", { name: "Kopie pausieren" }).click();
+    await page.getByRole("button", { name: "Fortsetzbare Kopie anzeigen" }).click();
+    const row = page.locator('[data-queue-id="teilkopie-probe"]');
+    assert.match(await row.innerText(), /pausiert[\s\S]*Gesichert: (8,2 KB von 16 KB|8,0 KiB von 16 KiB)/);
+    assert.equal(await row.getByRole("button", { name: "Fortsetzen", exact: true }).evaluate(button => document.activeElement === button), true);
+    const discard = row.getByRole("button", { name: "Teilkopie verwerfen …" });
+    await discard.click();
+    await page.keyboard.press("Escape");
+    await discard.waitFor();
+    assert.equal(await discard.evaluate(button => document.activeElement === button), true);
+    assert.deepEqual(await page.evaluate(() => window.__RESUME_COPY_CALLS__.map(({ command }) => command)),
+      ["enqueue_resumable_copy", "cancel_sync"]);
+    await discard.click();
+    await page.getByRole("button", { name: "Teilkopie löschen" }).click();
+    await row.getByText(/Teilkopie verworfen/).waitFor();
+    assert.equal(await row.getByRole("button").count(), 0);
+    const calls = await page.evaluate(() => window.__RESUME_COPY_CALLS__);
+    assert.deepEqual(calls[0].args.sourcePaths, [calls[0].args.sourceRoot + "/Beispiel.txt"]);
+    assert.deepEqual(calls.at(-1), { command: "discard_resumable_copy", args: { operationId: "teilkopie-probe" } });
+  });
+
   await runCase("Queue-Pause, Driftwirkung und Entfernen", "", async page => {
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
     await page.locator("#btn-sync-simulate").click();
@@ -8286,16 +8564,60 @@ try {
     ]);
   });
 
+  await runCase("Wiederherstellung führt den geprüften Auftrag in der Fensterqueue auf", "?quarantineData=1", async page => {
+    await page.setViewportSize({ width: 395, height: 710 });
+    await page.evaluate(() => {
+      const entry = {
+        operation_id: "review-copy", operation: { type: "File", kind: "Copy", items: ["/mock/quelle/Alpha.txt"], destination: "/mock/ziel" },
+        state: "Interrupted", error_code: "outcome_unclear", progress: {}, attempts: 1,
+      };
+      const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
+      queue.paused = true;
+      queue.entries = [entry];
+      queue.revision += 1;
+      const original = window.__TAURI__.core.invoke;
+      window.__RECOVERY_CALLS__ = [];
+      window.__TAURI__.core.invoke = async (command, args) => {
+        window.__RECOVERY_CALLS__.push(command);
+        if (command !== "inspect_recovery") return original(command, args);
+        return {
+          queue: [{ reason: "outcome_unclear", entry }],
+          trash: { Ok: [{ name: "trash-probe.json", entry_count: null, error: "Prüfjournal nicht lesbar" }] },
+        };
+      };
+    });
+    await page.locator("#btn-queue").click();
+    await page.getByRole("button", { name: "Wiederherstellung …" }).press("Enter");
+    const recovery = page.getByRole("dialog", { name: "Wiederherstellung", exact: true });
+    await recovery.getByText("Wirkung ungeklärt", { exact: true }).waitFor();
+    await recovery.getByText("trash-probe.json", { exact: true }).waitFor();
+    await recovery.getByText("run-1", { exact: true }).waitFor();
+    assert.equal(await recovery.evaluate(element => element.scrollWidth <= element.clientWidth), true);
+    await page.keyboard.press("Escape");
+    assert.equal(await page.locator("#btn-queue").evaluate(element => element === document.activeElement), true);
+
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "recovery"));
+    await recovery.getByRole("button", { name: "Auftrag öffnen", exact: true }).press("Enter");
+    const row = page.locator('#queue-popover [data-queue-id="review-copy"]');
+    await row.waitFor();
+    assert.equal(await row.getByRole("button", { name: "Neu prüfen", exact: true }).count(), 0);
+    assert.equal(await row.evaluate(element => element.contains(document.activeElement)), true);
+    assert.ok((await page.evaluate(() => window.__RECOVERY_CALLS__)).every(command =>
+      ["inspect_recovery", "list_operation_queue", "list_quarantine_runs"].includes(command)));
+  });
+
   await runCase("Nur die neueste langsame Quarantäne-Navigation darf rendern", "?quarantineRace=1", async page => {
     await page.locator("#btn-quarantine").click();
     const root = page.getByRole("dialog", { name: "Quarantäne" });
     await root.waitFor();
     const buttons = root.getByRole("button", { name: "Anzeigen" });
     await buttons.nth(0).click();
+    await page.waitForFunction(() => window.__MOCK_REQUEST_PHASES__().quarantineRace?.phase === "pending");
     await buttons.nth(1).click();
     const latest = page.getByRole("dialog", { name: "Quarantäne · run-schnell" });
     await latest.waitFor();
-    await page.waitForTimeout(200);
+    await page.evaluate(() => window.__MOCK_RELEASE_REQUEST__("quarantineRace"));
+    await page.waitForFunction(() => window.__MOCK_REQUEST_PHASES__().quarantineRace?.phase === "returned");
     assert.equal(await page.locator("#modal-title").innerText(), "Quarantäne · run-schnell");
     assert.match(await latest.innerText(), /run-schnell\.txt/);
     assert.doesNotMatch(await latest.innerText(), /run-langsam\.txt/);
@@ -8930,6 +9252,20 @@ try {
     assert.equal(await page.locator('#connection-list [data-protocol="smb"][data-id="mock_smb"]').count(), 1);
   });
 
+  await runCase("Gespeicherte Verbindungen sind per Tastatur erreichbar und fokussieren die Dateiliste", "", async page => {
+    const shortcut = await page.evaluate(() => /Mac/.test(navigator.platform) ? "Meta+k" : "Control+k");
+    const target = page.getByRole("listbox", { name: "Rechte Dateiliste" });
+    await target.click();
+    await page.keyboard.press(shortcut);
+    const profile = page.getByRole("button", { name: "Mock-SFTP öffnen", exact: true });
+    assert.equal(await profile.evaluate(element => document.activeElement === element), true);
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Rechte Dateiliste");
+    assert.match(await page.locator('[data-side="right"] .path').getAttribute("title"), /SFTP · Mock-SFTP/);
+    await page.evaluate(() => window.__MOCK_EMIT__("menu", "saved_connections"));
+    assert.equal(await profile.evaluate(element => document.activeElement === element), true);
+  });
+
   await runCase("Ein Verbindungs-Plus wählt das Protokoll vor dem Editor", "", async page => {
     const editors = [
       ["sftp", "SFTP-Verbindung hinzufügen", /keine Anmeldung/],
@@ -9378,10 +9714,9 @@ try {
     await page.locator("#queue-count").filter({ hasText: "1" }).waitFor();
   });
 } finally {
-  await cleanup.close();
+  await cleanup?.close();
 }
 
-for (const result of results) console.log(result);
 if (requestedCase && !matchedRequestedCase) {
   console.error(`Kein UI-Test enthält „${requestedCase}“ im Namen.`);
   process.exitCode = 1;

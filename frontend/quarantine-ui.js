@@ -49,6 +49,7 @@ export function createQuarantineUi({
     return current.targetPane.provider !== "local"
       ? Object.freeze({
         remote: true,
+        targetName: current.targetPane.profileName || current.targetPane.provider.toUpperCase(),
         capabilities: quarantineCapabilities(current.targetPane),
         endpoint: Object.freeze({
           provider: current.targetPane.provider,
@@ -441,12 +442,38 @@ export function createQuarantineUi({
     return openRun(run, parentToken, boundScope);
   }
 
+  async function inspection() {
+    const scope = currentScope();
+    const target = scope.remote ? `${scope.targetName} · ${scope.endpoint.root}` : scope.target;
+    if (scope.remote && !scope.capabilities.listing) {
+      return { target, message: "Für dieses Ziel ist keine Quarantäne verfügbar." };
+    }
+    if (!target) return { message: "Kein Zielordner geöffnet." };
+    const runs = await call(scope, "list_quarantine_runs", "list_provider_quarantine_runs");
+    if (!sameScope(scope, currentScope())) return { message: "Das Ziel hat gewechselt. Bitte aktualisieren." };
+    const reviews = runs.flatMap(run => {
+      const available = recoveryCounts([run]);
+      if (available.automatic || available.manual || run.items_available
+          || ["crash_recovery", "purge_recovery"].includes(run.status)) {
+        return [{ id: run.id, label: runStatusLabel(run.status), available }];
+      }
+      return [];
+    });
+    return {
+      target,
+      runs: reviews,
+      open: () => sameScope(scope, currentScope()) && open(null, scope),
+      current: () => sameScope(scope, currentScope()),
+    };
+  }
+
   function setRetentionDays(days) {
     retentionDays = days || 30;
   }
 
   return {
     closeModal: closeSpecialModal,
+    inspection,
     open,
     invalidateBadge,
     refreshBadge,

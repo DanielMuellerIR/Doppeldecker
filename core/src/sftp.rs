@@ -43,6 +43,9 @@ mod interactive_read;
 mod interactive_size;
 #[path = "sftp_write.rs"]
 mod interactive_write;
+pub(crate) use interactive_read::{
+    ensure_resume_profile_current, BoundSftpResume, SftpFileVersion,
+};
 pub use interactive_read::{validate_interactive_content_selection, SFTP_CONTENT_READ_LIMITATION};
 pub use interactive_size::SFTP_DIRECTORY_SIZE_LIMITATION;
 pub use interactive_write::{

@@ -139,6 +139,7 @@ fn source_reader_binds_descriptor_and_fresh_version() {
     let source = Source::bind(dir.path(), Path::new("a.zip"), &Cancel::new()).unwrap();
     let cancel = Cancel::new();
     let reader = BoundedReader {
+        expanded_tar: None,
         source,
         cancel,
         bytes: Cell::new(0),
@@ -463,7 +464,7 @@ fn zip64_sparse_extension_does_not_consume_archive_sized_resources() {
     )
     .unwrap();
     assert!(archive.is_complete());
-    assert!(archive.archive.get_ref().bytes.get() < 1024 * 1024);
+    assert!(archive.storage.reader().bytes.get() < 1024 * 1024);
     assert_eq!(read(&mut archive, 0).unwrap(), b"payload");
 }
 
@@ -512,7 +513,7 @@ fn source_change_from_sink_is_caught_before_verified_success() {
     assert_eq!(crate::error_code(&error), ErrorCode::PlanDrift);
     assert_eq!(
         error.to_string(),
-        "ZIP-Quelle wurde geändert oder ausgetauscht"
+        "Archivquelle wurde geändert oder ausgetauscht"
     );
 }
 
@@ -528,7 +529,7 @@ fn directory_source_is_rejected_before_visiting_unreadable_children() {
     std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
     let error = result.err().expect("Ordner ist keine ZIP-Dateiquelle");
     assert_eq!(crate::error_code(&error), ErrorCode::InvalidData);
-    assert_eq!(error.to_string(), "ZIP-Quelle ist keine reguläre Datei");
+    assert_eq!(error.to_string(), "Archivquelle ist keine reguläre Datei");
 }
 
 #[test]

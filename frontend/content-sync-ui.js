@@ -4,6 +4,7 @@ import { directoryDaclEffectsHtml } from "./directory-dacl-effects.js";
 import { directoryStreamEffectsHtml } from "./directory-stream-effects.js";
 import { hideModal, showOwnedModal } from "./modal.js";
 import { metadataClassLabels as metadataLabels } from "./metadata-labels.js";
+import { syncExclusionReportHtml } from "./plan-view.js";
 import { $, escapeHtml, fmtTransferBytes } from "./ui-utils.js";
 
 export function identityDisplay(root) {
@@ -57,6 +58,7 @@ export function confirmContentSync(preview) {
       `<p>Dieser Lauf verändert Dateien. Wurzeln und Bestand werden vor der Wirkung erneut geprüft.</p>` +
       `<div class="real-grid">${root("Quelle", preview.source_provider, preview.source_identity, preview.source_root)}${root("Ziel", preview.target_provider, preview.target_identity, preview.target_root)}</div>` +
       `<p>${plan.copy_count} neu · ${plan.update_count} ersetzen · ${plan.delete_count} entfernen · ${fmtTransferBytes(plan.bytes_to_transfer || 0)} übertragen.</p>` +
+      syncExclusionReportHtml(plan) +
       (savedReplacements || savedRemovals ? `<div class="real-card"><strong>Doppeldecker-Quarantäne</strong><p>${savedReplacements} vorhandene Dateiversion(en) werden vor dem Ersetzen gesichert. ${savedRemovals} zusätzliche Zieleinträge werden wiederherstellbar in die Quarantäne verschoben.</p>${preview.quarantine_run ? `<small>Lauf: <code>${escapeHtml(preview.quarantine_run)}</code></small>` : ""}</div>` : "") +
       (replacements ? `<p class="real-warning"><strong>${replacements} vorhandene Dateiversion(en) werden dauerhaft ersetzt. Keine Doppeldecker-Quarantäne und keine automatische Wiederherstellung.</strong></p>` : "") +
       (removals ? `<p class="real-warning"><strong>${removals} Einträge (${fmtTransferBytes(preview.irreversible_removal_bytes ?? plan.delete_bytes ?? 0)}) werden dauerhaft entfernt. Keine Doppeldecker-Quarantäne und keine automatische Wiederherstellung.</strong></p>` : "") +

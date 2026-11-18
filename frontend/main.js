@@ -33,12 +33,14 @@ import { byteUnitsMode, initByteUnits, setByteUnits } from "./byte-units.js";
 import { initTheme, setTheme, themePreference } from "./theme.js";
 import { createPlanView } from "./plan-view.js";
 import { createQueueUi } from "./queue-ui.js";
+import { createRecoveryUi } from "./recovery-ui.js";
 import { createQuarantineUi } from "./quarantine-ui.js";
 import { createRemoteEditUi } from "./remote-edit-ui.js";
 import { createRealModeUi } from "./real-mode-ui.js";
 import { initSidebarSections } from "./sidebar-sections.js";
 import { initSplitter } from "./splitter.js";
 import { createSyncView } from "./sync-view.js";
+import { createSyncJobsUi } from "./sync-jobs-ui.js";
 import { createSettingsUi } from "./settings-ui.js";
 import { createUpdateUi } from "./update-ui.js";
 import { localFolderSizesEnabled } from "./view-options.js";
@@ -541,8 +543,10 @@ const recoverBidirectionalQueueEntry = entry => bidirectionalUi.recoverQueueEntr
 
 const {
   applySnapshot: applyQueueSnapshot,
+  close: closeQueueManager,
   open: openQueueManager,
   refresh: refreshQueue,
+  settleGeneratedSource,
   warnBeforeExit: warnBeforeQueueExit,
 } = createQueueUi({
   closeModal: closeQuarantineModal,
@@ -555,7 +559,17 @@ const {
   startFileProgress: startOpUi,
   startSyncProgress: startProgressUi,
   resumeGeneratedUpload: entry => fileActions.resumeGeneratedUpload(entry),
-  showGeneratedSource: path => setPaneLocation(activeSide, { provider: "local", path }),
+  showGeneratedSource: (operationId, path) => paneController.showGeneratedSource(activeSide, operationId, path),
+  closeCleanedGeneratedSources: paneController.closeCleanedGeneratedSources,
+});
+
+const recoveryUi = createRecoveryUi({
+  openQueue: openQueueManager,
+  inspectQuarantine: quarantineUi.inspection,
+});
+$("#queue-recovery").addEventListener("click", () => {
+  closeQueueManager();
+  recoveryUi.open();
 });
 
 // Ein einziger Handler am Container statt eines Handlers je Meldung: `showDock`
@@ -581,6 +595,7 @@ const contextMenu = createContextMenu({
   batchRename: showBatchRename,
   addFavorite,
   transfer: transferToOther,
+  resumableCopy: fileActions.resumableCopy,
   duplicate: duplicateSelection,
   archivePack: archivePackSelection,
   archiveExtract: archiveExtractSelection,
@@ -610,6 +625,7 @@ const { onKeyDown, onMenu } = createInputController({
   clearSelection,
   checkForUpdates: updateUi.check,
   compareFiles,
+  focusConnections: connectionsUi.focusProfiles,
   focusPath,
   forward,
   goHome,
@@ -625,6 +641,7 @@ const { onKeyDown, onMenu } = createInputController({
   showArchiveRead,
   showBatchRename,
   openQuarantineManager,
+  openRecovery: recoveryUi.open,
   optionId,
   pageSize,
   paneRowHeight,
@@ -646,6 +663,7 @@ const { onKeyDown, onMenu } = createInputController({
   syncView,
   toggleHidden,
   transferToOther,
+  resumableCopy: fileActions.resumableCopy,
   duplicateSelection,
   archivePackSelection,
   archiveExtractSelection,
@@ -658,7 +676,10 @@ const remoteEditUi = createRemoteEditUi({ showDock, showError, refreshQueue });
 const eventController = createEventController({
   onRemoteOpened: snapshot => remoteEditUi.onOpened(snapshot),
   onOperationContext: context => fileClipboard.onContext(context),
-  onFileOperationDone: (summary, failed) => fileClipboard.onDone(summary, failed),
+  onFileOperationDone: (summary, failed) => {
+    if (!failed) settleGeneratedSource(summary.operationId);
+    fileClipboard.onDone(summary, failed);
+  },
   acceptOperationEvent,
   bindOperationContext,
   startFileProgress: startOpUi,
@@ -711,6 +732,85 @@ function remoteSyncContext() {
 function syncOptions() {
   return syncView.options();
 }
+
+function captureSyncJob() {
+  const direction = syncView.direction();
+  if (direction === "both") return null;
+  function endpoint({ provider, profileId, path, navigationPending }) {
+    if (navigationPending || !path || (provider !== "local" && !profileId)) {
+      throw new Error("Wählen Sie in beiden Dateiansichten einen Ordner.");
+    }
+    return provider === "local" ? { provider, path } : { provider, profileId, path };
+  }
+  return { left: endpoint(panes.left), right: endpoint(panes.right), direction, options: syncOptions() };
+}
+
+function loadSyncJobLocation(side, location) {
+  const pane = panes[side];
+  if (pane.provider === location.provider && (pane.profileId || null) === (location.profileId || null)
+    && pane.profileRevision === (location.profileRevision ?? null)) {
+    return loadPane(side, location.path, { preserveView: true, throwOnError: true });
+  }
+  return setPaneLocation(side, location, { throwOnError: true });
+}
+
+async function openSyncJob(job) {
+  const sides = ["left", "right"];
+  const sideLabel = side => side === "left" ? "Linker Ordner" : "Rechter Ordner";
+  const locations = sides.map(side => {
+    const endpoint = job[side];
+    if (endpoint.provider === "local") return endpoint;
+    const profile = connectionsUi.profileLocation(endpoint.provider, endpoint.profileId);
+    if (!profile || profile.unavailable) {
+      throw new Error(`${sideLabel(side)} · ${profile ? "Verbindungsprofil wird gerade aktualisiert." : "Das gespeicherte Verbindungsprofil fehlt."}`);
+    }
+    return { ...profile, path: endpoint.path };
+  });
+  const finish = beginActivity("sync-job-open");
+  if (!finish) return false;
+  const previous = sides.map(side => paneStartLocation(panes[side]));
+  syncView.close({ restoreFocus: false });
+  let failure = null;
+  try {
+    const results = await Promise.allSettled(sides.map((side, i) => loadSyncJobLocation(side, locations[i])));
+    const failed = results.findIndex(result => result.status !== "fulfilled" || !result.value);
+    if (failed !== -1) {
+      const result = results[failed];
+      const error = result.status === "rejected" ? result.reason : new Error("Der Ordner wurde zwischenzeitlich gewechselt.");
+      failure = { code: errCode(error), message: `${sideLabel(sides[failed])} · ${errText(error)}` };
+      // Die Ladeversuche sind abgeschlossen. Einen gleichzeitig geänderten Remote-
+      // Eintrag darf die Rückkehr nicht mit einer alten Profilrevision erneut öffnen.
+      await Promise.allSettled(sides.map((side, i) => {
+        const location = previous[i];
+        if (!location.path) return;
+        const profile = location.provider === "local" ? null : connectionsUi.profileLocation(location.provider, location.profileId);
+        if (location.provider !== "local" && profile?.profileRevision !== location.profileRevision) return;
+        return loadSyncJobLocation(side, location);
+      }));
+    }
+  } finally {
+    finish();
+  }
+  if (failure) {
+    $(".pane.active .listing")?.focus();
+    throw failure;
+  }
+  syncView.reopenForJob(job);
+  return true;
+}
+
+const syncJobsUi = createSyncJobsUi({
+  capture: captureSyncJob,
+  load: openSyncJob,
+  describeEndpoint: endpoint => {
+    if (endpoint.provider === "local") return endpoint.path;
+    const profile = connectionsUi.profileLocation(endpoint.provider, endpoint.profileId);
+    return `${profile?.profileName || endpoint.provider.toUpperCase()} · ${endpoint.path}`;
+  },
+  running: isRunning,
+  showError,
+  showDock,
+});
 
 // Nur sichtbaren Bedienzustand binden; ausführbare Pläne und Permits bleiben im
 // Backend. Die Zähler erkennen auch Weg-und-zurück-Navigation und erneut geöffnete
@@ -841,6 +941,7 @@ async function init() {
     sync: doSync,
     simulate: () => oneWaySyncUi.run({ simulate: true }),
   });
+  syncJobsUi.wire();
   initTheme();
   // Eine schmalere Seitenleiste macht die Panes breiter: Die Listen müssen neu
   // gezeichnet werden, damit das Datumsformat der neuen Spaltenbreite folgt.
@@ -855,11 +956,17 @@ async function init() {
     // Die Sitzungsdatei enthält je Remote-Endpunkt nur Protokoll, Profil-ID,
     // Revision und Pfad. Der Profilname wird beim Start ohnehin aus dem Profil
     // aufgelöst und würde in der Datei nach einer Umbenennung nur veralten.
-    currentWindow: () => ({
-      panes: { left: paneSessionLocation(panes.left), right: paneSessionLocation(panes.right) },
-      tabs: paneController.tabsSnapshot(),
-      activeSide,
-    }),
+    currentWindow: () => {
+      const tabs = paneController.tabsSnapshot();
+      const locations = Object.fromEntries(["left", "right"].map(side => {
+        const saved = tabs[side];
+        const pane = panes[side];
+        const active = saved?.tabs.find(tab => tab.id === saved.activeId);
+        const location = active && saved.activeId !== pane.tabs.active.id ? active.location : pane;
+        return [side, paneSessionLocation(location)];
+      }));
+      return { panes: locations, tabs, activeSide };
+    },
     legacyPreferences: () => ({
       theme: themePreference(),
       byteUnits: byteUnitsMode(),

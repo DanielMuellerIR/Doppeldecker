@@ -167,6 +167,41 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
       beginAction([source, target]));
   }
 
+  async function resumableCopy(side = activeSide()) {
+    if (enqueueBlocked()) return;
+    const source = paneScope(side);
+    const target = paneScope(side === "left" ? "right" : "left");
+    const entries = selectedEntries(side);
+    const remoteProtocol = { webdav: "WebDAV", ftps: "FTPS", sftp: "SFTP" }[source.provider];
+    if (!(source.provider === "local" || remoteProtocol) || target.provider !== "local"
+      || !entries.length || entries.some(entry => !entry.is_file || entry.is_symlink)) {
+      showDock('<span class="pill none">Fortsetzbar kopieren</span>Wähle reguläre Dateien lokal, über WebDAV, FTPS oder SFTP. Öffne im anderen Pane einen lokalen Zielordner.', { closable: true });
+      return;
+    }
+    if (!safeSelectedEntries(side, "Fortsetzbares Kopieren").length) return;
+    if (remoteProtocol) {
+      const check = source.provider !== "webdav"
+        ? "Der Server berechnet die Prüfsumme der gesamten Datei."
+        : "Die Dateiversion und ein kurzer Bytebereich werden geprüft.";
+      showDock(`<span class="pill copy">${remoteProtocol} · Fortsetzbarer Download</span> ${check}`, { closable: true });
+    }
+    const revision = dockRevision();
+    try {
+      await invoke("enqueue_resumable_copy", {
+        sourceRoot: source.path,
+        sourcePaths: entries.map(entry => joinPath(source.path, entry.name)),
+        targetRoot: target.path,
+        ...(remoteProtocol ? { remoteSource: paneEndpoint(source) } : {}),
+      });
+      if (revision === dockRevision()) {
+        const selection = entries.length === 1 ? "Eine Datei" : `${entries.length} Dateien`;
+        showDock(`<span class="pill copy">Fortsetzbare Kopie</span>${selection} eingereiht.`, { closable: true });
+      }
+    } catch (error) {
+      showError("Kopieren", error);
+    }
+  }
+
   function captureDrag(side, index) {
     const pane = panes[side];
     const entries = pane.sel.has(index) ? selectedEntries(side) : [pane.entries[index]];
@@ -772,6 +807,7 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
   }
 
   return {
+    resumableCopy,
     resumeGeneratedUpload,
     capturePasteTarget: paneScope,
     pastePaths,

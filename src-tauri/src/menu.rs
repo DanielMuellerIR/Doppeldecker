@@ -122,9 +122,10 @@ pub(crate) fn build_menu<R: tauri::Runtime>(
     let commands = SubmenuBuilder::new(app, "Befehle")
         .text("duplicate", shortcut_label("Duplizieren", "⌘D", "Strg+D"))
         .text("archive_pack", "ZIP-Archiv erstellen …")
-        .text("archive_extract", "ZIP entpacken …")
-        .text("archive_read", "ZIP-Inhalt anzeigen …")
+        .text("archive_extract", "Archiv entpacken …")
+        .text("archive_read", "Archivinhalt anzeigen …")
         .text("copy_over", "Ins andere Pane kopieren  (F5)")
+        .text("resumable_copy", "Dateiinhalt fortsetzbar kopieren")
         .text("move_over", "Ins andere Pane verschieben  (F6)")
         .text("rename", "Umbenennen  (F2)")
         .text("batch_rename", "Stapelumbenennen …")
@@ -148,8 +149,13 @@ pub(crate) fn build_menu<R: tauri::Runtime>(
             "goto",
             shortcut_label("Gehe zu Ordner…", "⌘⇧G", "Strg+Umschalt+G"),
         )
+        .text(
+            "saved_connections",
+            shortcut_label("Gespeicherte Verbindungen", "⌘K", "Strg+K"),
+        )
         .separator()
         .text("quarantine", "Quarantäne…")
+        .text("recovery", "Wiederherstellung …")
         .build()?;
 
     let window = SubmenuBuilder::new(app, "Fenster")

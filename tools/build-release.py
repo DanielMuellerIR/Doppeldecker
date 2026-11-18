@@ -607,25 +607,33 @@ def repack_and_sign_macos_updater(
     Erst das fertige App-Bundle samt Ticket wird in eine temporäre TAR-Gzip-Datei
     gepackt, atomar an den Zielnamen gesetzt und danach neu signiert.
     """
+    runner = run_command or subprocess.run
+    archive = app.parent / f"{app.name}.tar.gz"
+    updater_signature_path(archive).unlink(missing_ok=True)
+    pack_macos_updater(app, archive, run_command=runner)
+    sign_update_artifact(archive, environment, run_command=runner)
+    return archive
+
+
+def pack_macos_updater(app: Path, archive: Path, *, run_command=None) -> None:
     if not app.is_dir():
         raise SystemExit(f"Updater-Quelle fehlt: {app}")
     runner = run_command or subprocess.run
-    archive = app.parent / f"{app.name}.tar.gz"
     temporary = archive.with_name(f".{archive.name}.tmp")
-    updater_signature_path(archive).unlink(missing_ok=True)
     temporary.unlink(missing_ok=True)
     try:
+        # Der Tauri-Updater extrahiert mit Rust tar und interpretiert Apples
+        # ._Doppeldecker.app als Bundle-Eintrag. Das Ticket liegt in Contents.
         runner(
             ("tar", "-czf", str(temporary), "-C", str(app.parent), app.name),
+            env={**os.environ, "COPYFILE_DISABLE": "1"},
             check=True,
         )
         if not temporary.is_file() or temporary.stat().st_size == 0:
             raise SystemExit("Das neu gepackte macOS-Updaterarchiv ist leer oder fehlt.")
         os.replace(temporary, archive)
-        sign_update_artifact(archive, environment, run_command=runner)
     finally:
         temporary.unlink(missing_ok=True)
-    return archive
 
 
 def verify_macos_updater_archive(
@@ -653,8 +661,13 @@ def verify_macos_updater_archive(
         raise SystemExit("macOS-Updaterarchiv ist leer.")
     for name in listing:
         parts = Path(name).parts
-        if name.startswith("/") or ".." in parts:
-            raise SystemExit(f"macOS-Updaterarchiv enthält einen unsicheren Pfad: {name}")
+        if (
+            not parts
+            or parts[0] != "Doppeldecker.app"
+            or ".." in parts
+            or any(part.startswith("._") for part in parts)
+        ):
+            raise SystemExit(f"macOS-Updaterarchiv enthält einen unzulässigen Eintrag: {name}")
 
     with tempfile.TemporaryDirectory(prefix="doppeldecker-updater-verify-") as temporary:
         root = Path(temporary)

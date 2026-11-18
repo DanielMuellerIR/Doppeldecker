@@ -57,6 +57,7 @@ fn request(bytes: &[u8]) -> (tempfile::TempDir, ArchiveExtractRequest) {
     std::fs::create_dir(root.join("dst")).unwrap();
     std::fs::write(root.join("src/a.zip"), bytes).unwrap();
     let request = ArchiveExtractRequest {
+        format: Default::default(),
         snapshot: None,
         source_root: root.join("src"),
         source_path: root.join("src/a.zip"),
@@ -67,6 +68,72 @@ fn request(bytes: &[u8]) -> (tempfile::TempDir, ArchiveExtractRequest) {
     };
     (temp, request)
 }
+#[test]
+fn tar_und_tgz_entpacken_regulaere_dateien_ohne_linke_und_ausbruch() {
+    let mut archive = Vec::new();
+    for (name, kind, data) in [
+        (
+            b"./Ordner/Datei.txt".as_slice(),
+            tar::EntryType::Regular,
+            b"Nutzdaten".as_slice(),
+        ),
+        (
+            b"./Ordner/Link".as_slice(),
+            tar::EntryType::Symlink,
+            b"".as_slice(),
+        ),
+        (
+            b"../ausserhalb.txt".as_slice(),
+            tar::EntryType::Regular,
+            b"auslassen".as_slice(),
+        ),
+    ] {
+        let mut header = tar::Header::new_ustar();
+        header.as_mut_bytes()[..name.len()].copy_from_slice(name);
+        header.set_mode(0o644);
+        header.set_size(data.len() as u64);
+        header.set_entry_type(kind);
+        header.set_cksum();
+        archive.extend(header.as_bytes());
+        archive.extend(data);
+        archive.resize(archive.len().next_multiple_of(512), 0);
+    }
+    archive.extend([0; 1024]);
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&archive).unwrap();
+    let gzip = gzip.finish().unwrap();
+    for (format, bytes, name) in [
+        (ArchiveReadFormat::Tar, archive.as_slice(), "probe.tar"),
+        (ArchiveReadFormat::TarGzip, gzip.as_slice(), "probe.tgz"),
+    ] {
+        let (temp, mut request) = request(bytes);
+        let path = request.source_root.join(name);
+        std::fs::rename(&request.source_path, &path).unwrap();
+        request.source_path = path;
+        request.format = format;
+        let prepared = request.prepare(&Cancel::new()).unwrap();
+        let preview = prepared.preview();
+        assert!(preview.catalog_complete);
+        assert_eq!(preview.format, format);
+        assert_eq!(preview.files, 1);
+        assert_eq!(preview.omitted_entries, 2);
+        let serialized = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ArchiveExtractRequest>(&serialized).unwrap(),
+            request
+        );
+        let result = prepared.execute(None, &mut |_| {}).unwrap();
+        assert_eq!(result.files, 1);
+        assert_eq!(
+            std::fs::read(request.target_dir.join("Ordner/Datei.txt")).unwrap(),
+            b"Nutzdaten"
+        );
+        assert!(!request.target_dir.join("Ordner/Link").exists());
+        assert!(!temp.path().join("ausserhalb.txt").exists());
+        assert_eq!(std::fs::read(request.source_path).unwrap(), bytes);
+    }
+}
+
 #[test]
 fn crc_fehler_laesst_bestaetigtes_altziel_unveraendert() {
     let mut bytes = fixture(&[(b"file", b"new", 0o100644)]);

@@ -291,6 +291,22 @@ impl RootHandle {
                 "Staging-Elternordner ist nicht privat",
             ));
         }
+        self.create_empty_child_and_privatize(path)
+    }
+
+    pub(crate) fn create_private_stage(&self, path: &Path) -> io::Result<Self> {
+        if path.parent() != Some(self.path()) || !self.has_exclusive_namespace()? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Arbeitsordner benötigt einen direkt gebundenen Elternordner ohne fremde Schreibrechte",
+            ));
+        }
+        // Die ererbten Rechte des zunächst leeren Ordners werden entfernt, bevor
+        // der Aufrufer Nutzdaten hineinlegt. Der Elternordner bindet seinen Namen.
+        self.create_empty_child_and_privatize(path)
+    }
+
+    fn create_empty_child_and_privatize(&self, path: &Path) -> io::Result<Self> {
         let (parent, name) = open_parent_from(Some(self), path)?;
         mkdirat(&parent, &name, Mode::from_raw_mode(0o700))?;
         let child = Self::open_beneath(self, path)?;

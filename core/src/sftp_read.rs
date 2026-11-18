@@ -8,7 +8,7 @@
 use super::*;
 use crate::error::{coded_error, ErrorCode};
 use crate::Cancel;
-use russh_sftp::protocol::OpenFlags;
+use russh_sftp::protocol::{OpenFlags, Packet};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -469,7 +469,126 @@ struct ContentReader {
     failed: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SftpFileVersion {
+    pub(crate) size: u64,
+    pub(crate) mtime: Option<i64>,
+    pub(crate) sha256: [u8; 32],
+}
+
+pub(crate) struct BoundSftpResume(ContentReader);
+
+impl BoundSftpResume {
+    pub(crate) fn open_at(mut self, offset: u64) -> io::Result<Box<dyn Read + Send>> {
+        if offset > self.0.proof.entry.size {
+            return Err(drift(
+                "SFTP-Startposition liegt hinter der gebundenen Datei.",
+            ));
+        }
+        self.0.offset = offset;
+        Ok(Box::new(self.0))
+    }
+}
+
+impl SftpVfs {
+    pub(crate) fn bind_resume_file(
+        self: &Arc<Self>,
+        path: &Path,
+        cancel: &Cancel,
+    ) -> io::Result<(SftpFileVersion, BoundSftpResume)> {
+        let root = path
+            .parent()
+            .ok_or_else(|| invalid("SFTP-Quellordner fehlt"))?;
+        let (context, _) = self.prepare_interactive_context(
+            root,
+            &[path.to_path_buf()],
+            cancel,
+            ReadPurpose::Contents,
+        )?;
+        let reader = context.open_bound_reader(path)?;
+        let sha256 = context.record_failure(self.runtime.block_on(reader.sha256()))?;
+        context.record_failure(self.runtime.block_on(reader.finish()))?;
+        let version = SftpFileVersion {
+            size: reader.proof.entry.size,
+            mtime: reader.proof.entry.mtime,
+            sha256,
+        };
+        Ok((version, BoundSftpResume(reader)))
+    }
+}
+
+fn parse_check_file_sha256(reply: &[u8]) -> io::Result<[u8; 32]> {
+    const ALGORITHM: &[u8] = b"\0\0\0\x06sha256";
+    const MARKER: &[u8] = b"\0\0\0\x0acheck-file";
+    let reply = reply.strip_prefix(MARKER).unwrap_or(reply);
+    reply
+        .strip_prefix(ALGORITHM)
+        .and_then(|digest| digest.try_into().ok())
+        .ok_or_else(|| drift("SFTP-Server lieferte keinen vollständigen SHA-256-Dateibeleg."))
+}
+
+#[cfg(test)]
+#[test]
+fn check_file_sha256_requires_one_complete_digest() {
+    let mut actual = b"\0\0\0\x06sha256".to_vec();
+    actual.extend_from_slice(&[0x4b; 32]);
+    assert_eq!(parse_check_file_sha256(&actual).unwrap(), [0x4b; 32]);
+    let mut with_marker = b"\0\0\0\x0acheck-file".to_vec();
+    with_marker.extend_from_slice(&actual);
+    assert_eq!(parse_check_file_sha256(&with_marker).unwrap(), [0x4b; 32]);
+    assert!(parse_check_file_sha256(&actual[..actual.len() - 1]).is_err());
+    actual[8] = b'1';
+    assert!(parse_check_file_sha256(&actual).is_err());
+}
+
+pub(crate) fn ensure_resume_profile_current(
+    queue: &Path,
+    bindings: &[crate::RemoteProfileBinding],
+    config: &SftpConnectionConfig,
+) -> io::Result<()> {
+    let [binding] = bindings else {
+        return Err(drift(
+            "SFTP-Auftrag benötigt genau ein gespeichertes Profil.",
+        ));
+    };
+    let directory = queue
+        .parent()
+        .ok_or_else(|| drift("SFTP-Profilbindung besitzt keinen Konfigurationsordner."))?;
+    let profiles = crate::load_sftp_profiles_versioned(&directory.join("sftp-profiles.json"))?;
+    if binding.protocol != crate::RemoteProfileProtocol::Sftp
+        || !profiles.iter().any(|profile| {
+            profile.profile.id == binding.profile_id
+                && profile.revision == binding.revision
+                && &profile.profile.connection == config
+        })
+    {
+        return Err(drift(
+            "SFTP-Profil hat sich geändert. Teilkopie bleibt erhalten.",
+        ));
+    }
+    Ok(())
+}
+
 impl ContentReader {
+    async fn sha256(&self) -> io::Result<[u8; 32]> {
+        check_cancel(&self.files.cancel)?;
+        // Offset, Länge und Blockgröße 0 fordern genau einen Hash bis EOF an.
+        // ProFTPD antwortet auch bei SFTP v3 ohne Erweiterungsanzeige im VERSION-Paket.
+        let mut data = Vec::with_capacity(self.handle.len() + 34);
+        data.extend_from_slice(&(self.handle.len() as u32).to_be_bytes());
+        data.extend_from_slice(self.handle.as_bytes());
+        data.extend_from_slice(b"\0\0\0\x06sha256");
+        data.extend_from_slice(&[0; 20]);
+        match self.raw.extended("check-file-handle", data).await.map_err(sftp_error)? {
+            Packet::ExtendedReply(reply) => parse_check_file_sha256(&reply.data),
+            Packet::Status(status) if status.status_code == StatusCode::OpUnsupported => {
+                Err(io::Error::new(io::ErrorKind::Unsupported,
+                    "SFTP-Server liefert keinen SHA-256-Beleg für offene Dateien. Regulär kopieren bleibt verfügbar."))
+            }
+            _ => Err(drift("SFTP-Server konnte den vollständigen SHA-256-Dateibeleg nicht liefern. Regulär kopieren bleibt verfügbar.")),
+        }
+    }
     async fn verify_handle(&self, handle: &str) -> io::Result<()> {
         let attrs = self.raw.fstat(handle).await.map_err(sftp_error)?.attrs;
         if Attributes::from(&attrs) != self.proof.attributes {
@@ -570,6 +689,52 @@ impl Drop for ContentReader {
     }
 }
 
+impl InteractiveFiles {
+    fn open_bound_reader(&self, path: &Path) -> io::Result<ContentReader> {
+        let proof = self.proof(path)?.clone();
+        self.check_session()?;
+        let (session, raw) = {
+            let state = lock(&self.provider.state);
+            (
+                state.connection.sftp.clone(),
+                state.connection.read_session.clone(),
+            )
+        };
+        self.record_failure(
+            self.provider
+                .runtime
+                .block_on(self.verify(&proof, &session)),
+        )?;
+        let opened = self
+            .provider
+            .runtime
+            .block_on(raw.open(&proof.remote, OpenFlags::READ, FileAttributes::empty()))
+            .map_err(sftp_error);
+        let handle = self.record_failure(opened)?.handle;
+        let reader = ContentReader {
+            files: Arc::new(self.clone()),
+            proof,
+            session,
+            raw,
+            handle,
+            offset: 0,
+            verified: false,
+            failed: false,
+        };
+        self.record_failure(
+            self.provider
+                .runtime
+                .block_on(reader.verify_handle(&reader.handle)),
+        )?;
+        self.record_failure(
+            self.provider
+                .runtime
+                .block_on(self.verify(&reader.proof, &reader.session)),
+        )?;
+        Ok(reader)
+    }
+}
+
 impl Vfs for InteractiveFiles {
     fn interactive_additive_only(&self) -> bool {
         true
@@ -664,47 +829,7 @@ impl Vfs for InteractiveFiles {
         self.stat(path).is_ok()
     }
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
-        let proof = self.proof(path)?.clone();
-        self.check_session()?;
-        let (session, raw) = {
-            let state = lock(&self.provider.state);
-            (
-                state.connection.sftp.clone(),
-                state.connection.read_session.clone(),
-            )
-        };
-        self.record_failure(
-            self.provider
-                .runtime
-                .block_on(self.verify(&proof, &session)),
-        )?;
-        let opened = self
-            .provider
-            .runtime
-            .block_on(raw.open(&proof.remote, OpenFlags::READ, FileAttributes::empty()))
-            .map_err(sftp_error);
-        let handle = self.record_failure(opened)?.handle;
-        let reader = ContentReader {
-            files: Arc::new(self.clone()),
-            proof,
-            session,
-            raw,
-            handle,
-            offset: 0,
-            verified: false,
-            failed: false,
-        };
-        self.record_failure(
-            self.provider
-                .runtime
-                .block_on(reader.verify_handle(&reader.handle)),
-        )?;
-        self.record_failure(
-            self.provider
-                .runtime
-                .block_on(self.verify(&reader.proof, &reader.session)),
-        )?;
-        Ok(Box::new(reader))
+        Ok(Box::new(self.open_bound_reader(path)?))
     }
     fn verify_transferred_source(&self, path: &Path, _: &blake3::Hash) -> io::Result<()> {
         if self.omitted_selections.is_empty() && self.omission_directories.is_empty() {

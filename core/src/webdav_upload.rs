@@ -34,7 +34,7 @@ pub(crate) fn ensure_profile_current(
                 && &profile.profile.connection == config
         }) {
             return Err(drift(
-                "WebDAV-Uploadprofil änderte sich; vor weiterer Wirkung neu vorbereiten",
+                "WebDAV-Profil änderte sich; vor weiterer Wirkung neu vorbereiten",
             ));
         }
     }

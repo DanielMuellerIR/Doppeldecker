@@ -248,6 +248,8 @@ export function createConnectionsUi({
   function render() {
     const list = $("#connection-list");
     if (!list) return;
+    const focused = document.activeElement?.closest(".connection-item button");
+    const focusRow = focused?.closest(".connection-item");
     const rows = PROTOCOLS.flatMap(
       protocol => profiles[protocol]
         .filter(profile => !pendingProfileReads.has(`${protocol}:${profile.id}`))
@@ -256,9 +258,20 @@ export function createConnectionsUi({
     list.innerHTML = rows.length
       ? rows.join("")
       : `<li class="connection-empty">Noch keine Verbindung. „+" wählt das Protokoll; Geheimnisse bleiben im System-Schlüsselbund.</li>`;
+    if (focusRow) {
+      const replacement = [...list.children].find(row => row.dataset.protocol === focusRow.dataset.protocol
+        && row.dataset.id === focusRow.dataset.id);
+      const selector = ["[data-eject]", "[data-edit]", "[data-remove]"].find(item => focused.matches(item));
+      const action = selector && replacement?.querySelector(selector);
+      (action || replacement?.querySelector(".connection-open"))?.focus({ preventScroll: true });
+    }
     // Fire-and-forget: Der Sitzungsstatus zieht asynchron nach und rendert nur
     // bei tatsächlicher Änderung erneut (Schlüsselvergleich verhindert Schleifen).
     refreshActive();
+  }
+
+  function focusProfiles() {
+    ($("#connection-list .connection-open") || $("#conn-add")).focus();
   }
 
   function profileRow(protocol, profile) {
@@ -280,8 +293,10 @@ export function createConnectionsUi({
         : `${protocolLabel} · ${connection.username}@${connection.host}:${connection.port}`;
     const connected = activeConnections.has(`${protocol}:${profile.id}`);
     return `<li class="connection-item${active ? " active" : ""}${ftp?.warning ? " security-warning" : ""}" data-protocol="${protocol}" data-id="${escapeHtml(profile.id)}" title="${escapeHtml(title)}">
-      <span class="side-icon ${protocol}" aria-hidden="true"></span>
-      <span class="connection-name">${escapeHtml(profile.name)}<small class="connection-host">${escapeHtml(protocolLabel)}${ftp ? ` · ${escapeHtml(ftp.detail)}` : ""} · ${escapeHtml(host)}</small></span>
+      <button class="connection-open" type="button" aria-label="${escapeHtml(profile.name)} öffnen">
+        <span class="side-icon ${protocol}" aria-hidden="true"></span>
+        <span class="connection-name">${escapeHtml(profile.name)}<small class="connection-host">${escapeHtml(protocolLabel)}${ftp ? ` · ${escapeHtml(ftp.detail)}` : ""} · ${escapeHtml(host)}</small></span>
+      </button>
       ${connected ? `<button class="conn-eject icon-btn" data-eject="${escapeHtml(profile.id)}" title="Verbindung trennen">⏏</button>` : ""}
       <button class="conn-edit icon-btn" data-edit="${escapeHtml(profile.id)}" title="Profil bearbeiten" aria-label="Profil bearbeiten">✎</button>
       <button class="fav-del icon-btn" data-remove="${escapeHtml(profile.id)}" title="Profil entfernen (Secret bleibt im Schlüsselbund)">×</button>
@@ -306,7 +321,7 @@ export function createConnectionsUi({
     if (profile && openProfileEditor) openProfileEditor(protocol, profile);
   }
 
-  function openProfile(protocol, profile, side) {
+  async function openProfile(protocol, profile, side, { keyboard = false } = {}) {
     if (!profile) return;
     const ftp = protocol === "ftps" ? ftpDisplay(profile.connection) : null;
     const securityStatus = ftp?.label === "FTP"
@@ -314,7 +329,7 @@ export function createConnectionsUi({
       : profile.connection.certificate_policy === "unverified_certificate"
         ? "tls_identity_unverified"
         : null;
-    setPaneLocation(side, {
+    const loaded = await setPaneLocation(side, {
       provider: protocol,
       profileId: profile.id,
       profileRevision: profile.revision,
@@ -322,6 +337,14 @@ export function createConnectionsUi({
       securityStatus,
       path: "/",
     });
+    if (!keyboard || !loaded || activeSide() !== side) return;
+    const focused = document.activeElement;
+    const row = focused?.closest(".connection-item");
+    // Leitet nur den Fokus des auslösenden Knopfs weiter. Eine zwischenzeitlich
+    // fokussierte Aktion soll bei einer langsamen Verbindung bedienbar bleiben.
+    if (focused?.matches(".connection-open") && row?.dataset.protocol === protocol && row.dataset.id === profile.id) {
+      panes[side].listing.focus();
+    }
   }
 
   async function disconnectProfile(protocol, id) {
@@ -502,8 +525,10 @@ export function createConnectionsUi({
       await removeProfile(protocol, findProfile(protocol, removeButton.dataset.remove));
       return;
     }
-    openProfile(protocol, findProfile(protocol, item.dataset.id), activeSide());
+    await openProfile(protocol, findProfile(protocol, item.dataset.id), activeSide(), {
+      keyboard: event.detail === 0 && Boolean(event.target.closest(".connection-open")),
+    });
   }
 
-  return { handleConnectionUpdate, loadAll, profileLocation, render, save, wire };
+  return { focusProfiles, handleConnectionUpdate, loadAll, profileLocation, render, save, wire };
 }

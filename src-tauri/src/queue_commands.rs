@@ -4,7 +4,7 @@ use crate::frontend_payload::FrontendQueueSnapshot;
 use std::sync::Arc;
 
 use doppeldecker_core::OperationQueue;
-use tauri::{State, WebviewWindow};
+use tauri::{Manager, State, WebviewWindow};
 
 use crate::{
     emit_queue_snapshot, operation_queue, start_queue_worker, with_queue_extension, AppError,
@@ -78,6 +78,55 @@ pub(crate) fn list_operation_queue(
         start_queue_worker(app, label.to_owned());
     }
     Ok(snapshot.into())
+}
+
+#[derive(serde::Serialize)]
+struct QueueRecoveryReview {
+    reason: doppeldecker_core::queue::QueueRecoveryReason,
+    entry: doppeldecker_core::QueueEntry,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct RecoveryOverview {
+    queue: Option<Vec<crate::frontend_payload::FrontendPayload<QueueRecoveryReview>>>,
+    trash: Result<Vec<doppeldecker_core::TrashJournalReview>, AppError>,
+}
+
+#[tauri::command]
+pub(crate) async fn inspect_recovery(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+) -> Result<RecoveryOverview, AppError> {
+    let window_state = app.state::<AppState>().window(window.label());
+    tauri::async_runtime::spawn_blocking(move || {
+        // Den Blick in die Queue nicht mit dem normalen Öffnen der Queue
+        // verwechseln: Dort dürfen Altjournale migriert und Worker gestartet werden.
+        let queue = crate::queue_runtime::ready_queue_snapshot(&window_state).map(|snapshot| {
+            snapshot
+                .entries
+                .into_iter()
+                .filter_map(|entry| {
+                    let reason = entry.recovery_reason()?;
+                    Some(QueueRecoveryReview { reason, entry }.into())
+                })
+                .collect()
+        });
+        let trash = (|| {
+            let state = app.state::<AppState>();
+            let _guard = state.trash_journal_guard.try_lock().map_err(|_| {
+                AppError::new(
+                    "busy",
+                    "Papierkorb wird gerade verarbeitet. Erneut aktualisieren.",
+                )
+            })?;
+            let directory =
+                crate::app_support::app_config_dir_for_inspection(&app)?.join("trash-journals");
+            doppeldecker_core::inspect_trash_journals(&directory).map_err(AppError::from)
+        })();
+        RecoveryOverview { queue, trash }
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))
 }
 
 #[tauri::command]
@@ -168,6 +217,30 @@ pub(crate) async fn remove_queue_entry(
     })
     .await
     .map_err(|_| AppError::new("outcome_unclear", "Queue-Bereinigung unterbrochen"))?
+}
+
+#[tauri::command]
+pub(crate) async fn discard_resumable_copy(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> Result<FrontendQueueSnapshot, AppError> {
+    let label = window.label().to_owned();
+    let window_state = state.window(&label);
+    let queue = operation_queue(&app, &window_state, &label)?;
+    let sandbox = crate::sandbox_root()?;
+    let cleanup = crate::queue_runtime::reserve_queue_cleanup(&state, &window_state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = queue.discard_resumable_copy(&operation_id, sandbox.as_deref());
+        emit_queue_snapshot(&app, &label, &queue);
+        drop(cleanup);
+        start_queue_worker(app, label);
+        result.map_err(AppError::from)?;
+        Ok(queue.snapshot().into())
+    })
+    .await
+    .map_err(|_| AppError::new("outcome_unclear", "Bereinigung der Teilkopie unterbrochen"))?
 }
 
 #[tauri::command]

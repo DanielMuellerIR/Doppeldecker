@@ -13,6 +13,8 @@ mod transport_tests;
 #[path = "ftps_read.rs"]
 mod content_read;
 pub(crate) use content_read::FTP_CONTENT_READ_LIMITATION;
+#[path = "ftps_resume.rs"]
+pub(crate) mod resume;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -51,6 +53,7 @@ const REQUIRED_MLST_FACTS: &str = "Type;Size;Modify;";
 struct FtpsSession {
     stream: RustlsFtpStream,
     identity: FtpsServerIdentity,
+    resume_supported: bool,
     read_mlst_facts: Option<String>,
     mode_facts_selected: bool,
 }
@@ -2548,7 +2551,14 @@ fn connect_once(
             "FTPS-Server muss MLST/MLSD und UTF8 über FEAT ausweisen",
         ));
     }
-    stream.opts("UTF8", Some("ON")).map_err(ftp_error)?;
+    // RFC 2640 weist UTF-8 über FEAT aus. Server mit bereits aktivem UTF-8
+    // können den zusätzlichen Kompatibilitätsbefehl ablehnen. Namen werden
+    // weiterhin strikt als UTF-8 gelesen und vollständig geprüft.
+    if let Err(error) = stream.opts("UTF8", Some("ON")) {
+        if !optional_opts_rejection(&error) {
+            return Err(ftp_error(error));
+        }
+    }
     // RFC 3659 garantiert nicht, dass alle angebotenen MLST-Fakten standardmäßig
     // aktiv sind. Ohne diese Auswahl liefern manche korrekten Server nur Namen,
     // obwohl sie Typ, Größe und Änderungszeit unterstützen. Server ohne Faktenliste
@@ -2562,7 +2572,7 @@ fn connect_once(
     // Listing. Nur Transport-/Verbindungsfehler bleiben harte Fehler.
     if mlst_facts_need_selection(&features) {
         if let Err(error) = stream.opts("MLST", Some(REQUIRED_MLST_FACTS)) {
-            if !opts_mlst_rejection_is_tolerable(&error) {
+            if !optional_opts_rejection(&error) {
                 return Err(ftp_error(error));
             }
         }
@@ -2584,6 +2594,7 @@ fn connect_once(
     Ok(FtpsSession {
         stream,
         identity,
+        resume_supported: resume::supports_resume(&features),
         read_mlst_facts,
         mode_facts_selected: false,
     })
@@ -3500,12 +3511,12 @@ fn features_digest(features: &suppaftp::types::Features) -> io::Result<[u8; 32]>
     Ok(*blake3::hash(&payload).as_bytes())
 }
 
-/// True, wenn die Ablehnung des optionalen `OPTS MLST` toleriert werden darf.
+/// True, wenn die Ablehnung eines optionalen `OPTS` toleriert werden darf.
 /// Toleriert werden ausschließlich echte Protokollantworten des Servers (etwa
 /// 500/501/502 „Befehl nicht implementiert"). Verbindungs- und Datenkanalabbrüche
 /// (421/425/426) sowie Transportfehler (EOF, I/O) bleiben harte Fehler, weil dort
 /// gar keine belastbare Serverentscheidung vorliegt.
-fn opts_mlst_rejection_is_tolerable(error: &FtpError) -> bool {
+fn optional_opts_rejection(error: &FtpError) -> bool {
     matches!(error, FtpError::UnexpectedResponse(response)
         if matches!(response.status.code(), 500 | 501 | 502 | 504))
 }
@@ -3619,7 +3630,7 @@ fn select_mode_facts(session: &mut FtpsSession) -> io::Result<()> {
         // werden. Ein abgelehntes OPTS ist kein Schreibverbot: der echte Readback
         // entscheidet später über diese einzelne Metadatenklasse.
         if let Err(error) = session.stream.opts("MLST", Some(facts)) {
-            if !opts_mlst_rejection_is_tolerable(&error) {
+            if !optional_opts_rejection(&error) {
                 return Err(ftp_error(error));
             }
         }
@@ -4105,36 +4116,33 @@ mod tests {
     }
 
     #[test]
-    fn opts_mlst_ablehnung_ist_tolerierbar_transportfehler_nicht() {
-        // Regression: Ein standardkonformer Server darf den optionalen Befehl
-        // `OPTS MLST` ablehnen (z. B. 500/502), ohne dass die gesamte Verbindung
-        // scheitert — die Pflichtfakten prüft der strenge MLSD-Parser je Zeile.
+    fn optionale_opts_ablehnung_ist_tolerierbar_transportfehler_nicht() {
         for code in [500_u32, 501, 502, 504] {
-            assert!(opts_mlst_rejection_is_tolerable(
-                &FtpError::UnexpectedResponse(suppaftp::types::Response {
+            assert!(optional_opts_rejection(&FtpError::UnexpectedResponse(
+                suppaftp::types::Response {
                     status: suppaftp::Status::from(code),
                     body: Vec::new(),
-                })
-            ));
+                }
+            )));
         }
         // Verbindungs-/Datenkanalabbrüche und Transportfehler bleiben hart.
         for code in [421_u32, 425, 426] {
-            assert!(!opts_mlst_rejection_is_tolerable(
-                &FtpError::UnexpectedResponse(suppaftp::types::Response {
+            assert!(!optional_opts_rejection(&FtpError::UnexpectedResponse(
+                suppaftp::types::Response {
                     status: suppaftp::Status::from(code),
                     body: Vec::new(),
-                })
-            ));
+                }
+            )));
         }
         for code in [430_u32, 450, 451, 530, 532, 550, 553] {
-            assert!(!opts_mlst_rejection_is_tolerable(
-                &FtpError::UnexpectedResponse(suppaftp::types::Response {
+            assert!(!optional_opts_rejection(&FtpError::UnexpectedResponse(
+                suppaftp::types::Response {
                     status: suppaftp::Status::from(code),
                     body: Vec::new(),
-                })
-            ));
+                }
+            )));
         }
-        assert!(!opts_mlst_rejection_is_tolerable(&FtpError::BadResponse));
+        assert!(!optional_opts_rejection(&FtpError::BadResponse));
     }
 
     #[test]

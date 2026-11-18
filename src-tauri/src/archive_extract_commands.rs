@@ -118,7 +118,7 @@ impl ArchiveExtractCache {
     }
     fn bound(&self, id: &str) -> Result<&Pending, AppError> {
         self.pending.as_ref().filter(|pending| pending.id == id && pending.created.elapsed() < Duration::from_secs(600))
-            .ok_or_else(|| AppError::new("plan_drift", "ZIP-Vorschau ist abgelaufen oder gehört zu einem anderen Fenster; bitte erneut vorbereiten"))
+            .ok_or_else(|| AppError::new("plan_drift", "Entpackvorschau ist abgelaufen oder gehört zu einem anderen Fenster; bitte erneut vorbereiten"))
     }
 }
 #[derive(serde::Deserialize)]
@@ -149,7 +149,7 @@ pub(crate) async fn prepare_archive_extract(
     request: ArchiveRequest,
 ) -> Result<ArchivePreview, AppError> {
     if request.provider != "local" {
-        return Err(AppError::new("unsupported", "Entfernte ZIPs zuerst in der Archivansicht öffnen; Entpacken verwendet deren geladene Momentaufnahme."));
+        return Err(AppError::new("unsupported", "Entfernte Archive zuerst in der Archivansicht öffnen; Entpacken verwendet deren geladene Momentaufnahme."));
     }
     if request.root.is_empty() || request.target_dir.is_empty() {
         return Err(AppError::new("invalid_input", "Quelle oder Ziel zeigt keinen geöffneten Ordner. Bitte zuerst einen Ordner in beiden Panes öffnen."));
@@ -185,6 +185,9 @@ pub(crate) async fn prepare_archive_extract(
             (PathBuf::from(request.target_dir), None)
         };
         let mut intent = ArchiveExtractRequest {
+            format: doppeldecker_core::archive_read::ArchiveReadFormat::from_path(
+                std::path::Path::new(&request.source_path),
+            ),
             snapshot: None,
             source_root: PathBuf::from(request.root),
             source_path: PathBuf::from(request.source_path),
@@ -263,6 +266,7 @@ pub(crate) async fn prepare_archive_extract_selection(
             (PathBuf::from(request.target_dir), None)
         };
         let mut intent = ArchiveExtractRequest {
+            format: source.format,
             snapshot: source.snapshot,
             source_root: source.root,
             source_path: source.path,
@@ -442,6 +446,7 @@ mod tests {
         )
         .unwrap();
         let request = ArchiveExtractRequest {
+            format: Default::default(),
             snapshot: None,
             source_root: source.clone(),
             source_path: source.join("a.zip"),

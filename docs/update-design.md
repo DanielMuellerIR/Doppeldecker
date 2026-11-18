@@ -60,6 +60,9 @@ Secret-Speicher nur für den Release-Prozess. `tools/build-release.py` verlangt 
 
 Ohne einen Wert bricht der Build vor Tauri ab. Auf macOS erzeugt Tauri zunächst das
 Updaterarchiv; der Releasepfad packt und signiert es nach der App-Notarisierung neu.
+Dabei unterdrückt er AppleDouble-Metadateneinträge, die Tauri beim Entpacken als
+Bundle-Pfade behandeln würde. Die Archivprüfung kontrolliert die Pfade und das in
+der entpackten App erhaltene Notarisierungsticket.
 Unter Linux bleibt `createUpdaterArtifacts` aus: Der Linux-Prüfer entnimmt zuerst aus
 DEB und AppImage jeweils das CLI-Binary, führt `--version` aus und vergleicht die
 Ausgabe exakt mit der Workspace-Version. Erst danach signiert er AppImage, DEB und die

@@ -1,6 +1,23 @@
 # SFTP-Inhalte, Öffnen und Remote-Bearbeitung
 
-Stand: 2026-10-24.
+Stand: 2026-11-18.
+
+## Fortsetzbarer Download
+
+**Befehle → Dateiinhalt fortsetzbar kopieren** lädt reguläre Dateien aus einem
+gespeicherten SFTP-Profil in einen lokalen Zielordner. Der gepinnte Server
+muss für ein geöffnetes Dateihandle über `check-file-handle` genau einen
+vollständigen SHA-256 liefern. Doppeldecker prüft Pfad, Dateihandle und Profil.
+Nach der Wiederverbindung vergleicht es den Serverbeleg und den gespeicherten
+lokalen Abschnitt. Danach liest es den Rest ab der gespeicherten Byteposition.
+Der vollständige lokale Inhalt muss vor dem atomaren Zielabschluss denselben
+SHA-256 besitzen. Geänderte Quellen oder falsche Restbytes lassen die
+Teilkopie zur Prüfung erhalten.
+
+Dieser Weg ist mit ProFTPD `mod_sftp` geprüft. OpenSSH bietet den benötigten
+Inhaltsbeleg nicht an. Dort bleibt die normale Kopieraktion verfügbar.
+[ProFTPD mod_sftp](https://github.com/proftpd/www.proftpd.org/blob/master/docs/contrib/mod_sftp.html),
+[OpenSSH-SFTP-Erweiterungen](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL).
 
 ## Interaktive Leseklasse
 

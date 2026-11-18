@@ -16,19 +16,19 @@ kopieren, verschieben, durchsuchen und synchronisieren. Die Oberfläche ist deut
 
 ## Download
 
-**Öffentliche Preview: 0.1.127.** Verwende beim Erproben eine Zweitkopie deiner Daten.
+**Aktuelle Version: 1.0.0.**
 
 | System | Paket |
 | --- | --- |
-| macOS 14+, Apple Silicon | [Signiertes und notarisiertes DMG](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.127/Doppeldecker_0.1.127_aarch64.dmg) |
-| Linux Mint 22.2 / Ubuntu 24.04, x86_64 | [DEB](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.127/Doppeldecker_0.1.127_amd64.deb) · [AppImage](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v0.1.127/Doppeldecker_0.1.127_amd64.AppImage) |
+| macOS 14+, Apple Silicon | [Signiertes und notarisiertes DMG](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.0/Doppeldecker_1.0.0_aarch64.dmg) |
+| Linux Mint 22.2 / Ubuntu 24.04, x86_64 | [DEB](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.0/Doppeldecker_1.0.0_amd64.deb) · [AppImage](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.0/Doppeldecker_1.0.0_amd64.AppImage) |
 
 Unter macOS die App aus dem DMG nach Programme ziehen. Andere Distributionen und
 Intel-Macs sind noch nicht geprüft. **Doppeldecker → Nach Updates suchen …** prüft
 nur auf Wunsch; Download und Installation benötigen eine eigene Bestätigung.
 
-[Release Notes und Prüfsummen](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v0.1.127).
-[Änderungen dieser Preview](docs/release-notes-0.1.127.md).
+[Pakete und Prüfsummen](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v1.0.0).
+[Änderungen in 1.0.0](docs/release-notes-1.0.0.md).
 
 ## Funktionen
 
@@ -42,15 +42,18 @@ nur auf Wunsch; Download und Installation benötigen eine eigene Bestätigung.
   Während Übertragungen bleibt die Navigation bedienbar.
 - **Vorschau:** F3 zeigt lokale und entfernte UTF-8-Texte sowie PNG-/JPEG-Bilder.
 - **Stapel und Archive:** Namen per Vorschau ändern, einschließlich Namenzyklen;
-  lokale Auswahlen als ZIP packen und zur entfernten Pane hochladen; ZIPs durchsuchen
-  und ganze Archive oder einzelne Inhalte in lokale oder entfernte Ziele entpacken.
+  lokale Auswahlen als ZIP packen und zur entfernten Pane hochladen.
+  ZIP, TAR, TAR.GZ und TGZ durchsuchen und ganze Archive oder ausgewählte Inhalte
+  in lokale oder entfernte Ziele entpacken.
 - **Dateieigenschaften:** normale Unix-Rechte lokal/SFTP/FTP ändern, auch rekursiv;
   lokale Eigentümer/Gruppe bearbeiten, auf macOS und Linux optional mit Administratorfreigabe.
   Dort auch Finder-Tags, Kommentare, Sichtbarkeit und Dateisperren ändern.
 - **Synchronisation:** Nur hinzufügen, Aktualisieren und Spiegeln mit konkreter
-  Vorschau; einseitig oder bidirektional mit gespeicherter Baseline.
-- **Queue und Wiederherstellung:** Aufträge pausieren und abbrechen; nach Neustart
-  Endpunkte und Wirkung neu prüfen. Lokales Löschen nutzt den Systempapierkorb.
+  Vorschau. Einweg-Aufträge mit Ausschlussmustern speichern oder in beide Richtungen
+  gegen einen gespeicherten Vergleichsstand abgleichen.
+- **Queue und Wiederherstellung:** Pausierte lokale Kopien und kompatible WebDAV-,
+  FTPS- und SFTP-Downloads nach einem Neustart fortsetzen. Die Übersicht führt zu
+  wartenden Aufträgen, Quarantänebefunden und Papierkorb-Journalen.
 
 ## Grenzen und Datenintegrität
 

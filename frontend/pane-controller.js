@@ -201,9 +201,63 @@ export function createPaneController({
     if (running() || !pane.path) return;
     saveActiveTab(pane);
     if (pane.tabs.tabs.length === 32) return;
-    const tab = pane.tabs.add(pane.tabs.active.location);
-    tab.sort = { ...pane.sort };
+    const fallback = pane.tabs.active.runtime.generatedSource?.fallback;
+    const tab = pane.tabs.add(fallback?.location ?? pane.tabs.active.location, fallback?.viewOptions);
+    tab.sort = { ...(fallback?.sort ?? pane.sort) };
     return loadTab(side, pane.tabs.activate(tab.id));
+  }
+
+  function showGeneratedSource(side, operationId, path) {
+    const pane = panes[side];
+    if (!pane.tabs) return;
+    saveActiveTab(pane);
+    const existing = pane.tabs.tabs.find(tab => {
+      const inspection = tab.runtime.generatedSource;
+      return inspection?.operationId === operationId && inspection.path === path;
+    });
+    if (existing) {
+      if (existing.id !== pane.tabs.active.id) return loadTab(side, pane.tabs.activate(existing.id));
+      return;
+    }
+    if (pane.tabs.tabs.length === 32) {
+      showError("Zwischenstand", "Bitte zuerst einen Tab dieser Dateiliste schließen.");
+      return;
+    }
+    const location = { provider: "local", path };
+    const previous = pane.tabs.active;
+    const fallback = previous.runtime.generatedSource?.fallback
+      ?? pane.tabs.snapshot().tabs.find(tab => tab.id === previous.id);
+    const tab = pane.tabs.add(location, loadViewOptions(location));
+    tab.runtime.generatedSource = { operationId, path, previousId: previous.id, fallback };
+    return loadTab(side, pane.tabs.activate(tab.id));
+  }
+
+  function closeCleanedGeneratedSources(operationIds) {
+    if (!operationIds.size) return;
+    for (const side of ["left", "right"]) {
+      const pane = panes[side];
+      if (!pane.tabs) continue;
+      const active = pane.tabs.active;
+      const removed = pane.tabs.tabs.filter(tab => operationIds.has(tab.runtime.generatedSource?.operationId));
+      if (!removed.length) continue;
+      for (const tab of removed) {
+        if (pane.tabs.tabs.length > 1) pane.tabs.close(tab.id);
+      }
+      if (removed.includes(pane.tabs.active)) {
+        const { fallback } = pane.tabs.active.runtime.generatedSource;
+        pane.tabs = createPaneTabs(fallback.location, fallback.viewOptions, {
+          saved: { activeId: fallback.id, tabs: [fallback] },
+        });
+        void loadTab(side, pane.tabs.active);
+        continue;
+      } else if (removed.includes(active)) {
+        const previous = pane.tabs.tabs.find(tab => tab.id === active.runtime.generatedSource.previousId);
+        void loadTab(side, previous ? pane.tabs.activate(previous.id) : pane.tabs.active);
+        continue;
+      }
+      renderTabs(side);
+      onStateChanged();
+    }
   }
 
   function closeTab(side, id = panes[side].tabs?.active.id) {
@@ -237,7 +291,20 @@ export function createPaneController({
   function tabsSnapshot() {
     for (const pane of Object.values(panes)) saveActiveTab(pane);
     return Object.fromEntries(["left", "right"].map(side => {
-      const saved = panes[side].tabs?.snapshot();
+      const model = panes[side].tabs;
+      const saved = model?.snapshot();
+      const permanent = model?.tabs.filter(tab => !tab.runtime.generatedSource);
+      if (permanent && permanent.length < saved.tabs.length) {
+        // Prüfpfade können beim App-Neustart bereits bereinigt sein. Die
+        // Fensterqueue ist für erhaltene Zwischenstände der Wiedereinstieg.
+        const ids = new Set(permanent.map(tab => tab.id));
+        saved.tabs = saved.tabs.filter(tab => ids.has(tab.id));
+        if (!ids.has(saved.activeId)) {
+          const { previousId, fallback } = model.active.runtime.generatedSource;
+          if (!saved.tabs.length) saved.tabs.push(structuredClone(fallback));
+          saved.activeId = ids.has(previousId) ? previousId : saved.tabs[0].id;
+        }
+      }
       // Die persistierte Auswahl ist laut Sitzungsvertrag begrenzt. Im offenen
       // Tab bleibt die vollständige Auswahl im RAM erhalten.
       for (const tab of saved?.tabs || []) tab.selectedNames = tab.selectedNames.slice(0, 4096);
@@ -496,7 +563,7 @@ export function createPaneController({
     const pane = panes[side];
     // Ein Abschluss aktualisiert nur den sichtbaren Ort. Eine bereits angeforderte
     // Navigation besitzt Vorrang, auch solange Home noch seinen Zielpfad auflöst.
-    if (opts.passive && pane.navigationPending) return;
+    if (opts.passive && pane.navigationPending) return false;
     const seq = ++pane.loadSeq;
     pane.navigationPending = opts.push !== false || path !== pane.path
       || opts.historyPosition != null || Boolean(opts.tabRestore);
@@ -518,6 +585,10 @@ export function createPaneController({
       path: requestedPath,
     };
     const activeTab = pane.tabs?.active;
+    const inspection = activeTab?.runtime.generatedSource;
+    const inspectionPath = inspection && requestedProvider === "local"
+      && (requestedPath === inspection.path || requestedPath.startsWith(inspection.path + "/"));
+    const leaveInspection = inspection && !inspectionPath && !opts.passive;
     const sameTabLocation = activeTab?.location.provider === requestedProvider
       && activeTab.location.profileId === requestedProfileId
       && activeTab.location.path === requestedPath;
@@ -536,12 +607,12 @@ export function createPaneController({
     const { push = true, keepSelName = null, historyPosition = null } = opts;
     try {
       await discardRealPreparation();
-      if (seq !== pane.loadSeq) return;
+      if (seq !== pane.loadSeq) return false;
       await cancelDirectorySizeRun(side);
       // Unmittelbar vor dem eigentlichen Provideraufruf gilt das Sequenz-Token noch
       // einmal. Ein veralteter Abruf darf den inzwischen gewählten Server nicht
       // einmal kurz ansprechen und seine Sitzung dabei lazy öffnen.
-      if (seq !== pane.loadSeq) return;
+      if (seq !== pane.loadSeq) return false;
       const listing = requestedProvider === "local"
         ? await invoke("scan_dir", { path: requestedPath, showHidden: requestedOptions.showHidden })
         : await invoke(`scan_${requestedProvider}_dir`, {
@@ -552,7 +623,7 @@ export function createPaneController({
         });
       // Die Antwort gehört erst nach dieser Prüfung noch zur Pane. Insbesondere
       // darf ein altes SFTP-Listing keine bereits getrennte Sitzung neu öffnen.
-      if (seq !== pane.loadSeq) return;
+      if (seq !== pane.loadSeq) return false;
       if (requestedProvider !== "local"
           && (!Number.isSafeInteger(listing.profile_revision)
             || listing.profile_revision < 0
@@ -569,9 +640,14 @@ export function createPaneController({
         }))
           .quarantine_capabilities
         : null;
-      if (seq !== pane.loadSeq) return;
-      if (historyPosition !== null) pane.hpos = historyPosition;
-      if (push && listing.path !== pane.path) {
+      if (seq !== pane.loadSeq) return false;
+      if (leaveInspection) {
+        delete activeTab.runtime.generatedSource;
+        pane.history = [listing.path];
+        pane.hpos = 0;
+      } else if (historyPosition !== null) {
+        pane.hpos = historyPosition;
+      } else if (push && listing.path !== pane.path) {
         pane.history = pane.history.slice(0, pane.hpos + 1);
         pane.history.push(listing.path);
         pane.hpos = pane.history.length - 1;
@@ -658,17 +734,20 @@ export function createPaneController({
       }
       const dstSide = direction() === "lr" ? "right" : "left";
       if (side === dstSide && panes.left.path && panes.right.path) refreshQuarantineBadge();
+      return true;
     } catch (error) {
-      if (seq !== pane.loadSeq) return;
+      if (seq !== pane.loadSeq) return false;
       if (tabRead) pane.tabs.finishRead(tabRead, tab => { tab.runtime.status = "failed"; });
       renderTabs(side);
       $(".path", pane.el).value = pane.path;
+      if (opts.throwOnError) throw error;
       const provider = pane.provider === "local"
         ? "Lokales"
         : pane.provider === "ftps" && pane.securityStatus === "plaintext"
           ? "FTP"
           : pane.provider.toUpperCase();
       showError(`${provider}-Listing`, error);
+      return false;
     } finally {
       if (seq === pane.loadSeq) pane.navigationPending = false;
     }
@@ -1303,7 +1382,7 @@ export function createPaneController({
     setPaneLocation("right", left);
   }
 
-  function setPaneLocation(side, location) {
+  function setPaneLocation(side, location, opts) {
     const pane = panes[side];
     invalidateQuarantineBadge();
     // Zielpfad VOR dem Leeren bestimmen: der lokale Fallback nutzt den bisherigen Pfad.
@@ -1339,7 +1418,7 @@ export function createPaneController({
       render(side);
     }
     renderConnections();
-    return loadPane(side, targetPath);
+    return loadPane(side, targetPath, opts);
   }
 
   /** Macht eine Pane sofort wirkungslos, noch bevor ein langsamer lokaler
@@ -1609,6 +1688,7 @@ export function createPaneController({
 
   return {
     addTab,
+    closeCleanedGeneratedSources,
     closeTab,
     cycleTab,
     invalidateProfileTabs,
@@ -1642,6 +1722,7 @@ export function createPaneController({
     renderRows,
     selectAll,
     setPaneLocation,
+    showGeneratedSource,
     setSort,
     swapPanes,
     toggleHidden,

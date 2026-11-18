@@ -1,9 +1,13 @@
 #!/bin/sh
-# Startet Doppeldecker ausschließlich in einem frisch erzeugten Wegwerfbereich.
-# Der Ordner wird nach dem App-Ende absichtlich NICHT automatisch gelöscht: So können
-# Tester Quarantäne und Resultate prüfen und ihn anschließend über den Papierkorb entfernen.
+# Startet Doppeldecker in einer markierten Sandbox. Deren Lebensdauer umfasst
+# auch die Ergebnisprüfung nach App-Ende und gegebenenfalls einen Wiederanlauf.
 set -eu
 
+prepare_only=false
+if [ "$#" -eq 1 ] && [ "$1" = "--prepare" ]; then
+  prepare_only=true
+  shift
+fi
 release_bundle=false
 installed_bundle=false
 reuse_sandbox=
@@ -40,6 +44,7 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --help|-h)
+      printf 'Verwendung: %s --prepare (Testbereich anlegen, nur den Pfad ausgeben)\n' "$0"
       printf 'Verwendung: %s [--release|--installed|--binary <Programm>] [--open] [--reuse <Testbereich>]\n' "$0"
       printf '  --release  gebündeltes macOS-.app beziehungsweise Linux-AppImage starten\n'
       printf '  --installed unter Linux das installierte DEB-Programm starten\n'
@@ -92,7 +97,6 @@ fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(dirname "$script_dir")
-temp_base=${TMPDIR:-/tmp}
 if [ -n "$reuse_sandbox" ]; then
   if [ ! -d "$reuse_sandbox" ]; then
     printf 'Testbereich existiert nicht oder ist kein Ordner.\n' >&2
@@ -105,14 +109,23 @@ if [ -n "$reuse_sandbox" ]; then
     exit 2
   fi
 else
+  temp_base=${TMPDIR:-/tmp}
+  case "$temp_base" in
+    /*) ;;
+    *) temp_base=$PWD/$temp_base ;;
+  esac
   sandbox=$(mktemp -d "$temp_base/doppeldecker-test.XXXXXX")
   printf 'DOPPELDECKER TEST SANDBOX\n' > "$sandbox/.doppeldecker-test-sandbox"
   mkdir -p "$sandbox/quelle" "$sandbox/ziel"
 fi
 
+if [ "$prepare_only" = true ]; then
+  printf '%s\n' "$sandbox"
+  exit 0
+fi
+
 finish() {
-  printf '\nTestbereich bleibt zur Kontrolle erhalten:\n%s\n' "$sandbox"
-  printf 'Nach der Kontrolle bitte über den Papierkorb entfernen.\n'
+  printf '\nTestbereich für Ergebnisprüfung und Wiederanlauf:\n%s\n' "$sandbox"
 }
 trap finish EXIT
 

@@ -6,6 +6,7 @@ import { $, errText, fmtEntrySize, isEntryNameSafe, joinPath } from "./ui-utils.
 let dialogSequence = 0;
 const scopeKeys = ["provider", "profileId", "profileRevision", "sessionGeneration", "path", "navigationRevision"];
 const terminalCodes = new Set(["expired", "plan_drift", "not_found"]);
+const formatLabels = new Map([["zip", "ZIP"], ["tar", "TAR"], ["tar_gzip", "TAR.GZ"]]);
 const element = (tag, className, text) => {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -101,7 +102,7 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
     context.status.textContent = context.error || (context.extract ? "Archivauswahl und Ziel werden geprüft … Schließen bricht die Vorbereitung ab."
       : context.opening ? "Archiv wird vorbereitet und geprüft; entfernte Dateien werden vollständig als Momentaufnahme geladen … Schließen oder Escape bricht ab."
       : context.listing ? "Ordner wird angezeigt …"
-        : context.read ? context.read.cancelled ? "Vorige Vorschau endet … Eine neue Vorschau startet erst danach." : "Ausgewählter Inhalt wird vollständig geprüft …"
+        : context.read ? context.read.cancelled ? "Vorige Vorschau endet … Eine neue Vorschau startet erst danach." : context.tar ? "Ausgewählter Inhalt wird gelesen …" : "Ausgewählter Inhalt wird vollständig geprüft …"
           : context.listingData ? "Schreibgeschützte Archivansicht · Vorschau mit F3 oder dem Vorschauknopf." : "Archiv konnte nicht geöffnet werden.");
     const modal = context.status.closest(".modal");
     if (!modal.contains(document.activeElement) || document.activeElement.matches?.(":disabled")) {
@@ -283,7 +284,7 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
       if (response.requestId !== read.requestId || response.sessionId !== context.sessionId || response.entryId !== read.entryId) { protocolError(context); return; }
       const preview = response.preview;
       context.preview.replaceChildren(element("h3", "archive-read-preview-title", row.displayName));
-      context.preview.append(element("p", "archive-read-note", `${fmtEntrySize(preview.bytes)} · Inhalt vollständig geprüft${preview.content.kind === "image" ? ` · ${preview.content.width} × ${preview.content.height} Pixel` : ""}`));
+      context.preview.append(element("p", "archive-read-note", `${fmtEntrySize(preview.bytes)} · ${context.tar ? "Dateilänge und Archivquelle geprüft" : "Inhalt vollständig geprüft"}${preview.content.kind === "image" ? ` · ${preview.content.width} × ${preview.content.height} Pixel` : ""}`));
       if (!renderPassivePreviewContent(context.preview, preview.content, { name: row.displayName })) {
         context.preview.append(element("p", "archive-read-note", preview.content.reason || "Keine passive Vorschau verfügbar."));
       }
@@ -303,19 +304,20 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
     if (blocked()) return;
     const entries = selectedEntries(side);
     if (entries.length !== 1 || !entries[0].is_file || entries[0].is_symlink || !isEntryNameSafe(entries[0])) {
-      showDock('<span class="pill none">ZIP-Inhalt</span>Bitte genau eine reguläre Datei ohne Symlink auswählen.', { closable: true });
+      showDock('<span class="pill none">Archivinhalt</span>Bitte genau eine reguläre Datei ohne Symlink auswählen.', { closable: true });
       return;
     }
     if (current) close(current);
     const pane = panes[side];
-    const context = { side, name: entries[0].name, scope: Object.fromEntries(scopeKeys.map(key => [key, pane[key]])), tabId: pane.tabs?.active?.id,
+    const tar = /\.(?:tar(?:\.gz)?|tgz)$/i.test(entries[0].name);
+    const context = { side, tar, name: entries[0].name, scope: Object.fromEntries(scopeKeys.map(key => [key, pane[key]])), tabId: pane.tabs?.active?.id,
       uiId: ++dialogSequence, openRequestId: crypto.randomUUID(), sessionId: null, canExtract: false, canExtractFile: false, opening: true, listing: false, closed: false, stale: false,
       rows: [], selected: null, read: null, previewRevision: 0, navigationRevision: 0 };
     current = context;
     context.modalToken = showOwnedModal("archive-read", token => {
       context.modalToken = token;
       $("#modal .modal").classList.add("archive-read-modal");
-      $("#modal-title").textContent = `ZIP-Inhalt · ${context.name}`;
+      $("#modal-title").textContent = `${tar ? /\.tar$/i.test(context.name) ? "TAR" : "TAR.GZ" : "ZIP"}-Inhalt · ${context.name}`;
       const body = $("#modal-body");
       body.replaceChildren();
       context.body = body;
@@ -374,8 +376,11 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
             ...(context.scope.provider === "local" ? {} : { profileId: context.scope.profileId, profileRevision: context.scope.profileRevision }) };
           const response = await invoke("open_archive_read", { requestId: context.openRequestId, request: { endpoint, path: joinPath(context.scope.path, context.name) } });
           if (!ensureScope(context)) { if (response.sessionId) closeBackend(context, response.sessionId); return; }
-          if (response.requestId !== context.openRequestId || response.listing.sessionId !== response.sessionId) { if (response.sessionId) closeBackend(context, response.sessionId); protocolError(context); return; }
+          const format = response.listing.catalog?.format;
+          if (response.requestId !== context.openRequestId || response.listing.sessionId !== response.sessionId || !formatLabels.has(format)) { if (response.sessionId) closeBackend(context, response.sessionId); protocolError(context); return; }
           context.sessionId = response.sessionId;
+          context.tar = format !== "zip";
+          $("#modal-title").textContent = `${formatLabels.get(format)}-Inhalt · ${context.name}`;
           context.canExtract = response.canExtract === true;
           context.canExtractFile = response.canExtractFile === true || context.canExtract;
           context.origin.hidden = !response.origin;

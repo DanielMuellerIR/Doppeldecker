@@ -311,10 +311,9 @@ pub(crate) struct PreferencesSnapshot {
     load_error: Option<AppError>,
 }
 
-/// Gemeinsame Grenze für Lesen und Schreiben einschließlich der Tab-Navigation.
-const MAX_DOCUMENT_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 
-fn read_document(path: &Path) -> Result<DesktopDocument, AppError> {
+pub(crate) fn read_config_bytes(path: &Path, label: &str) -> Result<Option<Vec<u8>>, AppError> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(
@@ -331,26 +330,33 @@ fn read_document(path: &Path) -> Result<DesktopDocument, AppError> {
         .open(path)
     {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DesktopDocument::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     if !file.metadata()?.is_file() {
         return Err(AppError::new(
             "invalid_input",
-            "Einstellungsdatei ist keine reguläre Datei",
+            format!("{label} ist keine reguläre Datei"),
         ));
     }
     // Die Größe wird beim Lesen selbst begrenzt statt nur vorab geprüft: Eine
     // Datei, die zwischen `metadata` und `read_to_end` wächst, könnte sonst
     // beliebig viel Speicher belegen. Ein Byte über dem Limit reicht als Beweis.
     let mut bytes = Vec::new();
-    file.take(MAX_DOCUMENT_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err(AppError::new(
             "invalid_input",
-            "Einstellungsdatei überschreitet die zulässige Größe",
+            format!("{label} überschreitet die zulässige Größe"),
         ));
     }
+    Ok(Some(bytes))
+}
+
+fn read_document(path: &Path) -> Result<DesktopDocument, AppError> {
+    let Some(bytes) = read_config_bytes(path, "Einstellungsdatei")? else {
+        return Ok(DesktopDocument::default());
+    };
     let mut document: DesktopDocument = serde_json::from_slice(&bytes).map_err(|e| {
         AppError::new(
             "invalid_input",
@@ -386,24 +392,25 @@ fn read_document(path: &Path) -> Result<DesktopDocument, AppError> {
     Ok(document)
 }
 
-/// Ein exklusiver Tempname und Rename halten den alten Stand bei einem
-/// Schreibfehler lesbar. Der Prozesslock der Queue ist vor dem Laden bereits
-/// gehalten; die zusätzliche Mutex ordnet Änderungen aller Fenster.
-///
-/// Rückgabe `Ok(Some(fehler))` bedeutet: Die neue Datei liegt bereits an ihrem
-/// Platz, nur der abschließende Verzeichnis-fsync ist gescheitert. Der Aufrufer
-/// muss den neuen Stand dann trotzdem als gültig übernehmen — sonst zeigt der RAM
-/// den alten Wert, während die Datei (und damit der nächste Start) den neuen hat.
 fn write_document(path: &Path, document: &DesktopDocument) -> Result<Option<AppError>, AppError> {
     document.validate()?;
     let bytes =
         serde_json::to_vec_pretty(document).map_err(|e| AppError::new("io", e.to_string()))?;
-    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err(AppError::new(
             "invalid_input",
             "Sitzungsstand überschreitet die zulässige Größe",
         ));
     }
+    write_config_bytes(path, &bytes)
+}
+
+/// Ein exklusiver Tempname und Rename halten den alten Stand bei einem
+/// Schreibfehler lesbar. Aufrufer ordnen ihre Änderungen mit einer Sperre.
+///
+/// Bei `Ok(Some(fehler))` liegt die neue Datei bereits an ihrem Platz.
+/// Der Fehler betrifft nur die Absicherung per Verzeichnis-fsync.
+pub(crate) fn write_config_bytes(path: &Path, bytes: &[u8]) -> Result<Option<AppError>, AppError> {
     let parent = path
         .parent()
         .ok_or_else(|| AppError::new("io", "Einstellungsordner fehlt"))?;
@@ -411,7 +418,7 @@ fn write_document(path: &Path, document: &DesktopDocument) -> Result<Option<AppE
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).map_err(|e| AppError::new("io", e.to_string()))?;
     let id = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let temp = parent.join(format!(".desktop-settings-{id}.tmp"));
+    let temp = parent.join(format!(".config-{id}.tmp"));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -419,7 +426,7 @@ fn write_document(path: &Path, document: &DesktopDocument) -> Result<Option<AppE
         .custom_flags(libc::O_NOFOLLOW)
         .open(&temp)?;
     let result = (|| -> Result<(), AppError> {
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&temp, path)?;
         Ok(())
@@ -1599,7 +1606,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         let mut bytes =
             b"{\"version\":1,\"revision\":0,\"preferences\":{},\"windows\":{},\"x\":\"".to_vec();
-        bytes.resize(MAX_DOCUMENT_BYTES as usize + 16, b'a');
+        bytes.resize(MAX_CONFIG_BYTES as usize + 16, b'a');
         std::fs::write(&path, &bytes).unwrap();
         let error = read_document(&path).err().unwrap();
         assert!(error.message.contains("Größe"), "{}", error.message);

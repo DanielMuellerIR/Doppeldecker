@@ -1,39 +1,42 @@
-# Roadmap bis Version 1.0
+# Produktziele und Roadmap
 
-Stand: 2026-11-08. Ziel ist ein komfortabler, umfassender und effizienter
+Stand: 2026-11-18. Ziel ist ein komfortabler, umfassender und effizienter
 Two-Pane-Dateimanager für macOS und Linux. Offene Einzelaufgaben stehen nur im
 [Backlog](../backlog.md); die [Funktionsmatrix](function-audit.md) beschreibt das
 aktuell implementierte Verhalten.
 
-## Beauftragter Ausbau der Alltagstauglichkeit
+## Reihenfolge
 
-1. **Metadatenumfang umgesetzt:** Die belegten Alltagsfunktionen einschließlich
-   macOS-Administratorfreigabe sind implementiert. Über die belegte ForkLift-Parität
-   hinausgehende Spezialfähigkeiten sind keine Releasepflicht. Der
-   [Vergleich und Prüfstand](forklift-parity.md) begrenzt diesen Umfang.
-2. **Komfort umgesetzt:** Entfernte Namenzyklen sowie ZIP-Erzeugung und Entpacken
-   zu Remotezielen sind implementiert und gegen reale Provider geprüft.
-   Die native Archivmatrix ist für alle fünf Anbieter auf beiden Plattformen
-   abgenommen. [Prüfstand](remote-pack.md).
-3. **Kandidaten stabilisieren:** Neue Funktionen gezielt prüfen, anschließend den
-   aktuellen Kandidaten auf beiden unterstützten Plattformen als echte App und
-   Paket abnehmen. [Release- und Plattformplan](release-plan.md).
-4. **Auslieferung vorbereiten:** Funktionsmatrix, READMEs, Release Notes und Website
-   auf denselben abgenommenen Kandidaten beziehen. Die
-   [Entwicklungshinweise](release-notes-next.md) beschreiben den Umfang nach
-   0.1.125; die Website beschreibt weiterhin den verfügbaren Previewdownload.
-   Eine Veröffentlichung braucht einen eigenen konkreten Auftrag.
+1. **Dateiarbeit über Protokollgrenzen vervollständigen.** Häufige Abläufe vom
+   Verbinden bis zur abgeschlossenen Dateiaktion an der echten Oberfläche prüfen,
+   beginnend mit SFTP. Für FTP, FTPS, WebDAV und SMB die jeweils betroffene
+   Fähigkeit nachweisen. Konkrete Lücken nach Häufigkeit und Nutzerwirkung
+   einordnen. Die [Funktionsmatrix](function-audit.md) liefert den Ausgangsstand.
+   Weitere Fähigkeiten moderner Dateimanager an konkreten Arbeitsabläufen
+   vergleichen, etwa Suche und Vorschau, Archive, Stapelaktionen oder lange
+   Transfers. Fehlende Möglichkeiten mit ihrem Nutzen in den Backlog übernehmen.
+   Der ForkLift-Metadatenvergleich begrenzt nur den Metadatenumfang.
+2. **Bedienung in jedem Ausbau mitprüfen.** Eine sichtbare Menüaktion mit klarer
+   Wirkung hilft beim ersten Versuch. Tastatur, Mehrfachauswahl, erhaltener
+   Fokus und eine reaktionsfähige Fortschrittsanzeige machen dieselbe Arbeit
+   bei Wiederholung schnell. Am echten Fenster auch Beschriftung, Lesbarkeit,
+   Ausrichtung und Darstellung bei knapper Breite beurteilen.
+3. **Kandidaten abnehmen und ausliefern.** Den gewählten Stand als echte App
+   und Paket auf macOS und Linux prüfen. Funktionsmatrix, READMEs, Release Notes
+   und Website an den abgenommenen Stand angleichen. Die Veröffentlichung
+   braucht einen eigenen Auftrag. [Release- und Plattformplan](release-plan.md).
 
-## Was „fertig“ bedeutet
+## Kriterien für Version 1.0
 
-Version 1.0 benötigt:
+Zur Abnahme von Version 1.0 gehören:
 
 - direkt bedienbare gewöhnliche lokale und entfernte Dateiaktionen mit klaren
   Konflikt-, Abbruch- und Fehlerzuständen, auch bei großen Beständen;
-- die oben genannten Komfortabläufe und den begrenzten
+- auffindbare und per Tastatur bedienbare Abläufe sowie den belegten
   [Metadaten-Paritätsumfang](forklift-parity.md);
 - zuverlässige fenstereigene Queues, nachvollziehbare Wiederherstellung sowie
-  einseitigen und bidirektionalen Sync mit passendem Providervertrag;
+  einseitigen und bidirektionalen Sync mit verständlicher Wirkungsvorschau,
+  einstellbaren Ausschlüssen und wiederverwendbaren Aufträgen;
 - reproduzierbare macOS-/Linux-Pakete mit belegter Installation, Upgrade,
   Recovery und konsistenten öffentlichen Funktionszusagen.
 

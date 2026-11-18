@@ -5,13 +5,16 @@ import { bindArchivePackPages, archiveUploadDetailsHtml, archiveIssuesHtml } fro
 import { $, escapeHtml, fmtTransferBytes, errText, isEntryNameSafe, joinPath } from "./ui-utils.js";
 
 const keys = ["provider", "profileId", "profileRevision", "sessionGeneration", "path", "navigationRevision"];
+export function archiveExtractFormatLabel(preview) {
+  return ({ tar: "TAR", tar_gzip: "TAR.GZ" })[preview?.format] || "ZIP";
+}
 export function archiveExtractFailureMessage(code) {
   if (code === "invalid_data") return "Die Archiv- oder Inhaltsprüfung ist fehlgeschlagen.";
   if (code === "outcome_unclear") return "Der Entpackausgang ist teilweise unklar.";
-  return "Das ZIP-Archiv konnte nicht vollständig entpackt werden.";
+  return "Das Archiv konnte nicht vollständig entpackt werden.";
 }
 export function archiveExtractFailureHtml(payload) {
-  return `<span class="pill delete">ZIP entpacken fehlgeschlagen</span>${escapeHtml(archiveExtractFailureMessage(payload.code))} ` +
+  return `<span class="pill delete">Entpacken fehlgeschlagen</span>${escapeHtml(archiveExtractFailureMessage(payload.code))} ` +
     'Die Queue zeigt die tatsächliche Teilbilanz, vollständige Fehlerdetails und erhaltene Recoverypfade. ' +
     `<button class="dock-action" type="button" data-dock-action="open-queue" data-operation-id="${escapeHtml(payload.operationId)}">Entpackbilanz in Queue öffnen</button>`;
 }
@@ -32,7 +35,7 @@ export function archiveExtractPreviewHtml(preview, { targetLabel = preview.targe
     `<p>Ziel: <code class="archive-pack-path">${escapeHtml(targetLabel)}</code></p>` +
     `<p>${escapeHtml(archiveExtractSummary(preview))}</p>` +
     `<p>Zuerst lokal entpacken, danach hochladen. Die Quelle bleibt erhalten. Zielkonflikte werden vor dem Upload entschieden.</p>` +
-    `<p>Native Archivmetadaten werden nicht wiederhergestellt.${!preview.catalog_complete ? " Nur der bekannte Archivteil wird entpackt." : ""}</p>` +
+    `<p>Native Archivmetadaten werden nicht wiederhergestellt.${preview.format === "tar" ? " TAR speichert keine Prüfsumme pro Datei." : ""}${!preview.catalog_complete ? " Nur der bekannte Archivteil wird entpackt." : ""}</p>` +
     archiveUploadDetailsHtml(notice) + archiveIssuesHtml("Vollständige Entpackhinweise seitenweise");
   return `<p class="archive-pack-path">${escapeHtml(archiveExtractScope(preview))}</p><p>Archivquelle: <code class="archive-pack-path">${escapeHtml(archiveExtractSourceLabel(preview))}</code></p>` +
     (preview.snapshot ? '<p>Die bestätigten Bytes stammen aus der bereits geladenen Momentaufnahme. Spätere Serveränderungen werden nicht übernommen. Fehlt die Aufnahme beim Queue-Start, muss das Archiv erneut geöffnet werden.</p>' : "") +
@@ -41,6 +44,7 @@ export function archiveExtractPreviewHtml(preview, { targetLabel = preview.targe
     `<p>${escapeHtml(archiveExtractSummary(preview))}</p>` +
     (!preview.catalog_complete ? '<p class="archive-pack-warning">Teilkatalog: Nur der bekannte, ausführbare Teil kann entpackt werden. Der übrige Archivinhalt ist unbekannt.</p>' : "") +
     '<p>Die Archivquelle bleibt erhalten. Vorhandene Ordner werden zusammengeführt; zusätzliche Zielinhalte bleiben erhalten. Symlinks und Spezialdateien werden ausgelassen. Native Archivmetadaten werden nicht wiederhergestellt.</p>' +
+    (preview.format === "tar" ? '<p>TAR speichert keine Prüfsumme pro Datei. Doppeldecker vergleicht die gelesenen Bytes mit der Zielkopie.</p>' : "") +
     (preview.commit_class === "best_effort" ? '<p class="archive-pack-warning">Best Effort: Nach frischem Zielcheck wird ein Commit versucht und zurückgelesen. Ein gleichzeitig neu angelegtes Ziel kann dabei ersetzt werden.</p>' : "") +
     (!preview.file_flush || !preview.directory_flush ? '<p class="archive-pack-warning">Best Effort bei Dauerhaftigkeit: Datei- oder Ordner-Flush ist auf dem Ziel nicht vollständig garantiert.</p>' : "") +
     `<div class="archive-pack-issues" role="region" tabindex="0" aria-label="Vollständige Entpackhinweise seitenweise"></div>` +
@@ -49,7 +53,7 @@ export function archiveExtractPreviewHtml(preview, { targetLabel = preview.targe
 function conflictsFor(preview) {
   return preview.conflict_details.map(conflict => ({
     relative_name: conflict.relative_name,
-    source: { endpoint: `ZIP · ${archiveExtractSourceLabel(preview)}`, exists: true, kind: "file", size: conflict.source_bytes, mtime: null },
+    source: { endpoint: `${archiveExtractFormatLabel(preview)} · ${archiveExtractSourceLabel(preview)}`, exists: true, kind: "file", size: conflict.source_bytes, mtime: null },
     target: { endpoint: joinPath(preview.target_dir, conflict.relative_name), exists: true, kind: "file", size: conflict.target_bytes, mtime: conflict.target_mtime },
   }));
 }
@@ -101,7 +105,7 @@ export function createArchiveExtractUi({ panes, activeSide, selectedEntries, blo
     const entries = selectedEntries(side);
     if (entries.length !== 1 || !entries[0].is_file || entries[0].is_symlink || !isEntryNameSafe(entries[0])) {
       if (prepared) discard(prepared.preparationId);
-      showError("ZIP entpacken", new Error("Bitte genau eine reguläre Archivdatei auswählen.")); return;
+      showError("Archiv entpacken", new Error("Bitte genau eine reguläre Archivdatei auswählen.")); return;
     }
     if (current) finish(current);
     const context = { source: snapshot(side), target: snapshot(side === "left" ? "right" : "left"), name: entries[0].name,
@@ -110,7 +114,9 @@ export function createArchiveExtractUi({ panes, activeSide, selectedEntries, blo
     context.token = showOwnedModal("archive-extract", token => {
       context.token = token;
       $("#modal .modal").classList.add("archive-pack-modal");
-      $("#modal-title").textContent = "ZIP entpacken";
+      const format = prepared ? archiveExtractFormatLabel(prepared.binding.preview)
+        : /\.tar$/i.test(context.name) ? "TAR" : /\.(?:tar\.gz|tgz)$/i.test(context.name) ? "TAR.GZ" : "ZIP";
+      $("#modal-title").textContent = `${format} entpacken`;
       const body = $("#modal-body");
       body.innerHTML = `<div class="archive-extract-initial"><p>Ganzes Archiv: <code class="archive-pack-path">${escapeHtml(context.name)}</code></p><p>Ziel ist der Ordner der anderen Pane:</p><code class="archive-pack-path">${escapeHtml(context.target.path || "Kein Zielordner geöffnet")}</code></div><p class="archive-pack-status" role="status">Archiv und Ziel werden geprüft … Abbrechen bleibt möglich.</p><div class="archive-extract-result"></div>`;
       context.status = body.querySelector("[role=status]"); context.result = body.querySelector(".archive-extract-result");
@@ -142,7 +148,7 @@ export function createArchiveExtractUi({ panes, activeSide, selectedEntries, blo
         } catch (error) {
           if (!context.closed) {
             if (context.status.isConnected) { context.status.textContent = errText(error); context.cancel.textContent = "Schließen"; }
-            else { showError("ZIP entpacken", error); finish(context); }
+            else { showError("Archiv entpacken", error); finish(context); }
           }
         } finally { context.busy = false; }
       });

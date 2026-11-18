@@ -1,4 +1,4 @@
-//! Rein lesende lokale ZIP-Sicht. Einträge folgen dem Zentralverzeichnis;
+//! Rein lesende Sicht auf ZIP- und TAR-Inhalte. ZIP-Einträge folgen dem Zentralverzeichnis;
 //! eine vollständige strukturelle Validierung einschließlich aller Data Descriptors
 //! wird nicht behauptet. Dieses Modul erzeugt niemals Dateisystemziele.
 //!
@@ -15,6 +15,8 @@
 //! für den ausgewählten zentralen Eintrag. CRC ist die ZIP-Inhaltsprüfung, kein
 //! kryptografischer Echtheitsbeleg. Die Quellenbindung prüft vorhandene lokale
 //! Datei-/Eltern-/Rootversionen ohne vollständiges Vorhashen.
+
+mod tar_read;
 
 use crate::local_fs::{open_read_beneath, RootHandle};
 use crate::local_read::FileVersion;
@@ -34,7 +36,7 @@ fn drift() -> io::Error {
     coded_error(
         io::ErrorKind::Interrupted,
         ErrorCode::PlanDrift,
-        "ZIP-Quelle wurde geändert oder ausgetauscht",
+        "Archivquelle wurde geändert oder ausgetauscht",
     )
 }
 fn check_cancel(cancel: &Cancel) -> io::Result<()> {
@@ -42,7 +44,7 @@ fn check_cancel(cancel: &Cancel) -> io::Result<()> {
         Err(coded_error(
             io::ErrorKind::Interrupted,
             ErrorCode::Interrupted,
-            "ZIP-Lesen abgebrochen",
+            "Archivlesen abgebrochen",
         ))
     } else {
         Ok(())
@@ -69,7 +71,7 @@ impl Source {
                 .any(|c| !matches!(c, Component::Normal(_)))
         {
             return Err(invalid(
-                "ZIP-Quelle benötigt einen relativen Pfad ohne Sonderkomponenten",
+                "Archivquelle benötigt einen relativen Pfad ohne Sonderkomponenten",
             ));
         }
         let root = RootHandle::open(root)?;
@@ -80,7 +82,7 @@ impl Source {
         let file = open_read_beneath(&parent, &path)?;
         let meta = file.metadata()?;
         if !meta.is_file() {
-            return Err(invalid("ZIP-Quelle ist keine reguläre Datei"));
+            return Err(invalid("Archivquelle ist keine reguläre Datei"));
         }
         check_cancel(cancel)?;
         let verified = crate::vfs::LocalVfs::rooted(root.path())?
@@ -172,24 +174,33 @@ fn validate_catalog_budget(budget: CatalogBudget) -> io::Result<()> {
 }
 struct BoundedReader {
     source: Source,
+    expanded_tar: Option<Vec<u8>>,
     cancel: Cancel,
     bytes: Cell<u64>,
     calls: Cell<u64>,
     max_bytes: u64,
     max_calls: u64,
 }
+impl BoundedReader {
+    fn len(&self) -> u64 {
+        self.expanded_tar
+            .as_ref()
+            .map_or(self.source.length, |bytes| bytes.len() as u64)
+    }
+}
+
 impl ReaderAt for BoundedReader {
     fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
         check_cancel(&self.cancel)?;
         if buffer.is_empty() {
             return Ok(0);
         }
-        if offset > self.source.length {
+        if offset > self.len() {
             return Err(invalid(
-                "ZIP-Lesebereich liegt außerhalb der gebundenen Quelle",
+                "Archiv-Lesebereich liegt außerhalb der gebundenen Quelle",
             ));
         }
-        let available = self.source.length - offset;
+        let available = self.len() - offset;
         let requested = available.min(buffer.len() as u64);
         if self.calls.get() >= self.max_calls
             || requested > self.max_bytes.saturating_sub(self.bytes.get())
@@ -198,10 +209,16 @@ impl ReaderAt for BoundedReader {
         }
         self.calls.set(self.calls.get() + 1);
         self.source.verify()?;
-        let read = self
-            .source
-            .file
-            .read_at(&mut buffer[..requested as usize], offset)?;
+        let read = if let Some(bytes) = &self.expanded_tar {
+            let start = offset as usize;
+            let count = requested as usize;
+            buffer[..count].copy_from_slice(&bytes[start..start + count]);
+            count
+        } else {
+            self.source
+                .file
+                .read_at(&mut buffer[..requested as usize], offset)?
+        };
         self.bytes.set(self.bytes.get() + read as u64);
         self.source.verify()?;
         check_cancel(&self.cancel)?;
@@ -295,14 +312,78 @@ pub struct VerifiedArchiveRead {
     pub io_bytes: u64,
 }
 
-struct BoundEntry {
-    wayfinder: rawzip::ZipArchiveEntryWayfinder,
-    method: rawzip::CompressionMethod,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveReadFormat {
+    #[default]
+    Zip,
+    Tar,
+    TarGzip,
 }
+
+impl ArchiveReadFormat {
+    pub fn from_path(path: &Path) -> Self {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+            Self::TarGzip
+        } else if name.ends_with(".tar") {
+            Self::Tar
+        } else {
+            Self::Zip
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Zip => "ZIP",
+            Self::Tar => "TAR",
+            Self::TarGzip => "TAR.GZ",
+        }
+    }
+
+    pub(crate) fn is_zip(&self) -> bool {
+        *self == Self::Zip
+    }
+}
+
+enum BoundEntry {
+    Zip {
+        wayfinder: rawzip::ZipArchiveEntryWayfinder,
+        method: rawzip::CompressionMethod,
+    },
+    Tar {
+        offset: u64,
+    },
+}
+
+enum ArchiveStorage {
+    Zip(rawzip::ZipArchive<BoundedReader>),
+    Tar(BoundedReader),
+}
+
+impl ArchiveStorage {
+    fn reader(&self) -> &BoundedReader {
+        match self {
+            Self::Zip(archive) => archive.get_ref(),
+            Self::Tar(reader) => reader,
+        }
+    }
+
+    fn reader_mut(&mut self) -> &mut BoundedReader {
+        match self {
+            Self::Zip(archive) => archive.get_mut(),
+            Self::Tar(reader) => reader,
+        }
+    }
+}
+
 /// Nicht serialisierbare Lesesitzung mit gebundener Quelle und Backend-IDs.
-/// Der Katalog ist keine Zusage vollständiger ZIP-Strukturvalidität.
 pub struct ArchiveRead {
-    archive: rawzip::ZipArchive<BoundedReader>,
+    storage: ArchiveStorage,
     entries: Vec<ArchiveCatalogEntry>,
     bound: Vec<BoundEntry>,
     session: [u8; 16],
@@ -318,7 +399,7 @@ fn budget_error() -> io::Error {
     coded_error(
         io::ErrorKind::InvalidInput,
         ErrorCode::InvalidInput,
-        "ZIP-Ressourcenbudget erreicht",
+        "Archiv-Ressourcenbudget erreicht",
     )
 }
 pub(crate) fn path_is_safe(name: &str) -> bool {
@@ -340,47 +421,110 @@ impl ArchiveRead {
         budget: CatalogBudget,
         cancel: &Cancel,
     ) -> io::Result<Self> {
+        Self::open_as(
+            root,
+            relative_source,
+            ArchiveReadFormat::Zip,
+            budget,
+            cancel,
+        )
+    }
+
+    pub fn open_as(
+        root: &Path,
+        relative_source: &Path,
+        format: ArchiveReadFormat,
+        budget: CatalogBudget,
+        cancel: &Cancel,
+    ) -> io::Result<Self> {
         validate_catalog_budget(budget)?;
         let source = Source::bind(root, relative_source, cancel)?;
-        Self::open_source(source, budget, cancel)
+        Self::open_source(source, format, budget, cancel)
     }
+
     /// Übernimmt die bereits manifest- und inhaltsgeprüfte Datei am gehaltenen FD.
     pub fn open_snapshot(
         snapshot: crate::remote_snapshot::ValidatedSnapshot,
         budget: CatalogBudget,
         cancel: &Cancel,
     ) -> io::Result<Self> {
+        Self::open_snapshot_as(snapshot, ArchiveReadFormat::Zip, budget, cancel)
+    }
+
+    pub fn open_snapshot_as(
+        snapshot: crate::remote_snapshot::ValidatedSnapshot,
+        format: ArchiveReadFormat,
+        budget: CatalogBudget,
+        cancel: &Cancel,
+    ) -> io::Result<Self> {
         validate_catalog_budget(budget)?;
         let source = Source::bind_snapshot(snapshot, cancel)?;
-        Self::open_source(source, budget, cancel)
+        Self::open_source(source, format, budget, cancel)
     }
-    fn open_source(source: Source, budget: CatalogBudget, cancel: &Cancel) -> io::Result<Self> {
+
+    pub fn format(&self) -> ArchiveReadFormat {
+        match self.storage {
+            ArchiveStorage::Zip(_) => ArchiveReadFormat::Zip,
+            ArchiveStorage::Tar(ref reader) if reader.expanded_tar.is_some() => {
+                ArchiveReadFormat::TarGzip
+            }
+            ArchiveStorage::Tar(_) => ArchiveReadFormat::Tar,
+        }
+    }
+
+    fn open_source(
+        source: Source,
+        format: ArchiveReadFormat,
+        budget: CatalogBudget,
+        cancel: &Cancel,
+    ) -> io::Result<Self> {
         check_cancel(cancel)?;
-        let length = source.length;
-        let reader = BoundedReader {
+        let mut session = [0; 16];
+        getrandom::fill(&mut session).map_err(|error| io::Error::other(error.to_string()))?;
+        let mut reader = BoundedReader {
             source,
+            expanded_tar: None,
             cancel: cancel.clone(),
             bytes: Cell::new(0),
             calls: Cell::new(0),
             max_bytes: budget.max_io_bytes,
             max_calls: budget.max_read_calls,
         };
+        match format {
+            ArchiveReadFormat::Zip => Self::open_zip(reader, session, budget, cancel),
+            ArchiveReadFormat::Tar => tar_read::open_tar(reader, session, budget, cancel),
+            ArchiveReadFormat::TarGzip => {
+                reader.expanded_tar =
+                    Some(tar_read::expand_gzip(&reader, budget.max_io_bytes, cancel)?);
+                tar_read::open_tar(reader, session, budget, cancel)
+            }
+        }
+    }
+
+    fn open_zip(
+        reader: BoundedReader,
+        session: [u8; 16],
+        budget: CatalogBudget,
+        cancel: &Cancel,
+    ) -> io::Result<Self> {
+        let length = reader.source.length;
         // Feste Formatobergrenzen: keine aus Archivzahlen abgeleitete Allokation.
         let mut buffer = vec![0; rawzip::MAX_CENTRAL_DIRECTORY_RECORD_SIZE];
         let mut local_buffer = vec![0; 2 * usize::from(u16::MAX)];
         let archive = rawzip::ZipLocator::new()
             .locate_in_reader(reader, &mut buffer, length)
             .map_err(|(_, e)| zip_error(e))?;
-        let mut session = [0; 16];
-        getrandom::fill(&mut session).map_err(|error| io::Error::other(error.to_string()))?;
         let mut result = Self {
-            archive,
+            storage: ArchiveStorage::Zip(archive),
             entries: Vec::new(),
             bound: Vec::new(),
             session,
             stop: None,
         };
-        let mut iterator = result.archive.entries(&mut buffer);
+        let ArchiveStorage::Zip(archive) = &result.storage else {
+            unreachable!("open_zip erzeugt ausschließlich ZIP-Speicher");
+        };
+        let mut iterator = archive.entries(&mut buffer);
         let mut metadata_bytes = 0u64;
         let mut names = BTreeMap::<Vec<u8>, usize>::new();
         let mut ranges = Vec::new();
@@ -458,17 +602,13 @@ impl ArchiveRead {
             if !extra.remaining_bytes().is_empty() {
                 issues.push(ArchiveEntryIssue::InvalidHeader);
             }
-            match result
-                .archive
-                .get_entry(record.wayfinder())
-                .map_err(zip_error)
-            {
+            match archive.get_entry(record.wayfinder()).map_err(zip_error) {
                 Ok(entry) => {
                     let (start, end) = entry.compressed_data_range();
                     let header = record.local_header_offset();
-                    if header >= result.archive.directory_offset()
+                    if header >= archive.directory_offset()
                         || start > end
-                        || end > result.archive.directory_offset()
+                        || end > archive.directory_offset()
                         || end > length
                     {
                         issues.push(ArchiveEntryIssue::InvalidRange);
@@ -513,12 +653,12 @@ impl ArchiveRead {
                 duplicate_name: previous.is_some(),
                 issues,
             });
-            result.bound.push(BoundEntry {
+            result.bound.push(BoundEntry::Zip {
                 wayfinder: record.wayfinder(),
                 method,
             });
         }
-        if result.stop.is_none() && result.entries.len() as u64 != result.archive.entries_hint() {
+        if result.stop.is_none() && result.entries.len() as u64 != archive.entries_hint() {
             result.stop = Some(ArchiveCatalogStop {
                 code: ErrorCode::InvalidData,
                 message: "ZIP-Eintragszahl stimmt nicht mit dem gelesenen Katalog überein".into(),
@@ -547,28 +687,28 @@ impl ArchiveRead {
                 covering = Some((end, index));
             }
         }
-        result.archive.get_ref().source.verify()?;
+        archive.get_ref().source.verify()?;
         check_cancel(cancel)?;
         Ok(result)
     }
     /// Frische gemeinsame Quellenbindung ohne vollständiges Vorhashen.
     pub fn source_binding_digest(&self, cancel: &Cancel) -> io::Result<[u8; 32]> {
         self.verify_source(cancel)?;
-        Ok(self.archive.get_ref().source.digest)
+        Ok(self.storage.reader().source.digest)
     }
     /// Auch nach einem Ziel-Readback und vor einer Ordneranlage/Commit prüfen.
     pub fn verify_source(&self, cancel: &Cancel) -> io::Result<()> {
         check_cancel(cancel)?;
-        self.archive.get_ref().source.verify()?;
+        self.storage.reader().source.verify()?;
         check_cancel(cancel)
     }
     /// Gehaltene Quellbezeichner; ein frischer Versionsvergleich bleibt erforderlich.
     pub fn source_paths(&self) -> (&Path, &Path) {
-        let source = &self.archive.get_ref().source;
+        let source = &self.storage.reader().source;
         (source.root.path(), &source.path)
     }
     pub(crate) fn source_identity(&self) -> io::Result<(u64, u64)> {
-        let metadata = self.archive.get_ref().source.file.metadata()?;
+        let metadata = self.storage.reader().source.file.metadata()?;
         Ok((metadata.dev(), metadata.ino()))
     }
     /// Wandelt ausschließlich eine Kennung dieses Katalogs in eine persistente Dateiauswahl um.
@@ -580,14 +720,14 @@ impl ArchiveRead {
         self.verify_source(cancel)?;
         if id.session != self.session {
             return Err(invalid(
-                "ZIP-Eintragskennung gehört nicht zu diesem Katalog",
+                "Archiv-Eintragskennung gehört nicht zu diesem Katalog",
             ));
         }
         let entry = self
             .entries
             .get(id.index)
             .filter(|entry| entry.id == id && entry.kind == ArchiveEntryKind::File)
-            .ok_or_else(|| invalid("ZIP-Auswahl benötigt einen vorhandenen Dateieintrag"))?;
+            .ok_or_else(|| invalid("Die Auswahl benötigt einen vorhandenen Dateieintrag"))?;
         Ok(crate::archive_extract::ArchiveExtractSelection::Entry {
             ordinal: id.index,
             raw_name: entry.raw_name.clone(),
@@ -620,7 +760,7 @@ impl ArchiveRead {
     /// Nicht navigierbare Namen bleiben als problematische Einträge im Wurzelkatalog.
     pub fn directory(&self, directory: &str) -> io::Result<ArchiveDirectory<'_>> {
         if !directory.is_empty() && (!path_is_safe(directory) || directory.ends_with('/')) {
-            return Err(invalid("Ungültiger virtueller ZIP-Ordner"));
+            return Err(invalid("Ungültiger virtueller Archivordner"));
         }
         let prefix = if directory.is_empty() {
             String::new()
@@ -665,18 +805,18 @@ impl ArchiveRead {
         check_cancel(cancel)?;
         if id.session != self.session {
             return Err(invalid(
-                "ZIP-Eintrags-ID gehört zu einer anderen Lesesitzung",
+                "Archiv-Eintrags-ID gehört zu einer anderen Lesesitzung",
             ));
         }
         let entry = self
             .entries
             .get(id.index)
-            .ok_or_else(|| invalid("Unbekannte ZIP-Eintrags-ID"))?;
+            .ok_or_else(|| invalid("Unbekannte Archiv-Eintrags-ID"))?;
         if entry.kind != ArchiveEntryKind::File || !entry.issues.is_empty() {
             return Err(coded_error(
                 io::ErrorKind::Unsupported,
                 ErrorCode::Unsupported,
-                "ZIP-Eintrag ist in dieser Lesesicht nicht ausführbar",
+                "Archiveintrag ist in dieser Lesesicht nicht ausführbar",
             ));
         }
         if entry.uncompressed_bytes > budget.max_output_bytes
@@ -686,17 +826,26 @@ impl ArchiveRead {
             return Err(budget_error());
         }
         let bound = &self.bound[id.index];
-        let reader = self.archive.get_mut();
+        let reader = self.storage.reader_mut();
         reader.cancel = cancel.clone();
         reader.bytes.set(0);
         reader.calls.set(0);
         reader.max_bytes = budget.max_io_bytes;
         reader.max_calls = budget.max_read_calls;
         reader.source.verify()?;
-        let local = self.archive.get_entry(bound.wayfinder).map_err(zip_error)?;
+        let (archive, wayfinder, method) = match (&self.storage, bound) {
+            (ArchiveStorage::Zip(archive), BoundEntry::Zip { wayfinder, method }) => {
+                (archive, *wayfinder, *method)
+            }
+            (ArchiveStorage::Tar(reader), BoundEntry::Tar { offset }) => {
+                return tar_read::read_payload(reader, *offset, entry.uncompressed_bytes, sink);
+            }
+            _ => return Err(invalid("Archiveintrag gehört nicht zum gebundenen Format")),
+        };
+        let local = archive.get_entry(wayfinder).map_err(zip_error)?;
         let expected = local.reader().claim_verifier();
         let mut crc = rawzip::Crc32::new();
-        let output = if bound.method == rawzip::CompressionMethod::STORE {
+        let output = if method == rawzip::CompressionMethod::STORE {
             copy_stored(
                 local.reader(),
                 expected.uncompressed_size,
@@ -722,11 +871,11 @@ impl ArchiveRead {
                 uncompressed_size: output,
             })
             .map_err(zip_error)?;
-        self.archive.get_ref().source.verify()?;
+        self.storage.reader().source.verify()?;
         check_cancel(cancel)?;
         Ok(VerifiedArchiveRead {
             output_bytes: output,
-            io_bytes: self.archive.get_ref().bytes.get(),
+            io_bytes: self.storage.reader().bytes.get(),
         })
     }
 }

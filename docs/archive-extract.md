@@ -1,12 +1,12 @@
-# ZIP-Archive entpacken
+# Archive entpacken
 
-Stand: 2026-11-01. Ganze lokale ZIPs und geprüfte entfernte Momentaufnahmen,
-eine darin gewählte reguläre Datei oder ein virtueller Unterbaum lassen sich
+Stand: 2026-11-18. ZIP, TAR, TAR.GZ und TGZ lassen sich als ganzes Archiv,
+einzeln ausgewählte reguläre Datei oder virtueller Unterbaum
 in die lokale oder entfernte Gegenpane entpacken. Die Archivquelle bleibt erhalten.
 
 ## Bedienung
 
-**ZIP entpacken …** im Befehls-/Kontextmenü prüft zunächst Umfang, Ziel und
+**Archiv entpacken …** im Befehls-/Kontextmenü prüft zunächst Umfang, Ziel und
 Auslassungen. **Entpacken** startet die Fensterqueue. Im Archivbrowser gelten:
 
 | Aktion | Zielabbildung |
@@ -35,14 +35,17 @@ Unabhängige Inhalte bleiben nutzbar. Eigene Archivquelle und Identitätsaliase 
 Ein Teilkatalog braucht **Bekannten Teil entpacken**; sein unbekannter Rest gilt nie
 als vollständig. Der Ausführungsplan stammt aus dem Core, nicht aus sichtbaren Browserzeilen.
 
-CRC, gebundene Größen und frische Ziel-/Identitätsprüfungen gelten vor dem Commit.
+Gebundene Größen, Inhaltsvergleich mit dem Arbeitsstand und frische
+Ziel-/Identitätsprüfungen gelten vor dem Commit. ZIP-Dateien und GZIP-Streams
+liefern zusätzlich gespeicherte CRCs. Ein einfaches TAR hat nur Kopfprüfsummen.
+Bei TAR.GZ und TGZ ist der entpackte Stream auf 64 MiB begrenzt.
 Der zusätzliche Entpackindex ist auf 64 MiB und 50.000 Knoten begrenzt, einschließlich
 Elternnamensindizes; das ist kein Gesamtprozesslimit. Kataloggrenzen gelten zusätzlich.
 Platzmangel bleibt auch während des Streams ein sichtbarer Fehler.
 
 Dies ist ein portabler Inhaltstransfer. Owner, Rechte/Sonderbits, Zeitstempel,
-ACLs, xattrs, Resource Forks, Sparse- und Hardlinkbeziehungen werden nicht aus ZIPs
-wiederhergestellt. Weitere Archivformate und freie Mehrfachauswahl bleiben spätere Wünsche.
+ACLs, xattrs, Resource Forks, Sparse- und Hardlinkbeziehungen werden beim
+Entpacken nicht wiederhergestellt. Freie Mehrfachauswahl bleibt ein späterer Ausbau.
 
 ## Queue und Teilwirkungen
 
@@ -53,12 +56,12 @@ Handles, Secrets und Permits sind keine Freigaben im Journal.
 Remoteziele verwenden den zweiphasigen [Archivupload](remote-pack.md): zuerst lokal
 entpacken und versiegeln, dann dieselben Ergebnisbytes hochladen. Die Queue zeigt
 Archivhinweise, Zwischenstand und Upload getrennt. Konfliktpause und Neustart bauen
-die Quelle nicht neu auf. Journalversion 40 ergänzt diese Phase; bekannte ältere
-Journale werden migriert, ältere Programme lehnen das neue Format ab.
+die Quelle nicht neu auf. Journalversion 42 bindet das Archivformat in Queue
+und Vorschau. Frühere ZIP-Aufträge behalten ihre bisherige Bindung.
 
 Abbruch stoppt weitere Wirkungen. Fertige Dateien und angelegte Ordner bleiben;
-nur nachweislich eigene offene Temps werden bereinigt. Unbelegte Reste, CRC-Fehler
-und unklare Commitantworten erhalten Recoverypfade. Teilbilanzen unterscheiden
+nur nachweislich eigene offene Temps werden bereinigt. Unbelegte Reste,
+Inhaltsfehler und unklare Commitantworten erhalten Recoverypfade. Teilbilanzen unterscheiden
 fertige, übersprungene, fehlgeschlagene und offene Wirkungen. Entpacken ist keine
 Gesamttransaktion; laufend abgestürzte Aufträge werden nicht blind wiederholt.
 Siehe [Restbereinigung](decision-lokale-restbereinigung.md).

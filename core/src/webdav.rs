@@ -39,6 +39,9 @@ mod interactive_namespace;
 #[path = "webdav_rename.rs"]
 mod interactive_rename;
 
+#[path = "webdav_resume.rs"]
+pub(crate) mod resume;
+
 pub(crate) fn validate_ordinary_rename_path(source: &Path, new_name: &str) -> io::Result<()> {
     interactive_rename::validate_request(source, new_name)
 }
@@ -59,7 +62,7 @@ mod security_read;
 pub(crate) const STRICT_MUTATION_BLOCKER: &str = "Strikte WebDAV-Mutationen sind nicht ausführbar: Standardbedingungen binden höchstens eine Elternressource zusätzlich zur Request-Version, nicht die vollständige Root-/Elternkette. Deshalb keine künstliche Schreib-/Löschprobe, allgemeine VFS-Schreibfreigabe, Quellentfernung oder Quarantäne. Gewöhnliche additive Uploads, Ordneranlage und Umbenennung behalten ihre eigene bestätigte Best-Effort-Klasse.";
 pub(crate) const NAMESPACE_BINDING_LIMITATION: &str = "Gewöhnliches WebDAV ist Best Effort: Collections und Eltern werden vor und nach der Wirkung frisch geprüft, nicht über eine bei Sabre/Nextcloud wirkungslose Collection-ETag-Bedingung gebunden. Ein gleichzeitiger serverseitiger Pfadtausch kann auf andere Inhalte desselben Kontos umleiten und ist nicht atomar ausgeschlossen. Wirksame Dateibedingungen bleiben erhalten; unklare Wirkungen werden nicht wiederholt oder automatisch zurückgetauscht.";
 
-pub(crate) fn ensure_ordinary_upload_profile_current(
+pub(crate) fn ensure_file_profile_current(
     queue: &Path,
     bindings: &[crate::RemoteProfileBinding],
     config: &WebDavConnectionConfig,

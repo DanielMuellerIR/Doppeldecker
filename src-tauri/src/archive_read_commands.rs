@@ -1,4 +1,4 @@
-//! Fenstergebundener, rein lesender ZIP-Browser. Keine Queue oder Mutationsfreigabe.
+//! Fenstergebundener, rein lesender Archivbrowser. Keine Queue oder Mutationsfreigabe.
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use crate::bidirectional_commands::{resolve_endpoint, BidirectionalEndpointRequest};
 use crate::{AppError, MutexExt};
 use doppeldecker_core::archive_read::{
-    ArchiveEntryId, ArchiveEntryIssue, ArchiveEntryKind, ArchiveRead, CatalogBudget, ReadBudget,
+    ArchiveEntryId, ArchiveEntryIssue, ArchiveEntryKind, ArchiveRead, ArchiveReadFormat,
+    CatalogBudget, ReadBudget,
 };
 use doppeldecker_core::preview::{classify_preview_bytes, FilePreview, PREVIEW_MAX_BYTES};
 use doppeldecker_core::Cancel;
@@ -63,6 +64,7 @@ struct Row {
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Catalog {
+    format: ArchiveReadFormat,
     complete: bool,
     entry_count: usize,
     displayed_entry_count: usize,
@@ -77,6 +79,7 @@ struct Breadcrumb {
     label: String,
 }
 pub(crate) struct ExtractSource {
+    pub format: ArchiveReadFormat,
     pub root: std::path::PathBuf,
     pub path: std::path::PathBuf,
     pub selection: doppeldecker_core::archive_extract::ArchiveExtractSelection,
@@ -198,7 +201,7 @@ fn metadata_bounded(
         root_id.clone(),
         Directory {
             parent: None,
-            label: "ZIP-Inhalt".into(),
+            label: format!("{}-Inhalt", archive.format().name()),
             rows: Vec::new(),
         },
     )]);
@@ -345,7 +348,7 @@ fn metadata_bounded(
     }
     let view_partial = mapped != archive.entries().len();
     let stop_reason = if view_partial {
-        Some(Issue { code: "resource_limit".into(), message: format!("Teilansicht: {mapped} von {} katalogisierten Einträgen abgebildet, {} nicht dargestellt. Das zusätzliche Budget für virtuelle Ordner oder Ansichtsmetadaten wurde erreicht.{}", archive.entries().len(), archive.entries().len() - mapped, archive.stop_reason().map(|s| format!(" Der ZIP-Katalog ist ebenfalls unvollständig: {}", s.message)).unwrap_or_default()) })
+        Some(Issue { code: "resource_limit".into(), message: format!("Teilansicht: {mapped} von {} katalogisierten Einträgen abgebildet, {} nicht dargestellt. Das zusätzliche Budget für virtuelle Ordner oder Ansichtsmetadaten wurde erreicht.{}", archive.entries().len(), archive.entries().len() - mapped, archive.stop_reason().map(|s| format!(" Der Archivkatalog ist ebenfalls unvollständig: {}", s.message)).unwrap_or_default()) })
     } else {
         archive.stop_reason().map(|s| Issue {
             code: s.code.as_str().into(),
@@ -357,6 +360,7 @@ fn metadata_bounded(
         entries,
         root_id,
         catalog: Catalog {
+            format: archive.format(),
             complete: archive.is_complete() && !view_partial,
             entry_count: archive.entries().len(),
             displayed_entry_count: mapped,
@@ -582,7 +586,6 @@ impl ArchiveReadState {
         }
         let (reader, meta) = result?;
         let listing = listing(&id, &meta, &meta.root_id, 0)?;
-        let can_extract = true;
         let origin = reader.origin_label().map(str::to_owned);
         slot.session = Some(Session {
             id: id.clone(),
@@ -596,7 +599,7 @@ impl ArchiveReadState {
             request_id: request.into(),
             session_id: id,
             listing,
-            can_extract,
+            can_extract: true,
             can_extract_file: true,
             origin,
         })
@@ -827,6 +830,7 @@ impl ArchiveReadState {
                 }
             };
             Ok(ExtractSource {
+                format: reader.format(),
                 root: if snapshot.is_some() {
                     Default::default()
                 } else {
@@ -954,6 +958,7 @@ fn open_source(
         &store,
         format!("{protocol} · {}", request.path),
         profile,
+        ArchiveReadFormat::from_path(Path::new(&request.path)),
         cancel,
     )?;
     crate::queue_runtime::ensure_profile_bindings_current(app, &bindings)?;
@@ -965,10 +970,12 @@ fn open_snapshot_source(
     store: &doppeldecker_core::remote_snapshot::SnapshotStore,
     origin: String,
     profile: doppeldecker_core::RemoteProfileBinding,
+    format: ArchiveReadFormat,
     cancel: &Cancel,
 ) -> Result<ArchiveSource, AppError> {
     let validated = store.capture(snapshot, cancel)?;
-    let reader = ArchiveRead::open_snapshot(validated.clone(), CatalogBudget::default(), cancel)?;
+    let reader =
+        ArchiveRead::open_snapshot_as(validated.clone(), format, CatalogBudget::default(), cancel)?;
     Ok(ArchiveSource {
         reader,
         origin: ArchiveOrigin::Snapshot(Box::new(SnapshotArchiveOrigin {
@@ -1002,8 +1009,14 @@ fn open_local_source(
             "Archivquelle liegt außerhalb des Pane-Roots",
         )
     })?;
-    ArchiveRead::open(&normalized, relative, CatalogBudget::default(), cancel)
-        .map_err(AppError::from)
+    ArchiveRead::open_as(
+        &normalized,
+        relative,
+        ArchiveReadFormat::from_path(relative),
+        CatalogBudget::default(),
+        cancel,
+    )
+    .map_err(AppError::from)
 }
 fn read_preview(
     reader: &mut ArchiveRead,
@@ -1226,6 +1239,7 @@ mod tests {
                 "artificial",
                 1,
             )?,
+            ArchiveReadFormat::Zip,
             &Cancel::new(),
         )
     }
@@ -1343,6 +1357,7 @@ mod tests {
         let target = temp.path().canonicalize().unwrap().join("target");
         std::fs::create_dir(&target).unwrap();
         let request = doppeldecker_core::archive_extract::ArchiveExtractRequest {
+            format: Default::default(),
             source_root: selected.root,
             source_path: selected.path,
             snapshot: selected.snapshot,
@@ -1645,6 +1660,7 @@ mod tests {
         let target = temp.path().join("target");
         std::fs::create_dir(&target).unwrap();
         let request = doppeldecker_core::archive_extract::ArchiveExtractRequest {
+            format: Default::default(),
             snapshot: None,
             source_root: std::fs::canonicalize(source.root).unwrap(),
             source_path: std::fs::canonicalize(source.path).unwrap(),

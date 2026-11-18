@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import subprocess
+import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -292,6 +295,37 @@ class BuildReleasePrerequisitesTests(unittest.TestCase):
                 )
 
             self.assertFalse(signature.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS AppleDouble")
+    def test_updaterarchiv_enthaelt_keine_appledouble_eintraege(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "Doppeldecker.app"
+            app.mkdir()
+            subprocess.run(
+                ("xattr", "-w", "com.example.updater-test", "fixtures", str(app)),
+                check=True,
+            )
+            content = app / "CodeResources"
+            content.write_bytes(b"ticket-file")
+            archive = root / "updater.tar.gz"
+
+            self.module.pack_macos_updater(app, archive)
+
+            with tarfile.open(archive) as payload:
+                self.assertEqual(payload.getnames(), ["Doppeldecker.app", "Doppeldecker.app/CodeResources"])
+                self.assertEqual(payload.extractfile("Doppeldecker.app/CodeResources").read(), b"ticket-file")
+
+    def test_updaterpruefung_weist_appledouble_ab(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "updater.tar.gz"
+            with tarfile.open(archive, "w:gz") as payload:
+                member = tarfile.TarInfo("._Doppeldecker.app")
+                member.size = 1
+                payload.addfile(member, io.BytesIO(b"x"))
+
+            with self.assertRaisesRegex(SystemExit, r"unzulässigen.*\._Doppeldecker\.app"):
+                self.module.verify_macos_updater_archive(archive, {})
 
 
 if __name__ == "__main__":

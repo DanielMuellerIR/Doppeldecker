@@ -128,6 +128,7 @@ fn archive_pack_colon_names_are_omitted_and_usable_content_roundtrips() {
         let unpacked = f.target.join("unpacked");
         fs::create_dir(&unpacked).unwrap();
         let request = crate::archive_extract::ArchiveExtractRequest {
+            format: Default::default(),
             source_root: f.target.clone(),
             source_path: f.target.join("packed.zip"),
             snapshot: None,

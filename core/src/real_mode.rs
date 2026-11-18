@@ -1883,16 +1883,26 @@ pub(crate) fn sync_impact_warnings(source: &Path, target: &Path, plan: &SyncPlan
     }
     if plan.delete_count > 0 {
         if plan.source_count == 0 {
+            let absence = if plan.exclusions.source_count > 0 {
+                "enthält nach Anwendung der Ausschlussmuster keine Einträge"
+            } else {
+                "ist leer"
+            };
             warnings.push(format!(
-                "Die vollständig gescannte Quelle {} ist leer. Alle {} Zieleinträge werden aus {} in Quarantäne verschoben.",
+                "Die vollständig gescannte Quelle {} {absence}. Der Plan verschiebt {} Zieleinträge aus {} in Quarantäne.",
                 source.display(), plan.delete_count, target.display()
             ));
         }
         if plan.delete_count > 50
             || u128::from(plan.delete_count) * 100 > u128::from(plan.target_count) * 5
         {
+            let target_scope = if plan.exclusions.target_count > 0 {
+                "im Abgleich berücksichtigten Zieleinträgen"
+            } else {
+                "Zieleinträgen"
+            };
             warnings.push(format!(
-                "Mirror verschiebt {} von {} Zieleinträgen aus {} in Quarantäne. Der Zielbestand ist danach entsprechend kleiner; Platzbedarf und Wiederherstellung prüfen.",
+                "Mirror verschiebt {} von {} {target_scope} aus {} in Quarantäne. Platzbedarf und Wiederherstellung prüfen.",
                 plan.delete_count, plan.target_count, target.display()
             ));
         }

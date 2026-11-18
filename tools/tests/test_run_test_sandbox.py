@@ -47,6 +47,29 @@ class SandboxLauncherBinaerModus(unittest.TestCase):
             check=False,
         )
 
+    def test_prepare_liefert_pfadbasis_fuer_einen_vollstaendigen_pruefblock(self) -> None:
+        with tempfile.TemporaryDirectory() as block:
+            prepared = self._starte("--prepare", tmpdir=block)
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            sandbox = Path(prepared.stdout.rstrip("\n"))
+            self.assertTrue(sandbox.is_absolute())
+            self.assertEqual(sandbox.parent.resolve(), Path(block).resolve())
+            self.assertEqual(
+                {p.name for p in sandbox.iterdir()},
+                {".doppeldecker-test-sandbox", "quelle", "ziel"},
+            )
+            program = Path(block) / "probe"
+            write_executable(program, '''
+                #!/bin/sh
+                cat "$DOPPELDECKER_SANDBOX/quelle/probe" >> "$DOPPELDECKER_SANDBOX/ziel/probe"
+            ''')
+            (sandbox / "quelle/probe").write_text("A")
+            for expected in ("A", "AA"):
+                result = self._starte("--binary", str(program), "--reuse", str(sandbox), tmpdir=block)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((sandbox / "ziel/probe").read_text(), expected)
+        self.assertFalse(sandbox.exists())
+
     def test_uebergebenes_programm_bekommt_die_markierte_sandbox(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             temp = Path(raw)

@@ -1,6 +1,6 @@
 # Dokumentationsindex
 
-Stand: 2026-11-08. Produktüberblick im [README](../README.de.md), offene Arbeit im
+Stand: 2026-11-18. Produktüberblick im [README](../README.de.md), offene Arbeit im
 [Backlog](../backlog.md). Dieser Index führt zu den jeweiligen Verträgen.
 
 ## Produkt- und Releaseplanung
@@ -14,6 +14,8 @@ Stand: 2026-11-08. Produktüberblick im [README](../README.de.md), offene Arbeit
 - [Produkt- und Performancechancen](product-opportunities.md)
 - [Release- und Plattformplan](release-plan.md)
 - [Linux: Funktionen, Installation und Updates](linux.md)
+- [Testbereiche, Builddaten und Aufbewahrung](build-output-retention.md)
+- [Preview 0.1.127](release-notes-0.1.127.md)
 - [Preview 0.1.126](release-notes-0.1.126.md)
 - [Preview 0.1.125](release-notes-0.1.125.md)
 - [Weitere Entwicklung](release-notes-next.md)
@@ -24,8 +26,8 @@ Stand: 2026-11-08. Produktüberblick im [README](../README.de.md), offene Arbeit
 - [Stapelumbenennung](batch-rename.md)
 - [Lokale ZIP-Erzeugung](archive-pack.md)
 - [ZIP zu einem entfernten Ziel](remote-pack.md)
-- [ZIP-Inhalt anzeigen](archive-read.md)
-- [ZIP-Archive entpacken](archive-extract.md)
+- [ZIP- und TAR-Inhalte ansehen](archive-read.md)
+- [Archive entpacken](archive-extract.md)
 - [Lokal duplizieren](duplicate.md)
 - [Pane-Tabs](pane-tabs.md)
 - [Finder→FTPS](finder-ftps-gui.md)

@@ -1,6 +1,6 @@
 # Aktiver Backlog
 
-Stand: 2026-11-08. Nur offene Arbeit; Reihenfolge und Releaseumfang stehen in der
+Stand: 2026-11-18. Nur offene Arbeit; Reihenfolge und Releaseumfang stehen in der
 [Roadmap](docs/roadmap.md). Verfügbares Verhalten: [Funktionsmatrix](docs/function-audit.md).
 
 ## Später, ohne Releasepflicht
@@ -8,8 +8,14 @@ Stand: 2026-11-08. Nur offene Arbeit; Reihenfolge und Releaseumfang stehen in de
 - Weitergehende SMB-ACE-/Vererbungsmodelle, SID-/Domänenmigration, vollständiger
   SMB-Hardlink-Schreibvertrag und DAV-ACL-Editor, sofern kein konkreter
   ForkLift-Gegenbeleg sie zur Paritätslücke macht.
-- Gespeicherte Sync-Aufträge, zentrale Recovery-Ansicht, fortsetzbare Transfers
-  und weitere Archivformate. [Ideensammlung](docs/product-opportunities.md).
+- Fortsetzbare Transfers für SMB, unverschlüsseltes FTP und SFTP- oder FTPS-Server
+  ohne vollständigen SHA-256-Beleg sowie für entfernte Schreibziele.
+  Fertig mit belastbarem Teilbereichs- und Tempidentitätsbeleg über die
+  Wiederverbindung hinweg.
+  [Ideensammlung](docs/product-opportunities.md).
+- Weitere TAR-Varianten bei konkretem Bedarf. GNU-Sparse und unbekannte
+  PAX-Erweiterungen haben bislang eine sichtbare Teilkataloggrenze.
+  [Archivansicht](docs/archive-read.md).
 
 ## Pflege
 

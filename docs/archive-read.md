@@ -1,19 +1,31 @@
-# ZIP-Inhalt anzeigen und lesender Core
+# ZIP- und TAR-Inhalte ansehen
 
-Stand: 2026-10-24. `core::archive_read` bietet ein lokales, GUI-freies Fundament
-für ZIP-Kataloge, virtuelle Ordner und geprüfte Inhaltsstreams. Die App zeigt lokale
-und entfernte ZIP-Dateien über „Befehle → ZIP-Inhalt anzeigen …“ und das Kontextmenü an. Die
+Stand: 2026-11-18. `core::archive_read` bietet ein lokales, GUI-freies Fundament
+für Archivkataloge, virtuelle Ordner und gebundene Inhaltsstreams. Die App zeigt lokale
+und entfernte ZIP-, TAR-, TAR.GZ- und TGZ-Dateien über „Befehle → Archivinhalt anzeigen …“ und das Kontextmenü an. Die
 Archivquelle bleibt unverändert. [Entpacken](archive-extract.md) startet als
 eigener Ablauf zu einem lokalen Ziel: aus lokalen Archiven und Momentaufnahmen das ganze Archiv,
 eine gewählte Datei oder der geöffnete virtuelle Unterordner. Die Auswahl ist
 vor dem Schließen an die aktuelle Quelle und das Fenster gebunden.
 Entfernte Quellen werden zunächst vollständig als geprüfte lokale Momentaufnahme
-geladen. Entfernte Entpackziele bleiben ein eigener Ausbauschritt.
+geladen.
+
+## TAR
+
+Die Inhaltsansicht liest einfache TAR-Archive. Bei TAR.GZ und TGZ prüft sie
+den GZIP-Stream und hält bis zu 64 MiB entpackte Daten im Speicher. Sie prüft
+Headerprüfsummen, Blockgrenzen und Dateilängen an der gebundenen Quelle.
+TAR-Inhalte haben keine gespeicherte Payload-Prüfsumme. Symbolische Links,
+Hardlinks und andere Spezialtypen werden angezeigt und bleiben unbedienbar.
+Der Katalog berücksichtigt PAX-Pfad und -Dateigröße sowie GNU-Langnamen.
+Bekannte reine Metadaten verändern den Datenbereich nicht und werden beim
+Entpacken nicht wiederhergestellt. GNU-Sparse, unbekannte PAX-Felder und
+fehlerhafte Erweiterungsköpfe begrenzen den Katalog auf belegte Einträge.
 
 ## Bedienung und Fensterbindung
 
 Eine ausgewählte reguläre Datei öffnet einen eigenen Dialog. Der Backend-
-Reader prüft das ZIP-Format; die Dateiendung erteilt keine Formatfreigabe. Virtuelle
+Reader prüft das durch die Endung gewählte Format. Virtuelle
 Ordner lassen sich mit Enter oder Doppelklick öffnen, Pfadschaltflächen führen
 zurück. Jede Seite enthält höchstens 100 Zeilen. Explizite leere Ordner, gleiche
 Datei-/Ordnernamen und doppelte zentrale Einträge behalten ihre eigene Zeile.
@@ -45,7 +57,7 @@ brechen ihren laufenden Lesevorgang kooperativ ab.
 
 SFTP, FTP/FTPS, WebDAV und SMB verwenden den vorhandenen
 [Momentaufnahmevertrag](remote-providers-design.md). Das Öffnen lädt die gesamte
-Archivdatei, bevor der ZIP-Katalog erscheint; es gibt keinen entfernten Range-Reader.
+Archivdatei, bevor der Archivkatalog erscheint; es gibt keinen entfernten Range-Reader.
 Der Ladezustand nennt diese Wirkung und lässt sich schließen oder mit Escape
 abbrechen. Profil, ausgewählter Root und Quellpfad werden im Backend aufgelöst;
 eine zwischenzeitlich geänderte Profilbindung verhindert die Übernahme der Ansicht.
@@ -53,10 +65,8 @@ Die jeweiligen Protokoll- und Quellenbindungsgrenzen bleiben erhalten.
 
 Die Herkunftszeile „Momentaufnahme von …“ nennt Protokoll und Quellpfad.
 Navigation und Vorschau lesen danach dieselbe lokale Kopie; spätere Änderungen
-auf dem Server werden erst nach erneutem Öffnen sichtbar. Die bestehenden ZIP-,
-Katalog- und Vorschaugrenzen gelten unverändert. Das ganze Archiv, eine ausgewählte
-reguläre Datei oder der geöffnete virtuelle Unterbaum lassen sich aus dieser
-gebundenen Aufnahme in die lokale oder entfernte Gegenpane
+auf dem Server werden erst nach erneutem Öffnen sichtbar. Katalog- und Vorschaugrenzen gelten für dieselbe Momentaufnahme. Das ganze Archiv,
+eine ausgewählte reguläre Datei oder der geöffnete virtuelle Unterbaum lässt sich in die lokale oder entfernte Gegenpane
 [entpacken](archive-extract.md#bedienung).
 Der Ganzarchivstart verwendet auch aus einem tief geöffneten Ordner die
 Archivwurzel; die Unterbaumaktion bleibt am geöffneten Ordner gebunden.

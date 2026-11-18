@@ -1,6 +1,6 @@
 # Spätere Produkt- und Performancechancen
 
-Stand: 2026-11-01. Diese Ideen sind keine Releasepflicht. Beauftragte offene Arbeit
+Stand: 2026-11-18. Diese Ideen sind keine Releasepflicht. Beauftragte offene Arbeit
 steht im [Backlog](../backlog.md), das Releaseziel in der [Roadmap](roadmap.md).
 Vor Umsetzung Nutzen, Fertigkriterium und Prüfweg festlegen.
 
@@ -8,12 +8,9 @@ Vor Umsetzung Nutzen, Fertigkriterium und Prüfweg festlegen.
 
 | Idee | Nutzen / Grenze |
 | --- | --- |
-| Sync-Ausschlussmuster in der GUI | Core und CLI besitzen Muster bereits; Eingabe und konkrete Ausschlussbilanz im Assistenten ergänzen. |
-| Gespeicherte Sync-Aufträge | Endpunkte und Optionen wiederverwenden; jeden Lauf frisch planen und bestätigen. Keine Permits oder Secrets speichern. |
-| Zentrale Recovery-Ansicht | Vorhandene typisierte Journale gemeinsam lesbar machen; Aktionen bleiben an ihren jeweiligen Vertrag gebunden. |
-| Fortsetzbare große Transfers | Bestätigte Teilbereiche und Tempidentität persistieren; kein blinder mutierender Retry. |
+| Weitere fortsetzbare Provider-Transfers | WebDAV-Downloads verwenden bedingte Bytebereiche. Kompatible FTPS- und SFTP-Server liefern den vollständigen SHA-256 der Quelle. Weitere Server und Remoteziele benötigen belastbare Inhalts- und Tempidentitätsbelege über die Wiederverbindung hinweg. |
 | Prüfsummenaktion | Frische gebundene Streams hashen und Pane-Auswahlen vergleichen. |
-| Weitere Archivformate | tar/komprimierte tar-Dateien mit klarer Pfad-, Link- und Ressourcenbehandlung. |
+| Weitere TAR-Varianten | GNU-Sparse und unbekannte PAX-Erweiterungen benötigen bei konkretem Bedarf einen geprüften Katalog- und Nutzdatenvertrag. |
 | Metadaten in Stapelnamen | Foto-/Audio-/Dokumentfelder als ausdrückliche Namensregel verwenden. |
 | Zusätzliche native Metadatenmodelle | Nur nach konkretem Bedarf; [ForkLift-Parität](forklift-parity.md) begrenzt die Releasepflicht. |
 

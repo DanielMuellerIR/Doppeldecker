@@ -26,14 +26,15 @@ window.__TAURI__.core.invoke=async(command,args)=>{
  if(['approve_queue_entry','acknowledge_archive_extract_outcome'].includes(command)&&window.__EXTRACT_QUEUE__){window.__EXTRACT_CALLS__.push({command,args});if(command==='acknowledge_archive_extract_outcome'){window.__EXTRACT_QUEUE__.entries[0].state='Cancelled';window.__EXTRACT_QUEUE__.revision++;}return window.__EXTRACT_QUEUE__;}
  if(command==='preview_archive_entry'){window.__EXTRACT_CALLS__.push({command,args});await new Promise(resolve=>window.__EXTRACT_PREVIEW_HOLDS__.push(resolve));return {requestId:args.requestId,sessionId:args.sessionId,entryId:args.entryId,preview:{bytes:9,content:{kind:'text',text:'Verifiziert'},limitations:[]}};}
  if(command==='list_archive_directory')return {sessionId:args.sessionId,directoryId:args.directoryId,page:0,pageSize:100,totalRows:window.__EXTRACT_CONFIG__.showChild?1:0,breadcrumbs:[{directoryId:'root',label:'Archiv'},{directoryId:'virtual-dir',label:'B'}],rows:window.__EXTRACT_CONFIG__.showChild?[{rowId:'other-child',entryId:'other-child-entry',displayName:'Anderes Kind.bin',kind:'file',canPreview:false,issues:[]}]:[],catalog:{complete:true,entryCount:4,displayedEntryCount:4,problemCount:0}};
- if(command==='open_archive_read')return {requestId:args.requestId,sessionId:'reader-session',canExtract:true,canExtractFile:true,origin:window.__EXTRACT_CONFIG__.snapshot?window.__EXTRACT_CONFIG__.snapshotOrigin:null,listing:{sessionId:'reader-session',directoryId:'root',page:0,pageSize:100,totalRows:2,breadcrumbs:[{directoryId:'root',label:'Archiv'}],rows:[{rowId:'virtual',entryId:'virtual-entry',displayName:'nested.txt',kind:'file',canPreview:!!window.__EXTRACT_CONFIG__.previewable,issues:[]},{rowId:'folder',entryId:'dir-entry',directoryId:'virtual-dir',displayName:'B',kind:'directory',canPreview:false,issues:[]}],catalog:{complete:true,entryCount:2,displayedEntryCount:2,problemCount:0}}};
+ if(command==='open_archive_read')return {requestId:args.requestId,sessionId:'reader-session',canExtract:true,canExtractFile:true,origin:window.__EXTRACT_CONFIG__.snapshot?window.__EXTRACT_CONFIG__.snapshotOrigin:null,listing:{sessionId:'reader-session',directoryId:'root',page:0,pageSize:100,totalRows:2,breadcrumbs:[{directoryId:'root',label:'Archiv'}],rows:[{rowId:'virtual',entryId:'virtual-entry',displayName:'nested.txt',kind:'file',canPreview:!!window.__EXTRACT_CONFIG__.previewable,issues:[]},{rowId:'folder',entryId:'dir-entry',directoryId:'virtual-dir',displayName:'B',kind:'directory',canPreview:false,issues:[]}],catalog:{format:args.request.path.endsWith('.tar')?'tar':'zip',complete:true,entryCount:2,displayedEntryCount:2,problemCount:0}}};
  if(['close_archive_read','cancel_archive_read'].includes(command)){window.__EXTRACT_CALLS__.push({command,args});return null;}
  if(!['prepare_archive_extract_selection','prepare_archive_extract','confirm_archive_extract','discard_archive_extract','cancel_sync'].includes(command))return original(command,args);
  window.__EXTRACT_CALLS__.push({command,args:structuredClone(args)});
  if(command==='cancel_sync')throw Error('Fremder Abbruch');
  if(command==='discard_archive_extract')return null;
  if(command==='prepare_archive_extract'||command==='prepare_archive_extract_selection'){
- const id='extract-preparation-'+(++sequence);const preview=window.__EXTRACT_PREVIEW__({...args.request,root:'/künstlich/quelle',sourcePath:'/künstlich/quelle/Archiv.zip'});
+ const id='extract-preparation-'+(++sequence);const preview=window.__EXTRACT_PREVIEW__({...args.request,root:'/künstlich/quelle',sourcePath:window.__EXTRACT_CONFIG__.tar?'/künstlich/quelle/Archiv.tar':'/künstlich/quelle/Archiv.zip'});
+ if(window.__EXTRACT_CONFIG__.tar)preview.format='tar';
  if(command==='prepare_archive_extract_selection'){
  const scope=args.request.entryId?'entry':args.request.directoryId==='root'?'all':'subtree';
  preview.selection={kind:scope};preview.relative_root=scope==='entry'?'nested.txt':scope==='subtree'?'B':'';preview.selection_path=scope==='entry'?'A/B/nested.txt':scope==='subtree'?'A/B':'';
@@ -61,7 +62,7 @@ try {
  window.__EXTRACT_PANES__={left:{provider:'local',path:'/künstlich/quelle',navigationRevision:1,tabs:{active:{id:'quelle-a'}}},right:{provider:'local',path:'/künstlich/ziel',navigationRevision:1,tabs:{active:{id:'ziel-a'}}}};
  if(config.targetProvider)Object.assign(window.__EXTRACT_PANES__.right,{provider:config.targetProvider,profileId:'target-profile',profileRevision:23,path:'/remote/Entpackziel'});
  if(config.snapshot)Object.assign(window.__EXTRACT_PANES__.left,{provider:config.provider||'sftp',profileId:'artificial-profile',profileRevision:17});
- window.__EXTRACT_SELECTION__=[{name:'Archiv.zip',is_file:true,is_symlink:false}];window.__EXTRACT_DOCK__=[];
+ window.__EXTRACT_SELECTION__=[{name:config.tar?'Archiv.tar':'Archiv.zip',is_file:true,is_symlink:false}];window.__EXTRACT_DOCK__=[];
  const {createArchiveExtractUi}=await import('/archive-extract-ui.js');window.__EXTRACT_UI__=createArchiveExtractUi({panes:window.__EXTRACT_PANES__,activeSide:()=> 'left',selectedEntries:()=>window.__EXTRACT_SELECTION__,blocked:()=>false,showDock:message=>window.__EXTRACT_DOCK__.push(message),showError:(title,error)=>window.__EXTRACT_DOCK__.push(error.message)});
  },{config,theme});return {page,errors};}
  async function open(page){await page.getByRole('listbox',{name:/Linke Dateiliste/}).focus();await page.evaluate(()=>window.__EXTRACT_UI__.open());await dialog(page).waitFor();}
@@ -69,9 +70,19 @@ try {
  async function calls(page,command){return page.evaluate(command=>window.__EXTRACT_CALLS__.filter(call=>call.command===command),command);}
  async function finish(page,errors){assert.deepEqual(errors,[]);await page.keyboard.press('Escape');await page.close();}
  async function test(name,body){await body();count++;console.log('OK '+name);}
- async function browse(page){await page.getByRole('listbox',{name:/Linke Dateiliste/}).focus();await page.evaluate(async()=>{const {createArchiveReadUi}=await import('/archive-read-ui.js');window.__READ_FOR_EXTRACT__=createArchiveReadUi({panes:window.__EXTRACT_PANES__,selectedEntries:()=>window.__EXTRACT_SELECTION__,showDock:()=>{},extractSelectionReady:(side,response)=>window.__EXTRACT_UI__.openPrepared(side,response)});window.__READ_FOR_EXTRACT__.open('left');});const view=page.getByRole('dialog',{name:'ZIP-Inhalt · Archiv.zip',exact:true});await view.getByRole('option').first().waitFor();return view;}
+ async function browse(page,format='ZIP'){await page.getByRole('listbox',{name:/Linke Dateiliste/}).focus();await page.evaluate(async()=>{const {createArchiveReadUi}=await import('/archive-read-ui.js');window.__READ_FOR_EXTRACT__=createArchiveReadUi({panes:window.__EXTRACT_PANES__,selectedEntries:()=>window.__EXTRACT_SELECTION__,showDock:()=>{},extractSelectionReady:(side,response)=>window.__EXTRACT_UI__.openPrepared(side,response)});window.__READ_FOR_EXTRACT__.open('left');});const view=page.getByRole('dialog',{name:format==='TAR'?'TAR-Inhalt · Archiv.tar':'ZIP-Inhalt · Archiv.zip',exact:true});await view.getByRole('option').first().waitFor();return view;}
  await test('Dateiauswahl übergibt ausschließlich eigene IDs und nutzt gebundene Vorbereitung trotz Vorschaugrenze',async()=>{
  const {page,errors}=await pageFor({few:true});const view=await browse(page);assert.equal(await view.getByRole('button',{name:'Geöffneten Ordner entpacken …'}).count(),0);await view.getByRole('option').first().click();await view.getByRole('button',{name:'Datei entpacken …'}).click();await ready(page);const prepared=(await calls(page,'prepare_archive_extract_selection'))[0].args.request;assert.deepEqual(Object.keys(prepared).sort(),['entryId','requestId','sessionId','targetDir','targetProvider'].sort());assert.equal(prepared.entryId,'virtual-entry');assert.equal(prepared.sessionId,'reader-session');assert.equal((await calls(page,'prepare_archive_extract')).length,0);assert.match(await dialog(page).innerText(),/Ausgewählte Datei: A\/B\/nested.txt/);assert.match(await dialog(page).innerText(),/Name im Zielordner:\s+nested.txt/);await dialog(page).getByRole('button',{name:'Entpacken',exact:true}).click();await page.waitForFunction(()=>window.__EXTRACT_DOCK__.length>0);assert.equal((await calls(page,'confirm_archive_extract'))[0].args.preparationId,'extract-preparation-1');await finish(page,errors);
+ });
+ await test('TAR-Dateiauswahl bietet Entpacken mit Quellen- und Inhaltsgrenze',async()=>{
+ const {page,errors}=await pageFor({few:true,tar:true});const view=await browse(page,'TAR');
+ await view.getByRole('option').first().click();await view.getByRole('button',{name:'Datei entpacken …'}).click();
+ const dialog=page.getByRole('dialog',{name:'TAR entpacken',exact:true});
+ await dialog.getByText(/TAR speichert keine Prüfsumme pro Datei/).waitFor();
+ await dialog.getByRole('button',{name:'Entpacken',exact:true}).click();
+ await page.waitForFunction(()=>window.__EXTRACT_DOCK__.length>0);
+ assert.equal((await calls(page,'prepare_archive_extract_selection'))[0].args.request.entryId,'virtual-entry');
+ assert.equal((await calls(page,'confirm_archive_extract')).length,1);await finish(page,errors);
  });
  for(const [provider,theme,width] of [['sftp','light',1100],['ftps','dark',390],['webdav','light',390],['smb','dark',1100]])await test('Momentaufnahme '+provider+' bindet Dateiauswahl und sichtbare Herkunft '+width,async()=>{
  const {page,errors}=await pageFor({few:true,snapshot:true,conflicts:true,provider},theme,width);const view=await browse(page);

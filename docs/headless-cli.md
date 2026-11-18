@@ -141,8 +141,9 @@ akzeptiert höchstens 128 Muster mit je höchstens 256 UTF-8-Bytes. Die CLI prü
 Syntax, bevor sie einen Pfad auflöst, eine Providerverbindung öffnet oder eine
 Capability-Probe startet.
 
-Ein bewusst ausgeschlossener Eintrag ist für den Plan auf beiden Seiten unsichtbar:
-Er wird weder kopiert oder aktualisiert noch als nur im Ziel vorhanden behandelt.
+Ein bewusst ausgeschlossener Eintrag ist auf beiden Seiten von der Dateiwirkung
+ausgenommen. Er wird weder kopiert oder aktualisiert noch als nur im Ziel
+vorhanden behandelt.
 Er erzeugt keinen Skip und sperrt Mirror daher nicht. Enthält ein nur im Ziel
 vorhandener Ordner einen ausgeschlossenen Nachfahren, bleibt seine Ordnerhülle
 erhalten; sichtbare Geschwister werden weiterhin einzeln für die Quarantäne geplant.
