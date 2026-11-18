@@ -146,6 +146,13 @@ Journalversion 45 bindet den Inhaltsbeleg bei [fortsetzbaren SFTP-Downloads](sft
 an den gepinnten Host und ein geöffnetes Dateihandle. Ältere Aufträge bleiben
 lesbar.
 
+Journalversion 46 hält Byte-Checkpoints in einer kleinen atomar geschriebenen
+Datei neben dem jeweiligen Fensterjournal. Der Beleg bindet Auftrag, Versuch,
+Plan und die Identität der Arbeitsdatei. Die Nutzdaten werden vor dem Beleg
+synchronisiert. Beim Neustart übernimmt die Queue nur einen passenden neueren
+Beleg des unterbrochenen Versuchs. Pause, versiegelter Zielcommit und Abschluss
+bleiben im Hauptjournal nachvollziehbar.
+
 ## Scheduler und Persistenz
 
 - Der gehaltene Konfigurationsordner bindet Prozesslock, Journal, Audit und

@@ -18,7 +18,6 @@ Vor Umsetzung Nutzen, Fertigkriterium und Prüfweg festlegen.
 
 - Kanonische Baumbelege innerhalb derselben Prüfphase gemeinsam verwenden.
 - Doppelte Pane-Sortierung und wiederholte Sortierschlüsselbildung vermeiden.
-- Fortschritt günstiger persistieren, ohne Crash-Recovery zu schwächen.
 - Linux-Listing mit einem geeigneten Metadatenaufruf je Eintrag.
 - Ordnergrößenergebnisse und virtualisierte Scrollereignisse pro Frame bündeln.
 

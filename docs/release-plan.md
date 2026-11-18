@@ -1,7 +1,7 @@
 # Release- und Plattformplan
 
 Stand: 2026-11-18. Die aktuelle Version ist
-[1.0.0](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v1.0.0).
+[1.0.1](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v1.0.1).
 Künftige Änderungen bleiben unter `Unreleased`.
 
 ## Unterstützte Ziele
@@ -36,7 +36,16 @@ Versionswechsel nur für ausdrücklich benannte Meilensteine/Kandidaten; keine
 Versionsbumps für gewöhnliche Entwicklungs- oder Dokumentationscommits.
 Veröffentlichung, Tags und öffentliche Pakete brauchen einen konkreten Auftrag.
 
-## Abnahmestand von 1.0.0
+## Wiederanlaufprüfung für 1.0.1
+
+Der erste stabile Stand enthält die Korrektur für fortsetzbare Kopien.
+Der separate Byte-Beleg wird nach der Nutzdatei synchronisiert. In der
+Regression mit 128 früheren Aufträgen blieb das Fensterjournal während des
+Transfers bytegleich. Nach einem Prozessabbruch lud die native App den
+Beleg bei 8 MiB und stellte die 192 MiB große Testdatei bytegleich fertig.
+Eine pausierte Kopie aus Journalversion 45 bleibt fortsetzbar.
+
+## Prüfstand des unveröffentlichten 1.0.0-Entwurfs
 
 Die 1.0-Pakete verwenden dieselben Programmquellen wie der Release-Tag.
 DMG, DEB und AppImage übernehmen beim nativen Wechsel von 0.1.127 die

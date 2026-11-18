@@ -45,7 +45,10 @@ use crate::{
 mod forward;
 pub use forward::*;
 
-pub const QUEUE_JOURNAL_VERSION: u32 = 45;
+#[path = "queue/resume_progress.rs"]
+mod resume_progress;
+
+pub const QUEUE_JOURNAL_VERSION: u32 = 46;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 const LEGACY_UNBOUND_WEBDAV_ETAG: &str = "__doppeldecker_legacy_unbound__";
 const LEGACY_WEBDAV_REPLAN_ERROR: &str = "Dieser ältere WebDAV-Löschplan besitzt keine eindeutig gebundene Server- oder Root-Identität. Er wurde nicht ausgeführt und darf nicht wiederholt werden; Zielzustand neu laden und die Auswahl neu bestätigen.";
@@ -648,6 +651,9 @@ fn bidirectional_recovery_kind(
 pub struct OperationQueue {
     path: PathBuf,
     journal: Mutex<QueueSnapshot>,
+    // Immer unter der Journal-Sperre lesen und schreiben. Das Journal im RAM
+    // bleibt eine exakte Kopie des Hauptjournals für dessen Fehler-Readback.
+    resume_progress: Mutex<Option<resume_progress::CheckpointRecord>>,
     /// Ein nicht lesbarer oder unerwarteter Stand nach einem möglicherweise
     /// wirkenden atomaren Rename darf nie durch einen zweiten Schreibversuch
     /// überschrieben werden. Erst ein erneutes Öffnen klärt den Diskstand.
@@ -1557,7 +1563,7 @@ impl OperationQueue {
             }
             snapshot.version = QUEUE_JOURNAL_VERSION;
             true
-        } else if matches!(source_version, 40..=44) {
+        } else if matches!(source_version, 40..=45) {
             snapshot.version = QUEUE_JOURNAL_VERSION;
             true
         } else {
@@ -1572,7 +1578,12 @@ impl OperationQueue {
                 ),
             ));
         }
-        let mut recovered = false;
+        let mut recovered = source_version == QUEUE_JOURNAL_VERSION
+            && snapshot.entries.iter().any(|entry| {
+                entry.state == QueueState::Running
+                    && matches!(entry.operation, QueueOperation::ResumableCopy { .. })
+            })
+            && resume_progress::recover(&process_lock.root, &path, &mut snapshot)?;
         for entry in &mut snapshot.entries {
             // Frühere Migrationen haben auch einen bereits versuchten Retry als
             // sicher ungestartet markiert. Die erhaltene Versuchszahl und
@@ -2108,6 +2119,7 @@ impl OperationQueue {
         let queue = Self {
             path,
             journal: Mutex::new(snapshot),
+            resume_progress: Mutex::new(None),
             journal_outcome_unclear: AtomicBool::new(false),
             #[cfg(test)]
             fail_terminal_progress_update: AtomicBool::new(false),
@@ -2162,7 +2174,12 @@ impl OperationQueue {
     }
 
     pub fn snapshot(&self) -> QueueSnapshot {
-        self.journal.lock().unwrap().clone()
+        let journal = self.journal.lock().unwrap();
+        let mut snapshot = journal.clone();
+        if let Some(record) = self.resume_progress.lock().unwrap().as_ref() {
+            record.apply(&mut snapshot);
+        }
+        snapshot
     }
 
     /// Bindet eine Vorbereitung an dieses Fensterjournal, ohne den geteilten
@@ -5125,6 +5142,9 @@ impl OperationQueue {
             ));
         }
         let mut next = current.clone();
+        if let Some(record) = self.resume_progress.lock().unwrap().as_ref() {
+            record.apply(&mut next);
+        }
         next.revision = current.revision.checked_add(1).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -6911,6 +6931,10 @@ fn execute_resumable_copy(
         checkpoint,
         execution,
         |next| {
+            if matches!(next, CopyCheckpoint::Bytes { written, sealed: false, .. } if written != 0)
+            {
+                return queue.write_resume_progress(id, plan, next);
+            }
             queue.update(id, |entry| {
                 require_state(entry, QueueState::Running)?;
                 let QueueOperation::ResumableCopy {
@@ -10926,16 +10950,26 @@ fn write_snapshot_bound(
     snapshot: &QueueSnapshot,
     mode: AtomicWriteMode,
 ) -> io::Result<()> {
-    if path.parent() != Some(root.path()) || !root.is_current()? {
-        return Err(io::Error::other(
-            "Queue-Journal verlor seinen gehaltenen Elternordner",
-        ));
-    }
     let payload = serde_json::to_vec_pretty(snapshot).map_err(io::Error::other)?;
     if payload.len() as u64 > MAX_JOURNAL_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Queue-Journal überschreitet die Größenbegrenzung",
+        ));
+    }
+    write_queue_payload(root, path, &payload, ".operations-queue-", mode)
+}
+
+fn write_queue_payload(
+    root: &crate::local_fs::RootHandle,
+    path: &Path,
+    payload: &[u8],
+    temp_prefix: &str,
+    mode: AtomicWriteMode,
+) -> io::Result<()> {
+    if path.parent() != Some(root.path()) || !root.is_current()? {
+        return Err(io::Error::other(
+            "Queue-Datei verlor ihren gehaltenen Elternordner",
         ));
     }
     let vfs = LocalVfs::rooted(root.path())?;
@@ -10947,8 +10981,8 @@ fn write_snapshot_bound(
     crate::atomic_write::atomic_write_vfs_with_mode(
         &vfs,
         path,
-        &payload,
-        ".operations-queue-",
+        payload,
+        temp_prefix,
         mode,
         Some(0o600),
     )

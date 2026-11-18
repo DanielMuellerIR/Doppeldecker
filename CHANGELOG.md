@@ -5,7 +5,9 @@ folgt Keep a Changelog; Versionen verwenden Semantic Versioning.
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-11-18
+## [1.0.1] - 2026-11-18
+
+- Fortsetzbare Kopien speichern bestätigte Byteabschnitte in einem kleinen Wiederanlaufbeleg je Fenster. Die Journalhistorie wird für Zwischenstände nicht neu geschrieben.
 
 - **Dateiinhalt fortsetzbar kopieren** pausiert lokale Dateiauswahlen und kompatible WebDAV-, FTPS- und SFTP-Downloads. Die Queue sichert den Abschnitt der aktuellen Datei und setzt nach einem Neustart dort fort. WebDAV fordert bedingte Bytebereiche an. FTPS und SFTP holen die fehlenden Bytes und prüfen die fertige Datei anhand der Server-SHA-256.
 

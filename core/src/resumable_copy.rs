@@ -1339,6 +1339,10 @@ mod tests {
                 CHUNK as u64
             );
         }
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        legacy["version"] = 45.into();
+        std::fs::write(&journal, serde_json::to_vec(&legacy).unwrap()).unwrap();
         std::fs::OpenOptions::new()
             .append(true)
             .open(stage.join(PAYLOAD))
