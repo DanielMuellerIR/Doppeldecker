@@ -133,7 +133,7 @@ Diese Befunde bleiben eine eigene Prüfstabilitäts- und gegebenenfalls
 Produktkorrekturaufgabe. Sie werden weder übersprungen, ohne dies zu benennen,
 noch als durch AP13R behoben geführt. Die vollständige Release-Gateabnahme bleibt
 von ihren deterministischen Gegenbelegen abhängig. Der
-[AP14-Stabilitätsbericht](test-stability-2026-10-06.md#ap14-sftp-browser-ftps-erstbaseline-und-fastra)
+[AP14-Stabilitätsbericht](history/test-stability-2026-10-06.md#ap14-sftp-browser-ftps-erstbaseline-und-fastra)
 führt die späteren Gegenläufe getrennt: Browser-Zeitannahmen sind ersetzt,
 unnötige FTPS-Schreibproben für leere Pläne und reine Quellen sind korrigiert.
 Ein STOU-Probenrest und die historische Fastra-Ursache bleiben offen.

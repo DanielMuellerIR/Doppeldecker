@@ -1,0 +1,29 @@
+{
+  "request": {
+    "path": "string",
+    "showHidden": "boolean"
+  },
+  "listing": {
+    "path": "string",
+    "parent": "string|null",
+    "entries": "array"
+  },
+  "entry": {
+    "name": "string",
+    "is_dir": "boolean",
+    "is_file": "boolean",
+    "is_symlink": "boolean",
+    "size": "number",
+    "mtime": "number|null",
+    "created": "number|null",
+    "owner": "string|null",
+    "group": "string|null",
+    "extension": "string|null",
+    "mode": "number|null",
+    "device": "number|null",
+    "inode": "number|null",
+    "hard_links": "number|null",
+    "safely_decoded": "boolean",
+    "is_hidden": "boolean"
+  }
+}

@@ -18,7 +18,7 @@ use doppeldecker_core::{
     QuarantineRun, QueueEntry, QueueExecutionResult, QueueOperation, RealRunPreview,
     RemoteCapabilities, RemoteProfileBinding, RemoteProfileProtocol, SecretResolver, SecretString,
     SftpAuthenticationReference, SftpProfile, SftpPublicKeyIdentity, SftpQueueDirection,
-    SftpQueuePreparation, SftpServerIdentity, SftpVfs, SyncOptions, SyncPlan, VersionedProfile,
+    SftpQueuePreparation, SftpServerIdentity, SftpVfs, SyncOptions, VersionedProfile,
 };
 use tauri::{Manager, State, WebviewWindow};
 
@@ -26,14 +26,13 @@ use crate::quarantine_commands::{restore_response, QuarantineRestoreResponse};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::queue_runtime::{
-    cached_remote_connection, enqueue_bound_pending, CachedRemoteConnection, PendingRemoteRealRun,
-    QueueTerminalEvent,
+    cached_remote_connection, enqueue_protocol_sync, CachedRemoteConnection,
+    EnqueueRemoteSyncRequest, PendingRemoteRealRun, QueueTerminalEvent,
 };
 use crate::{
-    app_config_dir, begin_profile_transaction, emit_queue_snapshot,
-    enqueue_operation_with_profile_bindings, finish_operation, operation_queue, reserve_operation,
-    start_queue_worker, take_pending_for_operation, with_queue_extension, with_reserved_operation,
-    AppError, AppState, MutexExt,
+    app_config_dir, begin_profile_transaction, emit_queue_snapshot, finish_operation,
+    operation_queue, reserve_operation, start_queue_worker, take_pending_for_operation,
+    with_reserved_operation, AppError, AppState, MutexExt,
 };
 
 const PENDING_SECRET_LIFETIME: Duration = Duration::from_secs(10 * 60);
@@ -446,7 +445,7 @@ pub(crate) fn save_profile_with_secret<P, T>(
     secret_update: ProfileSecretUpdate<'_>,
     build_profile: impl FnOnce(Option<KeychainSecretReference>) -> P,
     save_profile: impl FnOnce(P) -> Result<T, AppError>,
-    load_profile: impl FnMut() -> Result<Option<P>, AppError>,
+    load_profile: impl FnMut() -> Result<Option<VersionedProfile<P>>, AppError>,
     invalidate: impl FnOnce(),
 ) -> Result<T, AppError>
 where
@@ -497,7 +496,7 @@ fn save_profile_with_secret_using<P, T>(
     secret: Option<String>,
     build_profile: impl FnOnce(Option<KeychainSecretReference>) -> P,
     save_profile: impl FnOnce(P) -> Result<T, AppError>,
-    load_profile: impl FnMut() -> Result<Option<P>, AppError>,
+    load_profile: impl FnMut() -> Result<Option<VersionedProfile<P>>, AppError>,
 ) -> Result<T, AppError>
 where
     P: Clone + PartialEq,
@@ -521,14 +520,14 @@ fn save_profile_with_secret_under_transaction<P, T>(
     secret: Option<Zeroizing<String>>,
     build_profile: impl FnOnce(Option<KeychainSecretReference>) -> P,
     save_profile: impl FnOnce(P) -> Result<T, AppError>,
-    mut load_profile: impl FnMut() -> Result<Option<P>, AppError>,
+    mut load_profile: impl FnMut() -> Result<Option<VersionedProfile<P>>, AppError>,
 ) -> ProfileSaveAttempt<T>
 where
     P: Clone + PartialEq,
 {
     // Der Vorzustand wird immer vor einer möglichen Profildateiwirkung gelesen,
-    // auch wenn kein neues Secret gespeichert wird. Nur so kann ein früher
-    // Schreibfehler von einem späten Fehler nach dem Rename unterschieden werden.
+    // auch wenn kein neues Secret gespeichert wird. Auch eine unveränderte
+    // Profildatei-Nutzlast kann nach dem Rename bereits eine neue Revision tragen.
     let previous_profile = match load_profile() {
         Ok(profile) => profile,
         Err(error) => return ProfileSaveAttempt::failed_before_profile(error),
@@ -604,7 +603,7 @@ where
                 }
                 ProfileSaveAttempt::failed_before_profile(profile_error)
             }
-            Ok(current) if current.as_ref() == Some(&desired_profile) => ProfileSaveAttempt {
+            Ok(current) if current.as_ref().is_some_and(|current| current.profile == desired_profile) => ProfileSaveAttempt {
                 result: Err(AppError::new(
                     "outcome_unclear",
                     "Das Profil ist trotz Speicherfehler mit dem neuen Schlüsselbundverweis sichtbar; die Dauerhaftigkeit muss geprüft werden",
@@ -624,9 +623,9 @@ where
 
 fn classify_profile_save<P, T>(
     result: Result<T, AppError>,
-    previous_profile: Option<P>,
+    previous_profile: Option<VersionedProfile<P>>,
     desired_profile: P,
-    mut load_profile: impl FnMut() -> Result<Option<P>, AppError>,
+    mut load_profile: impl FnMut() -> Result<Option<VersionedProfile<P>>, AppError>,
 ) -> ProfileSaveAttempt<T>
 where
     P: PartialEq,
@@ -646,7 +645,7 @@ where
             Ok(current) if current == previous_profile => {
                 ProfileSaveAttempt::failed_before_profile(error)
             }
-            Ok(current) if current.as_ref() == Some(&desired_profile) => ProfileSaveAttempt {
+            Ok(current) if current.as_ref().is_some_and(|current| current.profile == desired_profile) => ProfileSaveAttempt {
                 result: Err(AppError::new(
                     "outcome_unclear",
                     "Das Profil ist trotz Speicherfehler sichtbar; die Dauerhaftigkeit muss geprüft werden",
@@ -682,7 +681,7 @@ pub(crate) fn finish_profile_save<T>(
 pub(crate) fn remove_profile_with_readback<P, T>(
     state: &AppState,
     owner: &str,
-    mut load_profile: impl FnMut() -> Result<Option<P>, AppError>,
+    mut load_profile: impl FnMut() -> Result<Option<VersionedProfile<P>>, AppError>,
     remove_profile: impl FnOnce() -> Result<T, AppError>,
     invalidate: impl FnOnce(),
 ) -> Result<T, AppError>
@@ -714,6 +713,17 @@ where
         },
     };
     finish_profile_save(attempt, invalidate)
+}
+
+pub(crate) fn load_profile_for_readback<P>(
+    path: &Path,
+    load: impl FnOnce(&Path) -> io::Result<Vec<VersionedProfile<P>>>,
+    mut matches: impl FnMut(&P) -> bool,
+) -> Result<Option<VersionedProfile<P>>, AppError> {
+    Ok(load(path)
+        .map_err(AppError::from)?
+        .into_iter()
+        .find(|profile| matches(&profile.profile)))
 }
 
 impl SecretResolver for KeyringResolver {
@@ -841,146 +851,164 @@ pub(crate) async fn discover_sftp_host_key(
 }
 
 #[tauri::command]
-pub(crate) fn list_sftp_agent_keys() -> Result<Vec<SftpPublicKeyIdentity>, AppError> {
-    doppeldecker_core::list_sftp_agent_keys().map_err(AppError::from)
+pub(crate) async fn list_sftp_agent_keys() -> Result<Vec<SftpPublicKeyIdentity>, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        doppeldecker_core::list_sftp_agent_keys().map_err(AppError::from)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn list_sftp_profiles(
+pub(crate) async fn list_sftp_profiles(
     app: tauri::AppHandle,
 ) -> Result<Vec<VersionedProfile<SftpProfile>>, AppError> {
-    doppeldecker_core::load_sftp_profiles_versioned(&profile_path(&app)?).map_err(AppError::from)
+    tauri::async_runtime::spawn_blocking(move || {
+        doppeldecker_core::load_sftp_profiles_versioned(&profile_path(&app)?)
+            .map_err(AppError::from)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn save_sftp_profile(
+pub(crate) async fn save_sftp_profile(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     mut profile: SftpProfile,
     secret_id: Option<String>,
     profile_revision: Option<u64>,
 ) -> Result<Vec<VersionedProfile<SftpProfile>>, AppError> {
-    profile.validate().map_err(AppError::from)?;
-    let id = profile.id.clone();
-    let reference = match &profile.connection.authentication {
-        SftpAuthenticationReference::Password { secret } => Some(secret.clone()),
-        SftpAuthenticationReference::PrivateKey { passphrase, .. } => passphrase.clone(),
-        SftpAuthenticationReference::SshAgent { .. } => None,
-    };
-    let path = profile_path(&app)?;
-    let save_result = save_profile_with_secret(
-        &state,
-        ConnectionSecretPurpose {
-            owner: window.label(),
-            protocol: "sftp",
-            profile_id: &id,
-        },
-        ProfileSecretUpdate {
-            reference: reference.as_ref(),
-            secret_id,
-        },
-        |fresh| {
-            if let Some(fresh) = fresh {
-                match &mut profile.connection.authentication {
-                    SftpAuthenticationReference::Password { secret } => *secret = fresh,
-                    SftpAuthenticationReference::PrivateKey { passphrase, .. } => {
-                        *passphrase = Some(fresh);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        profile.validate().map_err(AppError::from)?;
+        let id = profile.id.clone();
+        let reference = match &profile.connection.authentication {
+            SftpAuthenticationReference::Password { secret } => Some(secret.clone()),
+            SftpAuthenticationReference::PrivateKey { passphrase, .. } => passphrase.clone(),
+            SftpAuthenticationReference::SshAgent { .. } => None,
+        };
+        let path = profile_path(&app)?;
+        let save_result = save_profile_with_secret(
+            &state,
+            ConnectionSecretPurpose {
+                owner: window.label(),
+                protocol: "sftp",
+                profile_id: &id,
+            },
+            ProfileSecretUpdate {
+                reference: reference.as_ref(),
+                secret_id,
+            },
+            |fresh| {
+                if let Some(fresh) = fresh {
+                    match &mut profile.connection.authentication {
+                        SftpAuthenticationReference::Password { secret } => *secret = fresh,
+                        SftpAuthenticationReference::PrivateKey { passphrase, .. } => {
+                            *passphrase = Some(fresh);
+                        }
+                        SftpAuthenticationReference::SshAgent { .. } => {}
                     }
-                    SftpAuthenticationReference::SshAgent { .. } => {}
                 }
-            }
-            profile
-        },
-        |profile| {
-            doppeldecker_core::save_sftp_profile_versioned_if_current(
-                &path,
-                profile,
-                profile_revision,
-            )
-            .map_err(AppError::from)
-        },
-        || {
-            core_load_profiles(&path)
+                profile
+            },
+            |profile| {
+                doppeldecker_core::save_sftp_profile_versioned_if_current(
+                    &path,
+                    profile,
+                    profile_revision,
+                )
                 .map_err(AppError::from)
-                .map(|profiles| profiles.into_iter().find(|profile| profile.id == id))
-        },
-        || {
-            // Auch ein Fehler nach dem atomaren Profil-Rename kann bereits den neuen
-            // Endpunkt sichtbar gemacht haben. Deshalb wird der alte Cache vor der
-            // Fehler-Rückgabe immer fail-closed verworfen.
-            state.sftp_connections.lock_recover().remove(&id);
-            crate::queue_runtime::invalidate_remote_profile(
-                &app,
-                &state,
-                RemoteProfileProtocol::Sftp,
-                &id,
-            );
-            if let Ok(Some(revision)) = current_profile_revision(&app, &id) {
-                let binding = RemoteProfileBinding::new(RemoteProfileProtocol::Sftp, &id, revision)
-                    .expect("bereits validierte Profil-ID");
-                crate::connection_state_commands::emit_connection_update(
+            },
+            || {
+                load_profile_for_readback(
+                    &path,
+                    doppeldecker_core::load_sftp_profiles_versioned,
+                    |profile| profile.id == id,
+                )
+            },
+            || {
+                // Auch ein Fehler nach dem atomaren Profil-Rename kann bereits den neuen
+                // Endpunkt sichtbar gemacht haben. Deshalb wird der alte Cache vor der
+                // Fehler-Rückgabe immer fail-closed verworfen.
+                state.sftp_connections.lock_recover().remove(&id);
+                crate::queue_runtime::invalidate_remote_profile(
                     &app,
-                    &binding,
-                    crate::connection_state_commands::ConnectionChangeKind::Saved,
+                    &state,
+                    RemoteProfileProtocol::Sftp,
+                    &id,
                 );
-            }
-        },
-    );
-    save_result.map(|mutation| mutation.profiles)
+                if let Ok(Some(revision)) = current_profile_revision(&app, &id) {
+                    let binding =
+                        RemoteProfileBinding::new(RemoteProfileProtocol::Sftp, &id, revision)
+                            .expect("bereits validierte Profil-ID");
+                    crate::connection_state_commands::emit_connection_update(
+                        &app,
+                        &binding,
+                        crate::connection_state_commands::ConnectionChangeKind::Saved,
+                    );
+                }
+            },
+        );
+        save_result.map(|mutation| mutation.profiles)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn remove_sftp_profile(
+pub(crate) async fn remove_sftp_profile(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     profile_id: String,
     profile_revision: u64,
 ) -> Result<Vec<VersionedProfile<SftpProfile>>, AppError> {
-    let path = profile_path(&app)?;
-    let attempt = remove_profile_with_readback(
-        &state,
-        window.label(),
-        || {
-            core_load_profiles(&path)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let path = profile_path(&app)?;
+        let attempt = remove_profile_with_readback(
+            &state,
+            window.label(),
+            || {
+                load_profile_for_readback(
+                    &path,
+                    doppeldecker_core::load_sftp_profiles_versioned,
+                    |profile| profile.id == profile_id,
+                )
+            },
+            || {
+                doppeldecker_core::remove_sftp_profile_versioned_if_current(
+                    &path,
+                    &profile_id,
+                    profile_revision,
+                )
                 .map_err(AppError::from)
-                .map(|profiles| {
-                    profiles
-                        .into_iter()
-                        .find(|profile| profile.id == profile_id)
-                })
-        },
-        || {
-            doppeldecker_core::remove_sftp_profile_versioned_if_current(
-                &path,
-                &profile_id,
-                profile_revision,
-            )
-            .map_err(AppError::from)
-        },
-        || {
-            state.sftp_connections.lock_recover().remove(&profile_id);
-            crate::queue_runtime::invalidate_remote_profile(
-                &app,
-                &state,
-                RemoteProfileProtocol::Sftp,
-                &profile_id,
-            );
-            let binding = RemoteProfileBinding::new(
-                RemoteProfileProtocol::Sftp,
-                &profile_id,
-                profile_revision,
-            )
-            .expect("bereits validierte Profil-ID");
-            crate::connection_state_commands::emit_connection_update(
-                &app,
-                &binding,
-                crate::connection_state_commands::ConnectionChangeKind::Removed,
-            );
-        },
-    );
-    attempt.map(|mutation| mutation.profiles)
+            },
+            || {
+                state.sftp_connections.lock_recover().remove(&profile_id);
+                crate::queue_runtime::invalidate_remote_profile(
+                    &app,
+                    &state,
+                    RemoteProfileProtocol::Sftp,
+                    &profile_id,
+                );
+                let binding = RemoteProfileBinding::new(
+                    RemoteProfileProtocol::Sftp,
+                    &profile_id,
+                    profile_revision,
+                )
+                .expect("bereits validierte Profil-ID");
+                crate::connection_state_commands::emit_connection_update(
+                    &app,
+                    &binding,
+                    crate::connection_state_commands::ConnectionChangeKind::Removed,
+                );
+            },
+        );
+        attempt.map(|mutation| mutation.profiles)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[derive(serde::Serialize)]
@@ -990,6 +1018,21 @@ pub(crate) struct SftpConnectionStatus {
     capabilities: RemoteCapabilities,
     quarantine_capabilities:
         doppeldecker_core::remote_real_mode::ProviderQuarantineManagementCapabilities,
+}
+
+#[cfg(test)]
+#[test]
+fn connection_profile_wire_sftp() {
+    crate::ipc_signature_contract::assert_connection_profile_wire::<SftpProfile, _, _>(
+        "sftp",
+        doppeldecker_core::ProviderKind::Sftp,
+        |profile_revision, identity, capabilities, quarantine_capabilities| SftpConnectionStatus {
+            profile_revision,
+            identity,
+            capabilities,
+            quarantine_capabilities,
+        },
+    );
 }
 
 #[tauri::command]
@@ -1031,6 +1074,45 @@ pub(crate) struct RemoteDirListing {
     security: doppeldecker_core::sftp::SftpReadSecurity,
 }
 
+fn sftp_listing_response(
+    profile_revision: u64,
+    path: String,
+    show_hidden: bool,
+    listing: doppeldecker_core::sftp::SftpInteractiveDirectoryListing,
+) -> Result<RemoteDirListing, AppError> {
+    let mut entries = listing.entries;
+    let mut omitted = listing.omitted;
+    if !show_hidden {
+        entries.retain(|listed| !listed.entry.name.starts_with('.'));
+        omitted.retain(|item| !item.is_hidden);
+    }
+    entries.sort_by(|left, right| {
+        right.entry.is_dir.cmp(&left.entry.is_dir).then_with(|| {
+            left.entry
+                .name
+                .to_lowercase()
+                .cmp(&right.entry.name.to_lowercase())
+        })
+    });
+    let parent = Path::new(&path)
+        .parent()
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .filter(|parent| !parent.is_empty());
+    Ok(RemoteDirListing {
+        profile_revision,
+        path,
+        parent,
+        entries: entries
+            .iter()
+            .map(|listed| listed.display_entry())
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(AppError::from)?,
+        omitted,
+        session_generation: listing.session_generation,
+        security: listing.security,
+    })
+}
+
 #[tauri::command]
 pub(crate) async fn scan_sftp_dir(
     app: tauri::AppHandle,
@@ -1051,178 +1133,170 @@ pub(crate) async fn scan_sftp_dir(
             || connection.reconnect(),
         )
         .map_err(AppError::from)?;
-        let mut entries = listing.entries;
-        let mut omitted = listing.omitted;
-        if !show_hidden {
-            entries.retain(|listed| !listed.entry.name.starts_with('.'));
-            omitted.retain(|item| !item.is_hidden);
-        }
-        entries.sort_by(|left, right| {
-            right.entry.is_dir.cmp(&left.entry.is_dir).then_with(|| {
-                left.entry
-                    .name
-                    .to_lowercase()
-                    .cmp(&right.entry.name.to_lowercase())
-            })
-        });
-        let parent = remote_path
-            .parent()
-            .map(|parent| parent.to_string_lossy().into_owned())
-            .filter(|parent| !parent.is_empty());
         crate::queue_runtime::ensure_profile_bindings_current(
             &app,
             std::slice::from_ref(&binding),
         )?;
-        Ok(RemoteDirListing {
-            profile_revision: binding.revision,
-            path,
-            parent,
-            entries: entries
-                .iter()
-                .map(|listed| listed.display_entry())
-                .collect::<io::Result<Vec<_>>>()
-                .map_err(AppError::from)?,
-            omitted,
-            session_generation: listing.session_generation,
-            security: listing.security,
-        })
+        sftp_listing_response(binding.revision, path, show_hidden, listing)
     })
     .await
     .map_err(|_| AppError::new("app", "SFTP-Worker wurde unterbrochen"))?
 }
 
 #[tauri::command]
-pub(crate) fn list_sftp_quarantine_runs(
+pub(crate) async fn list_sftp_quarantine_runs(
     app: tauri::AppHandle,
-    state: State<AppState>,
     profile_id: String,
     profile_revision: Option<u64>,
     target: String,
 ) -> Result<Vec<QuarantineRun>, AppError> {
-    let cached = cached_connection_bound(&app, &state, &profile_id, profile_revision)?;
-    crate::queue_runtime::ensure_requested_profile_revision(profile_revision, &cached.binding)?;
-    let result = list_quarantine_runs(
-        cached.connection.as_ref(),
-        &crate::queue_runtime::remote_quarantine_base("SFTP", Path::new(&target))?,
-        &None,
-    )
-    .map_err(AppError::from)?;
-    crate::queue_runtime::ensure_profile_bindings_current(&app, &[cached.binding])?;
-    Ok(result)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let cached = cached_connection_bound(&app, &state, &profile_id, profile_revision)?;
+        crate::queue_runtime::ensure_requested_profile_revision(profile_revision, &cached.binding)?;
+        let result = list_quarantine_runs(
+            cached.connection.as_ref(),
+            &crate::queue_runtime::remote_quarantine_base("SFTP", Path::new(&target))?,
+            &None,
+        )
+        .map_err(AppError::from)?;
+        crate::queue_runtime::ensure_profile_bindings_current(&app, &[cached.binding])?;
+        Ok(result)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn list_sftp_quarantine_entries(
+pub(crate) async fn list_sftp_quarantine_entries(
     app: tauri::AppHandle,
-    state: State<AppState>,
     profile_id: String,
     profile_revision: Option<u64>,
     target: String,
     run_id: String,
 ) -> Result<Vec<QuarantineEntry>, AppError> {
-    let cached = cached_connection_bound(&app, &state, &profile_id, profile_revision)?;
-    crate::queue_runtime::ensure_requested_profile_revision(profile_revision, &cached.binding)?;
-    let result = list_quarantine_entries_for_target(
-        cached.connection.as_ref(),
-        &crate::queue_runtime::remote_quarantine_base("SFTP", Path::new(&target))?,
-        &run_id,
-        &None,
-        Some(Path::new(&target)),
-    )
-    .map_err(AppError::from)?;
-    crate::queue_runtime::ensure_profile_bindings_current(&app, &[cached.binding])?;
-    Ok(result)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let cached = cached_connection_bound(&app, &state, &profile_id, profile_revision)?;
+        crate::queue_runtime::ensure_requested_profile_revision(profile_revision, &cached.binding)?;
+        let result = list_quarantine_entries_for_target(
+            cached.connection.as_ref(),
+            &crate::queue_runtime::remote_quarantine_base("SFTP", Path::new(&target))?,
+            &run_id,
+            &None,
+            Some(Path::new(&target)),
+        )
+        .map_err(AppError::from)?;
+        crate::queue_runtime::ensure_profile_bindings_current(&app, &[cached.binding])?;
+        Ok(result)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
 // Bestehende Top-Level-Argumente bleiben für ältere IPC-Aufrufer kompatibel; die
 // zusätzliche Revision darf nicht zugunsten einer künstlichen Kürzung entfallen.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn restore_sftp_quarantine_entry(
+pub(crate) async fn restore_sftp_quarantine_entry(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     profile_id: String,
     profile_revision: Option<u64>,
     target: String,
     run_id: String,
     relative_path: String,
 ) -> Result<QuarantineRestoreResponse, AppError> {
-    let label = window.label();
-    let window_state = state.window(label);
-    operation_queue(&app, &window_state, label)?;
-    reserve_operation(&window_state)?;
-    let result = (|| {
-        let cached = cached_connection_bound(&app, &state, &profile_id, profile_revision)?;
-        crate::queue_runtime::ensure_requested_profile_revision(profile_revision, &cached.binding)?;
-        let connection = cached.connection;
-        connection
-            .probe_add_only_capabilities_at(Path::new(&target))
-            .map_err(AppError::from)?;
-        restore_quarantine_entry_for_target(
-            connection.as_ref(),
-            &crate::queue_runtime::remote_quarantine_base("SFTP", Path::new(&target))?,
-            &run_id,
-            &relative_path,
-            &None,
-            Some(Path::new(&target)),
-        )
-        .map(restore_response)
-        .map_err(AppError::from)
-    })();
-    let succeeded = result.is_ok();
-    finish_operation(&app, label, || {
-        let _ = crate::emit_to_window(&window, "quarantine-terminal", succeeded);
-    });
-    result
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let label = window.label();
+        let window_state = state.window(label);
+        operation_queue(&app, &window_state, label)?;
+        reserve_operation(&window_state)?;
+        let result = (|| {
+            let cached = cached_connection_bound(&app, &state, &profile_id, profile_revision)?;
+            crate::queue_runtime::ensure_requested_profile_revision(
+                profile_revision,
+                &cached.binding,
+            )?;
+            let connection = cached.connection;
+            connection
+                .probe_add_only_capabilities_at(Path::new(&target))
+                .map_err(AppError::from)?;
+            restore_quarantine_entry_for_target(
+                connection.as_ref(),
+                &crate::queue_runtime::remote_quarantine_base("SFTP", Path::new(&target))?,
+                &run_id,
+                &relative_path,
+                &None,
+                Some(Path::new(&target)),
+            )
+            .map(restore_response)
+            .map_err(AppError::from)
+        })();
+        let succeeded = result.is_ok();
+        finish_operation(&app, label, || {
+            let _ = crate::emit_to_window(&window, "quarantine-terminal", succeeded);
+        });
+        result
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
 // Siehe `restore_sftp_quarantine_entry`: Der stabile Tauri-Vertrag ist absichtlich
 // flach und bindet nun zusätzlich die Profilrevision.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn purge_sftp_quarantine_run(
+pub(crate) async fn purge_sftp_quarantine_run(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     profile_id: String,
     profile_revision: Option<u64>,
     target: String,
     run_id: String,
     confirmation: String,
 ) -> Result<(), AppError> {
-    let expected = format!("LEEREN {run_id}");
-    if confirmation != expected {
-        return Err(AppError::new(
-            "confirmation_mismatch",
-            format!("Zum endgültigen Leeren exakt „{expected}“ eingeben"),
-        ));
-    }
-    let label = window.label();
-    let window_state = state.window(label);
-    operation_queue(&app, &window_state, label)?;
-    reserve_operation(&window_state)?;
-    let result = (|| {
-        let cached = cached_connection_bound(&app, &state, &profile_id, profile_revision)?;
-        crate::queue_runtime::ensure_requested_profile_revision(profile_revision, &cached.binding)?;
-        let connection = cached.connection;
-        connection
-            .probe_delete_capability_at(Path::new(&target))
-            .map_err(AppError::from)?;
-        purge_quarantine_run_for_target(
-            connection.as_ref(),
-            &crate::queue_runtime::remote_quarantine_base("SFTP", Path::new(&target))?,
-            &run_id,
-            &None,
-            Some(Path::new(&target)),
-        )
-        .map_err(AppError::from)
-    })();
-    let succeeded = result.is_ok();
-    finish_operation(&app, label, || {
-        let _ = crate::emit_to_window(&window, "quarantine-terminal", succeeded);
-    });
-    result
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let expected = format!("LEEREN {run_id}");
+        if confirmation != expected {
+            return Err(AppError::new(
+                "confirmation_mismatch",
+                format!("Zum endgültigen Leeren exakt „{expected}“ eingeben"),
+            ));
+        }
+        let label = window.label();
+        let window_state = state.window(label);
+        operation_queue(&app, &window_state, label)?;
+        reserve_operation(&window_state)?;
+        let result = (|| {
+            let cached = cached_connection_bound(&app, &state, &profile_id, profile_revision)?;
+            crate::queue_runtime::ensure_requested_profile_revision(
+                profile_revision,
+                &cached.binding,
+            )?;
+            let connection = cached.connection;
+            connection
+                .probe_delete_capability_at(Path::new(&target))
+                .map_err(AppError::from)?;
+            purge_quarantine_run_for_target(
+                connection.as_ref(),
+                &crate::queue_runtime::remote_quarantine_base("SFTP", Path::new(&target))?,
+                &run_id,
+                &None,
+                Some(Path::new(&target)),
+            )
+            .map_err(AppError::from)
+        })();
+        let succeeded = result.is_ok();
+        finish_operation(&app, label, || {
+            let _ = crate::emit_to_window(&window, "quarantine-terminal", succeeded);
+        });
+        result
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 /// Gemeinsame verschachtelte Request-Struktur aller Einweg-Remoteprotokolle.
@@ -1264,84 +1338,95 @@ pub(crate) fn prevalidate_remote_sync_roots(
 }
 
 #[tauri::command]
-pub(crate) fn prepare_sftp_sync(
+pub(crate) async fn prepare_sftp_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     request: RemoteSyncRequest,
 ) -> Result<RealRunPreview, AppError> {
-    // Schon die Vorbereitung mutiert den gewählten Providerroot durch Capability-
-    // und Restore-Proben. Queue-Prozessbesitz und Single-Flight müssen deshalb vor
-    // dem Verbindungsaufbau gelten, nicht erst beim später bestätigten Lauf.
-    let label = window.label();
-    let window_state = state.window(label);
-    let RemoteSyncRequest {
-        profile_id,
-        profile_revision,
-        direction,
-        local_root,
-        remote_root,
-        options,
-    } = request;
-    options.validate().map_err(AppError::from)?;
-    let (local_root, remote_root) = prevalidate_remote_sync_roots(&local_root, &remote_root)?;
-    with_reserved_operation(&app, label, &window_state, || {
-        let (connection, profile) = connect_fresh_bound(&app, &profile_id, profile_revision)?;
-        let binding =
-            RemoteProfileBinding::new(RemoteProfileProtocol::Sftp, &profile_id, profile.revision)
-                .map_err(AppError::from)?;
-        crate::queue_runtime::ensure_requested_profile_revision(profile_revision, &binding)?;
-        crate::queue_runtime::ensure_profile_bindings_current(
-            &app,
-            std::slice::from_ref(&binding),
-        )?;
-        let prepared = match direction {
-            SftpQueueDirection::Upload => prepare_sftp_upload(
-                Path::new(&local_root),
-                connection,
-                Path::new(&remote_root),
-                options.clone(),
-            ),
-            SftpQueueDirection::Download => prepare_sftp_download(
-                connection,
-                Path::new(&remote_root),
-                Path::new(&local_root),
-                options.clone(),
-            ),
-        }
-        .map_err(AppError::from)?;
-        let preview = prepared.preview().clone();
-        let operation = QueueOperation::SftpSync {
+    let window_state = app.state::<AppState>().window(window.label());
+    let generation = window_state
+        .sftp_sync_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // Schon die Vorbereitung mutiert den gewählten Providerroot durch Capability-
+        // und Restore-Proben. Queue-Prozessbesitz und Single-Flight müssen deshalb vor
+        // dem Verbindungsaufbau gelten, nicht erst beim später bestätigten Lauf.
+        let label = window.label();
+        let RemoteSyncRequest {
+            profile_id,
+            profile_revision,
             direction,
-            connection: Box::new(profile.profile.connection),
             local_root,
             remote_root,
             options,
-            expected_plan: Box::new(preview.plan.clone()),
-        };
-        let profile_bindings = vec![binding];
-        crate::queue_runtime::store_profile_bound_pending(
-            &app,
-            &state,
-            &window_state.pending_sftp_real,
-            &profile_bindings,
-            PendingRemoteRealRun {
-                prepared,
-                operation,
-                profile_bindings: profile_bindings.clone(),
-            },
-        )?;
-        Ok(preview)
+        } = request;
+        options.validate().map_err(AppError::from)?;
+        let (local_root, remote_root) = prevalidate_remote_sync_roots(&local_root, &remote_root)?;
+        with_reserved_operation(&app, label, &window_state, || {
+            let (connection, profile) = connect_fresh_bound(&app, &profile_id, profile_revision)?;
+            let binding = RemoteProfileBinding::new(
+                RemoteProfileProtocol::Sftp,
+                &profile_id,
+                profile.revision,
+            )
+            .map_err(AppError::from)?;
+            crate::queue_runtime::ensure_requested_profile_revision(profile_revision, &binding)?;
+            crate::queue_runtime::ensure_profile_bindings_current(
+                &app,
+                std::slice::from_ref(&binding),
+            )?;
+            let prepared = match direction {
+                SftpQueueDirection::Upload => prepare_sftp_upload(
+                    Path::new(&local_root),
+                    connection,
+                    Path::new(&remote_root),
+                    options.clone(),
+                ),
+                SftpQueueDirection::Download => prepare_sftp_download(
+                    connection,
+                    Path::new(&remote_root),
+                    Path::new(&local_root),
+                    options.clone(),
+                ),
+            }
+            .map_err(AppError::from)?;
+            let preview = prepared.preview().clone();
+            let operation = QueueOperation::SftpSync {
+                direction,
+                connection: Box::new(profile.profile.connection),
+                local_root,
+                remote_root,
+                options,
+                expected_plan: Box::new(preview.plan.clone()),
+            };
+            let profile_bindings = vec![binding];
+            crate::queue_runtime::store_profile_bound_pending_for_generation(
+                &app,
+                &state,
+                &window_state.pending_sftp_real,
+                &profile_bindings,
+                PendingRemoteRealRun {
+                    prepared,
+                    operation,
+                    profile_bindings: profile_bindings.clone(),
+                },
+                (&window_state.sftp_sync_generation, generation),
+            )?;
+            Ok(preview)
+        })
     })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
 pub(crate) fn discard_sftp_sync(window: WebviewWindow, state: State<AppState>) {
-    state
-        .window(window.label())
-        .pending_sftp_real
-        .lock_recover()
-        .take();
+    let window_state = state.window(window.label());
+    crate::queue_runtime::discard_sync_preparation(
+        &window_state.pending_sftp_real,
+        &window_state.sftp_sync_generation,
+    );
 }
 
 #[tauri::command]
@@ -1397,6 +1482,9 @@ fn validate_run_confirmation(
     Ok(())
 }
 
+pub(crate) type EnqueueSftpRequest =
+    EnqueueRemoteSyncRequest<doppeldecker_core::SftpConnectionConfig>;
+
 #[tauri::command]
 pub(crate) fn enqueue_sftp_sync(
     app: tauri::AppHandle,
@@ -1406,62 +1494,12 @@ pub(crate) fn enqueue_sftp_sync(
 ) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label();
     let window_state = state.window(label);
-    let queue = with_queue_extension(&state, &window_state, || {
-        let connection = find_profile(&app, &request.profile_id)?.connection;
-        let requested_operation = QueueOperation::SftpSync {
-            direction: request.direction,
-            connection: Box::new(connection),
-            local_root: request.local_root,
-            remote_root: request.remote_root,
-            options: request.options,
-            expected_plan: Box::new(request.expected_plan),
-        };
-        let mut pending_slot = window_state.pending_sftp_real.lock_recover();
-        let bindings = pending_slot
-            .as_ref()
-            .ok_or_else(|| AppError::new("app", "Keine SFTP-Vorbereitung zum Einreihen vorhanden"))?
-            .profile_bindings
-            .clone();
-        crate::queue_runtime::ensure_pending_profile_binding(
-            &bindings,
-            RemoteProfileProtocol::Sftp,
-            &request.profile_id,
-            request.profile_revision,
-        )?;
-        enqueue_bound_pending(
-            &mut pending_slot,
-            &requested_operation,
-            |pending| &pending.operation,
-            "Keine SFTP-Vorbereitung zum Einreihen vorhanden",
-            "SFTP-Queueanfrage stimmt nicht exakt mit der vorbereiteten Operation überein",
-            |operation| {
-                enqueue_operation_with_profile_bindings(
-                    &app,
-                    &window_state,
-                    label,
-                    operation,
-                    &bindings,
-                )
-                .map(|(queue, _)| queue)
-            },
-        )
+    let queue = enqueue_protocol_sync(&app, label, &state, &window_state, request, |id| {
+        find_profile(&app, id).map(|profile| profile.connection)
     })?;
     emit_queue_snapshot(&app, label, &queue);
     start_queue_worker(app, label.to_owned());
     Ok(queue.snapshot().into())
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct EnqueueSftpRequest {
-    profile_id: String,
-    #[serde(default)]
-    profile_revision: Option<u64>,
-    direction: SftpQueueDirection,
-    local_root: String,
-    remote_root: String,
-    options: SyncOptions,
-    expected_plan: SyncPlan,
 }
 
 /// Der normale Queue-Worker führt bei Remote-Einträgen nur die frische, lesende
@@ -1640,44 +1678,99 @@ pub(crate) fn approve_sftp_queue_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_editor_wire_matches_frontend_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tools/tests/connection-editor-wire.json"
+        ))
+        .unwrap();
+        macro_rules! assert_reply {
+            ($name:literal, $value:expr) => {
+                assert_eq!(
+                    serde_json::to_value($value).unwrap(),
+                    fixture[$name]["reply"]
+                )
+            };
+        }
+        assert_reply!(
+            "discover_sftp_host_key",
+            doppeldecker_core::SftpHostKeyPin {
+                algorithm: "ssh-ed25519".into(),
+                sha256: [11; 32],
+            }
+        );
+        assert_reply!(
+            "discover_ftps_certificate",
+            doppeldecker_core::FtpsCertificatePin { sha256: [7; 32] }
+        );
+        assert_reply!(
+            "verify_ftps_certificate",
+            doppeldecker_core::FtpsCertificatePin { sha256: [9; 32] }
+        );
+        assert_reply!(
+            "discover_webdav_certificate",
+            doppeldecker_core::WebDavCertificatePin { sha256: [5; 32] }
+        );
+        assert_reply!(
+            "discover_smb_server",
+            doppeldecker_core::SmbServerDiscovery {
+                server_guid: [6; 16],
+                dialect: 785,
+                encryption_capable: true,
+                signing_required: true,
+            }
+        );
+        assert_reply!(
+            "list_sftp_agent_keys",
+            [SftpPublicKeyIdentity {
+                comment: "Asynchroner Testschlüssel".into(),
+                algorithm: "ssh-ed25519".into(),
+                sha256: [23; 32],
+            }]
+        );
+        assert_reply!(
+            "capture_connection_secret",
+            CapturedConnectionSecret {
+                secret_id: "mock-pending-secret-1".into(),
+            }
+        );
+        assert_reply!("discard_connection_secret", ());
+    }
+
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
 
     #[test]
     fn sftp_listing_payload_bindet_generation_und_sicherheitsklasse_atomar() {
-        let source = include_str!("sftp_commands.rs");
-        let start = source.find("pub(crate) async fn scan_sftp_dir(").unwrap();
-        let body = &source[start
-            ..source[start..]
-                .find("pub(crate) fn list_sftp_quarantine_runs(")
-                .expect("Folgecommand von scan_sftp_dir fehlt")
-                + start];
-
-        assert!(body.contains("list_interactive_best_effort"));
-        assert!(body.contains("session_generation: listing.session_generation"));
-        assert!(body.contains("security: listing.security"));
-        assert!(
-            !body.contains("connection.session_generation()"),
-            "Listing und Generation dürfen nicht aus zwei getrennten State-Snapshots stammen"
-        );
-
-        let payload = RemoteDirListing {
-            profile_revision: 11,
-            path: "/".into(),
-            parent: None,
-            entries: Vec::new(),
-            omitted: vec![doppeldecker_core::InteractiveListingOmission {
-                display_name: "Zeile\\nneu.txt".into(),
-                is_hidden: false,
-                reason: "Dateityp nicht belegt".into(),
-            }],
-            session_generation: 7,
-            security: doppeldecker_core::sftp::SftpReadSecurity::SftpPathBestEffort,
-        };
+        let payload = sftp_listing_response(
+            11,
+            "/".into(),
+            false,
+            doppeldecker_core::sftp::SftpInteractiveDirectoryListing {
+                entries: Vec::new(),
+                omitted: vec![doppeldecker_core::InteractiveListingOmission {
+                    display_name: r"Zeile\nneu.txt".into(),
+                    is_hidden: false,
+                    reason: "Dateityp nicht belegt".into(),
+                }],
+                session_generation: 7,
+                security: doppeldecker_core::sftp::SftpReadSecurity::SftpPathBestEffort,
+            },
+        )
+        .unwrap();
         let json = serde_json::to_value(payload).unwrap();
+        let contract = crate::browser_commands::remote_dir_wire_contract();
+        let mut shape = contract["listing"].clone();
+        shape
+            .as_object_mut()
+            .unwrap()
+            .extend(contract["sftp"].as_object().unwrap().clone());
+        crate::browser_commands::assert_wire_object(&json, &shape);
+        crate::browser_commands::assert_wire_object(&json["omitted"][0], &contract["omission"]);
         assert_eq!(json["profile_revision"], 11);
         assert_eq!(json["session_generation"], 7);
-        assert_eq!(json["security"], "sftp_path_best_effort");
+        assert_eq!(json["security"], contract["sftpSecurity"][0]);
         assert_eq!(json["omitted"][0]["display_name"], "Zeile\\nneu.txt");
         let unknown = RemoteDirListing {
             profile_revision: 11,
@@ -1711,6 +1804,11 @@ mod tests {
             security: doppeldecker_core::sftp::SftpReadSecurity::SftpPathBestEffort,
         };
         let json = serde_json::to_value(unknown).unwrap();
+        let mut entry_shape = contract["entry"].clone();
+        entry_shape["size"] = serde_json::json!("number|null");
+        for entry in json["entries"].as_array().unwrap() {
+            crate::browser_commands::assert_wire_object(entry, &entry_shape);
+        }
         assert!(json["entries"][0]["size"].is_null());
         assert_eq!(json["entries"][1]["size"], 6);
     }
@@ -1832,24 +1930,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_queue_request_akzeptiert_verschachtelte_frontend_feldnamen() {
-        let request: EnqueueSftpRequest = serde_json::from_value(serde_json::json!({
-            "profileId": "server",
-            "profileRevision": 21,
-            "direction": "Download",
-            "localRoot": "/lokal",
-            "remoteRoot": "/remote",
-            "options": serde_json::to_value(SyncOptions::default()).unwrap(),
-            "expectedPlan": serde_json::to_value(SyncPlan::default()).unwrap()
-        }))
-        .unwrap();
-
-        assert_eq!(request.profile_id, "server");
-        assert_eq!(request.profile_revision, Some(21));
-        assert_eq!(request.expected_plan, SyncPlan::default());
-    }
-
-    #[test]
     fn profilfehler_laesst_altes_secret_fuer_alle_protokolle_unveraendert() {
         for protocol in ["sftp", "ftps", "webdav", "smb"] {
             let reference = KeychainSecretReference::new("Doppeldecker-Test", protocol).unwrap();
@@ -1867,7 +1947,10 @@ mod tests {
                 |_| Err::<(), _>(AppError::new("io", "Profildatei absichtlich gesperrt")),
                 || {
                     reads += 1;
-                    Ok(Some("altes-profil".to_owned()))
+                    Ok(Some(VersionedProfile {
+                        profile: "altes-profil".to_owned(),
+                        revision: 1,
+                    }))
                 },
             )
             .unwrap_err();
@@ -1899,7 +1982,7 @@ mod tests {
                 |_| Err::<(), _>(AppError::new("io", "Profildatei absichtlich gesperrt")),
                 || {
                     reads += 1;
-                    Ok(None::<String>)
+                    Ok(None::<VersionedProfile<String>>)
                 },
             )
             .unwrap_err();
@@ -1927,7 +2010,10 @@ mod tests {
             |_| Err::<(), _>(AppError::new("plan_drift", "neuerer Profilstand")),
             || {
                 readbacks += 1;
-                Ok(Some("neuerer-stand".to_owned()))
+                Ok(Some(VersionedProfile {
+                    profile: "neuerer-stand".to_owned(),
+                    revision: 2,
+                }))
             },
         )
         .unwrap_err();
@@ -1939,6 +2025,45 @@ mod tests {
         );
         assert_eq!(store.value(&reference).as_deref(), Some("vorher"));
         assert_eq!(store.len(), 1, "frischer Zufallseintrag muss entfernt sein");
+    }
+
+    #[test]
+    fn spaeter_speicherfehler_mit_neuer_revision_invalidiert_unveraendertes_profil() {
+        for revision_changed in [false, true] {
+            let store = FakeSecretStore::default();
+            let profile = "gleiches-profil";
+            let revision = std::cell::Cell::new(1);
+            let mut invalidated = false;
+            let attempt = save_profile_with_secret_under_transaction(
+                &store,
+                None,
+                None,
+                |_| profile,
+                |saved| {
+                    assert_eq!(saved, profile);
+                    if revision_changed {
+                        revision.set(2);
+                    }
+                    Err::<(), _>(AppError::new("io", "Eltern-fsync fehlgeschlagen"))
+                },
+                || {
+                    Ok(Some(VersionedProfile {
+                        profile,
+                        revision: revision.get(),
+                    }))
+                },
+            );
+            let error = finish_profile_save(attempt, || invalidated = true).unwrap_err();
+
+            assert_eq!(invalidated, revision_changed);
+            if revision_changed {
+                assert_eq!(error.code, "outcome_unclear");
+            } else {
+                assert_eq!(error.code, "io");
+                assert_eq!(error.message, "Eltern-fsync fehlgeschlagen");
+            }
+            assert_eq!(store.len(), 0);
+        }
     }
 
     #[test]
@@ -1964,9 +2089,18 @@ mod tests {
             || {
                 reads += 1;
                 if reads == 1 {
-                    Ok(Some("altes-profil".to_owned()))
+                    Ok(Some(VersionedProfile {
+                        profile: "altes-profil".to_owned(),
+                        revision: 1,
+                    }))
                 } else {
-                    Ok(desired.lock_recover().clone())
+                    Ok(desired
+                        .lock_recover()
+                        .clone()
+                        .map(|profile| VersionedProfile {
+                            profile,
+                            revision: 2,
+                        }))
                 }
             },
         )
@@ -1995,7 +2129,12 @@ mod tests {
             Some("neu".into()),
             |fresh| fresh.unwrap(),
             Ok,
-            || Ok(Some(reference.clone())),
+            || {
+                Ok(Some(VersionedProfile {
+                    profile: reference.clone(),
+                    revision: 1,
+                }))
+            },
         )
         .unwrap();
 
@@ -2017,7 +2156,7 @@ mod tests {
             Some("neu".into()),
             |fresh| fresh.unwrap().account,
             |_| Ok::<(), AppError>(()),
-            || Ok(None::<String>),
+            || Ok(None::<VersionedProfile<String>>),
         )
         .unwrap_err();
 
@@ -2075,7 +2214,7 @@ mod tests {
                 exit_was_blocked.store(assessment.must_prevent_exit(), Ordering::Release);
                 Ok::<_, AppError>(saved_profile)
             },
-            || Ok(None::<String>),
+            || Ok(None::<VersionedProfile<String>>),
         )
         .unwrap();
 
@@ -2123,7 +2262,10 @@ mod tests {
     fn wirkendes_remove_mit_spaetem_fehler_invalidiert_alle_protokolle() {
         for protocol in ["sftp", "ftps", "webdav", "smb"] {
             let state = AppState::default();
-            let current = std::sync::Mutex::new(Some("profil".to_owned()));
+            let current = std::sync::Mutex::new(Some(VersionedProfile {
+                profile: "profil".to_owned(),
+                revision: 1,
+            }));
             let mut invalidated = false;
             let mut invalidated_while_transaction_active = false;
             let error = remove_profile_with_readback(

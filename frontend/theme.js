@@ -1,5 +1,7 @@
+// @ts-check
+
 import { writeStoredValue } from "./ui-utils.js";
-import { invoke } from "./tauri-api.js";
+import { syncNativeTheme } from "./desktop-preferences-api.js";
 
 // Darstellung ohne Abhängigkeit vom übrigen App-Zustand. Theme-Boot setzt die erste
 // Wahl bereits vor dem Rendern; dieses Modul übernimmt danach Persistenz und
@@ -7,11 +9,16 @@ import { invoke } from "./tauri-api.js";
 
 const STORAGE_KEY = "doppeldecker-theme";
 const systemDarkQuery = window.matchMedia("(prefers-color-scheme: dark)");
-let preference = document.documentElement.dataset.theme || "auto";
+let preference = normalizedTheme(document.documentElement.dataset.theme);
 
+/** @param {string | undefined} value @returns {import("./desktop-preferences-wire.js").Theme} */
+function normalizedTheme(value) {
+  return value === "light" || value === "dark" ? value : "auto";
+}
+
+/** @param {string} nextPreference */
 export function setTheme(nextPreference, persist = true) {
-  if (!["auto", "light", "dark"].includes(nextPreference)) nextPreference = "auto";
-  preference = nextPreference;
+  preference = normalizedTheme(nextPreference);
   const resolved = preference === "auto"
     ? (systemDarkQuery.matches ? "dark" : "light")
     : preference;
@@ -19,7 +26,7 @@ export function setTheme(nextPreference, persist = true) {
   root.dataset.theme = preference;
   root.dataset.resolvedTheme = resolved;
   if (root.dataset.platform === "linux") {
-    void invoke("sync_native_theme", { preference, dark: resolved === "dark" })
+    void syncNativeTheme(preference, resolved === "dark")
       .catch(error => console.warn("Native Darstellung konnte nicht aktualisiert werden.", error));
   }
   // Die Darstellung funktioniert auch ohne lokale Persistenz weiter.

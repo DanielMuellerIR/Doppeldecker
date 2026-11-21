@@ -72,8 +72,8 @@ Stand: 2026-11-18. Produktüberblick im [README](../README.de.md), offene Arbeit
 ## Verbindliche UI-Verträge
 
 - [Beobachtete SFTP-Ordnergrößen](sftp-directory-sizes.md)
-- [Goal: Mehrere Fenster](goal-mehrere-fenster.md)
-- [Goal: Panes-Spalten und Seitenleiste](goal-spalten-seitenleiste.md)
+- [Mehrere Fenster](multi-window.md)
+- [Pane-Spalten und Seitenleiste](pane-columns-and-sidebar.md)
 
 Vor Arbeiten an Fenstern, `AppState` oder Queue den Vertrag zu mehreren Fenstern lesen.
 
@@ -81,30 +81,10 @@ Vor Arbeiten an Fenstern, `AppState` oder Queue den Vertrag zu mehreren Fenstern
 
 - [Lokale Temp- und Sicherungsreste](decision-lokale-restbereinigung.md)
 
-<details>
-<summary>Prüfberichte und historische Belege</summary>
-
-- [Korrekturen 2026-11-02](code-review-2026-11-02.md)
-- [Korrekturen 2026-11-01](code-review-2026-11-01.md)
-
-- [Korrekturen 2026-10-31](code-review-2026-10-31.md)
-- [Roadmap-Schnitte 2026-10-24](roadmap-2026-10-24.md)
-- [Review-Korrekturen und Schnellfilter 2026-10-22](code-review-2026-10-22.md)
-- [Gemeinsame Remote-Verträge 2026-10-19](code-review-2026-10-19-remote.md)
-- [Deltareview: Dateioperationen und Sync 2026-10-19](code-review-2026-10-19.md)
-- [SMB-Vollreview 2026-10-19](code-review-2026-10-19-smb.md)
-- [Review und Alltagstauglichkeit 2026-10-16](code-review-2026-10-16.md)
-- [Review-Korrekturen 2026-10-13](code-review-2026-10-13.md)
-- [Vollreview ab 2026-10-07](code-review-2026-10-07.md)
-- [Dokumentationsabgleich 2026-10-07](documentation-audit-2026-10-07.md)
-- [Review 2026-10-02](code-review-2026-10-02.md)
-- [Korrekturen 2026-10-03](code-review-2026-10-03.md)
-- [Prüfstabilität](test-stability-2026-10-06.md)
-
-</details>
+[Prüfberichte, frühere Roadmaps und Entwicklungsstände](history/README.md).
 
 ## Übergeordnete Einstiege
 
-- [Projektprofil](../AGENTS.md)
+- [Entwicklung und Tests](development.md)
 - [Öffentliche Übersicht](../README.md)
 - [Änderungsprotokoll](../CHANGELOG.md)

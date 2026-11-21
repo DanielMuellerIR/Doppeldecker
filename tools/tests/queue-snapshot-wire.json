@@ -1,0 +1,169 @@
+{
+  "entries": [
+    {
+      "archive_extract_report": null,
+      "attempts": 2,
+      "attention": null,
+      "bidirectional_completion_recovery": null,
+      "created_directory_dacl_recovery": true,
+      "created_directory_dacl_report": {
+        "completed": [
+          {
+            "after_digest": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+            "before_digest": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+            "directory": "/ziel/neu",
+            "file_id": "9007199254740993",
+            "object_namespace": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "origin": "ExclusiveMinimalCreate"
+          }
+        ],
+        "created": [
+          {
+            "effect_key": {
+              "directory": "/ziel/neu",
+              "file_id": "9007199254740992",
+              "object_namespace": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+              "origin": "ExclusiveMinimalCreate"
+            },
+            "ordinary_metadata_applied": false
+          },
+          {
+            "effect_key": {
+              "directory": "/ziel/neu",
+              "file_id": "9007199254740993",
+              "object_namespace": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+              "origin": "ExclusiveMinimalCreate"
+            },
+            "ordinary_metadata_applied": true
+          }
+        ],
+        "uncertain": [
+          {
+            "after_digest": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+            "before_digest": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+            "directory": "/ziel/neu",
+            "file_id": "18446744073709551615",
+            "object_namespace": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "origin": "ExclusiveMinimalCreate"
+          }
+        ]
+      },
+      "created_unix_ms": 1800000000000,
+      "error": null,
+      "error_code": "outcome_unclear",
+      "file_dacl_recovery": false,
+      "file_incomplete": false,
+      "generated_source": {
+        "bytes": 0,
+        "directories": 1,
+        "files": 0,
+        "id": "generated-11111111111111111111111111111111",
+        "issues": [],
+        "kind": "zip_extraction",
+        "label": "Archivauswahl",
+        "manifest_digest": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+      },
+      "generated_source_recovery": true,
+      "operation": {
+        "copy_new_best_effort_expected": null,
+        "destination": "/ziel",
+        "expected_conflict_proofs": [],
+        "expected_conflicts": [],
+        "items": [
+          "/mock/generated-sources/generated-11111111111111111111111111111111/content/neu"
+        ],
+        "keep_both_targets": [],
+        "kind": "Copy",
+        "local_copy_new_best_effort_expected": null,
+        "overwrite": false,
+        "remove_source_best_effort_expected": null,
+        "replace_best_effort_expected": null,
+        "source": {
+          "provider": "Local",
+          "root": "/mock/generated-sources/generated-11111111111111111111111111111111/content"
+        },
+        "source_tree_expected": null,
+        "target": {
+          "connection": {
+            "domain": "",
+            "host": "smb.example.test",
+            "password_reference": {
+              "account": "tester",
+              "service": "mock"
+            },
+            "port": 445,
+            "requested_root": "/ziel",
+            "server_guid": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "share": "Test",
+            "username": "tester"
+          },
+          "provider": "Smb",
+          "root": "/ziel"
+        },
+        "type": "ProviderFile"
+      },
+      "operation_id": "mock-1",
+      "profile_bindings": [],
+      "progress": {
+        "bytes_done": 0,
+        "bytes_total": 0,
+        "created_directory_dacl_report": {
+          "completed": [
+            {
+              "after_digest": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+              "before_digest": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+              "directory": "/ziel/neu",
+              "file_id": "9007199254740993",
+              "object_namespace": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+              "origin": "ExclusiveMinimalCreate"
+            }
+          ],
+          "created": [
+            {
+              "effect_key": {
+                "directory": "/ziel/neu",
+                "file_id": "9007199254740992",
+                "object_namespace": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                "origin": "ExclusiveMinimalCreate"
+              },
+              "ordinary_metadata_applied": false
+            },
+            {
+              "effect_key": {
+                "directory": "/ziel/neu",
+                "file_id": "9007199254740993",
+                "object_namespace": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                "origin": "ExclusiveMinimalCreate"
+              },
+              "ordinary_metadata_applied": true
+            }
+          ],
+          "uncertain": [
+            {
+              "after_digest": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+              "before_digest": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+              "directory": "/ziel/neu",
+              "file_id": "18446744073709551615",
+              "object_namespace": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+              "origin": "ExclusiveMinimalCreate"
+            }
+          ]
+        },
+        "current": "",
+        "files_done": 0,
+        "files_total": 0,
+        "phase": "interrupted"
+      },
+      "recovery_available": false,
+      "retained_backup_paths": [],
+      "state": "Interrupted",
+      "temp_recovery_paths": [
+        "/mock/generated-sources/generated-11111111111111111111111111111111"
+      ]
+    }
+  ],
+  "paused": false,
+  "revision": 0,
+  "stop_on_error": false,
+  "version": 46
+}

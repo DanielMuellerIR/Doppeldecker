@@ -211,7 +211,45 @@ function issueHtml(entries) {
   </section>`;
 }
 
+/** @typedef {import("./file-property-wire.js").FilePropertyEditRequest} FilePropertyEditRequest */
+/** @typedef {import("./file-property-wire.js").FilePropertyRowWire} FilePropertyRowWire */
+/** @typedef {{
+ * provider: string, parent: string, entries: {name: string, safely_decoded?: boolean}[],
+ * propertyCapabilities?: import("./file-property-wire.js").FilePropertyCapabilitiesWire,
+ * propertyKind?: string | null,
+ * }} FilePropertySnapshot */
+/**
+ * @template {FilePropertySnapshot} Snapshot
+ * @template {object} Fields
+ * @template {FilePropertyRowWire} Row
+ * @typedef {{
+ * getCurrent: () => Snapshot | null, scopeMatches: () => boolean,
+ * isBusy: () => boolean, refresh: () => void,
+ * applyEdit: (kind: string, sendRequest: (request: FilePropertyEditRequest & Fields) => Promise<Row[]>,
+ * fields: Fields, progressText: string) => Promise<Row[] | undefined>
+ * }} FilePropertyEditorCallbacks
+ */
+
+/** @typedef {"left" | "right"} PaneSide */
+/** @typedef {import("./pane-endpoint.js").PaneEndpointLocation & {
+ * profileId?: string | null, profileRevision?: number | null, profileName?: string | null,
+ * securityStatus?: string | null, sessionGeneration?: number | null
+ * }} FileInformationPane */
+/** @typedef {FilePropertySnapshot & {
+ * side: PaneSide, profileId?: string | null, profileRevision?: number | null,
+ * profileName?: string | null, securityStatus?: string | null, sessionGeneration?: number | null,
+ * propertyRequestId?: string | null, adminStatus?: import("./file-property-wire.js").AdminStatusWire,
+ * adminMessage?: string, propertyCapabilitiesError?: string, permissionStatus?: string, ownershipStatus?: string
+ * }} FileInformationSnapshot */
+/** @param {{
+ * panes: Record<PaneSide, FileInformationPane>,
+ * selectedEntries: (side: PaneSide) => {name: string, safely_decoded?: boolean, directorySize?: object | null}[],
+ * requestDirectorySizes: (side: PaneSide, names: string[], options: {recalculate: boolean}) => void,
+ * refreshPane?: (side: PaneSide) => void | Promise<unknown>,
+ * showDock?: (html: string, options: {closable: boolean}) => void
+ * }} callbacks */
 export function createFileInformationUi({ panes, selectedEntries, requestDirectorySizes, refreshPane, showDock }) {
+  /** @type {FileInformationSnapshot | null} */
   let current = null;
   let modalToken = null;
   let active = false;
@@ -264,6 +302,7 @@ export function createFileInformationUi({ panes, selectedEntries, requestDirecto
       snapshot.adminMessage = error.message || String(error); refresh();
     }
   }
+  /** @param {boolean} enabled */
   async function changeAdministratorService(enabled) {
     if (propertyBusy || !currentScopeMatches()) return;
     const snapshot = current; propertyBusy = true;
@@ -487,7 +526,10 @@ export function createFileInformationUi({ panes, selectedEntries, requestDirecto
       void invoke("open_metadata_admin_settings").catch(error => { if (current !== snapshot || !active) return; snapshot.adminMessage = error.message || String(error); refresh(); }); return;
     }
     if (event.target.closest("[data-file-info-property-cancel]")) {
-      if (propertyBusy) void invoke("cancel_file_property_edit", { requestId: current.propertyRequestId }).catch(error => showDock?.(error.message || String(error), { closable: true }));
+      const requestId = current?.propertyRequestId;
+      if (propertyBusy && requestId != null) {
+        void invoke("cancel_file_property_edit", { requestId }).catch(error => showDock?.(error.message || String(error), { closable: true }));
+      }
       return;
     }
     if (tagEditor.click(event) || visibilityEditor.click(event) || flagEditors.some(editor => editor.click(event)) || commentEditor.click(event)) return;
@@ -528,40 +570,69 @@ export function createFileInformationUi({ panes, selectedEntries, requestDirecto
   async function changePermissions() {
     if (propertyBusy || !currentScopeMatches()) return;
     const input = $("#file-info-mode");
+    if (!(input instanceof HTMLInputElement)) return;
     if (!/^[0-7]{3}$/.test(input.value)) {
       current.permissionStatus = "Bitte genau drei Ziffern von 0 bis 7 eingeben.";
       $("[data-file-info-permission-status]").textContent = current.permissionStatus;
       input.focus(); return;
     }
     const recursive = Boolean($("#file-info-recursive")?.checked);
-    await applyPropertyEdit("permission", "change_file_permissions", { mode: input.value, recursive,
-      ...($("#file-info-admin-permission")?.checked ? { administrator: true } : {}),
-      profileId: current.profileId ?? null, profileRevision: current.profileRevision ?? null },
+    await applyPropertyEdit(
+      "permission",
+      request => invoke("change_file_permissions", { request }),
+      /** @satisfies {import("./file-property-wire.js").PermissionEditFields} */ ({
+        mode: input.value, recursive,
+        ...($("#file-info-admin-permission")?.checked ? { administrator: true } : {}),
+        profileId: current.profileId ?? null, profileRevision: current.profileRevision ?? null,
+      }),
       recursive ? "Inhalte werden erfasst, danach Rechte geändert … Abbruch bleibt möglich." : "Berechtigungen werden geändert …",
-      (entry, row) => { if (row.changed) entry.mode = row.mode; else if (["outcome_unclear", "plan_drift", "not_found"].includes(row.code)) entry.mode = null; });
+      (entry, row) => {
+        if (row.changed) entry.mode = row.mode;
+        else if (["outcome_unclear", "plan_drift", "not_found"].includes(row.code)) entry.mode = null;
+      },
+    );
   }
   async function changeOwnership() {
     if (propertyBusy || !currentScopeMatches()) return;
-    const owner = $("#file-info-owner-name").value;
-    const group = $("#file-info-group-name").value;
+    const ownerInput = $("#file-info-owner-name");
+    const groupInput = $("#file-info-group-name");
+    if (!(ownerInput instanceof HTMLInputElement) || !(groupInput instanceof HTMLInputElement)) return;
+    const owner = ownerInput.value;
+    const group = groupInput.value;
     if (!owner.trim() && !group.trim()) {
       current.ownershipStatus = "Mindestens Eigentümer oder Gruppe angeben.";
       $("[data-file-info-ownership-status]").textContent = current.ownershipStatus;
       $("#file-info-owner-name").focus(); return;
     }
-    await applyPropertyEdit("ownership", "change_file_ownership", { owner, group, ...($("#file-info-admin-ownership")?.checked ? { administrator: true } : {}) },
+    await applyPropertyEdit(
+      "ownership",
+      request => invoke("change_file_ownership", { request }),
+      /** @satisfies {import("./file-property-wire.js").OwnerEditFields} */ ({
+        owner, group, ...($("#file-info-admin-ownership")?.checked ? { administrator: true } : {}),
+      }),
       "Lokale Konten und Eigentümer/Gruppe werden geprüft … Abbruch bleibt möglich.",
       (entry, row) => {
         if (row.changed) { entry.owner = row.owner; entry.group = row.group; }
         else if (["outcome_unclear", "plan_drift", "not_found"].includes(row.code)) { entry.owner = null; entry.group = null; }
-      });
+      },
+    );
   }
-  async function applyPropertyEdit(kind, command, fields, progressText, updateEntry = () => {}) {
+  /**
+   * @template {object} Fields
+   * @template {FilePropertyRowWire} Row
+   * @param {string} kind
+   * @param {(request: FilePropertyEditRequest & Fields) => Promise<Row[]>} sendRequest
+   * @param {Fields} fields
+   * @param {string} progressText
+   * @param {(entry: ReturnType<typeof cloneEntry>, row: Row) => void} [updateEntry]
+   */
+  async function applyPropertyEdit(kind, sendRequest, fields, progressText, updateEntry = () => {}) {
     if (propertyBusy || !currentScopeMatches()) return;
     const snapshot = current;
     propertyBusy = true;
     snapshot.propertyKind = kind;
-    snapshot.propertyRequestId = crypto.randomUUID();
+    const requestId = crypto.randomUUID();
+    snapshot.propertyRequestId = requestId;
     const controls = [...$("#modal").querySelectorAll("button:not([data-file-info-property-cancel]), input, select, textarea")].map(control => [control, control.disabled]);
     for (const [control] of controls) control.disabled = true;
     $(`[data-file-info-property-cancel="${kind}"]`).hidden = false;
@@ -569,10 +640,10 @@ export function createFileInformationUi({ panes, selectedEntries, requestDirecto
     const status = $(`[data-file-info-${kind}-status]`);
     status.textContent = progressText; status.tabIndex = -1; status.focus({ preventScroll: true });
     try {
-      const report = await invoke(command, { request: {
-        requestId: snapshot.propertyRequestId, provider: snapshot.provider, root: snapshot.parent,
+      const report = await sendRequest({
+        requestId, provider: snapshot.provider, root: snapshot.parent,
         names: snapshot.entries.filter(isEntryNameSafe).map(entry => entry.name), ...fields,
-      } });
+      });
       for (const row of report) {
         const entry = snapshot.entries.find(entry => entry.name === row.name);
         if (entry) updateEntry(entry, row);
@@ -616,10 +687,12 @@ export function createFileInformationUi({ panes, selectedEntries, requestDirecto
       && pane.path === current.parent;
   }
 
+  /** @param {PaneSide} side */
   function open(side) {
     const pane = panes[side];
     const entries = selectedEntries(side).map(cloneEntry);
     if (!pane || !entries.length) return;
+    /** @type {FileInformationSnapshot} */
     const snapshot = {
       side,
       provider: pane.provider,

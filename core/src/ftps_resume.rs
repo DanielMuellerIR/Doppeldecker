@@ -1,6 +1,6 @@
 //! Fortsetzbarer Download mit über TLS gebundenem Vollinhalt und FTP REST STREAM.
 use super::*;
-use crate::{FtpSecurityStatus, RemoteProfileBinding, RemoteProfileProtocol};
+use crate::{FtpSecurityStatus, RemoteProfileBinding};
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -79,7 +79,20 @@ impl FtpsVfs {
     pub(crate) fn bind_resume_file(
         &self,
         path: &Path,
+        cancel: &crate::Cancel,
     ) -> io::Result<(FtpsFileVersion, BoundFtpsResume)> {
+        let check_cancel = || {
+            if cancel.is_cancelled() {
+                Err(coded_error(
+                    io::ErrorKind::Interrupted,
+                    ErrorCode::Interrupted,
+                    "FTPS-Quellprüfung unterbrochen",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        check_cancel()?;
         if !matches!(
             self.connection_config().security_status(),
             FtpSecurityStatus::TlsIdentityExternallyVerified
@@ -95,6 +108,7 @@ impl FtpsVfs {
         // Die vollständige MLSD-Sicht bindet die Familie der ausgewählten Namen.
         let mut folder = session.identity.canonical_root.clone();
         for component in virtual_components(path)? {
+            check_cancel()?;
             let child = join_server_path(&folder, component);
             let item = list_remote_directory(&mut session.stream, &folder)?
                 .into_iter()
@@ -120,10 +134,13 @@ impl FtpsVfs {
             .stream
             .opts("HASH", Some("SHA-256"))
             .map_err(ftp_error)?;
+        check_cancel()?;
         let response = session
             .stream
             .custom_command(format!("HASH {remote}"), &[Status::File])
-            .map_err(ftp_error)?;
+            .map_err(ftp_error);
+        check_cancel()?;
+        let response = response?;
         let response = std::str::from_utf8(&response.body)
             .map_err(|_| drift("FTPS-SHA-256-Antwort ist kein gültiges UTF-8."))?;
         let sha256 = parse_hash_response(response, &remote, before.size)?;
@@ -175,27 +192,14 @@ pub(crate) fn ensure_profile_current(
     bindings: &[RemoteProfileBinding],
     config: &FtpsConnectionConfig,
 ) -> io::Result<()> {
-    let [binding] = bindings else {
-        return Err(drift(
-            "FTPS-Auftrag benötigt genau ein gespeichertes Profil.",
-        ));
-    };
-    let directory = queue
-        .parent()
-        .ok_or_else(|| drift("FTPS-Profilbindung besitzt keinen Konfigurationsordner."))?;
-    let profiles = crate::load_ftps_profiles_versioned(&directory.join("ftps-profiles.json"))?;
-    if binding.protocol != RemoteProfileProtocol::Ftps
-        || !profiles.iter().any(|profile| {
-            profile.profile.id == binding.profile_id
-                && profile.revision == binding.revision
-                && &profile.profile.connection == config
-        })
-    {
-        return Err(drift(
-            "FTPS-Profil hat sich geändert. Teilkopie bleibt erhalten.",
-        ));
-    }
-    Ok(())
+    crate::connections::ensure_bound_profile_current(
+        queue,
+        bindings,
+        crate::RemoteProfileProtocol::Ftps,
+        "FTPS",
+        crate::load_ftps_profiles_versioned,
+        |profile| &profile.connection == config,
+    )
 }
 
 #[cfg(test)]

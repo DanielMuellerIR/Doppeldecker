@@ -226,6 +226,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 
 #[cfg(target_os = "macos")]
 fn list_macos_mounts() -> io::Result<Vec<SystemMount>> {
+    // SAFETY: NULL und Länge 0 fragen nur die Anzahl ab. Der Kernel schreibt keinen Puffer.
     let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
     if count < 0 {
         return Err(io::Error::last_os_error());
@@ -239,6 +240,8 @@ fn list_macos_mounts() -> io::Result<Vec<SystemMount>> {
         .and_then(|value| libc::c_int::try_from(value).ok())
         .ok_or_else(|| invalid("macOS-Mounttabelle ist unplausibel groß"))?;
     let mut records = Vec::<libc::statfs>::with_capacity(capacity);
+    // SAFETY: records reserviert Speicher für capacity statfs-Datensätze. bytes gibt
+    // die überprüfte Größe dieses Puffers an.
     let received = unsafe { libc::getfsstat(records.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
     if received < 0 {
         return Err(io::Error::last_os_error());
@@ -247,12 +250,17 @@ fn list_macos_mounts() -> io::Result<Vec<SystemMount>> {
     if received > capacity {
         return Err(invalid("macOS schrieb mehr Mounts als angefordert"));
     }
+    // SAFETY: getfsstat hat received vollständige Datensätze geschrieben. Der Wert
+    // wurde gegen Fehler und die reservierte Kapazität geprüft.
     unsafe { records.set_len(received) };
 
     let mut mounts = Vec::new();
     for record in records {
+        // SAFETY: Das Darwin-statfs-Feld enthält einen NUL-terminierten Namen im gültigen Datensatz.
         let path_bytes = unsafe { CStr::from_ptr(record.f_mntonname.as_ptr()) }.to_bytes();
+        // SAFETY: Das Darwin-statfs-Feld enthält einen NUL-terminierten Namen im gültigen Datensatz.
         let source = unsafe { CStr::from_ptr(record.f_mntfromname.as_ptr()) }.to_bytes();
+        // SAFETY: Das Darwin-statfs-Feld enthält einen NUL-terminierten Namen im gültigen Datensatz.
         let filesystem = unsafe { CStr::from_ptr(record.f_fstypename.as_ptr()) }.to_bytes();
         let path = PathBuf::from(OsStr::from_bytes(path_bytes));
         let fs_name = String::from_utf8_lossy(filesystem).into_owned();
@@ -273,6 +281,8 @@ fn list_macos_mounts() -> io::Result<Vec<SystemMount>> {
         let unmount = (kind == SystemMountKind::Network).then(|| SystemUnmount::MacDiskutil {
             mount_path: path.clone(),
         });
+        // SAFETY: Darwin fsid_t besteht aus zwei initialisierten 32-Bit-Werten ohne
+        // Zwischenraum. Die Sicht auf ihre Bytes bleibt an record gebunden.
         let fsid = unsafe {
             std::slice::from_raw_parts(
                 (&record.f_fsid as *const libc::fsid_t).cast::<u8>(),

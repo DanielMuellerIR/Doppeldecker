@@ -1823,6 +1823,55 @@ mod tests {
         drop(temp);
     }
     #[test]
+    fn archive_read_responses_match_the_browser_wire_fixture() {
+        let fixture_wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/archive-read-wire.json")).unwrap();
+        let request: ArchiveOpenRequest =
+            serde_json::from_value(fixture_wire["request"].clone()).unwrap();
+        assert_eq!(request.endpoint.root(), "/artificial/quelle");
+        assert_eq!(request.path, "/artificial/quelle/Archiv.zip");
+        assert!(matches!(
+            request.endpoint,
+            BidirectionalEndpointRequest::Local { .. }
+        ));
+
+        let (_temp, mut reader) = source(&fixture(&[
+            (b"ordner/info.txt", b"Hallo", 0o100644),
+            (b"\xff", b"x", 0o100644),
+        ]));
+        let session = "archive-0";
+        let cancel = Cancel::new();
+        let meta = metadata(&reader, session, &cancel).unwrap();
+        let root = listing(session, &meta, &meta.root_id, 0).unwrap();
+        let directory = root.rows[0].directory_id.as_deref().unwrap();
+        let nested = listing(session, &meta, directory, 0).unwrap();
+        let entry_id = nested.rows[0].entry_id.clone().unwrap();
+        let preview = read_preview(&mut reader, meta.entries[&entry_id].core_id, &cancel).unwrap();
+
+        let opened = Opened {
+            request_id: "open".into(),
+            session_id: session.into(),
+            listing: root,
+            can_extract: true,
+            can_extract_file: true,
+            origin: None,
+        };
+        let previewed = Previewed {
+            request_id: "preview".into(),
+            session_id: session.into(),
+            entry_id,
+            preview,
+        };
+        for (field, actual) in [
+            ("opened", serde_json::to_value(opened).unwrap()),
+            ("listing", serde_json::to_value(nested).unwrap()),
+            ("previewed", serde_json::to_value(previewed).unwrap()),
+        ] {
+            assert_eq!(actual, fixture_wire[field], "{field}");
+        }
+    }
+
+    #[test]
     fn ids_sind_fenstergebunden_und_fremde_eintraege_werden_abgelehnt() {
         let state = ArchiveReadState::default();
         let (_a, reader) = source(&fixture(&[(b"file", b"hello", 0o100644)]));

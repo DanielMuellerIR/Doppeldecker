@@ -1,0 +1,26 @@
+{
+  "request": {
+    "requestId": "batch-wire",
+    "endpoint": { "provider": "local", "root": "/quelle" },
+    "names": ["Alpha.txt", "Beta.txt"],
+    "options": {
+      "find": "", "replacement": "", "prefix": "neu-", "suffix": "",
+      "preserveExtension": true,
+      "numbering": { "start": 1, "step": 1, "minDigits": 3, "position": "before" }
+    }
+  },
+  "preview": {
+    "requestId": "batch-wire", "planId": "batch-one", "limitations": [],
+    "rows": [
+      { "oldName": "Alpha.txt", "newName": "001_neu-Alpha.txt", "status": "ready", "message": "Bereit" },
+      { "oldName": "Beta.txt", "newName": "002_neu-Beta.txt", "status": "ready", "message": "Bereit" }
+    ]
+  },
+  "report": {
+    "renamed": 2, "partiallyRenamed": 0, "failedUnchanged": 0, "outcomeUnclear": 0, "cancelled": 0,
+    "rows": [
+      { "oldName": "Alpha.txt", "newName": "001_neu-Alpha.txt", "status": "renamed", "message": "Umbenannt; Identität zurückgelesen" },
+      { "oldName": "Beta.txt", "newName": "002_neu-Beta.txt", "status": "renamed", "message": "Umbenannt; Identität zurückgelesen" }
+    ]
+  }
+}

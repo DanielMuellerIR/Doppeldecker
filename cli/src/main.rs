@@ -2083,6 +2083,41 @@ fn provider_file_command(
     config_dir: &Path,
     output: &mut Output,
 ) -> io::Result<i32> {
+    let options = ProviderFileOptions {
+        kind,
+        replace: args.replace,
+        skip_conflicts: args.skip_conflicts,
+    };
+    let scope = validate_provider_file_scope(args, options)?;
+    let bound = bind_provider_file_scope(scope, options, config_dir)?;
+    run_bound_provider_file_operation(bound, options, output)
+}
+
+#[derive(Clone, Copy)]
+struct ProviderFileOptions {
+    kind: FileQueueKind,
+    replace: bool,
+    skip_conflicts: bool,
+}
+
+struct ProviderFileScope {
+    source_spec: EndpointSpec,
+    target_spec: EndpointSpec,
+    item_paths: Vec<PathBuf>,
+}
+
+struct BoundProviderFile {
+    queue: OperationQueue,
+    source: ResolvedEndpoint,
+    target: ResolvedEndpoint,
+    item_paths: Vec<PathBuf>,
+    profile_bindings: Vec<doppeldecker_core::RemoteProfileBinding>,
+}
+
+fn validate_provider_file_scope(
+    args: ProviderFileArgs,
+    options: ProviderFileOptions,
+) -> io::Result<ProviderFileScope> {
     let lexical_source_root = lexical_provider_path(args.source_provider, &args.source_root);
     let lexical_target_root = lexical_provider_path(args.target_provider, &args.target_root);
     let lexical_items = args
@@ -2114,31 +2149,51 @@ fn provider_file_command(
     let source_spec = EndpointSpec {
         provider: args.source_provider,
         profile: args.source_profile,
-        root: source_root.clone(),
+        root: source_root,
     };
     let target_spec = EndpointSpec {
         provider: args.target_provider,
         profile: args.target_profile,
-        root: target_root.clone(),
+        root: target_root,
     };
     validate_endpoint_spec(&source_spec)?;
     validate_endpoint_spec(&target_spec)?;
     doppeldecker_core::validate_interactive_file_transfer_request(
         source_spec.provider.kind(),
         target_spec.provider.kind(),
-        kind == FileQueueKind::Move,
-        args.replace,
+        options.kind == FileQueueKind::Move,
+        options.replace,
     )?;
     if source_spec.provider == ProviderArg::Sftp {
-        doppeldecker_core::sftp::validate_interactive_write_selection(&source_root, &item_paths)?;
+        doppeldecker_core::sftp::validate_interactive_write_selection(
+            &source_spec.root,
+            &item_paths,
+        )?;
     }
+    Ok(ProviderFileScope {
+        source_spec,
+        target_spec,
+        item_paths,
+    })
+}
+
+fn bind_provider_file_scope(
+    scope: ProviderFileScope,
+    options: ProviderFileOptions,
+    config_dir: &Path,
+) -> io::Result<BoundProviderFile> {
+    let ProviderFileScope {
+        source_spec,
+        target_spec,
+        item_paths,
+    } = scope;
     // Erst beide Profile prüfen, dann Prozessbesitz und Verbindungen erwerben.
     // Der additive WebDAV-Upload behält seine Bindung an die Profilrevision.
     let source_endpoint = resolve_queue_endpoint(&source_spec, config_dir)?;
     let (target_endpoint, profile_bindings) = if source_spec.provider == ProviderArg::Local
         && target_spec.provider == ProviderArg::Webdav
-        && kind == FileQueueKind::Copy
-        && !args.replace
+        && options.kind == FileQueueKind::Copy
+        && !options.replace
     {
         let profile = doppeldecker_core::load_webdav_profiles_versioned(
             &config_dir.join("webdav-profiles.json"),
@@ -2153,7 +2208,7 @@ fn provider_file_command(
         )?;
         let endpoint = BidirectionalQueueEndpoint::WebDav {
             connection: Box::new(profile.profile.connection),
-            root: doppeldecker_core::fileops::path_to_utf8(&target_root)?,
+            root: doppeldecker_core::fileops::path_to_utf8(&target_spec.root)?,
         };
         endpoint.validate()?;
         (endpoint, vec![binding])
@@ -2177,9 +2232,9 @@ fn provider_file_command(
         )?;
     let bound_target_root =
         doppeldecker_core::fileops::validate_file_operation_root(target.endpoint.root())?;
-    if bound_source_root != source_root
+    if bound_source_root != source_spec.root
         || bound_items != item_paths
-        || bound_target_root != target_root
+        || bound_target_root != target_spec.root
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -2188,9 +2243,31 @@ fn provider_file_command(
     }
     source.endpoint.validate_interactive_file_transfer(
         &target.endpoint,
-        kind == FileQueueKind::Move,
-        args.replace,
+        options.kind == FileQueueKind::Move,
+        options.replace,
     )?;
+    Ok(BoundProviderFile {
+        queue,
+        source,
+        target,
+        item_paths,
+        profile_bindings,
+    })
+}
+
+fn run_bound_provider_file_operation(
+    bound: BoundProviderFile,
+    options: ProviderFileOptions,
+    output: &mut Output,
+) -> io::Result<i32> {
+    let BoundProviderFile {
+        queue,
+        source,
+        target,
+        item_paths,
+        profile_bindings,
+    } = bound;
+    let kind = options.kind;
     let doppeldecker_core::InteractiveFileContexts {
         source_vfs,
         target_vfs,
@@ -2199,7 +2276,7 @@ fn provider_file_command(
         &target.endpoint,
         &item_paths,
         kind == FileQueueKind::Move,
-        args.replace,
+        options.replace,
         &Cancel::new(),
     )?;
     let target_root = target.endpoint.root().to_path_buf();
@@ -2221,7 +2298,7 @@ fn provider_file_command(
         &target_root,
         &item_paths,
     )?;
-    let conflict_proofs = if args.replace {
+    let conflict_proofs = if options.replace {
         capture_file_conflict_proofs(target_vfs.as_ref(), &conflicts)?
     } else {
         Vec::new()
@@ -2234,28 +2311,16 @@ fn provider_file_command(
         && source
             .queue_endpoint
             .shares_connection_definition(&target.queue_endpoint);
-    let mut all_top_level_targets_missing = true;
-    for source_path in &item_paths {
-        let name = source_path.file_name().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Auswahl enthält einen Eintrag ohne sicheren Namen",
-            )
-        })?;
-        match target_vfs.stat(&target_root.join(name)) {
-            Ok(_) => all_top_level_targets_missing = false,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
+    let all_top_level_targets_missing =
+        provider_file_targets_missing(target_vfs.as_ref(), &target_root, &item_paths)?;
     let prepared_target = source.endpoint.probe_interactive_file_target(
         doppeldecker_core::ProviderFileTargetProbe {
             target: &target.endpoint,
             items: &item_paths,
             kind,
-            overwrite: args.replace,
-            skip_conflicts: args.skip_conflicts && !args.replace,
-            inspect_conflicts: !args.skip_conflicts && !args.replace,
+            overwrite: options.replace,
+            skip_conflicts: options.skip_conflicts && !options.replace,
+            inspect_conflicts: !options.skip_conflicts && !options.replace,
             expected_conflicts: Some(&conflicts),
             shared_session: shared_rename_session,
             targets_missing: all_top_level_targets_missing,
@@ -2270,70 +2335,10 @@ fn provider_file_command(
     }
     let skip_only = prepared_target.skip_only;
     let source_removal_required = prepared_target.source_removal_required;
-    let same_namespace_move = prepared_target.rename_only;
+    let source_capabilities =
+        check_provider_file_capabilities(&source.endpoint, options, &prepared_target)?;
     let target_capabilities = prepared_target.capabilities;
-    if !skip_only
-        && target_capabilities.as_ref().is_some_and(|capabilities| {
-            !capabilities.copy_new && !capabilities.copy_new_best_effort
-        })
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            target_capabilities
-                .as_ref()
-                .expect("zuvor als Some geprüft")
-                .blockers
-                .join("; "),
-        ));
-    }
-    // Ein nur als Best Effort möglicher Commit ist ein reguläres Ergebnis, aber
-    // sichtbar: Die konkrete Einschränkung geht vor der Ausführung an stderr.
-    if let Some(capabilities) = target_capabilities
-        .as_ref()
-        .filter(|capabilities| !capabilities.copy_new && capabilities.copy_new_best_effort)
-    {
-        for limitation in &capabilities.limitations {
-            eprintln!("Best Effort: {limitation}");
-        }
-    }
-    let source_capabilities = if kind == FileQueueKind::Move
-        && !same_namespace_move
-        && source_removal_required
-        && !skip_only
-    {
-        Some(source.endpoint.probe_file_source_removal_capabilities()?)
-    } else {
-        None
-    };
-    if source_capabilities.as_ref().is_some_and(|capabilities| {
-        !capabilities.remove_source && !capabilities.remove_source_best_effort
-    }) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Zielkopie wäre möglich, aber die Quellentfernung ist weder provideratomar noch als begrenzter Best-Effort-Pfad verfügbar",
-        ));
-    }
-    if let Some(capabilities) = source_capabilities.as_ref().filter(|capabilities| {
-        !capabilities.remove_source && capabilities.remove_source_best_effort
-    }) {
-        // Die Bestätigung folgt erst danach. So erfährt auch die menschliche
-        // Ausgabe vor der Wirkung, welche schwächere Quellentfernung sie bestätigt.
-        for limitation in &capabilities.limitations {
-            eprintln!("Best Effort: {limitation}");
-        }
-    }
-    if !skip_only
-        && args.replace
-        && target_capabilities
-            .as_ref()
-            .is_none_or(|capabilities| !capabilities.replace && !capabilities.replace_best_effort)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Ersetzen ist für diese Zielverbindung weder mit Quarantäne noch als bestätigtes Best Effort gebunden",
-        ));
-    }
-    if !conflicts.is_empty() && !args.skip_conflicts && !args.replace {
+    if !conflicts.is_empty() && !options.skip_conflicts && !options.replace {
         output.event(serde_json::json!({
             "event": "conflicts",
             "conflicts": conflicts,
@@ -2347,7 +2352,7 @@ fn provider_file_command(
     // Der konkrete CLI-Aufruf mit --replace beziehungsweise move ist bereits
     // die Wirkungsentscheidung. Die frisch gebundenen Erwartungen fahren im
     // Queueauftrag mit; zusätzliche Routinephrasen prüfen keine Servergarantie.
-    let best_effort_replace = args.replace
+    let best_effort_replace = options.replace
         && !conflicts.is_empty()
         && target_capabilities
             .as_ref()
@@ -2391,7 +2396,7 @@ fn provider_file_command(
             .map(|path| doppeldecker_core::fileops::path_to_utf8(path))
             .collect::<io::Result<Vec<_>>>()?,
         destination: doppeldecker_core::fileops::path_to_utf8(&target_root)?,
-        overwrite: args.replace,
+        overwrite: options.replace,
         expected_conflicts: conflicts,
         source_tree_expected: source_tree.map(Box::new),
         keep_both_targets: Vec::new(),
@@ -2402,12 +2407,106 @@ fn provider_file_command(
             .as_ref()
             .map(|capabilities| !capabilities.copy_new && capabilities.copy_new_best_effort),
         replace_best_effort_expected: target_capabilities.as_ref().map(|capabilities| {
-            args.replace && !capabilities.replace && capabilities.replace_best_effort
+            options.replace && !capabilities.replace && capabilities.replace_best_effort
         }),
         remove_source_best_effort_expected: source_capabilities.as_ref().map(|capabilities| {
             !capabilities.remove_source && capabilities.remove_source_best_effort
         }),
     };
+    execute_provider_file_operation(&queue, operation, profile_bindings, output)
+}
+
+fn provider_file_targets_missing(
+    target_vfs: &dyn Vfs,
+    target_root: &Path,
+    item_paths: &[PathBuf],
+) -> io::Result<bool> {
+    let mut all_top_level_targets_missing = true;
+    for source_path in item_paths {
+        let name = source_path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Auswahl enthält einen Eintrag ohne sicheren Namen",
+            )
+        })?;
+        match target_vfs.stat(&target_root.join(name)) {
+            Ok(_) => all_top_level_targets_missing = false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(all_top_level_targets_missing)
+}
+
+fn check_provider_file_capabilities(
+    source: &ProviderEndpoint,
+    options: ProviderFileOptions,
+    prepared_target: &doppeldecker_core::ProviderFileTargetPreparation,
+) -> io::Result<Option<doppeldecker_core::ProviderFileCapabilities>> {
+    let target_capabilities = prepared_target.capabilities.as_ref();
+    let skip_only = prepared_target.skip_only;
+    if let Some(capabilities) = target_capabilities.filter(|capabilities| {
+        !skip_only && !capabilities.copy_new && !capabilities.copy_new_best_effort
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            capabilities.blockers.join("; "),
+        ));
+    }
+    // Ein nur als Best Effort möglicher Commit ist ein reguläres Ergebnis, aber
+    // sichtbar: Die konkrete Einschränkung geht vor der Ausführung an stderr.
+    if let Some(capabilities) = target_capabilities
+        .filter(|capabilities| !capabilities.copy_new && capabilities.copy_new_best_effort)
+    {
+        for limitation in &capabilities.limitations {
+            eprintln!("Best Effort: {limitation}");
+        }
+    }
+    let source_capabilities = if options.kind == FileQueueKind::Move
+        && !prepared_target.rename_only
+        && prepared_target.source_removal_required
+        && !skip_only
+    {
+        Some(source.probe_file_source_removal_capabilities()?)
+    } else {
+        None
+    };
+    if source_capabilities.as_ref().is_some_and(|capabilities| {
+        !capabilities.remove_source && !capabilities.remove_source_best_effort
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Zielkopie wäre möglich, aber die Quellentfernung ist weder provideratomar noch als begrenzter Best-Effort-Pfad verfügbar",
+        ));
+    }
+    if let Some(capabilities) = source_capabilities.as_ref().filter(|capabilities| {
+        !capabilities.remove_source && capabilities.remove_source_best_effort
+    }) {
+        // Die Bestätigung folgt erst danach. So erfährt auch die menschliche
+        // Ausgabe vor der Wirkung, welche schwächere Quellentfernung sie bestätigt.
+        for limitation in &capabilities.limitations {
+            eprintln!("Best Effort: {limitation}");
+        }
+    }
+    if !skip_only
+        && options.replace
+        && target_capabilities
+            .is_none_or(|capabilities| !capabilities.replace && !capabilities.replace_best_effort)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Ersetzen ist für diese Zielverbindung weder mit Quarantäne noch als bestätigtes Best Effort gebunden",
+        ));
+    }
+    Ok(source_capabilities)
+}
+
+fn execute_provider_file_operation(
+    queue: &OperationQueue,
+    operation: QueueOperation,
+    profile_bindings: Vec<doppeldecker_core::RemoteProfileBinding>,
+    output: &mut Output,
+) -> io::Result<i32> {
     // Einreihen und Claim sind eine einzige persistente Zustandsänderung. So kann
     // selbst ein unklarer Fehler nach dem Journal-Rename nie `Pending` hinterlassen.
     let claimed = queue.enqueue_claimed_with_profile_bindings(operation, profile_bindings)?;
@@ -2420,7 +2519,7 @@ fn provider_file_command(
         max_delete_fraction: 0.25,
     };
     let result = doppeldecker_core::queue::execute_provider_file_queue_entry_detailed(
-        &queue,
+        queue,
         claimed,
         &execution,
         Arc::new(KeyringResolver),
@@ -2454,7 +2553,7 @@ fn provider_file_command(
                 }
             } else {
                 match persist_executor_failure(
-                    &queue,
+                    queue,
                     &operation_id,
                     progress.clone(),
                     &failure.error,

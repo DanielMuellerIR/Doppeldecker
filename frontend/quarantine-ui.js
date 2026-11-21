@@ -8,8 +8,23 @@ import {
 import { invoke } from "./tauri-api.js";
 import { $, errCode, escapeHtml, fmtDate, fmtTransferBytes } from "./ui-utils.js";
 
+/** @typedef {import("./pane-endpoint.js").PaneEndpointLocation} PaneEndpointLocation */
+/** @typedef {Extract<import("./pane-endpoint.js").BidirectionalEndpointRequest, {profileId: string}>} RemoteEndpoint */
+/** @typedef {import("./quarantine-wire.js").QuarantineRunWire} QuarantineRun */
+/** @typedef {import("./quarantine-wire.js").QuarantineEntryWire} QuarantineEntry */
+/** @typedef {{listing: boolean, restore: boolean, purge: boolean}} QuarantineCapabilities */
+/** @typedef {PaneEndpointLocation & {profileName?: string | null, quarantineCapabilities?: QuarantineCapabilities | null}} QuarantinePane */
+/** @typedef {{remote: false, target: string | null} | {remote: true, targetName: string, capabilities: QuarantineCapabilities, endpoint: RemoteEndpoint}} QuarantineScope */
+
 /** Kapselt ausschließlich die Quarantäne-Ansicht. Manifestbindung, Restore ohne
- * Überschreiben und endgültiges Leeren werden weiterhin im Backend erzwungen. */
+ * Überschreiben und endgültiges Leeren werden weiterhin im Backend erzwungen.
+ * @param {{
+ *   currentSourceTarget: () => {target: string, targetPane: QuarantinePane},
+ *   refreshPanes: () => unknown, running: () => boolean,
+ *   showDock: (html: string, options: {closable: boolean}) => void,
+ *   showError: (title: string, error: unknown) => void,
+ * }} options
+ */
 export function createQuarantineUi({
   currentSourceTarget,
   refreshPanes,
@@ -35,6 +50,7 @@ export function createQuarantineUi({
       : genericQuarantineLimitation;
   }
 
+  /** @param {QuarantinePane} pane */
   function quarantineCapabilities(pane) {
     const value = pane?.quarantineCapabilities;
     return Object.freeze({
@@ -44,6 +60,7 @@ export function createQuarantineUi({
     });
   }
 
+  /** @returns {QuarantineScope} */
   function currentScope() {
     const current = currentSourceTarget();
     return current.targetPane.provider !== "local"
@@ -73,13 +90,31 @@ export function createQuarantineUi({
       && left.capabilities.purge === right.capabilities.purge;
   }
 
-  function call(boundScope, localCommand, remoteCommand, args = {}) {
+  /**
+   * @template {object} Args
+   * @template Result
+   * @param {QuarantineScope} boundScope
+   * @param {Args} args
+   * @param {(payload: Args & {target: string | null}) => Promise<Result>} local
+   * @param {(payload: Args & {endpoint: RemoteEndpoint}) => Promise<Result>} remote
+   */
+  function call(boundScope, args, local, remote) {
     return boundScope.remote
-      ? invoke(remoteCommand, {
+      ? remote({
         ...args,
         endpoint: boundScope.endpoint,
       })
-      : invoke(localCommand, { ...args, target: boundScope.target });
+      : local({ ...args, target: boundScope.target });
+  }
+
+  /** @param {QuarantineScope} boundScope */
+  function listRuns(boundScope) {
+    return call(
+      boundScope,
+      {},
+      args => invoke("list_quarantine_runs", args),
+      args => invoke("list_provider_quarantine_runs", args),
+    );
   }
 
   function invalidateBadge() {
@@ -88,6 +123,7 @@ export function createQuarantineUi({
     $("#btn-quarantine").title = "Quarantäne wird für den neuen Pane-Endpunkt neu geprüft";
   }
 
+  /** @param {QuarantineRun[]} runs */
   function recoveryCounts(runs) {
     return runs.reduce((counts, run) => ({
       automatic: counts.automatic
@@ -108,11 +144,7 @@ export function createQuarantineUi({
     }
     $("#btn-quarantine").disabled = false;
     try {
-      const badgeRuns = await call(
-        boundScope,
-        "list_quarantine_runs",
-        "list_provider_quarantine_runs",
-      );
+      const badgeRuns = await listRuns(boundScope);
       if (request !== badgeSequence || !sameScope(boundScope, currentScope())) return;
       const counts = recoveryCounts(badgeRuns);
       $("#quarantine-count").textContent = String(counts.automatic);
@@ -198,11 +230,7 @@ export function createQuarantineUi({
     const request = beginNavigation(expectedToken);
     let nextRuns;
     try {
-      nextRuns = await call(
-        boundScope,
-        "list_quarantine_runs",
-        "list_provider_quarantine_runs",
-      );
+      nextRuns = await listRuns(boundScope);
     } catch (error) {
       if (!stillOwnsScope(request, boundScope)) return;
       $("#quarantine-count").textContent = "!";
@@ -229,6 +257,7 @@ export function createQuarantineUi({
     );
   }
 
+  /** @param {QuarantineRun} run */
   function runRow(run, index) {
     const state = runStatusLabel(run.status);
     const expiry = Date.now() >= run.expires_unix_ms
@@ -263,15 +292,16 @@ export function createQuarantineUi({
     return runAllowsRestore(run) || run?.status === "purge_recovery";
   }
 
+  /** @param {QuarantineRun} run @param {QuarantineScope} boundScope */
   async function openRun(run, expectedToken, boundScope) {
     const request = beginNavigation(expectedToken);
     let entries;
     try {
       entries = await call(
         boundScope,
-        "list_quarantine_entries",
-        "list_provider_quarantine_entries",
         { runId: run.id },
+        args => invoke("list_quarantine_entries", args),
+        args => invoke("list_provider_quarantine_entries", args),
       );
     } catch (error) {
       if (!stillOwnsScope(request, boundScope)) return;
@@ -305,6 +335,7 @@ export function createQuarantineUi({
     );
   }
 
+  /** @param {QuarantineEntry} entry */
   function entryRow(entry, index, restoreAllowed) {
     const status = entry.restored
       ? "wiederhergestellt"
@@ -330,6 +361,7 @@ export function createQuarantineUi({
     </div>`;
   }
 
+  /** @param {QuarantineRun} run @param {QuarantineScope} boundScope */
   async function purge(run, parentToken, boundScope) {
     if (!runAllowsPurge(run)
         || (boundScope.remote && !boundScope.capabilities.purge)) return;
@@ -347,10 +379,12 @@ export function createQuarantineUi({
       return closeSpecialModal(parentToken);
     }
     try {
-      await call(boundScope, "purge_quarantine_run", "purge_provider_quarantine_run", {
-        runId: run.id,
-        confirmation: typed,
-      });
+      await call(
+        boundScope,
+        { runId: run.id, confirmation: expected },
+        args => invoke("purge_quarantine_run", args),
+        args => invoke("purge_provider_quarantine_run", args),
+      );
       showDock(`<span class="pill ok">Quarantäne</span>Inhalte von Lauf ${escapeHtml(run.id)} geleert; der Recovery-Tombstone bleibt sichtbar`, { closable: true });
       if (!stillOwnsScope(request, boundScope)) return undefined;
       // Der vom Prompt wieder eingesetzte Dialog beschreibt den Zustand vor der
@@ -368,11 +402,7 @@ export function createQuarantineUi({
       // darf deshalb nie das vor dem Aufruf geladene Run-Objekt Restore wieder
       // freischalten. Die frische Core-Liste liefert insbesondere `purge_recovery`.
       try {
-        const currentRuns = await call(
-          boundScope,
-          "list_quarantine_runs",
-          "list_provider_quarantine_runs",
-        );
+        const currentRuns = await listRuns(boundScope);
         if (!stillOwnsScope(request, boundScope)) return undefined;
         const currentRun = currentRuns.find(candidate => candidate.id === run.id);
         return currentRun
@@ -391,6 +421,11 @@ export function createQuarantineUi({
     }
   }
 
+  /**
+   * @param {QuarantineRun} run
+   * @param {QuarantineEntry[]} entries
+   * @param {QuarantineScope} boundScope
+   */
   async function restoreSelected(event, run, entries, parentToken, boundScope) {
     const button = event.target.closest("[data-restore-entry]");
     if (!button) return;
@@ -418,9 +453,9 @@ export function createQuarantineUi({
     try {
       const restored = await call(
         boundScope,
-        "restore_quarantine_entry",
-        "restore_provider_quarantine_entry",
         { runId: run.id, relativePath: entry.relative_path },
+        args => invoke("restore_quarantine_entry", args),
+        args => invoke("restore_provider_quarantine_entry", args),
       );
       if (!restored
           || typeof restored.path !== "string"
@@ -449,7 +484,7 @@ export function createQuarantineUi({
       return { target, message: "Für dieses Ziel ist keine Quarantäne verfügbar." };
     }
     if (!target) return { message: "Kein Zielordner geöffnet." };
-    const runs = await call(scope, "list_quarantine_runs", "list_provider_quarantine_runs");
+    const runs = await listRuns(scope);
     if (!sameScope(scope, currentScope())) return { message: "Das Ziel hat gewechselt. Bitte aktualisieren." };
     const reviews = runs.flatMap(run => {
       const available = recoveryCounts([run]);

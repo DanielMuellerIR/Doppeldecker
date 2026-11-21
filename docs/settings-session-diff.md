@@ -38,7 +38,7 @@ reagiert. Fehler beim asynchronen macOS-Dock-Icon oder beim Icon eines neu gebau
 nur mit dem Kontext `Fenstericon` und dem Fehlercode in `errors.jsonl` protokolliert.
 macOS liest die aktuelle Iconwahl erst im ausführenden Hauptthread-Task. Ein
 verspäteter Auftrag aus einem anderen Fenster kann dadurch keine ältere Auswahl
-wiederherstellen; die Regression ist im [Review-Abschluss](code-review-2026-10-13.md)
+wiederherstellen; die Regression ist im [Review-Abschluss](history/code-review-2026-10-13.md)
 belegt.
 Beim ersten Start dieser Version übergibt das
 Frontend Theme, Größeneinheit, automatische lokale Ordnergrößen und LAN-Suche aus
@@ -121,7 +121,7 @@ gebunden und je Fenster einmalig übernommen. Dieser kurze Zugriff wartet nicht 
 Mutex des schreibenden Einstellungsstores. Der vollständige Live- und Dateistand
 bleibt erhalten; Remember-Reihenfolge, atomarer Write und Beenden-Barriere ändern
 sich dadurch nicht. Neue Fenster ohne gespeicherte Geometrie verwenden weiterhin
-ihre Standarddarstellung. [Prüfbericht](code-review-2026-10-19-startgeometrie.md).
+ihre Standarddarstellung. [Prüfbericht](history/code-review-2026-10-19-startgeometrie.md).
 
 Beim Neustart liest Doppeldecker zuerst die gespeicherten Profile und ersetzt eine
 alte Profilrevision durch den aktuellen gespeicherten Stand. Das erste Listing
@@ -135,7 +135,7 @@ hinterlassen. Beim Start werden diese Dateien weder als Einstellungen übernomme
 noch nach ihrem Namen bereinigt. Dateipräfix und Prozesssperre ersetzen keinen
 beim Erzeugen gebundenen Besitzbeleg. Ebenso bleiben frühere Fensterjournale mit
 Historie und möglichen Recoverypfaden erhalten. Eine automatische Alterslöschung
-ist nicht vorgesehen; [Prüfung der Aufbewahrung](code-review-2026-10-19-konfigurationsreste.md).
+ist nicht vorgesehen; [Prüfung der Aufbewahrung](history/code-review-2026-10-19-konfigurationsreste.md).
 
 ## Dateivergleich
 

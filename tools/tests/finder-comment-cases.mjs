@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { assertFilePropertyWire } from "./file-property-wire.mjs";
 
 async function setup(page, theme = "light") {
   await page.evaluate(async theme => {
@@ -12,16 +13,20 @@ async function setup(page, theme = "light") {
       if (command === "get_file_finder_comments") {
         window.__COMMENT_CALLS__.push({ command, ...structuredClone(args) });
         if (args.request.requestPermission) window.__COMMENT_PERMISSION__ = true;
-        return args.request.names.map(name => ({ name, state: window.__COMMENT_PERMISSION__ ? { text: window.__COMMENT_TEXT__, metadataDiffers: !window.__COMMENT_SAVED__ } : null,
+        const rows = args.request.names.map(name => ({ name, state: window.__COMMENT_PERMISSION__ ? { text: window.__COMMENT_TEXT__, metadataDiffers: !window.__COMMENT_SAVED__ } : null,
           permissionRequired: !window.__COMMENT_PERMISSION__, code: window.__COMMENT_PERMISSION__ ? null : "permission_denied", message: "Finder-Zugriff ist nicht freigegeben" }));
+        if (args.request.requestPermission) window.__COMMENT_WIRE_READ__ ??= { request: structuredClone(args.request), rows };
+        return rows;
       }
       if (command !== "change_file_finder_comments") return original(command, args);
       window.__COMMENT_CALLS__.push({ command, ...structuredClone(args) });
       if (window.__COMMENT_HOLD__) return new Promise(resolve => { window.__COMMENT_RESOLVE__ = resolve; });
       if (!window.__COMMENT_UNCLEAR__) { window.__COMMENT_TEXT__ = args.request.text; window.__COMMENT_SAVED__ = true; }
-      return args.request.names.map((name, index) => ({ name, state: null, changed: !window.__COMMENT_UNCLEAR__,
+      const rows = args.request.names.map((name, index) => ({ name, state: null, changed: !window.__COMMENT_UNCLEAR__,
         code: window.__COMMENT_UNCLEAR__ ? index ? "interrupted" : "outcome_unclear" : null,
         message: window.__COMMENT_UNCLEAR__ ? "Ausgang <b> unklar; prüfen" : "Finder-Kommentar und Metadaten bestätigt" }));
+      window.__COMMENT_WIRE_EDIT__ ??= { request: structuredClone(args.request), rows };
+      return rows;
     };
   }, theme);
 }
@@ -58,6 +63,7 @@ export async function runFinderCommentCases(runCase) {
       await dialog.getByRole("button", { name: "Kommentar entfernen", exact: true }).click();
       await page.waitForFunction(() => window.__COMMENT_TEXT__ === "");
       await page.waitForFunction(() => document.querySelector("#file-info-comment-text")?.value === "");
+      assertFilePropertyWire("comments", ...await page.evaluate(() => [window.__COMMENT_WIRE_READ__, window.__COMMENT_WIRE_EDIT__]));
       const writes = await page.evaluate(() => window.__COMMENT_CALLS__.filter(call => call.command === "change_file_finder_comments"));
       assert.deepEqual(writes.map(({request}) => ({...request, requestId:"bound"})), [text,""].map(text => ({requestId:"bound",provider:"local",root:"/mock/quelle",names:["Alpha.txt"],text})));
       assert.equal(await dialog.evaluate(node => node.scrollWidth <= node.clientWidth), true);

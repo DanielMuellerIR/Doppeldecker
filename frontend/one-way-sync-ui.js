@@ -1,7 +1,34 @@
 import { invoke } from "./tauri-api.js";
 
-/** Kapselt Vorschau und lokale Einweg-Ausführung. Der Backend-Kern berechnet den
- * Plan erneut und bindet jede Queue-Mutation weiterhin an den bestätigten Digest. */
+/** @typedef {{
+ * protocol: string,
+ * source?: import("./pane-endpoint.js").BidirectionalEndpointRequest,
+ * target?: import("./pane-endpoint.js").BidirectionalEndpointRequest,
+ * error?: string,
+ * }} RemoteSyncContext */
+
+/** Kapselt Vorschau und lokale Einweg-Ausführung. Der Kern prüft den
+ * Simulationsplan und die backendgebundene lokale Vorbereitung erneut.
+ * @param {{
+ * compare: () => import("./local-sync-wire.js").SyncCompareWire,
+ * currentSourceTarget: () => {source: string, target: string},
+ * syncScope: () => string,
+ * discardPreparation: () => Promise<unknown>,
+ * dockRevision?: () => number,
+ * ensureContentHash: () => void,
+ * prepareRemotePreview: (remote: RemoteSyncContext) => Promise<unknown>,
+ * previewAllowed: () => boolean,
+ * remoteSyncContext: () => RemoteSyncContext | null,
+ * runRemote: (remote: RemoteSyncContext) => Promise<boolean | undefined>,
+ * runLocal: (current: () => boolean) => Promise<boolean | undefined>,
+ * runMirror: () => Promise<boolean | undefined>,
+ * running: () => boolean,
+ * showDock: (message: string, options: {closable?: boolean}) => void,
+ * showError: (title: string, error: unknown) => void,
+ * showPlan: (plan: import("./local-sync-wire.js").SyncPlanWire) => void,
+ * syncOptions: () => import("./local-sync-wire.js").SyncOptionsWire,
+ * }} dependencies
+ */
 export function createOneWaySyncUi({
   compare,
   currentSourceTarget,
@@ -78,6 +105,7 @@ export function createOneWaySyncUi({
     }
   }
 
+  /** @param {() => boolean} current @param {boolean} simulate */
   async function runCurrent(current, simulate) {
     const { source, target } = currentSourceTarget();
     const options = syncOptions();

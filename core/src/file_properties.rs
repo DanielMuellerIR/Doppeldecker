@@ -369,7 +369,9 @@ mod tests {
         fs::set_permissions(root.join("outside"), fs::Permissions::from_mode(0o640)).unwrap();
         symlink(root.join("outside"), root.join("pane/link")).unwrap();
         let fifo = std::ffi::CString::new(root.join("pane/fifo").as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // SAFETY: fifo hält den nullterminierten Pfad bis zur Rückkehr.
+        let created = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+        assert_eq!(created, 0);
         fs::write(root.join("pane/file"), b"Datei").unwrap();
         let report = change_local_permissions(
             &root.join("pane"),

@@ -198,15 +198,10 @@ pub(crate) async fn enqueue_provider_file_intent(
             request,
             &crate::sandbox_root()?,
         )?;
-        let (queue, entry) = crate::with_queue_extension(&state, &window_state, || {
-            crate::queue_runtime::enqueue_operation_with_profile_bindings(
-                &app,
-                &window_state,
-                label,
-                &operation,
-                &bindings,
-            )
-        })?;
+        let (queue, entry) =
+            crate::with_queue_extension_access(&state, &window_state, |extension| {
+                extension.enqueue_with_profile_bindings(&app, label, &operation, &bindings)
+            })?;
         crate::emit_queue_snapshot(&app, label, &queue);
         crate::start_queue_worker(app, label.to_owned());
         Ok(entry.operation_id)
@@ -218,6 +213,24 @@ pub(crate) async fn enqueue_provider_file_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_transfer_wire_intent_matches_frontend() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/file-transfer-wire.json"))
+                .unwrap();
+        let intent: FileIntent =
+            serde_json::from_value(fixture["providerTransfer"]["intent"].clone()).unwrap();
+        assert_eq!(intent.kind, "copy");
+        assert_eq!(intent.items, ["/remote.txt"]);
+        assert_eq!(intent.destination, "/mock/ziel");
+        assert_eq!(intent.target.root(), "/mock/ziel");
+        assert!(matches!(
+            intent.source,
+            BidirectionalEndpointRequest::Sftp { profile_id, profile_revision: Some(11), root }
+                if profile_id == "mock_sftp" && root == "/"
+        ));
+    }
+
     #[test]
     fn frontend_payload_akzeptiert_verschachtelte_camelcase_profilfelder() {
         for provider in ["sftp", "ftps", "webdav", "smb"] {

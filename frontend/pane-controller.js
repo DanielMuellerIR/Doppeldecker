@@ -1,6 +1,19 @@
+import { connectProfile } from "./connection-profile-api.js";
 import { invoke } from "./tauri-api.js";
+import { scanDir } from "./scan-dir-api.js";
+import { scanRemoteDir } from "./scan-remote-dir-api.js";
 import { createPaneTabs } from "./pane-tabs.js";
+import { paneEndpoint } from "./pane-endpoint.js";
+import { createPaneDirectorySizes } from "./pane-directory-sizes.js";
 import { createPaneTabsView } from "./pane-tabs-ui.js";
+import {
+  directorySizeDisplayText,
+  directorySizeEligible,
+  optionId,
+  renderPaneRows,
+  rowHeightForPane,
+  VIRTUALIZE_AFTER,
+} from "./pane-rows.js";
 import {
   DATE_WIDEST_SAMPLE,
   entrySizeSample,
@@ -9,21 +22,19 @@ import {
 } from "./column-layout.js";
 import { FOLDER_DRAG_TYPE } from "./favorites-ui.js";
 import {
-  $, $$, escapeHtml, fmtEntryDate, fmtEntryKind, fmtEntryPermissions, fmtEntrySize,
+  $, $$, escapeHtml, fmtEntryKind, fmtEntryPermissions, fmtEntrySize,
   isEntryNameSafe, joinPath,
 } from "./ui-utils.js";
 import {
   defaultViewOptions,
   initViewOptionsPopover,
-  localFolderSizesEnabled,
   loadViewOptions,
   saveFolderViewOptions,
-  setLocalFolderSizesEnabled,
 } from "./view-options.js";
 
+export { VIRTUALIZE_AFTER };
+
 const TYPE_RESET_MS = 500;
-export const VIRTUALIZE_AFTER = 2000;
-const VIRTUAL_OVERSCAN = 8;
 const SORT_KEYS = new Set([
   "name", "size", "kind", "modified", "created", "owner", "group", "permissions",
 ]);
@@ -75,7 +86,6 @@ function makePane() {
     // Lauf-ID und Frontend-Token sind panegebunden. Das Token entwertet auch ein
     // Ergebnis, das nach einer Navigation noch aus dem Backend eintrifft.
     directorySizeToken: 0,
-    directorySizeRunId: null,
     tabs: null,
     tabsView: null,
   };
@@ -104,6 +114,17 @@ export function createPaneController({
   showContextMenu,
 }) {
   const panes = { left: makePane(), right: makePane() };
+  const {
+    cancelDirectorySizeRun,
+    startDirectorySizes,
+    startAutomaticDirectorySizes,
+    changeLocalFolderSizes,
+    onDirectorySizeResult,
+    onDirectorySizeDone,
+    onDirectorySizeError,
+  } = createPaneDirectorySizes({
+    panes, onDirectorySizeChange, onGlobalPreferenceChange, renderDirectorySizeChange, showError,
+  });
 
   function saveActiveTab(pane) {
     if (!pane.path) return;
@@ -288,13 +309,16 @@ export function createPaneController({
     }
   }
 
+  /** @returns {import("./window-session-wire.js").WindowTabsWire | null} */
   function tabsSnapshot() {
     for (const pane of Object.values(panes)) saveActiveTab(pane);
-    return Object.fromEntries(["left", "right"].map(side => {
+    /** @param {"left" | "right"} side */
+    const snapshot = side => {
       const model = panes[side].tabs;
-      const saved = model?.snapshot();
-      const permanent = model?.tabs.filter(tab => !tab.runtime.generatedSource);
-      if (permanent && permanent.length < saved.tabs.length) {
+      if (!model) return null;
+      const saved = model.snapshot();
+      const permanent = model.tabs.filter(tab => !tab.runtime.generatedSource);
+      if (permanent.length < saved.tabs.length) {
         // Prüfpfade können beim App-Neustart bereits bereinigt sein. Die
         // Fensterqueue ist für erhaltene Zwischenstände der Wiedereinstieg.
         const ids = new Set(permanent.map(tab => tab.id));
@@ -307,9 +331,11 @@ export function createPaneController({
       }
       // Die persistierte Auswahl ist laut Sitzungsvertrag begrenzt. Im offenen
       // Tab bleibt die vollständige Auswahl im RAM erhalten.
-      for (const tab of saved?.tabs || []) tab.selectedNames = tab.selectedNames.slice(0, 4096);
-      return [side, saved];
-    }));
+      for (const tab of saved.tabs) tab.selectedNames = tab.selectedNames.slice(0, 4096);
+      return saved;
+    };
+    const left = snapshot("left"), right = snapshot("right");
+    return left && right ? { left, right } : null;
   }
 
   async function restoreTabs(saved) {
@@ -322,152 +348,6 @@ export function createPaneController({
 
   function paneLocation(pane, path = pane.path) {
     return { provider: pane.provider, profileId: pane.profileId, path };
-  }
-
-  function directorySizeEndpoint(pane) {
-    return pane.provider === "local"
-      ? { provider: "local", root: pane.path }
-      : {
-        provider: pane.provider,
-        profileId: pane.profileId,
-        profileRevision: pane.profileRevision,
-        root: pane.path,
-      };
-  }
-
-  function directorySizeEligible(entry) {
-    return entry.is_dir && !entry.is_symlink && isEntryNameSafe(entry);
-  }
-
-  async function cancelDirectorySizeRun(side, { clear = true } = {}) {
-    const pane = panes[side];
-    pane.directorySizeToken += 1;
-    pane.directorySizeRunId = null;
-    if (clear) {
-      for (const entry of pane.allEntries) delete entry.directorySize;
-      if (pane.el) renderDirectorySizeChange(side);
-    }
-    // Ein fehlgeschlagener Abbruch darf Navigation nicht sperren. Das Frontend-
-    // Token verwirft in diesem Fehlerfall weiterhin jedes verspätete Resultat.
-    try {
-      await invoke("cancel_directory_sizes", { side });
-    } catch (_) {
-      // Der nächste Backend-Start ersetzt denselben panegebundenen Lauf zusätzlich.
-    }
-  }
-
-  async function startDirectorySizes(side, names, { recalculate = false, automatic = false } = {}) {
-    const pane = panes[side];
-    const requested = new Set(names);
-    const entries = pane.entries.filter(
-      entry => requested.has(entry.name) && directorySizeEligible(entry),
-    );
-    if (!entries.length || !pane.path) return;
-
-    // Pro Pane existiert genau ein Größenlauf. Ein manueller Neulauf ersetzt einen
-    // noch laufenden Batch; fertige Resultate anderer Ordner bleiben sichtbar.
-    const token = ++pane.directorySizeToken;
-    pane.directorySizeRunId = null;
-    for (const entry of pane.entries) {
-      if (entry.directorySize?.status === "loading") delete entry.directorySize;
-    }
-    for (const entry of entries) entry.directorySize = { status: "loading" };
-    renderDirectorySizeChange(side);
-    for (const entry of entries) onDirectorySizeChange(side, entry);
-    const parent = pane.path;
-    try {
-      const started = await invoke("start_directory_sizes", {
-        request: {
-          side,
-          endpoint: directorySizeEndpoint(pane),
-          names: entries.map(entry => entry.name),
-          ...(pane.provider === "local"
-            ? {}
-            : { sessionGeneration: pane.sessionGeneration }),
-          recalculate,
-          clientToken: token,
-        },
-      });
-      if (token === pane.directorySizeToken && parent === pane.path) {
-        pane.directorySizeRunId = started.run_id;
-      }
-    } catch (error) {
-      if (token !== pane.directorySizeToken || parent !== pane.path) return;
-      for (const entry of entries) entry.directorySize = { status: "failed", error };
-      renderDirectorySizeChange(side);
-      for (const entry of entries) onDirectorySizeChange(side, entry);
-      showError(automatic ? "Automatische Ordnergrößen" : "Ordnergröße", error);
-    }
-  }
-
-  function startAutomaticDirectorySizes(side) {
-    const pane = panes[side];
-    if (pane.provider !== "local" || !localFolderSizesEnabled()) return;
-    const names = pane.entries.filter(directorySizeEligible).map(entry => entry.name);
-    if (names.length) void startDirectorySizes(side, names, { automatic: true });
-  }
-
-  function changeLocalFolderSizes(enabled, persist = true, notify = true) {
-    if (persist && notify) {
-      onGlobalPreferenceChange({ localFolderSizes: Boolean(enabled) });
-      return;
-    }
-    setLocalFolderSizesEnabled(enabled, persist);
-    for (const side of ["left", "right"]) {
-      const pane = panes[side];
-      pane.viewPopover?.sync();
-      if (pane.provider !== "local" || !pane.path) continue;
-      if (enabled) startAutomaticDirectorySizes(side);
-      else void cancelDirectorySizeRun(side);
-    }
-  }
-
-  function directorySizeEventMatches(side, payload) {
-    const pane = panes[side];
-    return payload?.side === side
-      && payload.client_token === pane.directorySizeToken
-      && payload.parent === pane.path;
-  }
-
-  function onDirectorySizeResult(payload) {
-    const side = payload?.side;
-    if (!panes[side] || !directorySizeEventMatches(side, payload)) return;
-    const entry = panes[side].allEntries.find(item => item.name === payload.name);
-    if (!entry || !directorySizeEligible(entry)) return;
-    entry.directorySize = payload.result;
-    renderDirectorySizeChange(side);
-    onDirectorySizeChange(side, entry);
-  }
-
-  /**
-   * Beendet einen Messlauf und gibt jeder noch wartenden Zeile ihren Endzustand.
-   *
-   * Eine Zeile, die auf „lädt“ stehen bleibt, würde eine laufende Messung
-   * vortäuschen, die es nicht mehr gibt. Das Ereignis wird nur angenommen, wenn
-   * es zum aktuellen Lauf genau dieser Pane gehört.
-   */
-  function finishDirectorySizeRun(payload, pendingResult) {
-    const side = payload?.side;
-    if (!panes[side] || !directorySizeEventMatches(side, payload)) return false;
-    const pane = panes[side];
-    pane.directorySizeRunId = null;
-    for (const entry of pane.allEntries) {
-      if (entry.directorySize?.status === "loading") {
-        entry.directorySize = pendingResult;
-        onDirectorySizeChange(side, entry);
-      }
-    }
-    renderDirectorySizeChange(side);
-    return true;
-  }
-
-  function onDirectorySizeDone(payload) {
-    finishDirectorySizeRun(payload, { status: "cancelled" });
-  }
-
-  function onDirectorySizeError(payload) {
-    if (!finishDirectorySizeRun(payload, { status: "failed", error: payload.error })) return;
-    showError("Ordnergröße", payload.error);
   }
 
   /**
@@ -614,8 +494,8 @@ export function createPaneController({
       // einmal kurz ansprechen und seine Sitzung dabei lazy öffnen.
       if (seq !== pane.loadSeq) return false;
       const listing = requestedProvider === "local"
-        ? await invoke("scan_dir", { path: requestedPath, showHidden: requestedOptions.showHidden })
-        : await invoke(`scan_${requestedProvider}_dir`, {
+        ? await scanDir({ path: requestedPath, showHidden: requestedOptions.showHidden })
+        : await scanRemoteDir(requestedProvider, {
           profileId: requestedProfileId,
           profileRevision: requestedProfileRevision,
           path: requestedPath,
@@ -634,7 +514,7 @@ export function createPaneController({
         };
       }
       const quarantineCapabilities = requestedProvider !== "local"
-        ? (await invoke(`connect_${requestedProvider}_profile`, {
+        ? (await connectProfile(requestedProvider, {
           profileId: requestedProfileId,
           profileRevision: requestedProfileRevision,
         }))
@@ -774,15 +654,7 @@ export function createPaneController({
   }
 
   function paneRowHeight(side) {
-    const root = side && panes[side]?.el ? panes[side].el : document.documentElement;
-    const value = Number.parseFloat(
-      getComputedStyle(root).getPropertyValue("--row-height"),
-    );
-    return Number.isFinite(value) && value > 0 ? value : 1;
-  }
-
-  function optionId(side, index) {
-    return `pane-${side}-option-${index}`;
+    return rowHeightForPane(side && panes[side]?.el);
   }
 
   /**
@@ -931,192 +803,8 @@ export function createPaneController({
     onStateChanged();
   }
 
-  function rowHtml(side, pane, entry, index) {
-    const safeName = isEntryNameSafe(entry);
-    const iconType = entry.is_dir ? "folder" : "file";
-    const linkBadge = entry.is_symlink
-      ? `<span class="link-badge" aria-hidden="true">↗</span>`
-      : "";
-    const classes = [entry.is_dir ? "dir" : "file"];
-    if (pane.viewOptions.zebraRows && index % 2 === 1) classes.push("stripe");
-    if (pane.sel.has(index)) classes.push("selected");
-    if (index === pane.cursor) classes.push("cursor");
-    if (!safeName) classes.push("unsafe-name");
-    // Sicher benannte Einträge sind Kopierquellen für die andere Pane. Echte
-    // Ordner tragen zusätzlich den bisherigen Payload für die Favoritenliste.
-    const draggable = safeName;
-    const unsafeBadge = safeName
-      ? ""
-      : '<span class="unsafe-name-badge" aria-label="Name nicht bedienbar">!</span>';
-    const unsafeTitle = safeName
-      ? ""
-      : ' title="Dateiname ist nicht eindeutig als UTF-8 darstellbar und bleibt deshalb unverändert"';
-    const columns = pane.viewOptions.columns;
-    const cells = [];
-    // Jede optionale Spalte besitzt im gemeinsamen Raster davor eine schmale
-    // Trennerspur. Im Kopf liegt dort der bedienbare Griff; die Zeile braucht an
-    // derselben Stelle einen leeren Platzhalter, damit alle Werte bündig bleiben.
-    const addCell = html => cells.push('<span class="r-col-separator" aria-hidden="true"></span>', html);
-    if (columns.size) {
-      addCell(`<span class="r-size">${entry.is_dir
-        ? directorySizeHtml(pane, entry)
-        : (entry.is_file && entry.size == null ? "—" : fmtEntrySize(entry.size))}</span>`);
-    }
-    if (columns.kind) addCell(`<span class="r-kind">${escapeHtml(fmtEntryKind(entry))}</span>`);
-    if (columns.modified) {
-      addCell(`<span class="r-date">${fmtEntryDate(
-        entry.mtime,
-        pane.dateStages.modified,
-        pane.viewOptions.relativeDates,
-      )}</span>`);
-    }
-    if (columns.created) {
-      addCell(`<span class="r-created">${fmtEntryDate(
-        entry.created,
-        pane.dateStages.created,
-        pane.viewOptions.relativeDates,
-      )}</span>`);
-    }
-    if (columns.owner) addCell(`<span class="r-owner">${escapeHtml(entry.owner || "")}</span>`);
-    if (columns.group) addCell(`<span class="r-group">${escapeHtml(entry.group || "")}</span>`);
-    if (columns.permissions) {
-      addCell(`<span class="r-permissions">${fmtEntryPermissions(entry.mode)}</span>`);
-    }
-    return `<div id="${optionId(side, index)}" class="row ${classes.join(" ")}" data-i="${index}"${draggable ? ' draggable="true"' : ""}${unsafeTitle}
-      role="option" aria-selected="${pane.sel.has(index)}" aria-posinset="${index + 1}" aria-setsize="${pane.entries.length}">
-      <span class="r-icon" aria-hidden="true"><span class="file-icon ${iconType}"></span>${linkBadge}</span>
-      <span class="r-name">${escapeHtml(entry.name)}${unsafeBadge}</span>
-      ${cells.join("")}
-    </div>`;
-  }
-
-  function directorySizeDisplayText(value) {
-    if (!value || value.status === "loading" || value.status === "cancelled") return "";
-    if (value.status === "failed") return "Fehler";
-    return `${value.limitations?.length ? "≈ " : ""}${fmtEntrySize(value.bytes)}`;
-  }
-
-  function directorySizeHtml(pane, entry) {
-    if (!directorySizeEligible(entry)) return "";
-    const value = entry.directorySize;
-    if (!value) {
-      if (pane.provider === "local") return "";
-      return `<button class="folder-size-action" type="button" data-directory-size="calculate"
-        aria-label="Größe von ${escapeHtml(entry.name)} berechnen">Berechnen</button>`;
-    }
-    if (value.status === "loading") {
-      return `<span class="folder-size-loading" role="status"
-        aria-label="Größe von ${escapeHtml(entry.name)} wird berechnet">…</span>`;
-    }
-    if (value.status === "cancelled") {
-      return `<button class="folder-size-action" type="button" data-directory-size="calculate"
-        aria-label="Größe von ${escapeHtml(entry.name)} berechnen">Berechnen</button>`;
-    }
-    const text = directorySizeDisplayText(value);
-    const issueText = (value.issues || []).map(issue => issue.message).join(" · ");
-    const partial = value.status === "partial";
-    const failed = value.status === "failed";
-    const resultTitle = failed
-      ? issueText || value.error?.message || "Berechnung fehlgeschlagen; klicken für einen neuen Versuch"
-      : partial
-        ? `${issueText || "Bilanz unvollständig"}; klicken für eine neue Berechnung`
-        : `${value.files} Dateien · ${value.directories} Unterordner; klicken für eine neue Berechnung`;
-    const title = [resultTitle, ...(value.limitations || [])].join(" · ");
-    const label = value.limitations?.length
-      ? `Größe von ${entry.name}: ${text} · Best Effort; neu berechnen`
-      : `Größe von ${entry.name} neu berechnen`;
-    return `<button class="folder-size-value${partial || failed ? " incomplete" : ""}" type="button"
-      data-directory-size="recalculate" title="${escapeHtml(title)}"
-      aria-label="${escapeHtml(label)}">${escapeHtml(text)}${partial ? " ⚠" : ""}</button>`;
-  }
-
-  // Die CSP verbietet Inline-Styles. Ein leeres SVG mit numerischer Höhe hält den
-  // nicht gerenderten Scrollbereich deshalb ohne Style-Attribut frei.
-  function virtualSpacer(height) {
-    if (height <= 0) return "";
-    return `<div class="virtual-spacer" aria-hidden="true"><svg width="1" height="${Math.ceil(height)}" aria-hidden="true"></svg></div>`;
-  }
-
-  /** Die sichtbaren Zeilen dürfen klein bleiben, der semantisch aktive Eintrag
-   * muss für Hilfstechniken aber im DOM bleiben. Diese knappe Ersatzoption liegt
-   * nur außerhalb des sichtbaren Ausschnitts und verwendet dieselbe stabile ID. */
-  function virtualActiveOptionHtml(side, pane, start, end) {
-    if (pane.cursor < 0 || pane.cursor >= pane.entries.length
-      || (pane.cursor >= start && pane.cursor < end)) {
-      return "";
-    }
-    const entry = pane.entries[pane.cursor];
-    return `<div id="${optionId(side, pane.cursor)}" class="virtual-active-option"
-      role="option" aria-selected="${pane.sel.has(pane.cursor)}"
-      aria-posinset="${pane.cursor + 1}" aria-setsize="${pane.entries.length}">${escapeHtml(entry.name)}</div>`;
-  }
-
-  /**
-   * Der Listen-Scrollbalken verschiebt die Zeilen nach links, den Spaltenkopf aber
-   * nicht. Seine gemessene Breite wandert deshalb als Variable an die Pane und wird
-   * dort als zusätzliche rechte Polsterung des Kopfes wirksam — nur so bleiben
-   * Trenner und Zellen bündig.
-   */
-  function syncListGutter(pane) {
-    const gutter = Math.max(0, pane.listing.offsetWidth - pane.listing.clientWidth);
-    if (gutter === pane.listGutter) return;
-    pane.listGutter = gutter;
-    pane.el.style.setProperty("--list-gutter", `${gutter}px`);
-  }
-
   function renderRows(side) {
-    const pane = panes[side];
-    // Die Datumsstufe folgt der tatsächlich gerenderten Spaltenbreite und wird vor
-    // dem Aufbau der Zeilen bestimmt — damit wirkt jedes Ziehen und jeder
-    // Fensterresize sofort.
-    if (pane.columns) {
-      pane.dateStages.modified = pane.columns.dateStage("date");
-      pane.dateStages.created = pane.columns.dateStage("created");
-    }
-    const total = pane.entries.length;
-    if (total === 0) {
-      pane.renderStart = 0;
-      pane.renderEnd = 0;
-      pane.listing.dataset.virtualized = "false";
-      pane.listing.removeAttribute("aria-activedescendant");
-      const emptyLabel = pane.filterText.trim() || pane.filterKind !== "all"
-        ? "Keine Treffer im geladenen Ordner"
-        : pane.listingOmissions.length ? "Keine anzeigbaren Einträge" : "Leerer Ordner";
-      pane.listing.innerHTML = `<div class="empty">${emptyLabel}</div>`;
-      syncListGutter(pane);
-      return;
-    }
-
-    const virtualized = total > VIRTUALIZE_AFTER;
-    const rowHeight = paneRowHeight(side);
-    const visibleRows = Math.max(1, Math.ceil(pane.listing.clientHeight / rowHeight));
-    const firstVisible = Math.max(0, Math.floor(pane.listing.scrollTop / rowHeight));
-    const start = virtualized ? Math.max(0, firstVisible - VIRTUAL_OVERSCAN) : 0;
-    const end = virtualized
-      ? Math.min(total, firstVisible + visibleRows + VIRTUAL_OVERSCAN)
-      : total;
-    pane.renderStart = start;
-    pane.renderEnd = end;
-    pane.listing.dataset.virtualized = String(virtualized);
-    pane.listing.dataset.renderStart = String(start);
-    pane.listing.dataset.renderEnd = String(end);
-    const rows = pane.entries
-      .slice(start, end)
-      .map((entry, offset) => rowHtml(side, pane, entry, start + offset))
-      .join("");
-    const semanticActive = virtualized
-      ? virtualActiveOptionHtml(side, pane, start, end)
-      : "";
-    pane.listing.innerHTML = virtualSpacer(start * rowHeight)
-      + rows
-      + virtualSpacer((total - end) * rowHeight)
-      + semanticActive;
-    if (pane.cursor >= 0 && pane.cursor < total) {
-      pane.listing.setAttribute("aria-activedescendant", optionId(side, pane.cursor));
-    } else {
-      pane.listing.removeAttribute("aria-activedescendant");
-    }
-    syncListGutter(pane);
+    renderPaneRows(side, panes[side]);
   }
 
   function updatePaneFooter(pane) {
@@ -1261,6 +949,10 @@ export function createPaneController({
     refreshSelection(side);
   }
 
+  /** @param {"left" | "right"} side
+   * @param {import("./file-opening-wire.js").RemoteOpenMode} mode
+   * @param {import("./file-opening-wire.js").SnapshotVerification} verification
+   */
   async function openCursor(side, mode = "original", verification = "streaming") {
     const pane = panes[side];
     const entry = pane.entries[pane.cursor];
@@ -1278,19 +970,10 @@ export function createPaneController({
         await invoke("open_path", { path });
         showDock(`<span class="pill ok">Geöffnet</span>${escapeHtml(entry.name)} wurde an die System-App übergeben.`, { closable: true });
       } else {
-        await invoke("open_remote_snapshot", {
-          request: {
-            endpoint: {
-              provider: pane.provider,
-              profileId: pane.profileId,
-              profileRevision: pane.profileRevision,
-              root: pane.path,
-            },
-            path,
-            mode,
-            verification,
-          },
+        const request = /** @satisfies {import("./file-opening-wire.js").OpenRemoteSnapshotRequestWire} */ ({
+          endpoint: paneEndpoint(pane), path, mode, verification,
         });
+        await invoke("open_remote_snapshot", { request });
       }
     } catch (error) {
       showError("Öffnen fehlgeschlagen", error);
@@ -1429,7 +1112,6 @@ export function createPaneController({
     pane.loadSeq += 1;
     pane.navigationPending = false;
     pane.directorySizeToken += 1;
-    pane.directorySizeRunId = null;
     pane.provider = "local";
     pane.profileId = null;
     pane.profileRevision = null;

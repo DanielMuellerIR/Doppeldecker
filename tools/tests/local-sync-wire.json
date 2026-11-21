@@ -1,0 +1,198 @@
+{
+  "request": {
+    "source": "/mock/quelle",
+    "target": "/mock/ziel",
+    "options": {
+      "mode": "AddOnly",
+      "compare": "SizeAndTime",
+      "metadata": "Portable",
+      "mtime_tolerance": 2,
+      "exclude": []
+    }
+  },
+  "plan": {
+    "actions": [
+      {
+        "type": "CopyFile",
+        "path": "Planbeleg.txt",
+        "size": 12,
+        "source_mtime": 1,
+        "source_mode": 420,
+        "source_hash": null,
+        "metadata": null
+      }
+    ],
+    "local_parent_inheritance": [],
+    "comparison": {
+      "rows": [],
+      "categories": {
+        "additions": 0,
+        "updates": 0,
+        "quarantines": 0,
+        "skipped": 0
+      }
+    },
+    "copy_count": 1,
+    "update_count": 0,
+    "metadata_count": 0,
+    "delete_count": 0,
+    "skip_count": 0,
+    "source_count": 1,
+    "target_count": 0,
+    "delete_bytes": 0,
+    "bytes_to_transfer": 12,
+    "hashed_files": 0,
+    "bytes_hashed": 0,
+    "metadata_report": {
+      "profile": "Portable",
+      "content_changes": 0,
+      "metadata_changes": 0,
+      "hardlink_actions": 0,
+      "unsupported_metadata": 0,
+      "privilege_failures": 0,
+      "incompatible_acl_models": 0,
+      "classes": [],
+      "issues": [],
+      "strict_verified": false
+    }
+  },
+  "preview": {
+    "source_identity": {
+      "provider": "Local",
+      "identity": {
+        "device": 1,
+        "inode": 10,
+        "is_directory": true,
+        "mount": {
+          "mount_id": 42,
+          "unique_mount_id": true,
+          "fsid": [1, 2, 3, 4],
+          "volume_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+          "fs_type": "mockfs",
+          "mount_flags": 0
+        },
+        "display_path": "/mock/quelle"
+      }
+    },
+    "target_identity": {
+      "provider": "Local",
+      "identity": {
+        "device": 1,
+        "inode": 11,
+        "is_directory": true,
+        "mount": {
+          "mount_id": 42,
+          "unique_mount_id": true,
+          "fsid": [1, 2, 3, 4],
+          "volume_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+          "fs_type": "mockfs",
+          "mount_flags": 0
+        },
+        "display_path": "/mock/ziel"
+      }
+    },
+    "quarantine_identity": {
+      "provider": "Local",
+      "identity": {
+        "device": 1,
+        "inode": 12,
+        "is_directory": true,
+        "mount": {
+          "mount_id": 42,
+          "unique_mount_id": true,
+          "fsid": [1, 2, 3, 4],
+          "volume_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+          "fs_type": "mockfs",
+          "mount_flags": 0
+        },
+        "display_path": "/mock/.doppeldecker-quarantine"
+      }
+    },
+    "source_listing": {
+      "root_identity": {
+        "provider": "Local",
+        "identity": {
+          "device": 1,
+          "inode": 10,
+          "is_directory": true,
+          "mount": {
+            "mount_id": 42,
+            "unique_mount_id": true,
+            "fsid": [1, 2, 3, 4],
+            "volume_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+            "fs_type": "mockfs",
+            "mount_flags": 0
+          },
+          "display_path": "/mock/quelle"
+        }
+      },
+      "directories_started": 1,
+      "directories_completed": 1,
+      "entries_seen": 1,
+      "listing_digest": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+      "provider_token": null,
+      "errors": [],
+      "complete": true
+    },
+    "target_listing": {
+      "root_identity": {
+        "provider": "Local",
+        "identity": {
+          "device": 1,
+          "inode": 11,
+          "is_directory": true,
+          "mount": {
+            "mount_id": 42,
+            "unique_mount_id": true,
+            "fsid": [1, 2, 3, 4],
+            "volume_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+            "fs_type": "mockfs",
+            "mount_flags": 0
+          },
+          "display_path": "/mock/ziel"
+        }
+      },
+      "directories_started": 1,
+      "directories_completed": 1,
+      "entries_seen": 0,
+      "listing_digest": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
+      "provider_token": null,
+      "errors": [],
+      "complete": true
+    },
+    "options": {
+      "mode": "AddOnly",
+      "compare": "SizeAndTime",
+      "metadata": "Portable",
+      "mtime_tolerance": 2
+    },
+    "impact": {
+      "new_files": 1,
+      "new_bytes": 12,
+      "replacements": 0,
+      "replacement_new_bytes": 0,
+      "replacement_old_bytes": 0,
+      "metadata_changes": 0,
+      "quarantine_entries": 0,
+      "quarantine_bytes": 0,
+      "required_available_bytes": 4108,
+      "available_bytes": 1000000,
+      "available_bytes_known": true
+    },
+    "plan_digest": [23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23],
+    "confirmation_phrase": "REAL ziel ABC123",
+    "scope_warnings": [
+      "Künstlicher Bereichshinweis"
+    ],
+    "prepared_at_unix_ms": 42,
+    "expires_at_unix_ms": 600042,
+    "restore_probe_ok": false,
+    "backup_confirmation_required": false,
+    "local_execution": {
+      "new_file_commit": "assured",
+      "file_flush": true,
+      "directory_flush": true,
+      "irreversible_replacements": 0
+    }
+  }
+}

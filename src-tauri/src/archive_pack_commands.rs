@@ -1,7 +1,7 @@
 //! Fenstergebundene ZIP-Vorbereitung; Bestandsbelege entstehen ausschließlich im Core.
 use crate::{
-    emit_queue_snapshot, enqueue_operation_with_readback, start_queue_worker, with_queue_extension,
-    AppError, AppState, MutexExt,
+    emit_queue_snapshot, start_queue_worker, with_queue_extension_access, AppError, AppState,
+    MutexExt,
 };
 use doppeldecker_core::archive_pack::{
     ArchivePackBinding, ArchivePackOptions, ArchivePackRequest, PreparedArchivePack,
@@ -94,7 +94,7 @@ impl ArchivePackCache {
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ArchiveRequest {
+pub(crate) struct ArchivePackPrepareRequest {
     request_id: String,
     provider: String,
     root: String,
@@ -105,7 +105,7 @@ pub(crate) struct ArchiveRequest {
 }
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ArchivePreview {
+pub(crate) struct ArchivePackPrepared {
     preparation_id: String,
     binding: ArchivePackBinding,
     upload_target: Option<String>,
@@ -116,8 +116,8 @@ pub(crate) struct ArchivePreview {
 pub(crate) async fn prepare_archive_pack(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    request: ArchiveRequest,
-) -> Result<ArchivePreview, AppError> {
+    request: ArchivePackPrepareRequest,
+) -> Result<ArchivePackPrepared, AppError> {
     if request.provider != "local" {
         return Err(AppError::new("unsupported", "ZIP-Erzeugung ist derzeit für lokale Panes verfügbar. Entfernte Archive können hier noch nicht erstellt werden."));
     }
@@ -179,7 +179,7 @@ pub(crate) async fn prepare_archive_pack(
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let preview = ArchivePreview {
+        let preview = ArchivePackPrepared {
             preparation_id: id.clone(),
             binding: binding.clone(),
             upload_target: upload.as_ref().map(|target| target.label.clone()),
@@ -211,7 +211,7 @@ pub(crate) async fn confirm_archive_pack(
         let state = app.state::<AppState>();
         let label = window.label();
         let owner = state.window(label);
-        let (queue, entry) = with_queue_extension(&state, &owner, || {
+        let (queue, entry) = with_queue_extension_access(&state, &owner, |extension| {
             let mut cache = owner.archive_pack_preparation.lock_recover();
             let pending = cache.bound(&preparation_id)?;
             let result = if let Some(upload) = &pending.upload {
@@ -221,9 +221,8 @@ pub(crate) async fn confirm_archive_pack(
                         request: Box::new(pending.request.clone()),
                         expected: Box::new(pending.binding.clone()),
                     });
-                crate::queue_runtime::enqueue_operation_with_profile_bindings(
+                extension.enqueue_with_profile_bindings(
                     &app,
-                    &owner,
                     label,
                     &operation,
                     &upload.profiles,
@@ -233,7 +232,7 @@ pub(crate) async fn confirm_archive_pack(
                     request: Box::new(pending.request.clone()),
                     expected: Box::new(pending.binding.clone()),
                 };
-                enqueue_operation_with_readback(&app, &owner, label, &operation)?
+                extension.enqueue_with_readback(&app, label, &operation)?
             };
             cache.pending = None;
             Ok(result)
@@ -309,15 +308,52 @@ mod tests {
         assert!(new_cancel.is_cancelled());
         assert!(cache.begin("closed".into()).is_err());
     }
+    fn archive_pack_wire_fixture() -> serde_json::Value {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/archive-mutation-wire.json"))
+                .unwrap();
+        fixture["pack"].clone()
+    }
+
+    #[test]
+    fn archive_pack_responses_match_the_browser_wire_fixture() {
+        use doppeldecker_core::{archive_pack::ArchivePackPreview, vfs::FileCommitClass};
+
+        let response = ArchivePackPrepared {
+            preparation_id: "backend-zip-id".into(),
+            binding: ArchivePackBinding {
+                digest: [9; 32],
+                preview: ArchivePackPreview {
+                    source_root: "/artificial/source".into(),
+                    target: "/private/artificial-workspace/content/result.zip".into(),
+                    files: 1,
+                    directories: 0,
+                    source_bytes: 9,
+                    commit_class: FileCommitClass::Assured,
+                    file_flush: true,
+                    directory_flush: true,
+                    issues: vec![],
+                },
+            },
+            upload_target: Some("SFTP · example.invalid:22 · /remote/Archivziel".into()),
+            upload_notice: Some(doppeldecker_core::sftp::SFTP_WRITE_LIMITATION.into()),
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            archive_pack_wire_fixture()["response"]
+        );
+    }
+
     #[test]
     fn archive_pack_nested_request_accepts_camel_case_and_rejects_forged_binding() {
-        let request = serde_json::json!({"requestId":"request-1","provider":"local","root":"/pane","items":["/pane/file"],"targetName":"new.zip","options":{"compression":"deflate"}});
-        assert!(serde_json::from_value::<ArchiveRequest>(request.clone()).is_ok());
+        let request = archive_pack_wire_fixture()["request"].clone();
+        let parsed: ArchivePackPrepareRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(parsed.target.unwrap().root(), "/remote/Archivziel");
         let mut forged = request.clone();
         forged["digest"] = serde_json::json!(vec![0; 32]);
-        assert!(serde_json::from_value::<ArchiveRequest>(forged).is_err());
+        assert!(serde_json::from_value::<ArchivePackPrepareRequest>(forged).is_err());
         let mut invalid = request;
         invalid["options"]["compression"] = serde_json::json!("unsupported");
-        assert!(serde_json::from_value::<ArchiveRequest>(invalid).is_err());
+        assert!(serde_json::from_value::<ArchivePackPrepareRequest>(invalid).is_err());
     }
 }

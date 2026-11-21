@@ -1,0 +1,137 @@
+{
+  "endpoint": {
+    "provider": "sftp",
+    "root": "/",
+    "profileId": "mock_sftp",
+    "profileRevision": 11
+  },
+  "delete": {
+    "items": [
+      "/remote.txt"
+    ],
+    "preview": {
+      "capabilities": {
+        "provider": "sftp",
+        "quarantine": false,
+        "permanent": true,
+        "limitations": [
+          "SFTP · Best Effort: Gleichzeitige serverseitige Pfadänderungen können die Aktion auf ein anderes Ziel im selben Konto umlenken, auch außerhalb dieses Ordners.",
+          "Die bestätigte Auswahl wird dauerhaft ohne Papierkorb oder Wiederherstellungsweg entfernt."
+        ],
+        "blockers": []
+      },
+      "mode": "permanent",
+      "plan": {
+        "root": "/",
+        "root_identity": {
+          "provider": "Sftp",
+          "identity": {
+            "server": {
+              "host": "sftp.example.invalid",
+              "port": 22,
+              "host_key": {
+                "algorithm": "ssh-ed25519",
+                "sha256": [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+              },
+              "canonical_root": "/daten",
+              "sftp_version": 3,
+              "extensions_digest": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+            },
+            "virtual_root": "/",
+            "session_generation": 1
+          }
+        },
+        "items": [
+          {
+            "path": "/remote.txt",
+            "is_dir": false,
+            "entries": 1,
+            "bytes": 8,
+            "digest": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "source_proof": {
+              "raw_name": [114, 101, 109, 111, 116, 101, 46, 116, 120, 116],
+              "provider_token": [5, 7],
+              "is_dir": false,
+              "is_file": true,
+              "is_symlink": false,
+              "size": 8,
+              "mtime": 1,
+              "mode": 420,
+              "device": null,
+              "inode": null
+            },
+            "records": [
+              {
+                "path": "/remote.txt",
+                "is_dir": false,
+                "size": 8,
+                "provider_token": [5, 7],
+                "content_digest": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+              }
+            ]
+          }
+        ],
+        "entries": 1,
+        "bytes": 8,
+        "digest": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+      },
+      "confirmation": null
+    }
+  },
+  "rename": {
+    "request": {
+      "endpoint": {
+        "provider": "sftp",
+        "root": "/",
+        "profileId": "mock_sftp",
+        "profileRevision": 11
+      },
+      "path": "/remote.txt",
+      "newName": "Umbenannt.txt",
+      "expectedExecutionClass": "best_effort"
+    },
+    "contract": {
+      "kind": "confirmed",
+      "execution_class": "best_effort",
+      "limitations": [
+        "SFTP · Best Effort: Gleichzeitige serverseitige Pfadänderungen können die Aktion auf ein anderes Ziel im selben Konto umlenken, auch außerhalb dieses Ordners."
+      ]
+    },
+    "response": {
+      "outcome": "renamed",
+      "class": "best_effort",
+      "limitations": [
+        "SFTP · Best Effort: Gleichzeitige serverseitige Pfadänderungen können die Aktion auf ein anderes Ziel im selben Konto umlenken, auch außerhalb dieses Ordners."
+      ],
+      "newPath": "/Umbenannt.txt",
+      "existingIsDir": null,
+      "verifiedAfterReconnect": false
+    }
+  },
+  "folder": {
+    "request": {
+      "endpoint": {
+        "provider": "sftp",
+        "root": "/",
+        "profileId": "mock_sftp",
+        "profileRevision": 11
+      },
+      "name": "Künstlicher Ordner",
+      "expectedExecutionClass": "best_effort"
+    },
+    "contract": {
+      "execution_class": "best_effort",
+      "limitations": [
+        "SFTP · Best Effort: Gleichzeitige serverseitige Pfadänderungen können die Aktion auf ein anderes Ziel im selben Konto umlenken, auch außerhalb dieses Ordners."
+      ],
+      "blockers": []
+    },
+    "response": {
+      "path": "/Künstlicher Ordner",
+      "execution_class": "best_effort",
+      "limitations": [
+        "SFTP · Best Effort: Gleichzeitige serverseitige Pfadänderungen können die Aktion auf ein anderes Ziel im selben Konto umlenken, auch außerhalb dieses Ordners."
+      ]
+    }
+  }
+}

@@ -206,7 +206,7 @@ Jedes Fenster besitzt eigene Queue, Schranke, Vorbereitungen und Permits;
 Verbindungen und externer Prozesslock sind gemeinsam. Handles, Secrets und Permits
 werden nicht persistiert. `outcome_unclear` sperrt den normalen Retry auch nach
 Neustart. Ausgelassene Resource Forks bleiben als Teilstatus erhalten.
-Verträge: [Queue](operations-queue-design.md), [Fenster](goal-mehrere-fenster.md),
+Verträge: [Queue](operations-queue-design.md), [Fenster](multi-window.md),
 [Recoverybilanz](recovery-aggregation.md).
 
 Core, Tauri und CLI reichen strukturierte Fehlercodes durch. Fehlende Fähigkeit,

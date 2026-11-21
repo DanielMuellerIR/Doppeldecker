@@ -72,7 +72,9 @@ fn execute(input: &mut impl Read, cancel: &Cancel) -> serde_json::Value {
 pub(super) fn run() -> i32 {
     // Der Helfer wird nie als allgemeines Root-CLI freigegeben. pkexec prüft die
     // Systemanmeldung selbst; dessen UID kennzeichnet den ursprünglichen Benutzer.
-    let authenticated = unsafe { libc::geteuid() } == 0
+    // SAFETY: geteuid liest nur die effektive UID und erwartet keine Argumente.
+    let effective_uid = unsafe { libc::geteuid() };
+    let authenticated = effective_uid == 0
         && std::env::var("PKEXEC_UID")
             .ok()
             .and_then(|uid| uid.parse::<u32>().ok())

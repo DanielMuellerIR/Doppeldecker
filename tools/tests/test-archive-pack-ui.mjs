@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { chromium } from "playwright";
 import { createBrowserCleanup } from "../browser-cleanup.mjs";
 const probe = createServer(); probe.listen(0,"127.0.0.1"); await once(probe,"listening"); const port = probe.address().port; probe.close(); await once(probe,"close");
@@ -12,8 +12,10 @@ const server = spawn("python3",["tools/mock-ui-server.py","--port",String(port)]
 // Assetzugriffe füllen sonst die Pipe und blockieren spätere Seitenaufrufe.
 server.stderr.resume();
 const cleanup = createBrowserCleanup(server); const url = `http://127.0.0.1:${port}`;
+const packWire = JSON.parse(await readFile(new URL("./archive-mutation-wire.json", import.meta.url))).pack;
 const mock = `
 (() => {
+ const wire = ${JSON.stringify(packWire)};
  const original = window.__TAURI__.core.invoke;
  window.__ZIP_CALLS__=[]; window.__ZIP_CONFIG__={}; window.__ZIP_GLOBAL_CANCELS__=0;
  window.__ZIP_PREVIEW__ = root => ({source_root:root,target:root+"/exact.zip",files:2,directories:1,source_bytes:12345,commit_class:window.__ZIP_CONFIG__.weak?"best_effort":"assured",file_flush:true,directory_flush:!window.__ZIP_CONFIG__.weak,
@@ -26,9 +28,10 @@ const mock = `
   if(command==="prepare_archive_pack"){
    if(window.__ZIP_CONFIG__.hold)await new Promise(resolve=>{window.__ZIP_RELEASE__=resolve;});
    if(args.request.provider!=="local")throw {code:"unsupported",message:"ZIP-Erzeugung derzeit nur für lokale Panes"};
+   if(window.__ZIP_CONFIG__.useWireFixture)return wire.response;
    const preview=window.__ZIP_PREVIEW__(args.request.root);
    if(args.request.target)preview.target="/private/artificial-workspace/content/result.zip";
-   return {preparationId:"backend-zip-id",binding:{digest:Array(32).fill(9),preview},uploadTarget:args.request.target?args.request.target.provider.toUpperCase()+" · "+args.request.target.root:null};
+   return {preparationId:"backend-zip-id",binding:{digest:Array(32).fill(9),preview},uploadTarget:args.request.target?args.request.target.provider.toUpperCase()+" · "+args.request.target.root:null,uploadNotice:null};
   }
   if(args.preparationId!=="backend-zip-id")throw new Error("Ungebundene ZIP-Ausführung");
   if(window.__ZIP_CONFIG__.drift)throw {code:"plan_drift",message:"ZIP-Auswahl änderte sich; erneut vorbereiten"};
@@ -120,17 +123,25 @@ try {
   const {page,errors}=await pageFor(theme);await page.setViewportSize({width,height:850});
   await page.evaluate(async provider=>{
    const {createArchivePackUi}=await import("/archive-pack-ui.js");
+   window.__ZIP_CONFIG__.useWireFixture=provider==="sftp";
    window.__ZIP_PANES__={left:{provider:"local",path:"/artificial/source",navigationRevision:1,tabs:{active:{id:"left"}}},right:{provider,path:"/remote/Archivziel",profileId:"target-profile",profileRevision:7,navigationRevision:2,tabs:{active:{id:"right"}}}};
    window.__ZIP_REMOTE__=createArchivePackUi({panes:window.__ZIP_PANES__,activeSide:()=>"left",selectedEntries:()=>[{name:"file.txt",is_file:true}],blocked:()=>false,showDock:()=>{},showError:()=>{}});window.__ZIP_REMOTE__.open();
   },provider);
   await page.getByLabel("Ziel",{exact:true}).selectOption("remote");await page.getByRole("button",{name:"Vorschau erstellen",exact:true}).click();
   const dialog=page.getByRole("dialog");await dialog.getByRole("button",{name:"ZIP erstellen und hochladen",exact:true}).waitFor();
   assert.match(await dialog.innerText(),/remote\/Archivziel/);assert.doesNotMatch(await dialog.innerText(),/private\/artificial-workspace/);
+  if(provider==="sftp"){
+   const details=dialog.getByText("Grenzen und Zwischenstand",{exact:true});
+   await details.click();
+   await dialog.getByText(packWire.response.uploadNotice,{exact:true}).waitFor();
+   await details.click();
+  }
   assert.equal(await dialog.evaluate(element=>element.scrollWidth<=element.clientWidth),true);
   if(evidence)await page.screenshot({path:evidence+"/remote-pack-"+provider+"-"+theme+"-"+width+".png"});
   await dialog.getByRole("button",{name:"ZIP erstellen und hochladen",exact:true}).click();
   const calls=await page.evaluate(()=>window.__ZIP_CALLS__);const request=calls.find(call=>call.command==="prepare_archive_pack").args.request;
   assert.deepEqual(request.target,{provider,root:"/remote/Archivziel",profileId:"target-profile",profileRevision:7});
+  if(provider==="sftp")assert.deepEqual(request,{...packWire.request,requestId:request.requestId});
   assert.deepEqual(calls.find(call=>call.command==="confirm_archive_pack").args,{preparationId:"backend-zip-id"});assert.deepEqual(errors,[]);await page.close();
  }
  for(const change of ["profile","tab"]) {

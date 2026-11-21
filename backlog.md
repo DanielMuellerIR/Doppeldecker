@@ -22,4 +22,4 @@ Stand: 2026-11-18. Nur offene Arbeit; Reihenfolge und Releaseumfang stehen in de
 Neue Punkte nennen Wirkung, Fertigkriterium und höchstens einen Detailverweis.
 Erledigtes aus dieser Liste entfernen; Änderungen ins Changelog, Prüfbelege ins
 zuständige Vertrags-/Prüfdokument. Keine Commitchronik oder wiederholten
-Testzahlen im Backlog. Historie: [Stand bis 2026-10](docs/backlog-history-2026-10.md).
+Testzahlen im Backlog. Historie: [Stand bis 2026-10](docs/history/backlog-history-2026-10.md).

@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "strict": true,
+    "noEmit": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "types": []
+  },
+  "files": [
+    "frontend/remote-edit-ui.js",
+    "frontend/file-property-api.js",
+    "frontend/file-information-comments.js",
+    "frontend/file-information-flags.js",
+    "frontend/file-information-tags.js",
+    "frontend/file-information-visibility.js",
+    "frontend/connection-profile-api.js",
+    "frontend/desktop-preferences-api.js",
+    "frontend/settings-ui.js",
+    "frontend/theme.js",
+    "frontend/favorites-api.js",
+    "frontend/batch-rename-ui.js",
+    "frontend/file-preview.js",
+    "frontend/file-transfer.js",
+    "frontend/scan-dir-api.js",
+    "frontend/scan-remote-dir-api.js",
+    "frontend/provider-command-names.js",
+    "frontend/pane-directory-sizes.js",
+    "frontend/name-search-api.js",
+    "tools/tests/ipc-primitive-typecheck.ts"
+  ]
+}

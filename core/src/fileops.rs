@@ -6681,6 +6681,7 @@ mod tests {
             use std::os::fd::AsRawFd;
             for path in &self.0 {
                 if let Ok(file) = std::fs::File::open(path) {
+                    // SAFETY: file hält den gültigen Deskriptor bis zur Rückkehr.
                     unsafe {
                         libc::fchflags(file.as_raw_fd(), 0);
                     }
@@ -6694,10 +6695,19 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn make_test_file_immutable(path: &Path) {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(path).unwrap();
+        // SAFETY: file hält den gültigen Deskriptor bis zur Rückkehr.
+        let result = unsafe { libc::fchflags(file.as_raw_fd(), libc::UF_IMMUTABLE) };
+        assert_eq!(result, 0);
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn native_copy_locked_files_and_new_directories_finish_after_commit_and_preserve_metadata() {
         use std::os::darwin::fs::MetadataExt as _;
-        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        use std::os::unix::fs::MetadataExt;
         let area = tempfile::tempdir().unwrap();
         let root = area.path().canonicalize().unwrap();
         let folder = root.join("source");
@@ -6731,15 +6741,7 @@ mod tests {
             vfs.set_copy_mtime(path, time).unwrap();
             vfs.set_mode(path, if path == &file { 0o640 } else { 0o555 })
                 .unwrap();
-            assert_eq!(
-                unsafe {
-                    libc::fchflags(
-                        std::fs::File::open(path).unwrap().as_raw_fd(),
-                        libc::UF_IMMUTABLE,
-                    )
-                },
-                0
-            );
+            make_test_file_immutable(path);
         }
         let original = std::fs::metadata(&file).unwrap();
         for (items, destination, policy) in [
@@ -6819,7 +6821,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn native_locked_completion_rejects_replaced_pane_root_with_retained_target_parent() {
-        use std::os::{darwin::fs::MetadataExt as _, fd::AsRawFd, unix::fs::PermissionsExt};
+        use std::os::{darwin::fs::MetadataExt as _, unix::fs::PermissionsExt};
         let area = tempfile::tempdir().unwrap();
         let root = area.path().canonicalize().unwrap();
         let pane = root.join("pane");
@@ -6831,15 +6833,7 @@ mod tests {
         let destination = parent.join("file");
         std::fs::write(&source, b"committed bytes").unwrap();
         let _cleanup = UnlockCopies(vec![source.clone(), destination.clone()]);
-        assert_eq!(
-            unsafe {
-                libc::fchflags(
-                    std::fs::File::open(&source).unwrap().as_raw_fd(),
-                    libc::UF_IMMUTABLE,
-                )
-            },
-            0
-        );
+        make_test_file_immutable(&source);
         let src = LocalVfs::rooted(&root).unwrap();
         let source_metadata = src
             .read_copy_metadata(&source, &src.stat(&source).unwrap(), &Cancel::new())
@@ -6905,7 +6899,6 @@ mod tests {
     #[test]
     fn native_locked_completion_error_keeps_committed_effect_and_move_source_without_temp_cleanup()
     {
-        use std::os::fd::AsRawFd;
         let area = tempfile::tempdir().unwrap();
         let root = area.path().canonicalize().unwrap();
         let source = root.join("file");
@@ -6913,15 +6906,7 @@ mod tests {
         std::fs::write(&source, b"already committed content").unwrap();
         std::fs::create_dir(&target).unwrap();
         let _cleanup = UnlockCopies(vec![source.clone()]);
-        assert_eq!(
-            unsafe {
-                libc::fchflags(
-                    std::fs::File::open(&source).unwrap().as_raw_fd(),
-                    libc::UF_IMMUTABLE,
-                )
-            },
-            0
-        );
+        make_test_file_immutable(&source);
         let src = LocalVfs::rooted(&root).unwrap();
         let mut dst = FileopsRaceVfs::new(ForeignReplacementKind::File);
         dst.fail_copy_finish = true;
@@ -6965,7 +6950,6 @@ mod tests {
     #[test]
     fn native_copy_locked_source_without_target_adapter_keeps_content_and_reports_lock_omission() {
         use std::os::darwin::fs::MetadataExt as _;
-        use std::os::fd::AsRawFd;
         let area = tempfile::tempdir().unwrap();
         let root = area.path().canonicalize().unwrap();
         let source = root.join("file");
@@ -6973,15 +6957,7 @@ mod tests {
         std::fs::write(&source, b"locked bytes").unwrap();
         std::fs::create_dir(&target).unwrap();
         let _cleanup = UnlockCopies(vec![source.clone()]);
-        assert_eq!(
-            unsafe {
-                libc::fchflags(
-                    std::fs::File::open(&source).unwrap().as_raw_fd(),
-                    libc::UF_IMMUTABLE,
-                )
-            },
-            0
-        );
+        make_test_file_immutable(&source);
         let src = LocalVfs::rooted(&root).unwrap();
         let dst = FileopsRaceVfs::new(ForeignReplacementKind::File);
         dst.swapped.store(true, Ordering::SeqCst);

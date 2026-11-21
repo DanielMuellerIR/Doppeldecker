@@ -419,6 +419,7 @@ mod tests {
         let fifo =
             std::ffi::CString::new(area.path().join("favorites.json").as_os_str().as_bytes())
                 .unwrap();
+        // SAFETY: Der CString bleibt bis zur Rückkehr gültig und benennt nur die Test-FIFO.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         let name = "favorites::tests::favorites_fifo_child";
         let binary = std::env::current_exe().unwrap();

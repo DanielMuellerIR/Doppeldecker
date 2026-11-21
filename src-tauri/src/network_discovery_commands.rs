@@ -21,3 +21,37 @@ pub(crate) async fn discover_network_services() -> Result<Vec<DiscoveredNetworkS
     .map_err(|_| AppError::new("app", "Der begrenzte LAN-Suchworker wurde unterbrochen"))?
     .map_err(AppError::from)
 }
+
+#[cfg(test)]
+#[test]
+fn command_read_results_discovered_network_services() {
+    use doppeldecker_core::NetworkServiceProtocol;
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../tools/tests/command-read-results.json")).unwrap();
+    let services = [
+        (
+            NetworkServiceProtocol::Smb,
+            "Studio-NAS",
+            "studio-nas.local",
+            445,
+        ),
+        (
+            NetworkServiceProtocol::Sftp,
+            "Buildserver",
+            "build.local",
+            2222,
+        ),
+        (NetworkServiceProtocol::WebDav, "Cloud", "cloud.local", 8443),
+    ]
+    .map(|(protocol, name, host, port)| DiscoveredNetworkService {
+        protocol,
+        name: name.into(),
+        host: host.into(),
+        port,
+    });
+    assert_eq!(
+        serde_json::to_value(services).unwrap(),
+        fixture["networkServices"]
+    );
+}

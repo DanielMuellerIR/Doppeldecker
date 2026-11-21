@@ -67,5 +67,5 @@ Gesamttransaktion; laufend abgestürzte Aufträge werden nicht blind wiederholt.
 Siehe [Restbereinigung](decision-lokale-restbereinigung.md).
 
 Plattformbelege für die bisherigen lokalen Wege stehen in den Roadmapständen
-[2026-10-23](roadmap-2026-10-23.md) und [2026-10-24](roadmap-2026-10-24.md).
+[2026-10-23](history/roadmap-2026-10-23.md) und [2026-10-24](history/roadmap-2026-10-24.md).
 Aktuelle Remote- und GUI-Prüflücken: [Releaseplan](release-plan.md).

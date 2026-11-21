@@ -1,6 +1,8 @@
 import { invoke } from "./tauri-api.js";
 import { isEntryNameSafe, joinPath } from "./ui-utils.js";
 
+/** @typedef {{ids: string[], outcomes: Map<string, boolean>, ready: boolean, version: string | null, consuming?: boolean}} ClipboardMove */
+
 export const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
 export function isTextTarget(target) {
   return Boolean(target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"])'));
@@ -10,15 +12,18 @@ export function isTextTarget(target) {
  * Stand und erst nach vollständig erfolgreichen Queue-Abschlüssen aller Gruppen. */
 export function createFileClipboard({ panes, activeSide, selectedEntries, fileActions, blocked, showDock, showError }) {
   const completed = new Map();
+  /** @type {Set<ClipboardMove>} */
   const moves = new Set();
   const attempts = new Map();
   let preparing = false;
   let copyRevision = 0;
+  /** @type {Promise<boolean> | null} */
   let pendingCopy = null;
 
   async function copy(cut = false, side = activeSide()) {
     if (blocked()) return;
     const pane = panes[side];
+    /** @type {{name: string}[]} */
     const entries = selectedEntries(side);
     if (pane.provider !== "local") {
       showDock('<span class="pill none">Datei-Zwischenablage</span>Diese Aktion unterstützt lokale Dateien. Remote-Dateien über F5/F6 übertragen.', { closable: true });
@@ -37,8 +42,9 @@ export function createFileClipboard({ panes, activeSide, selectedEntries, fileAc
     finally { if (pendingCopy === writing) pendingCopy = null; }
   }
 
+  /** @param {ClipboardMove} move */
   async function consume(move) {
-    if (!move.ready || move.consuming || !move.ids.length || !move.ids.every(id => move.outcomes.has(id))) return;
+    if (move.version === null || !move.ready || move.consuming || !move.ids.length || !move.ids.every(id => move.outcomes.has(id))) return;
     moves.delete(move);
     if (!move.ids.every(id => move.outcomes.get(id))) return;
     move.consuming = true;
@@ -49,6 +55,7 @@ export function createFileClipboard({ panes, activeSide, selectedEntries, fileAc
   async function paste(forceMove = false, side = activeSide()) {
     if (blocked() || preparing) return;
     const target = fileActions.capturePasteTarget(side);
+    /** @type {ClipboardMove} */
     const move = { ids: [], outcomes: new Map(), ready: false, version: null };
     preparing = true;
     try {

@@ -1,16 +1,19 @@
 //! Gemeinsame Laufzeit für Queue, Single-Flight-Schranke und Fortschrittsereignisse.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use doppeldecker_core::{
-    recover_trash_journals, Cancel, FtpsVfs, LocalBidirectionalStats, OpStats, OperationQueue,
-    OperationQueueProcessLock, PreparedLocalRealRun, PreparedSftpQueueRun, PreparedSftpRealRun,
-    Progress, QueueEntry, QueueOperation, QueueOperationClass, RemoteProfileBinding,
-    RemoteProfileProtocol, SftpVfs, SmbVfs, SyncStats, VersionedProfile, WebDavVfs,
+    recover_trash_journals, Cancel, FtpsConnectionConfig, FtpsVfs, LocalBidirectionalStats,
+    OpStats, OperationQueue, OperationQueueProcessLock, PreparedLocalRealRun, PreparedSftpQueueRun,
+    PreparedSftpRealRun, Progress, QueueEntry, QueueOperation, QueueOperationClass,
+    RemoteProfileBinding, RemoteProfileProtocol, SftpConnectionConfig, SftpQueueDirection, SftpVfs,
+    SmbConnectionConfig, SmbVfs, SyncOptions, SyncPlan, SyncStats, VersionedProfile,
+    WebDavConnectionConfig, WebDavVfs,
 };
 use tauri::{Emitter, Manager};
 use zeroize::Zeroizing;
@@ -403,7 +406,7 @@ pub(crate) fn ensure_requested_profile_revision(
     ))
 }
 
-pub(crate) fn ensure_pending_profile_binding(
+fn ensure_pending_profile_binding(
     bindings: &[RemoteProfileBinding],
     protocol: RemoteProfileProtocol,
     profile_id: &str,
@@ -744,20 +747,46 @@ pub(crate) fn store_profile_bound_pending<T>(
     bindings: &[RemoteProfileBinding],
     pending: T,
 ) -> Result<(), AppError> {
-    store_profile_bound_pending_using(state, slot, pending, || {
+    store_profile_bound_pending_using(state, slot, pending, None, || {
         ensure_profile_bindings_current(app, bindings)
     })
+}
+
+pub(crate) fn store_profile_bound_pending_for_generation<T>(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    slot: &Mutex<Option<T>>,
+    bindings: &[RemoteProfileBinding],
+    pending: T,
+    generation: (&AtomicU64, u64),
+) -> Result<(), AppError> {
+    store_profile_bound_pending_using(state, slot, pending, Some(generation), || {
+        ensure_profile_bindings_current(app, bindings)
+    })
+}
+
+pub(crate) fn discard_sync_preparation<T>(slot: &Mutex<Option<T>>, generation: &AtomicU64) {
+    let mut slot = slot.lock_recover();
+    generation.fetch_add(1, Ordering::Release);
+    slot.take();
 }
 
 fn store_profile_bound_pending_using<T>(
     state: &AppState,
     slot: &Mutex<Option<T>>,
     pending: T,
+    generation: Option<(&AtomicU64, u64)>,
     validate: impl FnOnce() -> Result<(), AppError>,
 ) -> Result<(), AppError> {
     let _transaction = state.profile_secret_guard.lock_recover();
     validate()?;
     let mut slot = slot.lock_recover();
+    if generation.is_some_and(|(current, expected)| current.load(Ordering::Acquire) != expected) {
+        return Err(AppError::new(
+            "plan_drift",
+            "Die Sync-Vorbereitung wurde inzwischen verworfen",
+        ));
+    }
     if slot.is_some() {
         return Err(AppError::new(
             "busy",
@@ -897,72 +926,120 @@ impl QueueTerminalEvent {
     }
 }
 
-/// Ausschließlich einem Fenster gehörender, nicht serialisierbarer Laufzustand.
-/// Jedes Fenster hat damit seine eigene Single-Flight-Schranke, seine eigene Queue
-/// und seine eigenen Einmal-Permits. Andere Fenster dürfen parallel arbeiten.
-#[derive(Default)]
-pub(crate) struct WindowState {
-    /// Geteilte Referenz auf das appweite Exit-Gate. `AppState::window` ersetzt den
-    /// Default durch dieselbe Instanz für jedes Fenster.
-    exit_in_progress: Arc<AtomicBool>,
-    /// Wird vor dem Close-Snapshot gesetzt. Danach dürfen weder neue Operationen
-    /// noch neue Queueeinträge dieses Fensters beginnen.
-    pub(crate) closing: AtomicBool,
-    /// Wird beim dynamischen Erzeugen genau einmal vom neuen Frontend abgeholt.
-    /// Danach lebt der aktuelle Pane-Zustand ausschließlich im jeweiligen Fenster.
-    pub(crate) initial_panes: Mutex<Option<crate::window_commands::WindowStartState>>,
-    pub(crate) active_cancel: Mutex<Option<Cancel>>,
-    /// Auch ein bereits entfernter Queueeintrag kann noch lokale Daten bereinigen.
-    /// Dieser Zähler blockiert nur Schließen/Beenden, nicht andere Dateiaktionen.
-    queue_cleanups: AtomicUsize,
-    pub(crate) property_edits: Mutex<crate::file_property_commands::PropertyEditCache>,
-    pub(crate) remote_edits: Mutex<HashMap<String, crate::remote_edit_commands::RemoteEdit>>,
-    /// Nicht serialisierbare Realmodus-Vorbereitung samt gehaltenen Deskriptoren. Ein
-    /// Neustart oder explizites Verwerfen lässt sie automatisch verschwinden.
-    pub(crate) pending_real: Mutex<Option<PreparedLocalRealRun>>,
-    pub(crate) pending_content_sync:
-        Mutex<Option<crate::content_sync_commands::PendingContentSync>>,
-    pub(crate) content_sync_generation: AtomicU64,
-    pub(crate) content_sync_runs:
-        Mutex<HashMap<String, crate::content_sync_commands::QueuedContentSync>>,
-    pub(crate) pending_local_sync: Mutex<crate::normal_sync_commands::LocalSyncPreparationSlot>,
-    pub(crate) local_sync_runs:
-        Mutex<HashMap<String, crate::normal_sync_commands::QueuedLocalSync>>,
-    /// Remote-Vorbereitungen und Verbindungen enthalten lebende Sitzungen und bleiben
-    /// ausschließlich im Prozessspeicher. Profile auf Platte sind geheimnisfrei.
-    pub(crate) pending_sftp_real: Mutex<Option<PendingRemoteRealRun>>,
-    pub(crate) pending_sftp_queue: Mutex<Option<PendingRemoteQueueRun>>,
-    pub(crate) pending_ftps_real: Mutex<Option<PendingRemoteRealRun>>,
-    pub(crate) pending_ftps_queue: Mutex<Option<PendingRemoteQueueRun>>,
-    pub(crate) pending_webdav_real: Mutex<Option<PendingRemoteRealRun>>,
-    pub(crate) pending_webdav_queue: Mutex<Option<PendingRemoteQueueRun>>,
-    pub(crate) pending_smb_real: Mutex<Option<PendingRemoteRealRun>>,
-    pub(crate) pending_smb_queue: Mutex<Option<PendingRemoteQueueRun>>,
-    /// Generische Provider→Provider-Vorbereitung. Auch hier bleiben beide lebenden
-    /// Sitzungen und das Einmal-Permit ausschließlich im RAM.
-    pub(crate) pending_provider_real:
-        Mutex<Option<crate::provider_sync_commands::PendingProviderRun>>,
-    pub(crate) pending_provider_queue: Mutex<Option<PendingRemoteQueueRun>>,
-    pub(crate) file_conflict_choices: Mutex<crate::file_commands::FileConflictChoiceCache>,
-    pub(crate) archive_extract_preparation:
-        Mutex<crate::archive_extract_commands::ArchiveExtractCache>,
-    pub(crate) archive_pack_preparation: Mutex<crate::archive_pack_commands::ArchivePackCache>,
-    pub(crate) duplicate_preparation: Mutex<crate::duplicate_commands::DuplicateCache>,
-    pub(crate) pending_forward_bidirectional:
-        Mutex<Option<crate::forward_bidirectional_commands::PendingForwardRun>>,
-    pub(crate) forward_bidirectional_generation: AtomicU64,
-    pub(crate) forward_bidirectional_preparing: AtomicBool,
-    pub(crate) forward_bidirectional_runs:
-        Mutex<HashMap<String, crate::forward_bidirectional_commands::QueuedForwardRun>>,
-    pub(crate) pending_bidirectional:
-        Mutex<Option<bidirectional_commands::PendingBidirectionalRun>>,
-    pub(crate) pending_bidirectional_queue: Mutex<Option<PendingBidirectionalQueueRun>>,
-    pub(crate) pending_bidirectional_rollback:
-        Mutex<Option<bidirectional_commands::PendingBidirectionalRollback>>,
-    /// Lazy geöffnet, damit ein beschädigtes Journal die App nicht unsichtbar beim
-    /// Start beendet, sondern als klarer Command-Fehler in der Queue-UI erscheint.
-    operation_queue: Mutex<Option<Arc<OperationQueue>>>,
-    queue_worker_active: AtomicBool,
+// Neue Vorbereitungen erhalten hier zugleich ihren Namen für den Exit-Snapshot.
+// Die Reihenfolge der Vorbereitungsliste bestimmt die Reihenfolge der Locks.
+macro_rules! window_state {
+    (
+        $(#[$state_attr:meta])*
+        $vis:vis struct $name:ident {
+            fields { $($fields:tt)* }
+            preparations {
+                $(
+                    $(#[$prep_attr:meta])*
+                    $field:ident: $slot:ty => $kind:literal,
+                )*
+            }
+        }
+    ) => {
+        $(#[$state_attr])*
+        $vis struct $name {
+            $($fields)*
+            $(
+                $(#[$prep_attr])*
+                pub(crate) $field: $slot,
+            )*
+        }
+
+        impl $name {
+            /// Geheimnisfreie Arten aller noch nicht gestarteten Vorbereitungen. Auch ein
+            /// Queue-Bestätigungspermit bleibt hier sichtbar: Der zugehörige Queueeintrag
+            /// blockiert zwar ebenfalls, doch der vollständige Snapshot darf einen Slotwechsel
+            /// nicht mit demselben Queuezustand verwechseln.
+            pub(crate) fn pending_preparation_kinds(&self) -> Vec<String> {
+                let mut kinds = Vec::new();
+                $(
+                    if self.$field.lock_recover().is_some() {
+                        kinds.push($kind.to_owned());
+                    }
+                )*
+                kinds.sort();
+                kinds
+            }
+        }
+    };
+}
+
+window_state! {
+    /// Ausschließlich einem Fenster gehörender, nicht serialisierbarer Laufzustand.
+    /// Jedes Fenster hat damit seine eigene Single-Flight-Schranke, seine eigene Queue
+    /// und seine eigenen Einmal-Permits. Andere Fenster dürfen parallel arbeiten.
+    #[derive(Default)]
+    pub(crate) struct WindowState {
+        fields {
+            /// Geteilte Referenz auf das appweite Exit-Gate. `AppState::window` ersetzt den
+            /// Default durch dieselbe Instanz für jedes Fenster.
+            exit_in_progress: Arc<AtomicBool>,
+            /// Wird vor dem Close-Snapshot gesetzt. Danach dürfen weder neue Operationen
+            /// noch neue Queueeinträge dieses Fensters beginnen.
+            pub(crate) closing: AtomicBool,
+            /// Wird beim dynamischen Erzeugen genau einmal vom neuen Frontend abgeholt.
+            /// Danach lebt der aktuelle Pane-Zustand ausschließlich im jeweiligen Fenster.
+            pub(crate) initial_panes: Mutex<Option<crate::window_commands::WindowStartState>>,
+            pub(crate) active_cancel: Mutex<Option<Cancel>>,
+            pub(crate) resumable_copy_preparation: Mutex<crate::file_commands::ResumePreparationSlot>,
+            /// Auch ein bereits entfernter Queueeintrag kann noch lokale Daten bereinigen.
+            /// Dieser Zähler blockiert nur Schließen/Beenden, nicht andere Dateiaktionen.
+            queue_cleanups: AtomicUsize,
+            pub(crate) property_edits: Mutex<crate::file_property_commands::PropertyEditCache>,
+            pub(crate) remote_edits: Mutex<HashMap<String, crate::remote_edit_commands::RemoteEdit>>,
+            pub(crate) real_sync_generation: AtomicU64,
+            pub(crate) sftp_sync_generation: AtomicU64,
+            pub(crate) provider_sync_generation: AtomicU64,
+            pub(crate) content_sync_generation: AtomicU64,
+            pub(crate) content_sync_runs:
+                Mutex<HashMap<String, crate::content_sync_commands::QueuedContentSync>>,
+            pub(crate) local_sync_runs:
+                Mutex<HashMap<String, crate::normal_sync_commands::QueuedLocalSync>>,
+            pub(crate) file_conflict_choices: Mutex<crate::file_commands::FileConflictChoiceCache>,
+            pub(crate) archive_extract_preparation:
+                Mutex<crate::archive_extract_commands::ArchiveExtractCache>,
+            pub(crate) archive_pack_preparation: Mutex<crate::archive_pack_commands::ArchivePackCache>,
+            pub(crate) duplicate_preparation: Mutex<crate::duplicate_commands::DuplicateCache>,
+            pub(crate) forward_bidirectional_generation: AtomicU64,
+            pub(crate) forward_bidirectional_preparing: AtomicBool,
+            pub(crate) forward_bidirectional_runs:
+                Mutex<HashMap<String, crate::forward_bidirectional_commands::QueuedForwardRun>>,
+            /// Lazy geöffnet, damit ein beschädigtes Journal die App nicht unsichtbar beim
+            /// Start beendet, sondern als klarer Command-Fehler in der Queue-UI erscheint.
+            operation_queue: Mutex<Option<Arc<OperationQueue>>>,
+            queue_worker_active: AtomicBool,
+        }
+        preparations {
+            /// Nicht serialisierbare Realmodus-Vorbereitung samt gehaltenen Deskriptoren. Ein
+            /// Neustart oder explizites Verwerfen lässt sie automatisch verschwinden.
+            pending_real: Mutex<Option<PreparedLocalRealRun>> => "local-real",
+            pending_local_sync: Mutex<crate::normal_sync_commands::LocalSyncPreparationSlot> => "local-sync",
+            pending_content_sync: Mutex<Option<crate::content_sync_commands::PendingContentSync>> => "content-sync",
+            /// Remote-Vorbereitungen und Verbindungen enthalten lebende Sitzungen und bleiben
+            /// ausschließlich im Prozessspeicher. Profile auf Platte sind geheimnisfrei.
+            pending_sftp_real: Mutex<Option<PendingRemoteRealRun>> => "sftp-real",
+            pending_sftp_queue: Mutex<Option<PendingRemoteQueueRun>> => "sftp-queue-confirmation",
+            pending_ftps_real: Mutex<Option<PendingRemoteRealRun>> => "ftps-real",
+            pending_ftps_queue: Mutex<Option<PendingRemoteQueueRun>> => "ftps-queue-confirmation",
+            pending_webdav_real: Mutex<Option<PendingRemoteRealRun>> => "webdav-real",
+            pending_webdav_queue: Mutex<Option<PendingRemoteQueueRun>> => "webdav-queue-confirmation",
+            pending_smb_real: Mutex<Option<PendingRemoteRealRun>> => "smb-real",
+            pending_smb_queue: Mutex<Option<PendingRemoteQueueRun>> => "smb-queue-confirmation",
+            /// Generische Provider→Provider-Vorbereitung. Auch hier bleiben beide lebenden
+            /// Sitzungen und das Einmal-Permit ausschließlich im RAM.
+            pending_provider_real: Mutex<Option<crate::provider_sync_commands::PendingProviderRun>> => "provider-real",
+            pending_provider_queue: Mutex<Option<PendingRemoteQueueRun>> => "provider-queue-confirmation",
+            pending_bidirectional: Mutex<Option<bidirectional_commands::PendingBidirectionalRun>> => "bidirectional-real",
+            pending_forward_bidirectional: Mutex<Option<crate::forward_bidirectional_commands::PendingForwardRun>> => "forward-bidirectional",
+            pending_bidirectional_queue: Mutex<Option<PendingBidirectionalQueueRun>> => "bidirectional-queue-confirmation",
+            pending_bidirectional_rollback: Mutex<Option<bidirectional_commands::PendingBidirectionalRollback>> => "bidirectional-rollback",
+        }
+    }
 }
 
 impl AppState {
@@ -1011,47 +1088,11 @@ impl WindowState {
     pub(crate) fn has_active_operation(&self) -> bool {
         self.active_cancel.lock_recover().is_some()
             || self.queue_cleanups.load(Ordering::Acquire) != 0
+            || self.resumable_copy_preparation.lock_recover().is_active()
     }
 
     fn operations_are_closing(&self) -> bool {
         self.exit_in_progress.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire)
-    }
-
-    /// Geheimnisfreie Arten aller noch nicht gestarteten Vorbereitungen. Auch ein
-    /// Queue-Bestätigungspermit bleibt hier sichtbar: Der zugehörige Queueeintrag
-    /// blockiert zwar ebenfalls, doch der vollständige Snapshot darf einen Slotwechsel
-    /// nicht mit demselben Queuezustand verwechseln.
-    pub(crate) fn pending_preparation_kinds(&self) -> Vec<String> {
-        let mut kinds = Vec::new();
-        macro_rules! record {
-            ($field:ident, $kind:literal) => {
-                if self.$field.lock_recover().is_some() {
-                    kinds.push($kind.to_owned());
-                }
-            };
-        }
-        record!(pending_real, "local-real");
-        record!(pending_local_sync, "local-sync");
-        record!(pending_content_sync, "content-sync");
-        record!(pending_sftp_real, "sftp-real");
-        record!(pending_sftp_queue, "sftp-queue-confirmation");
-        record!(pending_ftps_real, "ftps-real");
-        record!(pending_ftps_queue, "ftps-queue-confirmation");
-        record!(pending_webdav_real, "webdav-real");
-        record!(pending_webdav_queue, "webdav-queue-confirmation");
-        record!(pending_smb_real, "smb-real");
-        record!(pending_smb_queue, "smb-queue-confirmation");
-        record!(pending_provider_real, "provider-real");
-        record!(pending_provider_queue, "provider-queue-confirmation");
-        record!(pending_bidirectional, "bidirectional-real");
-        record!(pending_forward_bidirectional, "forward-bidirectional");
-        record!(
-            pending_bidirectional_queue,
-            "bidirectional-queue-confirmation"
-        );
-        record!(pending_bidirectional_rollback, "bidirectional-rollback");
-        kinds.sort();
-        kinds
     }
 }
 
@@ -1114,29 +1155,213 @@ pub(crate) fn with_queue_extension<T>(
     operation()
 }
 
-/// Reiht genau die bereits vorbereitete, gebundene Absicht ein. Ein abweichender
-/// Frontendrequest und jeder Fehler vor dem bewiesenen Commit lassen den Slot
-/// unverändert; erst `enqueue` mit `Ok` verbraucht das Einmal-Permit.
-pub(crate) fn enqueue_bound_pending<T, B: PartialEq, R>(
-    pending_slot: &mut Option<T>,
-    requested: &B,
-    bound: impl FnOnce(&T) -> &B,
-    missing_message: &str,
-    mismatch_message: &str,
-    enqueue: impl FnOnce(&B) -> Result<R, AppError>,
-) -> Result<R, AppError> {
-    let result = {
-        let pending = pending_slot
-            .as_ref()
-            .ok_or_else(|| AppError::new("app", missing_message))?;
-        let operation = bound(pending);
-        if requested != operation {
-            return Err(AppError::new("plan_drift", mismatch_message));
+/// Der Aufrufer erhält den Zugriff nur für die Dauer der gehaltenen Exit-Barriere.
+pub(crate) struct QueueExtension<'a> {
+    window: &'a WindowState,
+}
+
+pub(crate) fn with_queue_extension_access<T>(
+    state: &AppState,
+    window: &WindowState,
+    operation: impl FnOnce(&QueueExtension<'_>) -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    with_queue_extension(state, window, || operation(&QueueExtension { window }))
+}
+
+impl QueueExtension<'_> {
+    /// Reiht eine bereits vollständig gebundene Operation ein. Meldet das atomare
+    /// Schreiben erst nach dem Rename einen Fehler, klärt der Core den Stand anhand
+    /// der vorab erzeugten Operation-ID und hält RAM und Journal zusammen. Die Tauri-
+    /// Schicht deserialisiert das sicherheitskritische Queue-Journal nie selbst.
+    pub(crate) fn enqueue_with_readback(
+        &self,
+        app: &tauri::AppHandle,
+        label: &str,
+        operation: &QueueOperation,
+    ) -> Result<(Arc<OperationQueue>, QueueEntry), AppError> {
+        let queue = operation_queue(app, self.window, label)?;
+        let entry = queue
+            .enqueue_reconciled(operation.clone())
+            .map_err(AppError::from)?;
+        Ok((queue, entry))
+    }
+
+    pub(crate) fn enqueue_with_profile_bindings(
+        &self,
+        app: &tauri::AppHandle,
+        label: &str,
+        operation: &QueueOperation,
+        profile_bindings: &[RemoteProfileBinding],
+    ) -> Result<(Arc<OperationQueue>, QueueEntry), AppError> {
+        self.enqueue_with_profile_bindings_using(operation, profile_bindings, |bindings| {
+            ensure_profile_bindings_current(app, bindings)?;
+            operation_queue(app, self.window, label)
+        })
+    }
+
+    pub(crate) fn enqueue_with_profile_bindings_using(
+        &self,
+        operation: &QueueOperation,
+        profile_bindings: &[RemoteProfileBinding],
+        prepare_queue: impl FnOnce(&[RemoteProfileBinding]) -> Result<Arc<OperationQueue>, AppError>,
+    ) -> Result<(Arc<OperationQueue>, QueueEntry), AppError> {
+        let queue = prepare_queue(profile_bindings)?;
+        let entry = queue
+            .enqueue_reconciled_with_profile_bindings(operation.clone(), profile_bindings.to_vec())
+            .map_err(AppError::from)?;
+        Ok((queue, entry))
+    }
+
+    pub(crate) fn enqueue_provider_file(
+        &self,
+        app: &tauri::AppHandle,
+        label: &str,
+        operation: QueueOperation,
+        profile_bindings: Vec<RemoteProfileBinding>,
+        generated_previous: Option<QueueEntry>,
+        cancel: &Cancel,
+    ) -> Result<(Arc<OperationQueue>, QueueEntry), AppError> {
+        if let Some(previous) = generated_previous {
+            let queue = operation_queue(app, self.window, label)?;
+            let entry =
+                queue.resume_generated_upload(&previous, operation, profile_bindings, cancel)?;
+            Ok((queue, entry))
+        } else {
+            self.enqueue_with_profile_bindings(app, label, &operation, &profile_bindings)
         }
-        enqueue(operation)?
-    };
-    pending_slot.take();
-    Ok(result)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EnqueueRemoteSyncRequest<C> {
+    profile_id: String,
+    #[serde(default)]
+    profile_revision: Option<u64>,
+    direction: SftpQueueDirection,
+    local_root: String,
+    remote_root: String,
+    options: SyncOptions,
+    expected_plan: SyncPlan,
+    #[serde(skip)]
+    connection_type: PhantomData<C>,
+}
+
+#[cfg_attr(test, derive(Clone))]
+pub(crate) enum RemoteSyncConnection {
+    Sftp(Box<SftpConnectionConfig>),
+    Ftps(Box<FtpsConnectionConfig>),
+    WebDav(Box<WebDavConnectionConfig>),
+    Smb(Box<SmbConnectionConfig>),
+}
+
+impl From<SftpConnectionConfig> for RemoteSyncConnection {
+    fn from(config: SftpConnectionConfig) -> Self {
+        Self::Sftp(Box::new(config))
+    }
+}
+
+impl From<FtpsConnectionConfig> for RemoteSyncConnection {
+    fn from(config: FtpsConnectionConfig) -> Self {
+        Self::Ftps(Box::new(config))
+    }
+}
+
+impl From<WebDavConnectionConfig> for RemoteSyncConnection {
+    fn from(config: WebDavConnectionConfig) -> Self {
+        Self::WebDav(Box::new(config))
+    }
+}
+
+impl From<SmbConnectionConfig> for RemoteSyncConnection {
+    fn from(config: SmbConnectionConfig) -> Self {
+        Self::Smb(Box::new(config))
+    }
+}
+
+pub(crate) fn enqueue_protocol_sync<C: Into<RemoteSyncConnection>>(
+    app: &tauri::AppHandle,
+    label: &str,
+    state: &AppState,
+    window: &WindowState,
+    request: EnqueueRemoteSyncRequest<C>,
+    resolve_connection: impl FnOnce(&str) -> Result<C, AppError>,
+) -> Result<Arc<OperationQueue>, AppError> {
+    enqueue_protocol_sync_using(state, window, request, resolve_connection, |bindings| {
+        ensure_profile_bindings_current(app, bindings)?;
+        operation_queue(app, window, label)
+    })
+}
+
+fn enqueue_protocol_sync_using<C: Into<RemoteSyncConnection>>(
+    state: &AppState,
+    window: &WindowState,
+    request: EnqueueRemoteSyncRequest<C>,
+    resolve_connection: impl FnOnce(&str) -> Result<C, AppError>,
+    prepare_queue: impl FnOnce(&[RemoteProfileBinding]) -> Result<Arc<OperationQueue>, AppError>,
+) -> Result<Arc<OperationQueue>, AppError> {
+    with_queue_extension_access(state, window, |extension| {
+        // Dieselbe typisierte Verbindung bestimmt den Slot und die angeforderte
+        // Operation. Der Command kann keinen abweichenden Pending-Slot übergeben.
+        macro_rules! bind_protocol {
+            ($config:expr, $protocol:ident, $slot:ident, $name:literal, $operation:ident) => {
+                (
+                    RemoteProfileProtocol::$protocol,
+                    &window.$slot,
+                    $name,
+                    QueueOperation::$operation {
+                        direction: request.direction,
+                        connection: $config,
+                        local_root: request.local_root,
+                        remote_root: request.remote_root,
+                        options: request.options,
+                        expected_plan: Box::new(request.expected_plan),
+                    },
+                )
+            };
+        }
+        let (protocol, slot, name, requested_operation) =
+            match resolve_connection(&request.profile_id)?.into() {
+                RemoteSyncConnection::Sftp(config) => {
+                    bind_protocol!(config, Sftp, pending_sftp_real, "SFTP", SftpSync)
+                }
+                RemoteSyncConnection::Ftps(config) => {
+                    bind_protocol!(config, Ftps, pending_ftps_real, "FTPS", FtpsSync)
+                }
+                RemoteSyncConnection::WebDav(config) => {
+                    bind_protocol!(config, Webdav, pending_webdav_real, "WebDAV", WebDavSync)
+                }
+                RemoteSyncConnection::Smb(config) => {
+                    bind_protocol!(config, Smb, pending_smb_real, "SMB", SmbSync)
+                }
+            };
+        let mut pending = slot.lock_recover();
+        let prepared = pending.as_ref().ok_or_else(|| {
+            AppError::new(
+                "app",
+                format!("Keine {name}-Vorbereitung zum Einreihen vorhanden"),
+            )
+        })?;
+        ensure_pending_profile_binding(
+            &prepared.profile_bindings,
+            protocol,
+            &request.profile_id,
+            request.profile_revision,
+        )?;
+        if requested_operation != prepared.operation {
+            return Err(AppError::new(
+                "plan_drift",
+                format!("{name}-Queueanfrage stimmt nicht exakt mit der vorbereiteten Operation überein"),
+            ));
+        }
+        let (queue, _) = extension.enqueue_with_profile_bindings_using(
+            &prepared.operation,
+            &prepared.profile_bindings,
+            prepare_queue,
+        )?;
+        pending.take();
+        Ok(queue)
+    })
 }
 
 /// Startet eine bereits vorbereitete Operation mit einheitlicher Lockreihenfolge:
@@ -1230,8 +1455,8 @@ pub(crate) fn begin_profile_transaction<'a>(
     })
 }
 
-/// Kurze synchrone Mutation (Wiederherstellen/Leeren) unter dieselbe Single-Flight-
-/// Schranke wie Sync und Dateioperationen stellen.
+/// Direkte Mutation unter dieselbe Single-Flight-Schranke wie Sync und
+/// Dateioperationen stellen.
 pub(crate) fn with_reserved_operation<T>(
     app: &tauri::AppHandle,
     label: &str,
@@ -1241,9 +1466,7 @@ pub(crate) fn with_reserved_operation<T>(
     // Auch kurze Direktmutationen brauchen den app-ordnerweiten Prozessbesitz. Eine
     // zweite Doppeldecker-Instanz darf die Queue-Sperre nicht über Nebencommands umgehen.
     operation_queue(app, state, label)?;
-    reserve_operation(state)?;
-    let result = operation();
-    state.active_cancel.lock_recover().take();
+    let result = run_reserved_cancellable(state, |_| operation(), |_| {})?;
     start_queue_worker(app.clone(), label.to_owned());
     result
 }
@@ -1430,38 +1653,6 @@ fn acquire_shared_process_lock(
         });
     }
     Ok(process_lock)
-}
-
-/// Reiht eine bereits vollständig gebundene Operation ein. Meldet das atomare
-/// Schreiben erst nach dem Rename einen Fehler, klärt der Core den Stand anhand
-/// der vorab erzeugten Operation-ID und hält RAM und Journal zusammen. Die Tauri-
-/// Schicht deserialisiert das sicherheitskritische Queue-Journal nie selbst.
-pub(crate) fn enqueue_operation_with_readback(
-    app: &tauri::AppHandle,
-    state: &WindowState,
-    label: &str,
-    operation: &QueueOperation,
-) -> Result<(Arc<OperationQueue>, QueueEntry), AppError> {
-    let queue = operation_queue(app, state, label)?;
-    let entry = queue
-        .enqueue_reconciled(operation.clone())
-        .map_err(AppError::from)?;
-    Ok((queue, entry))
-}
-
-pub(crate) fn enqueue_operation_with_profile_bindings(
-    app: &tauri::AppHandle,
-    state: &WindowState,
-    label: &str,
-    operation: &QueueOperation,
-    profile_bindings: &[RemoteProfileBinding],
-) -> Result<(Arc<OperationQueue>, QueueEntry), AppError> {
-    ensure_profile_bindings_current(app, profile_bindings)?;
-    let queue = operation_queue(app, state, label)?;
-    let entry = queue
-        .enqueue_reconciled_with_profile_bindings(operation.clone(), profile_bindings.to_vec())
-        .map_err(AppError::from)?;
-    Ok((queue, entry))
 }
 
 /// Das Hauptfenster übernimmt das bisherige Journal ohne Migration. Weitere
@@ -1755,7 +1946,13 @@ fn execute_queue_entry(
     if matches!(entry.operation, QueueOperation::Bidirectional { .. }) {
         return bidirectional_commands::prepare_queue_entry(app, label, queue, entry);
     }
-    if let Err(error) = ensure_profile_bindings_current(app, &entry.profile_bindings) {
+    // Teilkopien prüfen das Profil im Core, nachdem ein möglicher lokaler
+    // Abschluss wiedergefunden wurde.
+    if let Err(error) = if resumable_copy {
+        Ok(())
+    } else {
+        ensure_profile_bindings_current(app, &entry.profile_bindings)
+    } {
         if forward_bidirectional {
             crate::forward_bidirectional_commands::interrupt_failed_preparation(
                 queue, &entry, &error,
@@ -1979,20 +2176,19 @@ fn execute_queue_entry(
             QueueTerminalOutcome::BidirectionalDone(stats)
         }
         Ok(doppeldecker_core::QueueExecutionResult::AwaitingConfirmation { class, reason }) => {
-            let event = match class {
-                doppeldecker_core::QueueOperationClass::File => "fileop-error",
-                doppeldecker_core::QueueOperationClass::Sync => "sync-error",
-            };
             // Eigener Code statt `plan_drift`: Nur so kann die Oberfläche den Weg
             // zur Wartestelle anbieten, ohne auf den deutschen Text zu matchen.
             // Der Satz sagt, was als Nächstes zu tun ist; das Warum steht davor.
-            QueueTerminalOutcome::Error {
-                event,
-                error: AppError::new(
+            queue_execution_error(
+                class,
+                AppError::new(
                     "queue_confirmation_required",
                     format!("{reason}. Der Auftrag wartet in der Queue auf deine Bestätigung."),
                 ),
-            }
+            )
+        }
+        Err(error) if provider_delete || local_sync || content_sync => {
+            persist_queue_execution_error(queue, &operation_id, class, &error)
         }
         Err(error) => {
             let code = doppeldecker_core::error_code(&error);
@@ -2018,27 +2214,41 @@ fn execute_queue_entry(
             if forward_bidirectional {
                 app_error.recovery_paths = doppeldecker_core::error::recovery_paths(&error);
             }
-            if provider_delete || local_sync || content_sync {
-                let progress = queue
-                    .snapshot()
-                    .entries
-                    .iter()
-                    .find(|candidate| candidate.operation_id == operation_id)
-                    .map(|candidate| candidate.progress.clone())
-                    .unwrap_or_default();
-                let _ = queue.fail_coded(&operation_id, progress, &error);
-            }
-            let event = match class {
-                doppeldecker_core::QueueOperationClass::File => "fileop-error",
-                doppeldecker_core::QueueOperationClass::Sync => "sync-error",
-            };
-            QueueTerminalOutcome::Error {
-                event,
-                error: app_error,
-            }
+            queue_execution_error(class, app_error)
         }
     };
     QueueTerminalEvent::with_progress(terminal_progress, outcome)
+}
+
+fn queue_execution_error(class: QueueOperationClass, error: AppError) -> QueueTerminalOutcome {
+    let event = match class {
+        QueueOperationClass::File => "fileop-error",
+        QueueOperationClass::Sync => "sync-error",
+    };
+    QueueTerminalOutcome::Error { event, error }
+}
+
+fn persist_queue_execution_error(
+    queue: &OperationQueue,
+    operation_id: &str,
+    class: QueueOperationClass,
+    error: &std::io::Error,
+) -> QueueTerminalOutcome {
+    let progress = queue
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|candidate| candidate.operation_id == operation_id)
+        .map(|candidate| candidate.progress)
+        .unwrap_or_default();
+    let _ = queue.fail_coded(operation_id, progress, error);
+    queue_execution_error(
+        class,
+        AppError::new(
+            doppeldecker_core::error_code(error).as_str(),
+            error.to_string(),
+        ),
+    )
 }
 
 fn finalize_detailed_file_failure(
@@ -2127,6 +2337,34 @@ fn path_safe_token(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verworfene_remote_vorbereitung_kann_keinen_slot_veroeffentlichen() {
+        let state = AppState::default();
+        let slot = Mutex::new(None);
+        let generation = AtomicU64::new(0);
+        let started = generation.load(Ordering::Acquire);
+        discard_sync_preparation(&slot, &generation);
+        let error = store_profile_bound_pending_using(
+            &state,
+            &slot,
+            "verspätete Vorschau",
+            Some((&generation, started)),
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "plan_drift");
+        assert!(slot.lock_recover().is_none());
+        store_profile_bound_pending_using(
+            &state,
+            &slot,
+            "neue Vorschau",
+            Some((&generation, generation.load(Ordering::Acquire))),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(*slot.lock_recover(), Some("neue Vorschau"));
+    }
 
     #[test]
     fn exit_waits_for_removed_queue_entry_cleanup_and_error_reporting() {
@@ -2248,6 +2486,62 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.unwrap_err().code, "app");
         assert!(reserve_operation(&state).is_ok());
+    }
+
+    #[test]
+    fn direktworker_lehnt_zweiten_start_ab_und_gibt_bei_fehler_frei() {
+        let state = WindowState::default();
+        let result = run_reserved_cancellable::<()>(
+            &state,
+            |_| {
+                let busy = run_reserved_cancellable::<()>(
+                    &state,
+                    |_| panic!("Zweiter Worker wurde gestartet"),
+                    |_| panic!("Zweiter Worker hat ein Terminalereignis ausgelöst"),
+                )
+                .unwrap_err();
+                assert_eq!(busy.code, "busy");
+                Err(AppError::new("plan_drift", "Testfehler"))
+            },
+            |result| assert_eq!(result.as_ref().unwrap_err().code, "plan_drift"),
+        )
+        .unwrap();
+        assert_eq!(result.unwrap_err().code, "plan_drift");
+        assert!(run_reserved_cancellable(&state, |_| Ok(()), |_| {})
+            .unwrap()
+            .is_ok());
+    }
+
+    #[test]
+    fn queue_erweiterung_haelt_barriere_bis_zum_fehler() {
+        let state = AppState::default();
+        let window = state.window("main");
+
+        let error = with_queue_extension_access::<()>(&state, &window, |_| {
+            assert!(matches!(
+                state.exit_barrier.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            Err(AppError::new("plan_drift", "Testfehler"))
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "plan_drift");
+        assert!(state.exit_barrier.try_lock().is_ok());
+
+        window.closing.store(true, Ordering::Release);
+        let error = with_queue_extension_access::<()>(&state, &window, |_| {
+            panic!("Schließendes Fenster durfte die Queue erweitern")
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "busy");
+
+        window.closing.store(false, Ordering::Release);
+        state.exit_in_progress.store(true, Ordering::Release);
+        let error = with_queue_extension_access::<()>(&state, &window, |_| {
+            panic!("App durfte beim Beenden die Queue erweitern")
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "busy");
     }
 
     #[test]
@@ -2549,8 +2843,54 @@ mod tests {
         assert!(queue.has_runnable());
     }
 
+    fn queue_inventory_helper(path: &syn::ExprPath, helper: &str) -> bool {
+        let parts = &path.path.segments;
+        path.qself.is_none()
+            && path.path.leading_colon.is_none()
+            && parts.last().is_some_and(|part| part.ident == helper)
+            && (parts.len() == 1
+                || (parts.len() == 3
+                    && parts[0].ident == "crate"
+                    && parts[1].ident == "queue_runtime"))
+    }
+
+    #[derive(Default)]
+    struct RemoteCleanupCalls {
+        resets: usize,
+        ignored_discards: usize,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for RemoteCleanupCalls {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if matches!(call.func.as_ref(), syn::Expr::Path(path)
+                if queue_inventory_helper(path, "reset_consumed_remote_preparation"))
+            {
+                self.resets += 1;
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if matches!(local.pat, syn::Pat::Wild(_)) {
+                if let Some(init) = &local.init {
+                    let mut expr = init.expr.as_ref();
+                    while let syn::Expr::Paren(parenthesized) = expr {
+                        expr = &parenthesized.expr;
+                    }
+                    if matches!(expr, syn::Expr::MethodCall(call)
+                        if call.method == "discard_remote_preparation")
+                    {
+                        self.ignored_discards += 1;
+                    }
+                }
+            }
+            syn::visit::visit_local(self, local);
+        }
+    }
+
     #[test]
     fn alle_remote_cleanup_fehlerzweige_behalten_journalfehler() {
+        use syn::visit::Visit;
         for (name, source, expected) in [
             ("SFTP", include_str!("sftp_commands.rs"), 3),
             ("FTPS", include_str!("ftps_commands.rs"), 3),
@@ -2563,18 +2903,13 @@ mod tests {
                 2,
             ),
         ] {
+            let file = syn::parse_file(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let mut calls = RemoteCleanupCalls::default();
+            calls.visit_file(&file);
+            assert_eq!(calls.resets, expected, "{name}: Inventur der Cleanup-Pfade");
             assert_eq!(
-                source.matches("reset_consumed_remote_preparation(").count(),
-                expected,
-                "{name}"
-            );
-            assert!(
-                !source.contains("let _ = queue.discard_remote_preparation("),
-                "{name}"
-            );
-            assert!(
-                !source.contains("let _ = queue_for_worker.discard_remote_preparation("),
-                "{name}"
+                calls.ignored_discards, 0,
+                "{name}: Fehler beim Verwerfen der Vorbereitung ignoriert"
             );
         }
     }
@@ -2963,7 +3298,7 @@ mod tests {
         std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
                 started.wait();
-                store_profile_bound_pending_using(&state, &slot, "stale".into(), || {
+                store_profile_bound_pending_using(&state, &slot, "stale".into(), None, || {
                     if revision.load(Ordering::Acquire) == 7 {
                         Ok(())
                     } else {
@@ -3056,52 +3391,29 @@ mod tests {
     }
 
     #[test]
-    fn exit_inventar_erfasst_jeden_window_pending_slot() {
-        let source = include_str!("queue_runtime.rs");
-        let window_state = &source[source.find("pub(crate) struct WindowState").unwrap()
-            ..source.find("impl AppState").unwrap()];
-        let mut declared = window_state
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                line.strip_prefix("pub(crate) pending_")
-                    .and_then(|rest| rest.split_once(':'))
-                    .map(|(name, _)| format!("pending_{name}"))
-            })
-            .collect::<Vec<_>>();
-        declared.sort();
-        let mut expected = vec![
-            "pending_bidirectional",
-            "pending_forward_bidirectional",
-            "pending_bidirectional_queue",
-            "pending_bidirectional_rollback",
-            "pending_ftps_queue",
-            "pending_ftps_real",
-            "pending_local_sync",
-            "pending_content_sync",
-            "pending_provider_queue",
-            "pending_provider_real",
-            "pending_real",
-            "pending_sftp_queue",
-            "pending_sftp_real",
-            "pending_smb_queue",
-            "pending_smb_real",
-            "pending_webdav_queue",
-            "pending_webdav_real",
-        ];
-        expected.sort();
-        assert_eq!(
-            declared, expected,
-            "WindowState-Pending-Inventar ist veraltet"
-        );
-
-        let inventory = &source[source
-            .find("pub(crate) fn pending_preparation_kinds")
-            .unwrap()
-            ..source.find("/// Genau eine mutierende").unwrap()];
-        for field in expected {
-            assert!(inventory.contains(field), "{field} fehlt im Exit-Snapshot");
+    fn exit_inventar_meldet_nur_belegte_vorbereitungsslots_sortiert() {
+        window_state! {
+            #[derive(Default)]
+            struct TestWindow {
+                fields {}
+                preparations {
+                    pending_later: Mutex<Option<u8>> => "zweite",
+                    pending_earlier: Mutex<Option<u16>> => "erste",
+                }
+            }
         }
+
+        assert!(WindowState::default()
+            .pending_preparation_kinds()
+            .is_empty());
+        let window = TestWindow::default();
+        assert!(window.pending_preparation_kinds().is_empty());
+        *window.pending_later.lock_recover() = Some(1);
+        assert_eq!(window.pending_preparation_kinds(), ["zweite"]);
+        *window.pending_earlier.lock_recover() = Some(2);
+        assert_eq!(window.pending_preparation_kinds(), ["erste", "zweite"]);
+        window.pending_later.lock_recover().take();
+        assert_eq!(window.pending_preparation_kinds(), ["erste"]);
     }
 
     #[test]
@@ -3175,26 +3487,6 @@ mod tests {
     }
 
     #[test]
-    fn spaeten_enqueue_commit_klaert_ausschliesslich_die_core_queue() {
-        let source = include_str!("queue_runtime.rs");
-        let helper = command_source(
-            source,
-            "pub(crate) fn enqueue_operation_with_readback(",
-            "/// Das Hauptfenster übernimmt",
-        );
-        assert!(
-            helper.contains(".enqueue_reconciled("),
-            "Tauri delegiert die operation-ID-gebundene Commitklärung nicht an den Core"
-        );
-        assert!(
-            !helper.contains("serde_json")
-                && !helper.contains("std::fs::read")
-                && !helper.contains("reload_operation_queue"),
-            "Tauri dupliziert Parser oder Readback des sicherheitskritischen Queue-Journals"
-        );
-    }
-
-    #[test]
     fn jedes_fenster_bekommt_ein_eigenes_sicheres_queue_journal() {
         assert_eq!(queue_journal_name("main").unwrap(), "operations-queue.json");
         assert_eq!(
@@ -3210,251 +3502,343 @@ mod tests {
         }
     }
 
-    /// Schneidet genau einen Command aus der jeweiligen Modulquelle aus. Der Test
-    /// bindet damit die schwer mit künstlichen Tauri-AppHandles ausführbaren
-    /// Command-Einstiege mechanisch an die gemeinsame Backend-Reservierung.
-    fn command_source<'a>(source: &'a str, start: &str, next: &str) -> &'a str {
-        let start = source.find(start).expect("Command-Einstieg fehlt");
-        let rest = &source[start..];
-        let end = rest.find(next).expect("nachfolgender Command fehlt");
-        &rest[..end]
+    fn reserves_current_preparation_window(call: &syn::ExprCall) -> bool {
+        let mut args = call.args.iter();
+        let name_is = |value: &syn::Expr, name| matches!(value, syn::Expr::Path(path) if path.path.is_ident(name));
+        matches!(args.next(), Some(syn::Expr::Reference(value)) if name_is(&value.expr, "app"))
+            && matches!(args.next(), Some(value) if name_is(value, "label"))
+            && matches!(args.next(), Some(syn::Expr::Reference(value))
+                if name_is(&value.expr, "window_state"))
     }
 
-    /// Regression: Eine bloße Abfrage von `active_cancel` reserviert nichts. Zwischen
-    /// Abfrage und mutierender Capability-/Restore-Probe konnte deshalb ein Queue-Lauf
-    /// starten. Jeder vorbereitende Command mit solchen Nebenwirkungen muss die Queue-
-    /// Prozesssperre und Single-Flight gemeinsam über die reservierenden Backendhelfer halten.
+    struct ReservedPreparationCalls<'a> {
+        effect: &'a str,
+        in_reservation: bool,
+        reserved: usize,
+        unreserved: usize,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ReservedPreparationCalls<'_> {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                if let Some(part) = path.path.segments.last() {
+                    if queue_inventory_helper(path, "with_reserved_operation")
+                        || queue_inventory_helper(path, "with_reserved_cancellable_operation")
+                    {
+                        let enclosing_reservation = self.in_reservation;
+                        for (index, argument) in call.args.iter().enumerate() {
+                            self.in_reservation = enclosing_reservation
+                                || index == 3
+                                    && matches!(argument, syn::Expr::Closure(_))
+                                    && reserves_current_preparation_window(call);
+                            self.visit_expr(argument);
+                        }
+                        self.in_reservation = enclosing_reservation;
+                        return;
+                    }
+                    if part.ident == self.effect {
+                        if self.in_reservation {
+                            self.reserved += 1;
+                        } else {
+                            self.unreserved += 1;
+                        }
+                    }
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_item(&mut self, _: &'ast syn::Item) {}
+    }
+
+    #[test]
+    fn vorbereitungsinventur_prueft_callback_und_ignoriert_kommentare() {
+        use syn::visit::Visit;
+        let file = syn::parse_file(
+            r#"fn prepare() {
+                // connect_fresh_bound();
+                let _ = "connect_fresh_bound()";
+                with_reserved_operation(&app, label, &window_state, || {
+                    crate::connect_fresh_bound /* im Worker */ ();
+                });
+                with_reserved_cancellable_operation(&app, label, &window_state,
+                   |_| {}, |_| { connect_fresh_bound(); });
+                with_reserved_operation(&app, label, &other_window, || {
+                    connect_fresh_bound();
+                });
+                connect_fresh_bound();
+            }
+            fn other() { connect_fresh_bound(); }
+            "#,
+        )
+        .unwrap();
+        let mut calls = ReservedPreparationCalls {
+            effect: "connect_fresh_bound",
+            in_reservation: false,
+            reserved: 0,
+            unreserved: 0,
+        };
+        calls.visit_block(&named_function(&file, "Test", "prepare").block);
+        assert_eq!((calls.reserved, calls.unreserved), (1, 3));
+
+        let cleanup = syn::parse_file(
+            r#"fn cleanup() {
+                // reset_consumed_remote_preparation();
+                let _ = "let _ = queue.discard_remote_preparation()";
+                let _ = (queue .discard_remote_preparation ());
+                queue.discard_remote_preparation()?;
+                crate :: queue_runtime :: reset_consumed_remote_preparation ();
+            }"#,
+        )
+        .unwrap();
+        let mut calls = RemoteCleanupCalls::default();
+        calls.visit_file(&cleanup);
+        assert_eq!((calls.resets, calls.ignored_discards), (1, 1));
+    }
+
+    /// Die mutierende Arbeit gehört in den reservierten Callback. Ein
+    /// Reservierungsaufruf davor oder im Terminalcallback genügt nicht.
     #[test]
     fn mutierende_vorbereitungen_nutzen_die_backend_reservierung() {
-        let cases = [
+        use syn::visit::Visit;
+        let cases: [(&str, &str, &[&str]); 9] = [
             (
-                "lokaler Realmodus",
+                "prepare_real_sync",
                 include_str!("local_sync_commands.rs"),
-                "pub(crate) fn prepare_real_sync(",
-                "pub(crate) fn discard_real_sync(",
-                "doppeldecker_core::prepare_local_real_run_for_queue(",
+                &["prepare_local_real_run_for_queue"],
             ),
             (
-                "SFTP",
+                "prepare_sftp_sync",
                 include_str!("sftp_commands.rs"),
-                "pub(crate) fn prepare_sftp_sync(",
-                "pub(crate) fn discard_sftp_sync(",
-                "let (connection, profile) = connect_fresh_bound(",
+                &["connect_fresh_bound"],
             ),
             (
-                "FTPS",
+                "prepare_ftps_sync",
                 include_str!("ftps_commands.rs"),
-                "pub(crate) async fn prepare_ftps_sync(",
-                "pub(crate) fn discard_ftps_sync(",
-                "let (connection, profile) = connect_fresh_bound(",
+                &["connect_fresh_bound"],
             ),
             (
-                "WebDAV",
+                "prepare_webdav_sync",
                 include_str!("webdav_commands.rs"),
-                "pub(crate) async fn prepare_webdav_sync(",
-                "pub(crate) fn discard_webdav_sync(",
-                "let (connection, profile) = connect_fresh_bound(",
+                &["connect_fresh_bound"],
             ),
             (
-                "SMB",
+                "prepare_smb_sync",
                 include_str!("smb_commands.rs"),
-                "pub(crate) async fn prepare_smb_sync(",
-                "pub(crate) fn discard_smb_sync(",
-                "let (connection, profile) = connect_fresh_bound(",
+                &["connect_fresh_bound"],
             ),
             (
-                "generischer Providerlauf",
+                "prepare_provider_sync",
                 include_str!("provider_sync_commands.rs"),
-                "pub(crate) fn prepare_provider_sync(",
-                "pub(crate) fn discard_provider_sync(",
-                "resolve_validated_registry_pair(",
+                &["resolve_validated_registry_pair"],
             ),
             (
-                "bidirektionaler Lauf",
+                "prepare_bidirectional_sync",
                 include_str!("bidirectional_commands.rs"),
-                "pub(crate) async fn prepare_bidirectional_sync(",
-                "pub(crate) fn discard_bidirectional_sync(",
-                "let prepared = if",
+                &[
+                    "prepare_local_bidirectional_with_decisions_bound_for_queue",
+                    "prepare_provider_bidirectional_with_decisions_bound_for_queue",
+                ],
             ),
             (
-                "bidirektionales Resume",
+                "prepare_bidirectional_resume",
                 include_str!("bidirectional_commands.rs"),
-                "pub(crate) async fn prepare_bidirectional_resume(",
-                "pub(crate) fn discard_bidirectional_recovery_preparation(",
-                "let prepared = if",
+                &[
+                    "prepare_resume_local_bidirectional_for_queue_operation",
+                    "prepare_resume_provider_bidirectional_for_queue_operation",
+                ],
             ),
             (
-                "bidirektionales Rollback",
+                "prepare_bidirectional_rollback",
                 include_str!("bidirectional_commands.rs"),
-                "pub(crate) async fn prepare_bidirectional_rollback(",
-                "pub(crate) fn run_bidirectional_rollback(",
-                "let prepared = if",
+                &[
+                    "prepare_local_bidirectional_rollback_for_queue_operation",
+                    "prepare_provider_bidirectional_rollback_for_queue_operation",
+                ],
             ),
         ];
 
-        for (name, source, start, next, first_mutation) in cases {
-            let command = command_source(source, start, next);
-            let reservation = command
-                .find("with_reserved_operation(&app, label, &window_state")
-                .or_else(|| command.find("with_reserved_cancellable_operation("))
-                .unwrap_or_else(|| {
-                    panic!("{name} läuft nicht unter Queue-Prozessbesitz und Single-Flight")
-                });
-            let mutation = command
-                .find(first_mutation)
-                .unwrap_or_else(|| panic!("Mutationsbeginn für {name} fehlt"));
-            assert!(
-                reservation < mutation,
-                "{name} reserviert erst nach Beginn der mutierenden Vorbereitung"
-            );
+        for (name, source, effects) in cases {
+            let file = syn::parse_file(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let command = named_function(&file, name, name);
+            for effect in effects {
+                let mut calls = ReservedPreparationCalls {
+                    effect,
+                    in_reservation: false,
+                    reserved: 0,
+                    unreserved: 0,
+                };
+                calls.visit_block(&command.block);
+                assert_eq!(
+                    calls.reserved, 1,
+                    "{name}: reservierter Aufruf {effect} fehlt"
+                );
+                assert_eq!(
+                    calls.unreserved, 0,
+                    "{name}: {effect} läuft ohne Reservierung"
+                );
+            }
         }
     }
 
-    /// Die Exit-Barriere muss nicht nur die ersten Enqueue-Commands kennen. Auch
-    /// Retry und Bestätigung können einen vorhandenen Eintrag wieder runnable
-    /// machen. Dieser Quelltest listet deshalb jeden produktiven Erweiterungspfad
-    /// ausdrücklich auf und scheitert, sobald die Mutation vor der Barriere steht.
-    #[test]
-    fn alle_queue_erweiterungen_laufen_unter_der_exit_barriere() {
-        let cases = [
-            (
-                "Provider-Dateiabsicht",
-                include_str!("file_intents.rs"),
-                "pub(crate) async fn enqueue_provider_file_intent(",
-                "#[cfg(test)]",
-                "enqueue_operation_with_profile_bindings(",
-            ),
-            (
-                "lokaler Sync",
-                include_str!("local_sync_commands.rs"),
-                "pub(crate) fn run_sync(",
-                "#[derive(serde::Serialize)]",
-                "enqueue_operation_with_readback(",
-            ),
-            (
-                "Provider-Löschen",
-                include_str!("file_commands.rs"),
-                "pub(crate) async fn enqueue_provider_delete(",
-                "fn file_kind(",
-                "enqueue_operation_with_profile_bindings(",
-            ),
-            (
-                "Provider-Dateioperation",
-                include_str!("file_commands.rs"),
-                "pub(crate) async fn enqueue_provider_file_operation(",
-                "/// Meldet die tatsächlich zu ersetzenden Ziele",
-                "enqueue_operation_with_profile_bindings(",
-            ),
-            (
-                "lokale Dateioperation",
-                include_str!("file_commands.rs"),
-                "fn enqueue_file_operation(",
-                "pub(crate) async fn copy_paths(",
-                "enqueue_operation_with_readback(",
-            ),
-            (
-                "SFTP",
-                include_str!("sftp_commands.rs"),
-                "pub(crate) fn enqueue_sftp_sync(",
-                "pub(crate) fn prepare_remote_queue_entry(",
-                "enqueue_operation_with_profile_bindings(",
-            ),
-            (
-                "FTPS",
-                include_str!("ftps_commands.rs"),
-                "pub(crate) async fn enqueue_ftps_sync(",
-                "pub(crate) fn prepare_remote_queue_entry(",
-                "enqueue_operation_with_profile_bindings(",
-            ),
-            (
-                "WebDAV",
-                include_str!("webdav_commands.rs"),
-                "pub(crate) async fn enqueue_webdav_sync(",
-                "pub(crate) fn prepare_remote_queue_entry(",
-                "enqueue_operation_with_profile_bindings(",
-            ),
-            (
-                "SMB",
-                include_str!("smb_commands.rs"),
-                "pub(crate) async fn enqueue_smb_sync(",
-                "pub(crate) fn prepare_remote_queue_entry(",
-                "enqueue_operation_with_profile_bindings(",
-            ),
-            (
-                "generischer Provider-Sync",
-                include_str!("provider_sync_commands.rs"),
-                "pub(crate) fn enqueue_provider_sync(",
-                "pub(crate) fn prepare_remote_queue_entry(",
-                "enqueue_operation_with_profile_bindings(",
-            ),
-            (
-                "bidirektionaler Sync",
-                include_str!("bidirectional_commands.rs"),
-                "pub(crate) fn enqueue_bidirectional_sync(",
-                "pub(crate) async fn prepare_bidirectional_resume(",
-                "enqueue_operation_with_profile_bindings(",
-            ),
-            (
-                // Die Queue-Bedienbefehle teilen sich diesen Helfer; er ist die
-                // einzige Stelle, an der eine Wiederaufnahme die Queue anfasst.
-                "Queue-Wiederaufnahme",
-                include_str!("queue_commands.rs"),
-                "fn resume_queue(",
-                "#[tauri::command]",
-                "change(&queue)",
-            ),
-        ];
+    #[derive(Clone, Copy)]
+    enum QueueCall<'a> {
+        Function(&'a str),
+        Method(&'a str),
+    }
 
-        for (name, source, start, next, mutation) in cases {
-            let command = command_source(source, start, next);
-            let barrier = command
-                .find("with_queue_extension(")
-                .unwrap_or_else(|| panic!("{name} umgeht die Exit-Barriere"));
-            let mutation = command
-                .find(mutation)
-                .unwrap_or_else(|| panic!("Queue-Mutation für {name} fehlt"));
-            assert!(barrier < mutation, "{name} mutiert vor der Exit-Barriere");
+    struct QueueCalls<'a> {
+        expected: QueueCall<'a>,
+        guarded: usize,
+        unguarded: usize,
+        in_extension: bool,
+        include_items: bool,
+    }
+
+    impl<'a> QueueCalls<'a> {
+        fn new(expected: QueueCall<'a>) -> Self {
+            Self {
+                expected,
+                guarded: 0,
+                unguarded: 0,
+                in_extension: false,
+                include_items: false,
+            }
         }
 
-        // Jeder Bedienbefehl, der einen wartenden Eintrag wieder lauffähig macht,
-        // muss über diesen Helfer gehen. Sonst liefe die Wiederaufnahme an der
-        // Exit-Barriere vorbei, ohne dass die Prüfung oben es merkt.
-        for (name, start, next) in [
+        fn in_function(function: &syn::ItemFn, expected: QueueCall<'a>) -> Self {
+            use syn::visit::Visit;
+            let mut calls = Self::new(expected);
+            calls.visit_block(&function.block);
+            calls
+        }
+
+        fn count(&mut self) {
+            if self.in_extension {
+                self.guarded += 1;
+            } else {
+                self.unguarded += 1;
+            }
+        }
+
+        fn total(&self) -> usize {
+            self.guarded + self.unguarded
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for QueueCalls<'_> {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                if let Some(last) = path.path.segments.last() {
+                    if matches!(self.expected, QueueCall::Function(name) if last.ident == name) {
+                        self.count();
+                    }
+                    if last.ident == "with_queue_extension" {
+                        // Die Barriere gilt im dritten Argument, dem aufzurufenden
+                        // Callback. Die übrigen Argumente werden vorher ausgewertet.
+                        let enclosing = self.in_extension;
+                        for (index, arg) in call.args.iter().enumerate() {
+                            self.in_extension =
+                                enclosing || index == 2 && matches!(arg, syn::Expr::Closure(_));
+                            self.visit_expr(arg);
+                        }
+                        self.in_extension = enclosing;
+                        return;
+                    }
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if matches!(self.expected, QueueCall::Method(name) if call.method == name) {
+                self.count();
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if self.include_items {
+                syn::visit::visit_item(self, item);
+            }
+        }
+    }
+
+    #[test]
+    fn queue_inventur_unterscheidet_callback_und_argumentauswertung() {
+        let file = syn::parse_file(
+            r#"
+            fn run() {
+                // resume_queue();
+                let _ = "queue.enqueue_resumable_copies()";
+                let _ = with_queue_extension;
+                with_queue_extension(queue.enqueue_resumable_copies(), window, || {
+                    queue .enqueue_resumable_copies /* Kommentar */ ();
+                });
+                queue.enqueue_resumable_copies();
+            }
+            fn anderer_befehl() { resume_queue(); }
+            "#,
+        )
+        .unwrap();
+        let command = named_function(&file, "Test", "run");
+        let mutation =
+            QueueCalls::in_function(command, QueueCall::Method("enqueue_resumable_copies"));
+        assert_eq!((mutation.guarded, mutation.unguarded), (1, 2));
+        assert_eq!(
+            QueueCalls::in_function(command, QueueCall::Function("resume_queue")).total(),
+            0
+        );
+    }
+
+    #[test]
+    fn queue_wiederaufnahme_und_spezial_enqueue_laufen_unter_der_exit_barriere() {
+        for (name, source, command, mutation) in [
             (
-                "Queue-Retry",
-                "pub(crate) fn retry_queue_entry(",
-                "#[tauri::command]",
+                "fortsetzbare Kopien",
+                include_str!("file_commands.rs"),
+                "enqueue_resumable_copy",
+                QueueCall::Method("enqueue_resumable_copies"),
             ),
             (
-                "Queue-Verwerfen",
-                "pub(crate) fn discard_queue_confirmation(",
-                "#[tauri::command]",
+                "direkter bidirektionaler Lauf",
+                include_str!("bidirectional_commands.rs"),
+                "run_bidirectional_sync",
+                QueueCall::Method("enqueue_claimed_with_profile_bindings"),
             ),
             (
-                "Neuplanungspflicht verwerfen",
-                "pub(crate) fn discard_replan_required_queue_entry(",
-                "#[tauri::command]",
-            ),
-            (
-                "alten WebDAV-Löschlauf quittieren",
-                "pub(crate) fn acknowledge_legacy_webdav_delete(",
-                "#[tauri::command]",
-            ),
-            (
-                "unklaren Queue-Ausgang quittieren",
-                "pub(crate) fn acknowledge_unclear_queue_outcome(",
-                "#[tauri::command]",
-            ),
-            (
-                "Queue-Freigabe",
-                "pub(crate) fn approve_queue_entry(",
-                "\n}\n",
+                "Queue-Wiederaufnahme",
+                include_str!("queue_commands.rs"),
+                "resume_queue",
+                QueueCall::Function("change"),
             ),
         ] {
-            let command = command_source(include_str!("queue_commands.rs"), start, next);
+            let file = syn::parse_file(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let calls = QueueCalls::in_function(named_function(&file, name, command), mutation);
             assert!(
-                command.contains("resume_queue("),
-                "{name} nimmt die Queue ohne den gemeinsamen Wiederaufnahme-Helfer wieder auf"
+                calls.guarded > 0,
+                "{name}: Queue-Mutation im Exit-Callback fehlt"
+            );
+            assert_eq!(
+                calls.unguarded, 0,
+                "{name}: Queue-Mutation außerhalb des Exit-Callbacks"
+            );
+        }
+
+        // Diese Bedienbefehle teilen die Wiederaufnahme unter derselben Barriere.
+        let commands = syn::parse_file(include_str!("queue_commands.rs")).unwrap();
+        for command in [
+            "retry_queue_entry",
+            "discard_queue_confirmation",
+            "discard_replan_required_queue_entry",
+            "acknowledge_legacy_webdav_delete",
+            "acknowledge_unclear_queue_outcome",
+            "approve_queue_entry",
+        ] {
+            let function = named_function(&commands, "Queue-Bedienung", command);
+            assert!(
+                QueueCalls::in_function(function, QueueCall::Function("resume_queue")).total() > 0,
+                "{command}: gemeinsamer Wiederaufnahme-Helfer fehlt"
             );
         }
 
@@ -3471,263 +3855,447 @@ mod tests {
                 include_str!("bidirectional_commands.rs"),
             ),
         ] {
-            assert!(
-                !source.contains(".enqueue("),
-                "{name} umgeht die zentrale Late-Commit-Klärung"
-            );
+            use syn::visit::Visit;
+            let file = syn::parse_file(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let mut calls = QueueCalls::new(QueueCall::Method("enqueue"));
+            calls.include_items = true;
+            calls.visit_file(&file);
+            assert_eq!(calls.total(), 0, "{name}: direkter enqueue-Aufruf");
         }
 
-        // Die frühere Einzelprüfung für `approve_queue_entry` ist entfallen: Der
-        // Befehl mutiert nicht mehr selbst, sondern über `resume_queue`. Beides —
-        // die Reihenfolge im Helfer und die Nutzung des Helfers — prüfen die
-        // Schleifen oben.
-
-        for (name, source, start) in [
+        for (name, source, identifier) in [
             (
                 "SFTP-Workerfreigabe",
                 include_str!("sftp_commands.rs"),
-                "pub(crate) fn approve_sftp_queue_entry(",
+                "approve_sftp_queue_entry",
             ),
             (
                 "FTPS-Workerfreigabe",
                 include_str!("ftps_commands.rs"),
-                "pub(crate) async fn approve_ftps_queue_entry(",
+                "approve_ftps_queue_entry",
             ),
             (
                 "WebDAV-Workerfreigabe",
                 include_str!("webdav_commands.rs"),
-                "pub(crate) async fn approve_webdav_queue_entry(",
+                "approve_webdav_queue_entry",
             ),
             (
                 "SMB-Workerfreigabe",
                 include_str!("smb_commands.rs"),
-                "pub(crate) async fn approve_smb_queue_entry(",
+                "approve_smb_queue_entry",
             ),
             (
                 "Provider-Workerfreigabe",
                 include_str!("provider_sync_commands.rs"),
-                "pub(crate) fn approve_provider_queue_entry(",
+                "approve_provider_queue_entry",
             ),
             (
                 "bidirektionale Workerfreigabe",
                 include_str!("bidirectional_commands.rs"),
-                "pub(crate) fn approve_bidirectional_queue_entry(",
+                "approve_bidirectional_queue_entry",
             ),
         ] {
-            let command = &source[source.find(start).expect("Approve-Command fehlt")..];
+            let file = syn::parse_file(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let approval = named_function(&file, name, identifier);
+            let start = if identifier == "approve_bidirectional_queue_entry" {
+                let helper = "reserve_bidirectional_queue_approval";
+                assert!(
+                    QueueCalls::in_function(approval, QueueCall::Function(helper)).total() > 0,
+                    "{name}: Aufruf der typisierten Queue-Freigabe fehlt"
+                );
+                named_function(&file, name, helper)
+            } else {
+                approval
+            };
             assert!(
-                command.contains("take_pending_for_operation("),
+                uses_pending_start(start),
                 "{name} muss Bestätigung, Pending-Entnahme und Reservierung unter der gemeinsamen Exit-Barriere binden"
             );
         }
     }
 
+    #[derive(Default)]
+    struct PendingStartCall(bool);
+
+    impl<'ast> syn::visit::Visit<'ast> for PendingStartCall {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                let segments = &path.path.segments;
+                let known_path = match segments.len() {
+                    1 => true,
+                    2 => segments[0].ident == "crate",
+                    3 => segments[0].ident == "crate" && segments[1].ident == "queue_runtime",
+                    _ => false,
+                };
+                self.0 |= path.qself.is_none()
+                    && path.path.leading_colon.is_none()
+                    && known_path
+                    && segments
+                        .last()
+                        .is_some_and(|part| part.ident == "take_pending_for_operation");
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        // Eine im Command deklarierte Hilfsfunktion führt ihren Rumpf nicht aus.
+        fn visit_item(&mut self, _: &'ast syn::Item) {}
+    }
+
+    fn uses_pending_start(command: &syn::ItemFn) -> bool {
+        use syn::visit::Visit;
+        let mut call = PendingStartCall::default();
+        call.visit_block(&command.block);
+        call.0
+    }
+
+    #[test]
+    fn pending_start_guard_prueft_nur_aufrufe_im_benannten_command() {
+        let missing = syn::parse_file(
+            r#"
+            fn run_sync() {
+                // take_pending_for_operation();
+                let _ = "take_pending_for_operation()";
+                let _ = take_pending_for_operation;
+                audit_take_pending_for_operation();
+                other::take_pending_for_operation();
+                fn helper() { take_pending_for_operation(); }
+            }
+            fn approve_queue_entry() { take_pending_for_operation(); }
+            fn later_helper() { take_pending_for_operation(); }
+        "#,
+        )
+        .unwrap();
+        let starts = |identifier| uses_pending_start(named_function(&missing, "Test", identifier));
+        assert!(!starts("run_sync"));
+        assert!(starts("approve_queue_entry"));
+        assert!(starts("later_helper"));
+
+        for source in [
+            "fn run_sync() { take_pending_for_operation(); }",
+            r#"pub(crate) async fn run_sync () {
+                spawn_blocking(move || {
+                    crate :: queue_runtime :: take_pending_for_operation::<_, _>
+                        /* dieselbe Starttransaktion */ (state, window, pending);
+                });
+            }"#,
+        ] {
+            let file = syn::parse_file(source).unwrap();
+            assert!(uses_pending_start(named_function(
+                &file, "Test", "run_sync"
+            )));
+        }
+    }
+
     #[test]
     fn alle_direkten_pending_starts_nutzen_die_zentrale_starttransaktion() {
-        for (name, source, start) in [
+        for (name, source, identifier) in [
             (
                 "lokaler Realmodus",
                 include_str!("local_sync_commands.rs"),
-                "pub(crate) fn run_real_sync(",
+                "run_real_sync",
             ),
             (
                 "SFTP-Realmodus",
                 include_str!("sftp_commands.rs"),
-                "pub(crate) fn run_sftp_sync(",
+                "run_sftp_sync",
             ),
             (
                 "FTPS-Realmodus",
                 include_str!("ftps_commands.rs"),
-                "pub(crate) async fn run_ftps_sync(",
+                "run_ftps_sync",
             ),
             (
                 "WebDAV-Realmodus",
                 include_str!("webdav_commands.rs"),
-                "pub(crate) async fn run_webdav_sync(",
+                "run_webdav_sync",
             ),
             (
                 "SMB-Realmodus",
                 include_str!("smb_commands.rs"),
-                "pub(crate) async fn run_smb_sync(",
+                "run_smb_sync",
             ),
             (
                 "bidirektionaler Rollback",
                 include_str!("bidirectional_commands.rs"),
-                "pub(crate) fn run_bidirectional_rollback(",
+                "run_bidirectional_rollback",
             ),
         ] {
-            let command = &source[source.find(start).expect("Run-Command fehlt")..];
+            let file = syn::parse_file(source).unwrap_or_else(|error| panic!("{name}: {error}"));
             assert!(
-                command.contains("take_pending_for_operation("),
+                uses_pending_start(named_function(&file, name, identifier)),
                 "{name} umgeht die zentrale Reihenfolge Exit-Barriere → Pending → Reservierung"
             );
         }
     }
 
     #[test]
-    fn pending_enqueue_und_discard_leeren_den_slot_erst_nach_bewiesenem_erfolg() {
-        for (name, source, start, next) in [
-            (
-                "Provider-Enqueue",
-                include_str!("provider_sync_commands.rs"),
-                "pub(crate) fn enqueue_provider_sync(",
-                "pub(crate) fn prepare_remote_queue_entry(",
-            ),
-            (
-                "bidirektionales Enqueue",
-                include_str!("bidirectional_commands.rs"),
-                "pub(crate) fn enqueue_bidirectional_sync(",
-                "pub(crate) async fn prepare_bidirectional_resume(",
-            ),
-        ] {
-            let command = command_source(source, start, next);
-            let proof = command
-                .find("enqueue_operation_with_profile_bindings(")
-                .unwrap_or_else(|| panic!("{name} klärt keinen späten Journalcommit"));
-            let take = command
-                .find("pending.take()")
-                .unwrap_or_else(|| panic!("{name} leert seinen Pending-Slot nicht"));
-            assert!(
-                proof < take,
-                "{name} entnimmt die Vorbereitung vor dem Queuebeweis"
-            );
-        }
+    fn remote_queue_request_akzeptiert_verschachtelte_frontend_feldnamen() {
+        let request: EnqueueRemoteSyncRequest<SftpConnectionConfig> =
+            serde_json::from_value(serde_json::json!({
+                "profileId": "server",
+                "profileRevision": 21,
+                "direction": "Download",
+                "localRoot": "/lokal",
+                "remoteRoot": "/remote",
+                "options": serde_json::to_value(SyncOptions::default()).unwrap(),
+                "expectedPlan": serde_json::to_value(SyncPlan::default()).unwrap()
+            }))
+            .unwrap();
 
-        let source = include_str!("bidirectional_commands.rs");
-        let discard = command_source(
-            source,
-            "pub(crate) fn discard_bidirectional_sync(",
-            "pub(crate) fn enqueue_bidirectional_sync(",
-        );
-        assert!(
-            discard.find("prepared.prepared.discard()").unwrap()
-                < discard.find("pending.take()").unwrap(),
-            "Bidirektionales Discard leert den Slot vor erfolgreicher Journalentfernung"
-        );
+        assert_eq!(request.profile_id, "server");
+        assert_eq!(request.profile_revision, Some(21));
+        assert_eq!(request.expected_plan, SyncPlan::default());
     }
 
     #[test]
-    fn protokoll_enqueue_verbraucht_exakt_die_vorbereitete_direktoperation() {
-        for (name, source, start, next, slot) in [
-            (
-                "SFTP",
-                include_str!("sftp_commands.rs"),
-                "pub(crate) fn enqueue_sftp_sync(",
-                "pub(crate) fn prepare_remote_queue_entry(",
-                "pending_sftp_real",
-            ),
-            (
-                "FTPS",
-                include_str!("ftps_commands.rs"),
-                "pub(crate) async fn enqueue_ftps_sync(",
-                "pub(crate) fn prepare_remote_queue_entry(",
-                "pending_ftps_real",
-            ),
-            (
-                "WebDAV",
-                include_str!("webdav_commands.rs"),
-                "pub(crate) async fn enqueue_webdav_sync(",
-                "pub(crate) fn prepare_remote_queue_entry(",
-                "pending_webdav_real",
-            ),
-            (
-                "SMB",
-                include_str!("smb_commands.rs"),
-                "pub(crate) async fn enqueue_smb_sync(",
-                "pub(crate) fn prepare_remote_queue_entry(",
-                "pending_smb_real",
-            ),
-        ] {
-            let command = command_source(source, start, next);
-            let lock = command
-                .find(slot)
-                .unwrap_or_else(|| panic!("{name} liest den vorbereiteten Direktlauf nicht"));
-            let comparison = command
-                .find("enqueue_bound_pending(")
-                .unwrap_or_else(|| panic!("{name} nutzt nicht den gemeinsamen exakten Vergleich"));
-            let enqueue = command
-                .find("|pending| &pending.operation")
-                .unwrap_or_else(|| panic!("{name} reiht nicht die gebundene Operation ein"));
-            assert!(
-                lock < comparison && comparison < enqueue,
-                "{name} muss denselben Pending-Lauf erst nach bewiesenem Queuecommit verbrauchen"
-            );
+    fn protokoll_enqueue_bewahrt_und_verbucht_exakt_den_jeweils_vorbereiteten_lauf() {
+        use doppeldecker_core::{
+            prepare_provider_transfer_for_queue, Compare, FtpTransportSecurity, FtpsCertificatePin,
+            FtpsCertificatePolicy, KeychainSecretReference, ProviderEndpoint, QueueState,
+            SftpAuthenticationReference, SftpHostKeyPin,
+        };
+        use std::fs;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let source = root.join("quelle");
+        let target = root.join("ziel");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("beispiel.txt"), b"vorbereiteter Inhalt").unwrap();
+        let journal = root.join("config/operations-queue.json");
+        let lock = Arc::new(OperationQueueProcessLock::acquire(&journal).unwrap());
+        let queue =
+            Arc::new(OperationQueue::open_with_process_lock(&journal, lock.clone()).unwrap());
+        let state = AppState::default();
+        let window = state.window("main");
+
+        let options = SyncOptions {
+            compare: Compare::ContentHash,
+            ..SyncOptions::default()
+        };
+        let profile_id = "testprofil";
+        let secret = || KeychainSecretReference::new("Doppeldecker-Test", profile_id).unwrap();
+        let local_root = source.to_str().unwrap();
+        let remote_root = "/daten";
+        let prepare = || {
+            prepare_provider_transfer_for_queue(
+                &queue,
+                ProviderEndpoint::local(&source).unwrap(),
+                ProviderEndpoint::local(&target).unwrap(),
+                options.clone(),
+            )
+            .unwrap()
+        };
+        let plan = prepare().preview().plan.clone();
+
+        macro_rules! prepared_case {
+            ($protocol:ident, $slot:ident, $operation:ident, $config:expr) => {{
+                let config = $config;
+                (
+                    RemoteProfileProtocol::$protocol,
+                    &window.$slot,
+                    RemoteSyncConnection::from(config.clone()),
+                    QueueOperation::$operation {
+                        direction: SftpQueueDirection::Upload,
+                        connection: Box::new(config),
+                        local_root: local_root.into(),
+                        remote_root: remote_root.into(),
+                        options: options.clone(),
+                        expected_plan: Box::new(plan.clone()),
+                    },
+                )
+            }};
         }
+        let cases = [
+            prepared_case!(
+                Sftp,
+                pending_sftp_real,
+                SftpSync,
+                SftpConnectionConfig {
+                    host: "sftp.example.test".into(),
+                    alternate_hosts: Vec::new(),
+                    port: 22,
+                    username: "test".into(),
+                    requested_root: remote_root.into(),
+                    host_key: SftpHostKeyPin {
+                        algorithm: "ssh-ed25519".into(),
+                        sha256: [1; 32],
+                    },
+                    authentication: SftpAuthenticationReference::Password { secret: secret() },
+                }
+            ),
+            prepared_case!(
+                Ftps,
+                pending_ftps_real,
+                FtpsSync,
+                FtpsConnectionConfig {
+                    host: "ftp.example.test".into(),
+                    alternate_hosts: Vec::new(),
+                    port: 21,
+                    username: "test".into(),
+                    requested_root: remote_root.into(),
+                    transport_security: FtpTransportSecurity::Plaintext,
+                    certificate: None,
+                    certificate_policy: None,
+                    password_reference: secret(),
+                }
+            ),
+            prepared_case!(
+                Webdav,
+                pending_webdav_real,
+                WebDavSync,
+                WebDavConnectionConfig {
+                    origin: "https://dav.example.test".into(),
+                    username: "test".into(),
+                    requested_root: remote_root.into(),
+                    certificate: FtpsCertificatePin { sha256: [4; 32] },
+                    certificate_policy: FtpsCertificatePolicy::WebPkiAndPin,
+                    password_reference: secret(),
+                }
+            ),
+            prepared_case!(
+                Smb,
+                pending_smb_real,
+                SmbSync,
+                SmbConnectionConfig {
+                    host: "smb.example.test".into(),
+                    port: 445,
+                    server_guid: [7; 16],
+                    share: "Daten".into(),
+                    username: "test".into(),
+                    domain: "WORKGROUP".into(),
+                    requested_root: remote_root.into(),
+                    password_reference: secret(),
+                }
+            ),
+        ];
+        for (protocol, slot, connection, operation) in cases {
+            let prepared = prepare();
+            let bindings = vec![RemoteProfileBinding::new(protocol, profile_id, 3).unwrap()];
+            *slot.lock_recover() = Some(PendingRemoteRealRun {
+                prepared,
+                operation: operation.clone(),
+                profile_bindings: bindings.clone(),
+            });
+            let request = |remote_root: &str, revision| EnqueueRemoteSyncRequest {
+                profile_id: profile_id.into(),
+                profile_revision: Some(revision),
+                direction: SftpQueueDirection::Upload,
+                local_root: local_root.into(),
+                remote_root: remote_root.into(),
+                options: options.clone(),
+                expected_plan: plan.clone(),
+                connection_type: PhantomData,
+            };
+            let resolve = |id: &str| {
+                assert_eq!(id, profile_id);
+                Ok(connection.clone())
+            };
+            let before = queue.snapshot();
+            for mismatched in [request(remote_root, 2), request("/abweichend", 3)] {
+                let failure =
+                    enqueue_protocol_sync_using(&state, &window, mismatched, resolve, |_| {
+                        panic!("Abweichende Anfragen dürfen die Queue nicht öffnen")
+                    });
+                assert_eq!(failure.err().unwrap().code, "plan_drift");
+                assert!(slot.lock_recover().is_some());
+            }
+            let failure = enqueue_protocol_sync_using(
+                &state,
+                &window,
+                request(remote_root, 3),
+                resolve,
+                |bound| {
+                    assert_eq!(bound, bindings);
+                    Err(AppError::new("busy", "Queue vorübergehend belegt"))
+                },
+            );
+            assert_eq!(failure.err().unwrap().code, "busy");
+            assert_eq!(slot.lock_recover().as_ref().unwrap().operation, operation);
+            assert_eq!(queue.snapshot(), before);
+
+            enqueue_protocol_sync_using(
+                &state,
+                &window,
+                request(remote_root, 3),
+                resolve,
+                |bound| {
+                    assert_eq!(bound, bindings);
+                    Ok(queue.clone())
+                },
+            )
+            .unwrap();
+            assert!(slot.lock_recover().is_none());
+            let after = queue.snapshot();
+            assert_eq!(after.entries.len(), before.entries.len() + 1);
+            let committed = after.entries.last().unwrap();
+            assert_eq!(committed.operation, operation);
+            assert_eq!(committed.profile_bindings, bindings);
+            assert_eq!(committed.state, QueueState::Pending);
+        }
+        assert_eq!(
+            OperationQueue::open_with_process_lock(&journal, lock)
+                .unwrap()
+                .snapshot(),
+            queue.snapshot()
+        );
+        assert!(fs::read_dir(&target).unwrap().next().is_none());
     }
 
     #[test]
-    fn gebundener_enqueue_behaelt_fehler_und_verbraucht_nur_erfolg() {
-        #[derive(Debug, PartialEq, Eq)]
-        struct Bound(&'static str);
-
-        let mut pending = Some(Bound("vorbereitet"));
-        let mismatch = enqueue_bound_pending(
-            &mut pending,
-            &"anders",
-            |bound| &bound.0,
-            "fehlt",
-            "abweichend",
-            |_| Ok(()),
-        )
-        .unwrap_err();
-        assert_eq!(mismatch.code, "plan_drift");
-        assert_eq!(pending, Some(Bound("vorbereitet")));
-
-        let busy = enqueue_bound_pending(
-            &mut pending,
-            &"vorbereitet",
-            |bound| &bound.0,
-            "fehlt",
-            "abweichend",
-            |_| Err::<(), _>(AppError::new("busy", "Queue belegt")),
-        )
-        .unwrap_err();
-        assert_eq!(busy.code, "busy");
-        assert_eq!(pending, Some(Bound("vorbereitet")));
-
-        let result = enqueue_bound_pending(
-            &mut pending,
-            &"vorbereitet",
-            |bound| &bound.0,
-            "fehlt",
-            "abweichend",
-            |operation| {
-                assert_eq!(*operation, "vorbereitet");
-                Ok(17)
-            },
-        )
-        .unwrap();
-        assert_eq!(result, 17);
-        assert!(
-            pending.is_none(),
-            "Nach bewiesenem Enqueue darf die alte Direktphrase nicht mehr starten"
+    fn queuefehler_erhaelt_code_und_fortschritt_in_journal_und_terminalereignis() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config/operations-queue.json");
+        let queue = OperationQueue::open(&path).unwrap();
+        let entry = queue
+            .enqueue_claimed(QueueOperation::File {
+                kind: doppeldecker_core::FileQueueKind::Copy,
+                items: vec!["/quelle/datei".into()],
+                destination: "/ziel".into(),
+                overwrite: false,
+                expected_conflicts: Vec::new(),
+                keep_both_targets: Vec::new(),
+                expected_conflict_proofs: Vec::new(),
+                local_replace_best_effort_expected: Some(false),
+                local_copy_new_best_effort_expected: None,
+            })
+            .unwrap();
+        queue.mark_running(&entry.operation_id).unwrap();
+        queue
+            .update_progress(
+                &entry.operation_id,
+                &Progress {
+                    files_done: 1,
+                    ..Progress::default()
+                },
+            )
+            .unwrap();
+        let error = doppeldecker_core::coded_error(
+            std::io::ErrorKind::Other,
+            doppeldecker_core::ErrorCode::OutcomeUnclear,
+            "Zielwirkung konnte nicht geprüft werden",
         );
-    }
-
-    #[test]
-    fn queueausfuehrung_gibt_terminale_anzeige_an_den_worker_zurueck() {
-        let source = include_str!("queue_runtime.rs");
-        let execution = command_source(
-            source,
-            "fn execute_queue_entry(",
-            "/// Laufbezogener Quarantänepfad.",
+        let QueueTerminalOutcome::Error { event, error } = persist_queue_execution_error(
+            &queue,
+            &entry.operation_id,
+            QueueOperationClass::File,
+            &error,
+        ) else {
+            panic!("Die Ausführung lieferte kein Fehlerereignis");
+        };
+        assert_eq!(event, "fileop-error");
+        drop(queue);
+        let queue = OperationQueue::open(&path).unwrap();
+        let stored = &queue.snapshot().entries[0];
+        assert_eq!(stored.state, doppeldecker_core::QueueState::Failed);
+        assert_eq!(
+            stored.error_code,
+            Some(doppeldecker_core::ErrorCode::OutcomeUnclear)
         );
-        assert!(
-            execution.contains("-> QueueTerminalEvent"),
-            "Die Ausführung muss ihr Terminalresultat an den Worker zurückgeben"
-        );
-        for forbidden in ["\"fileop-done\"", "\"sync-done\"", "\"bidirectional-done\""] {
-            assert!(
-                !execution.contains(forbidden),
-                "Terminalevent oder -snapshot wird noch unter gehaltener Reservierung gesendet: {forbidden}"
-            );
-        }
-        assert!(
-            execution.contains("fail_coded(")
-                && execution.contains("QueueTerminalOutcome::Error")
-                && execution.contains("error_code(&error)"),
-            "Fehlercode muss Journal und fachliches GUI-Ereignis gemeinsam erreichen"
-        );
+        assert_eq!(stored.error_code.unwrap().as_str(), error.code);
+        assert_eq!(stored.error.as_deref(), Some(error.message.as_str()));
+        assert_eq!(stored.progress.files_done, 1);
     }
 
     #[test]
@@ -3762,124 +4330,184 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remote_worker_und_approvals_emittieren_terminal_erst_nach_freigabe() {
-        for (name, source, start) in [
-            (
-                "SFTP-Vorbereitung",
-                include_str!("sftp_commands.rs"),
-                "pub(crate) fn prepare_remote_queue_entry(",
-            ),
-            (
-                "FTPS-Vorbereitung",
-                include_str!("ftps_commands.rs"),
-                "pub(crate) fn prepare_remote_queue_entry(",
-            ),
-            (
-                "WebDAV-Vorbereitung",
-                include_str!("webdav_commands.rs"),
-                "pub(crate) fn prepare_remote_queue_entry(",
-            ),
-            (
-                "SMB-Vorbereitung",
-                include_str!("smb_commands.rs"),
-                "pub(crate) fn prepare_remote_queue_entry(",
-            ),
-            (
-                "Provider-Vorbereitung",
-                include_str!("provider_sync_commands.rs"),
-                "pub(crate) fn prepare_remote_queue_entry(",
-            ),
-            (
-                "bidirektionale Vorbereitung",
-                include_str!("bidirectional_commands.rs"),
-                "pub(crate) fn prepare_queue_entry(",
-            ),
-        ] {
-            let command = &source[source.find(start).expect("Prepare-Worker fehlt")..];
-            let end = command.find("#[tauri::command]").unwrap_or(command.len());
-            let command = &command[..end];
-            assert!(
-                command.contains("-> QueueTerminalEvent"),
-                "{name} gibt kein verzögert sendbares Terminalresultat zurück"
-            );
-            assert!(
-                !command.contains(".emit_to("),
-                "{name} emittiert noch unter der Workerreservation"
-            );
+    fn named_function<'a>(file: &'a syn::File, name: &str, identifier: &str) -> &'a syn::ItemFn {
+        file.items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == identifier => Some(function),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name}: {identifier} fehlt"))
+    }
+
+    #[derive(Default)]
+    struct TerminalCalls {
+        emits: usize,
+        finishes: usize,
+        finishes_without_inline_callback: usize,
+        snapshots_after_release: usize,
+        snapshots_outside_finish: usize,
+        in_finish_callback: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for TerminalCalls {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                if let Some(last) = path.path.segments.last() {
+                    if last.ident == "finish_operation" {
+                        self.finishes += 1;
+                        if !matches!(call.args.iter().nth(2), Some(syn::Expr::Closure(_))) {
+                            self.finishes_without_inline_callback += 1;
+                        }
+                        // Nur der dritte Parameter ist der Callback, den
+                        // finish_operation nach Freigabe tatsächlich ausführt.
+                        let enclosing_callback = self.in_finish_callback;
+                        for (index, arg) in call.args.iter().enumerate() {
+                            self.in_finish_callback = enclosing_callback
+                                || index == 2 && matches!(arg, syn::Expr::Closure(_));
+                            self.visit_expr(arg);
+                        }
+                        self.in_finish_callback = enclosing_callback;
+                        return;
+                    }
+                    if last.ident == "emit_queue_snapshot" {
+                        if self.in_finish_callback {
+                            self.snapshots_after_release += 1;
+                        } else {
+                            self.snapshots_outside_finish += 1;
+                        }
+                    }
+                    if last.ident == "emit_to"
+                        || last.ident == "emit_to_window"
+                        || last.ident == "emit_to_window_label"
+                    {
+                        self.emits += 1;
+                    }
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
         }
 
-        for (name, source, start) in [
-            (
-                "SFTP-Approve",
-                include_str!("sftp_commands.rs"),
-                "pub(crate) fn approve_sftp_queue_entry(",
-            ),
-            (
-                "FTPS-Approve",
-                include_str!("ftps_commands.rs"),
-                "pub(crate) async fn approve_ftps_queue_entry(",
-            ),
-            (
-                "WebDAV-Approve",
-                include_str!("webdav_commands.rs"),
-                "pub(crate) async fn approve_webdav_queue_entry(",
-            ),
-            (
-                "SMB-Approve",
-                include_str!("smb_commands.rs"),
-                "pub(crate) async fn approve_smb_queue_entry(",
-            ),
-            (
-                "Provider-Approve",
-                include_str!("provider_sync_commands.rs"),
-                "pub(crate) fn approve_provider_queue_entry(",
-            ),
-            (
-                "bidirektionales Approve",
-                include_str!("bidirectional_commands.rs"),
-                "pub(crate) fn approve_bidirectional_queue_entry(",
-            ),
-        ] {
-            let command = &source[source.find(start).expect("Approve-Command fehlt")..];
-            let finish = command
-                .find("finish_operation(")
-                .unwrap_or_else(|| panic!("{name} gibt die Reservation nicht zentral frei"));
-            let snapshot = command
-                .find("emit_queue_snapshot(")
-                .unwrap_or_else(|| panic!("{name} emittiert keinen terminalen Snapshot"));
-            assert!(
-                finish < snapshot,
-                "{name} sendet den terminalen Snapshot vor der Reservierungsfreigabe"
-            );
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "emit_to" {
+                self.emits += 1;
+            }
+            syn::visit::visit_expr_method_call(self, call);
         }
     }
 
+    fn terminal_calls(command: &syn::ItemFn) -> TerminalCalls {
+        use syn::visit::Visit;
+        let mut calls = TerminalCalls::default();
+        calls.visit_block(&command.block);
+        calls
+    }
+
     #[test]
-    fn bidirektionaler_queueuebergang_entfernt_journal_erst_nach_queuebeweis() {
-        let source = include_str!("bidirectional_commands.rs");
-        let command = command_source(
-            source,
-            "pub(crate) fn enqueue_bidirectional_sync(",
-            "pub(crate) async fn prepare_bidirectional_resume(",
+    fn terminal_wiring_guard_distinguishes_calls_from_text_and_checks_callback() {
+        let prepare = syn::parse_str(
+            r#"fn prepare() {
+                // emit_to_window(&window, "sync-error", error);
+                let _ = "emit_to_window_label(...) .emit_to(...)";
+                let _ = crate::emit_to_window;
+                audit_emit_to_window(&window);
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(terminal_calls(&prepare).emits, 0);
+        for source in [
+            r#"fn prepare() { event .emit_to (&window); }"#,
+            r#"fn prepare() { tauri::Emitter::emit_to(&app, label); }"#,
+            r#"fn prepare() { crate::emit_to_window /* gezieltes Ereignis */ (&window); }"#,
+            r#"fn prepare() { emit_to_window_label::<_, _> (&app, label); }"#,
+        ] {
+            assert_eq!(terminal_calls(&syn::parse_str(source).unwrap()).emits, 1);
+        }
+
+        let approve: syn::ItemFn = syn::parse_quote! {
+            fn approve() {
+                emit_queue_snapshot(&app, label, &queue);
+                finish_operation(&app, label, || {
+                    if complete { crate::emit_queue_snapshot(&app, label, &queue); }
+                });
+            }
+        };
+        let calls = terminal_calls(&approve);
+        assert_terminal_callbacks("Testfreigabe", &calls, 1);
+        assert_eq!(calls.snapshots_after_release, 1);
+        assert_eq!(calls.snapshots_outside_finish, 1);
+
+        let misplaced: syn::ItemFn = syn::parse_quote! {
+            fn approve() {
+                finish_operation(|| emit_queue_snapshot(&app, label, &queue), label, callback);
+            }
+        };
+        assert_eq!(
+            terminal_calls(&misplaced).finishes_without_inline_callback,
+            1
         );
-        let enqueue = command
-            .find("enqueue_operation_with_profile_bindings(")
-            .expect("Queuebeweis fehlt");
-        let transition = command
-            .find("finish_enqueue_transition()")
-            .expect("wiederherstellbarer Journalübergang fehlt");
-        let take = command
-            .find("pending.take()")
-            .expect("Pending-Entnahme fehlt");
-        assert!(
-            enqueue < transition && transition < take,
-            "Laufjournal und Pending-Slot dürfen erst nach bewiesenem Queuecommit verschwinden"
-        );
-        assert!(
-            command.contains("enqueued_operation_id"),
-            "Ein Fehler nach Queuecommit wäre ohne gespeicherte ID nicht duplikatfrei retryfähig"
-        );
+    }
+
+    #[test]
+    fn remote_worker_und_approvals_emittieren_terminal_erst_nach_freigabe() {
+        for (name, source, prepare, approve) in [
+            (
+                "SFTP",
+                include_str!("sftp_commands.rs"),
+                "prepare_remote_queue_entry",
+                "approve_sftp_queue_entry",
+            ),
+            (
+                "FTPS",
+                include_str!("ftps_commands.rs"),
+                "prepare_remote_queue_entry",
+                "approve_ftps_queue_entry",
+            ),
+            (
+                "WebDAV",
+                include_str!("webdav_commands.rs"),
+                "prepare_remote_queue_entry",
+                "approve_webdav_queue_entry",
+            ),
+            (
+                "SMB",
+                include_str!("smb_commands.rs"),
+                "prepare_remote_queue_entry",
+                "approve_smb_queue_entry",
+            ),
+            (
+                "Provider",
+                include_str!("provider_sync_commands.rs"),
+                "prepare_remote_queue_entry",
+                "approve_provider_queue_entry",
+            ),
+            (
+                "bidirektionaler Sync",
+                include_str!("bidirectional_commands.rs"),
+                "prepare_queue_entry",
+                "approve_bidirectional_queue_entry",
+            ),
+        ] {
+            let file = syn::parse_file(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+            // Der Rückgabetyp aller sechs Vorbereitungen wird bereits am
+            // Produktionsaufruf durch execute_queue_entry erzwungen.
+            assert_eq!(
+                terminal_calls(named_function(&file, name, prepare)).emits,
+                0,
+                "{name}: Vorbereitung sendet Ereignisse unter der Workerreservation"
+            );
+
+            let approval = terminal_calls(named_function(&file, name, approve));
+            assert!(approval.finishes > 0, "{name}: Freigabe fehlt");
+            assert!(
+                approval.snapshots_after_release > 0,
+                "{name}: kein terminaler Snapshot im Freigabe-Callback"
+            );
+            assert_eq!(
+                approval.snapshots_outside_finish, 0,
+                "{name}: terminaler Snapshot außerhalb des Freigabe-Callbacks"
+            );
+        }
     }
 
     #[test]
@@ -3913,6 +4541,7 @@ mod tests {
 
     #[test]
     fn alle_terminalpfade_geben_das_event_vor_dem_folgeworker_weiter() {
+        use syn::visit::Visit;
         // Die Signatur von `finish_operation` verhindert bereits neue Aufrufer ohne
         // Event-Callback. Diese Inventur hält zusätzlich fest, welche Commands heute
         // direkte Operationen beenden. So fällt bei einem neuen Pfad sofort auf, wenn
@@ -3939,46 +4568,28 @@ mod tests {
                 5,
             ),
         ] {
-            let calls = source
-                .match_indices("finish_operation(")
-                .collect::<Vec<_>>();
-            assert_eq!(
-                calls.len(),
-                expected_calls,
-                "{name}: Inventur der direkten Abschlusspfade hat sich geändert"
-            );
-            for (offset, _) in calls {
-                let end = (offset + 180).min(source.len());
-                assert!(
-                    source[offset..end].contains(", ||"),
-                    "{name}: finish_operation braucht das Terminalevent als Callback"
-                );
-            }
+            let file = syn::parse_file(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let mut calls = TerminalCalls::default();
+            calls.visit_file(&file);
+            assert_terminal_callbacks(name, &calls, expected_calls);
         }
 
-        // Der gemeinsame Remote-Ablauf hat die fünf protokollspezifischen Kopien
-        // abgelöst. Seine beiden Abschlusspfade — gescheiterte Bindungsprüfung und
-        // regulärer Abschluss — gehören damit in dieselbe Inventur.
-        let shared = command_source(
-            include_str!("queue_runtime.rs"),
-            "pub(crate) fn spawn_confirmed_remote_run<",
-            "/// Eine protokollspezifische Remote-Vorbereitung",
-        );
-        let shared_calls = shared
-            .match_indices("finish_operation(")
-            .collect::<Vec<_>>();
+        // Bindungsfehler und regulärer Abschluss nutzen denselben Remote-Worker.
+        let name = "gemeinsamer Remote-Ablauf";
+        let file = syn::parse_file(include_str!("queue_runtime.rs")).unwrap();
+        let shared = named_function(&file, name, "spawn_confirmed_remote_run");
+        assert_terminal_callbacks(name, &terminal_calls(shared), 2);
+    }
+
+    fn assert_terminal_callbacks(name: &str, calls: &TerminalCalls, expected_calls: usize) {
         assert_eq!(
-            shared_calls.len(),
-            2,
-            "gemeinsamer Remote-Ablauf: Inventur der Abschlusspfade hat sich geändert"
+            calls.finishes, expected_calls,
+            "{name}: Inventur der direkten Abschlusspfade hat sich geändert"
         );
-        for (offset, _) in shared_calls {
-            let end = (offset + 180).min(shared.len());
-            assert!(
-                shared[offset..end].contains(", ||"),
-                "gemeinsamer Remote-Ablauf: finish_operation braucht das Terminalevent als Callback"
-            );
-        }
+        assert_eq!(
+            calls.finishes_without_inline_callback, 0,
+            "{name}: finish_operation braucht den Terminal-Callback als drittes Argument"
+        );
     }
 
     /// Regression: Eine Pane ohne Pfad schickte einen Leerstring als `parent`. Der

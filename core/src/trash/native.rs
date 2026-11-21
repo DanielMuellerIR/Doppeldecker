@@ -111,7 +111,7 @@ fn trash_with_context(
                 roots.push(
                     mount
                         .path()
-                        .join(format!(".Trash-{}", unsafe { libc::geteuid() })),
+                        .join(format!(".Trash-{}", rustix::process::geteuid().as_raw())),
                 );
             }
             roots
@@ -281,7 +281,7 @@ fn destination(source: &RootHandle, home: &Context) -> io::Result<Destination> {
         root: root
             .path()
             .join(".Trashes")
-            .join(unsafe { libc::geteuid() }.to_string()),
+            .join(rustix::process::geteuid().as_raw().to_string()),
         origin_mount: None,
         shared_parent: true,
     })
@@ -384,7 +384,7 @@ fn parent_proof(
             _ => false,
         };
         if !safe_acl
-            || ![0, unsafe { libc::geteuid() }].contains(&stat.st_uid)
+            || ![0, rustix::process::geteuid().as_raw()].contains(&stat.st_uid)
             || (mode & 0o022 != 0 && mode & 0o1000 == 0)
         {
             return Err(io::Error::new(

@@ -25,6 +25,7 @@ fn helper_refuses_direct_start_without_polkit() {
 
 fn authorized_request(request: AdminMetadataRequest, gate: u8) -> serde_json::Value {
     assert_eq!(
+        // SAFETY: geteuid liest die effektive UID dieses Prozesses und hat keine Parameter.
         unsafe { libc::geteuid() },
         0,
         "Nur im isolierten Root-Testcontainer ausführen"

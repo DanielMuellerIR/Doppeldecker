@@ -120,14 +120,7 @@ pub fn discover_smb_server(host: &str, port: u16) -> io::Result<SmbServerDiscove
     })
 }
 
-/// Ein interaktives Pane-Listing samt der Generation, unter der es entstanden ist.
-/// Die Generation verhindert eine Vermischung mit einem parallelen Reconnect, ist
-/// aber ausdrücklich kein Namespace- oder Identitätsbeleg.
-#[derive(Clone, Debug)]
-pub struct SmbInteractiveDirectoryListing {
-    pub entries: Vec<Entry>,
-    pub session_generation: u64,
-}
+pub use crate::vfs::RemoteInteractiveDirectoryListing as SmbInteractiveDirectoryListing;
 
 impl SmbVfs {
     pub(crate) fn set_mtime_unchecked(&self, path: &Path, mtime: i64) -> io::Result<()> {
@@ -2277,6 +2270,9 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smb2::msg::header::Header;
+    use smb2::pack::Pack;
+    use smb2::transport::MockTransport;
 
     #[test]
     fn letzte_smb_verbindungsreferenz_gibt_transport_und_empfaenger_frei() {
@@ -2310,15 +2306,8 @@ mod tests {
         });
     }
 
-    #[test]
-    fn gewoehnliche_dateifaehigkeiten_benoetigen_keine_schreibprobe() {
-        use smb2::msg::close::CloseResponse;
-        use smb2::msg::create::CreateAction;
-        use smb2::msg::header::{ErrorResponse, Header};
-        use smb2::pack::{Pack, WriteCursor};
-        use smb2::transport::MockTransport;
+    fn mock_smb_vfs(capabilities: RemoteCapabilities) -> (SmbVfs, Arc<MockTransport>) {
         use smb2::types::TreeId;
-
         struct NoSecrets;
         impl SecretResolver for NoSecrets {
             fn resolve(
@@ -2328,57 +2317,8 @@ mod tests {
                 panic!("Die bereits verbundene Testsitzung benötigt kein Secret")
             }
         }
-        let packet = |command, status, body: &dyn Pack| {
-            let mut header = Header::new_request(command);
-            header.flags.set_response();
-            header.credits = 16;
-            header.status = status;
-            let mut cursor = WriteCursor::new();
-            header.pack(&mut cursor);
-            body.pack(&mut cursor);
-            cursor.into_inner()
-        };
-        let created = CreateResponse {
-            oplock_level: OplockLevel::None,
-            flags: 0,
-            create_action: CreateAction::FileCreated,
-            creation_time: FileTime(0),
-            last_access_time: FileTime(0),
-            last_write_time: FileTime(0),
-            change_time: FileTime(0),
-            allocation_size: 0,
-            end_of_file: 0,
-            file_attributes: FILE_ATTRIBUTE_DIRECTORY,
-            file_id: FileId {
-                persistent: 1,
-                volatile: 2,
-            },
-            create_contexts: Vec::new(),
-        };
-        let closed = CloseResponse {
-            flags: 0,
-            creation_time: FileTime(0),
-            last_access_time: FileTime(0),
-            last_write_time: FileTime(0),
-            change_time: FileTime(0),
-            allocation_size: 0,
-            end_of_file: 0,
-            file_attributes: FILE_ATTRIBUTE_DIRECTORY,
-        };
         let mock = Arc::new(MockTransport::new());
         mock.enable_auto_rewrite_msg_id();
-        mock.queue_response(packet(Command::Create, NtStatus::SUCCESS, &created));
-        mock.queue_response(packet(Command::Close, NtStatus::SUCCESS, &closed));
-        for _ in 0..6 {
-            mock.queue_response(packet(
-                Command::Create,
-                NtStatus::ACCESS_DENIED,
-                &ErrorResponse {
-                    error_context_count: 0,
-                    error_data: Vec::new(),
-                },
-            ));
-        }
         let runtime = Arc::new(
             RuntimeBuilder::new_multi_thread()
                 .worker_threads(1)
@@ -2393,13 +2333,13 @@ mod tests {
                 "test-server",
             )
         });
-        let timeout = {
+        {
             let mock = mock.clone();
             runtime.spawn(async move {
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 mock.close();
-            })
-        };
+            });
+        }
         let config = SmbConnectionConfig {
             host: "127.0.0.1".into(),
             port: 445,
@@ -2423,7 +2363,7 @@ mod tests {
             signing_algorithm: "AES-CMAC".into(),
             encryption_cipher: "AES-128-GCM".into(),
         };
-        let vfs = Arc::new(SmbVfs {
+        let vfs = SmbVfs {
             runtime,
             config,
             secrets: Arc::new(NoSecrets),
@@ -2441,16 +2381,31 @@ mod tests {
                     identity,
                 },
                 generation: 1,
-                capabilities: RemoteCapabilities {
-                    complete_listing: true,
-                    ..RemoteCapabilities::default()
-                },
+                capabilities,
             }),
+        };
+        (vfs, mock)
+    }
+
+    fn mock_response(command: Command, status: NtStatus, body: &dyn smb2::pack::Pack) -> Vec<u8> {
+        let mut header = Header::new_request(command);
+        header.flags.set_response();
+        header.credits = 16;
+        header.status = status;
+        let mut cursor = smb2::pack::WriteCursor::new();
+        header.pack(&mut cursor);
+        body.pack(&mut cursor);
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn gewoehnliche_dateifaehigkeiten_benoetigen_keine_schreibprobe() {
+        let (vfs, mock) = mock_smb_vfs(RemoteCapabilities {
+            complete_listing: true,
+            ..RemoteCapabilities::default()
         });
-        let endpoint = crate::ProviderEndpoint::smb(vfs, Path::new("/")).unwrap();
+        let endpoint = crate::ProviderEndpoint::smb(Arc::new(vfs), Path::new("/")).unwrap();
         let result = endpoint.probe_file_capabilities();
-        timeout.abort();
-        mock.close();
         let capabilities = result.unwrap();
         assert!(capabilities.copy_new);
         assert!(capabilities.replace_best_effort);
@@ -2624,6 +2579,99 @@ mod tests {
     }
 
     #[test]
+    fn smb_rename_und_loeschprobe_erhalten_probe_und_cleanup_fehler() {
+        use smb2::msg::close::CloseResponse;
+        use smb2::msg::create::CreateAction;
+        use smb2::msg::header::ErrorResponse;
+
+        let created = CreateResponse {
+            oplock_level: OplockLevel::None,
+            flags: 0,
+            create_action: CreateAction::FileCreated,
+            creation_time: FileTime(0),
+            last_access_time: FileTime(0),
+            last_write_time: FileTime(0),
+            change_time: FileTime(0),
+            allocation_size: 0,
+            end_of_file: 0,
+            file_attributes: FILE_ATTRIBUTE_DIRECTORY,
+            file_id: FileId {
+                persistent: 1,
+                volatile: 2,
+            },
+            create_contexts: vec![],
+        };
+        let closed = CloseResponse {
+            flags: 0,
+            creation_time: FileTime(0),
+            last_access_time: FileTime(0),
+            last_write_time: FileTime(0),
+            change_time: FileTime(0),
+            allocation_size: 0,
+            end_of_file: 0,
+            file_attributes: FILE_ATTRIBUTE_DIRECTORY,
+        };
+        let rename_probe = SmbVfs::probe_rename_capability_at as fn(&SmbVfs, &Path) -> _;
+        let statuses = [
+            NtStatus::ACCESS_DENIED,
+            NtStatus::OBJECT_NAME_NOT_FOUND,
+            NtStatus::NOT_SUPPORTED,
+        ];
+        for probe in [rename_probe, SmbVfs::probe_delete_capability_at] {
+            let (vfs, mock) = mock_smb_vfs(RemoteCapabilities {
+                complete_listing: true,
+                exclusive_directory_create: true,
+                ..RemoteCapabilities::default()
+            });
+            mock.queue_response(mock_response(Command::Create, NtStatus::SUCCESS, &created));
+            mock.queue_response(mock_response(Command::Close, NtStatus::SUCCESS, &closed));
+            // Erst scheitert die Anlage im Probenordner, dann beide Readbacks.
+            // Ohne eigene bestätigte Kinder darf die Probe den Bestand nicht bereinigen.
+            for status in statuses {
+                mock.queue_response(mock_response(
+                    Command::Create,
+                    status,
+                    &ErrorResponse {
+                        error_context_count: 0,
+                        error_data: vec![],
+                    },
+                ));
+            }
+
+            let error = probe(&vfs, Path::new("/pane")).unwrap_err();
+            assert_eq!(crate::error_code(&error), crate::ErrorCode::OutcomeUnclear);
+            let text = error.to_string();
+            for status in statuses {
+                assert!(text.contains(&status.to_string()), "{text}");
+            }
+            let requests = mock.sent_messages();
+            assert_eq!(requests.len(), 5);
+            let create = |frame: &[u8]| {
+                let mut cursor = ReadCursor::new(frame);
+                assert_eq!(
+                    Header::unpack(&mut cursor).unwrap().command,
+                    Command::Create
+                );
+                CreateRequest::unpack(&mut cursor).unwrap()
+            };
+            let remote_probe = create(&requests[0]).name;
+            assert!(remote_probe.starts_with("pane\\.doppeldecker-"));
+            assert!(create(&requests[2])
+                .name
+                .starts_with(&format!("{remote_probe}\\")));
+            for (frame, path) in [(&requests[3], "pane"), (&requests[4], "")] {
+                let readback = create(frame);
+                assert_eq!(readback.name, path);
+                assert_eq!(readback.create_disposition, CreateDisposition::FileOpen);
+            }
+            let probe_path = format!("/{}", remote_probe.replace('\\', "/"));
+            assert_eq!(crate::error::recovery_paths(&error), [probe_path]);
+            assert!(!vfs.capabilities().atomic_noreplace_rename);
+            assert!(!vfs.capabilities().entry_delete);
+        }
+    }
+
+    #[test]
     fn filetime_liest_auch_zeitpunkte_vor_1970() {
         assert_eq!(filetime_to_unix(0), None);
         assert_eq!(filetime_to_unix(116_444_735_990_000_000), Some(-1));
@@ -2640,47 +2688,160 @@ mod tests {
         );
     }
 
-    /// Die SMB-Löschung darf nur über `delete_with_readback` laufen.
-    ///
-    /// Ohne Readback wäre die Serverantwort der einzige Beleg — und die ist keiner:
-    /// SMB löscht ein mit `FILE_DELETE_ON_CLOSE` geöffnetes Objekt erst, wenn das
-    /// letzte Handle geschlossen ist. Hält ein anderer Client eines, antwortet CLOSE
-    /// mit Erfolg, während die Datei sichtbar bleibt. Ein echter Beweis braucht einen
-    /// Samba-Server; diese Grenze lässt sich aber an der Quelle festhalten.
     #[test]
-    fn jede_smb_loeschung_laeuft_ueber_den_readback() {
-        let quelle = include_str!("smb.rs");
-        // Zusammengesetzt, damit die Suchzeichenkette nicht selbst als Treffer zählt.
-        let aufruf = format!("delete_{}(", "path");
-        let treffer: Vec<&str> = quelle
-            .lines()
-            .filter(|zeile| zeile.contains(&aufruf) && !zeile.trim_start().starts_with("//"))
-            .collect();
-        assert_eq!(
-            treffer.len(),
-            2,
-            "Erwartet: genau die Definition und der eine Aufruf in delete_with_readback, gefunden: {treffer:?}"
-        );
-        assert!(treffer.iter().any(|zeile| zeile.contains("async fn")));
+    fn loeschmethoden_pruefen_die_loeschfaehigkeit_unabhaengig_vom_upload() {
+        let path = Path::new("/../ausserhalb");
+        for entry_delete in [false, true] {
+            let (vfs, _) = mock_smb_vfs(RemoteCapabilities {
+                complete_listing: true,
+                entry_delete,
+                exclusive_create: !entry_delete,
+                verified_file_commit: !entry_delete,
+                ..RemoteCapabilities::default()
+            });
+            assert_eq!(vfs.capabilities().permits_add_only(), !entry_delete);
+            let outside = vfs.remote_path(path).unwrap_err();
+            for result in [
+                vfs.remove_file(path),
+                vfs.remove_dir_all(path),
+                vfs.remove_dir(path),
+            ] {
+                let error = result.unwrap_err();
+                if entry_delete {
+                    assert_eq!(error.kind(), outside.kind());
+                    assert_eq!(error.to_string(), outside.to_string());
+                } else {
+                    assert_eq!(
+                        crate::error_code(&error),
+                        crate::ErrorCode::CapabilityProbeRequired
+                    );
+                }
+            }
+        }
+    }
 
-        // Der Aufruf muss im Rumpf von `delete_with_readback` liegen.
-        let start = quelle
-            .find("fn delete_with_readback(")
-            .expect("delete_with_readback fehlt");
-        let rest = &quelle[start..];
-        let ende = rest
-            .find("\n    fn remove_file_unchecked(")
-            .expect("Folgefunktion fehlt");
-        let rumpf = &rest[..ende];
-        assert!(rumpf.contains(&aufruf));
-        assert!(
-            rumpf.contains("ErrorCode::OutcomeUnclear"),
-            "Ein unbestätigter Readback muss als unklarer Ausgang enden"
-        );
-        assert!(
-            rumpf.contains("io::ErrorKind::NotFound => Ok(())"),
-            "Nur ein echtes NotFound darf als Abwesenheit gelten"
-        );
+    #[test]
+    fn smb_datei_und_ordnerloeschung_verlangen_abwesenheitsreadback() {
+        use smb2::msg::close::CloseResponse;
+        use smb2::msg::create::CreateAction;
+        use smb2::msg::header::ErrorResponse;
+
+        for (directory, type_option, attributes) in [
+            (false, FILE_NON_DIRECTORY_FILE, FILE_ATTRIBUTE_NORMAL),
+            (true, FILE_DIRECTORY_FILE, FILE_ATTRIBUTE_DIRECTORY),
+        ] {
+            let created = CreateResponse {
+                oplock_level: OplockLevel::None,
+                flags: 0,
+                create_action: CreateAction::FileOpened,
+                creation_time: FileTime(0),
+                last_access_time: FileTime(0),
+                last_write_time: FileTime(0),
+                change_time: FileTime(0),
+                allocation_size: 0,
+                end_of_file: 0,
+                file_attributes: attributes,
+                file_id: FileId {
+                    persistent: 1,
+                    volatile: 2,
+                },
+                create_contexts: Vec::new(),
+            };
+            let closed = CloseResponse {
+                flags: 0,
+                creation_time: FileTime(0),
+                last_access_time: FileTime(0),
+                last_write_time: FileTime(0),
+                change_time: FileTime(0),
+                allocation_size: 0,
+                end_of_file: 0,
+                file_attributes: attributes,
+            };
+            let path = Path::new("/pane/entry");
+            for status in [
+                NtStatus::OBJECT_NAME_NOT_FOUND,
+                NtStatus::SUCCESS,
+                NtStatus::ACCESS_DENIED,
+            ] {
+                let (vfs, mock) = mock_smb_vfs(RemoteCapabilities {
+                    complete_listing: true,
+                    entry_delete: true,
+                    ..RemoteCapabilities::default()
+                });
+                mock.queue_response(mock_response(Command::Create, NtStatus::SUCCESS, &created));
+                mock.queue_response(mock_response(Command::Close, NtStatus::SUCCESS, &closed));
+
+                let mut expected = vec![Command::Create, Command::Close, Command::Create];
+                if status == NtStatus::SUCCESS {
+                    mock.queue_response(mock_response(
+                        Command::Create,
+                        NtStatus::SUCCESS,
+                        &created,
+                    ));
+                    let mut basic = vec![0; 40];
+                    basic[32..36].copy_from_slice(&attributes.to_le_bytes());
+                    let mut standard = vec![0; 24];
+                    standard[16..20].copy_from_slice(&1_u32.to_le_bytes());
+                    standard[21] = u8::from(directory);
+                    for output_buffer in [basic, standard, 1_u64.to_le_bytes().to_vec()] {
+                        mock.queue_response(mock_response(
+                            Command::QueryInfo,
+                            NtStatus::SUCCESS,
+                            &QueryInfoResponse { output_buffer },
+                        ));
+                        expected.push(Command::QueryInfo);
+                    }
+                    mock.queue_response(mock_response(Command::Close, NtStatus::SUCCESS, &closed));
+                    expected.push(Command::Close);
+                } else {
+                    mock.queue_response(mock_response(
+                        Command::Create,
+                        status,
+                        &ErrorResponse {
+                            error_context_count: 0,
+                            error_data: Vec::new(),
+                        },
+                    ));
+                }
+
+                let result = if directory {
+                    vfs.remove_dir(path)
+                } else {
+                    vfs.remove_file(path)
+                };
+                if status == NtStatus::OBJECT_NAME_NOT_FOUND {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(crate::error_code(&error), crate::ErrorCode::OutcomeUnclear);
+                    if status == NtStatus::ACCESS_DENIED {
+                        assert!(error.to_string().contains(&status.to_string()), "{error}");
+                    } else {
+                        assert!(error.to_string().contains("weiterhin sichtbar"), "{error}");
+                    }
+                }
+
+                let sent = mock.sent_messages();
+                let commands = sent
+                    .iter()
+                    .map(|frame| Header::unpack(&mut ReadCursor::new(frame)).unwrap().command)
+                    .collect::<Vec<_>>();
+                assert_eq!(commands, expected);
+                for (frame, options) in [
+                    (
+                        &sent[0],
+                        type_option | FILE_OPEN_REPARSE_POINT | FILE_DELETE_ON_CLOSE,
+                    ),
+                    (&sent[2], FILE_OPEN_REPARSE_POINT),
+                ] {
+                    let mut cursor = ReadCursor::new(frame);
+                    Header::unpack(&mut cursor).unwrap();
+                    let request = CreateRequest::unpack(&mut cursor).unwrap();
+                    assert_eq!(request.name, "pane\\entry");
+                    assert_eq!(request.create_options, options);
+                }
+            }
+        }
     }
 
     fn cleanup_entry(name: &str, is_dir: bool) -> SmbListedEntry {

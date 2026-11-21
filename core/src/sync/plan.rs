@@ -1,8 +1,8 @@
 //! Rein lesende Planerstellung und plan-gebundene Metadatenbilanz.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::metadata::{Capability, MetadataCapabilities, MetadataManifest, MetadataProfile};
 use crate::vfs::{Entry, ProofListEntry, Vfs};
@@ -1307,19 +1307,84 @@ fn diff_dir(
     plan: &mut SyncPlan,
 ) -> io::Result<()> {
     let DiffRequest {
+        dst,
+        dst_root,
+        opts,
+        cancel,
+        exclusions,
+        conservative_names,
+        ..
+    } = *request;
+    check_cancel(cancel)?;
+    let (source, target) = observe_directory(request, rel, target_knowledge, plan)?;
+    let names = index_directory_names(&source, &target, conservative_names);
+
+    let mut covered = HashSet::new();
+    for src_item in &source {
+        check_cancel(cancel)?;
+        // Auch ausgelassene Einträge schützen ihren Namen vor einer Mirror-Entfernung.
+        covered.insert(src_item.entry.name.as_str());
+        let Some(pair) = classify_source_entry(request, rel, src_item, &names, plan)? else {
+            continue;
+        };
+        if pair.source.is_dir {
+            reconcile_source_directory(request, pair, hardlinks, plan)?;
+        } else {
+            reconcile_source_file(request, pair, hardlinks, plan)?;
+        }
+    }
+
+    // Überzählige Einträge im Ziel — nur im Mirror-Modus löschen.
+    if opts.mode == SyncMode::Mirror {
+        for de_item in &target {
+            check_cancel(cancel)?;
+            let de = &de_item.entry;
+            if de_item.safely_decoded && covered.contains(de.name.as_str()) {
+                continue;
+            }
+            let child_rel = rel.join(&de.name);
+            // Ein ganzes Zielverzeichnis darf nur dann als eine DeleteDir-Aktion in
+            // die Quarantäne wandern, wenn darin kein bewusst ausgeschlossener
+            // Nachfahre liegt. Andernfalls bleibt der Ordner als Hülle stehen und nur
+            // seine sichtbaren Kinder werden granular geplant.
+            let node = scan_target_only_node(
+                dst,
+                dst_root,
+                child_rel,
+                de_item.clone(),
+                exclusions,
+                cancel,
+            )?;
+            plan_target_only_node(
+                dst,
+                dst_root,
+                opts,
+                &node,
+                plan,
+                cancel,
+                request.ordinary_content,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn observe_directory(
+    request: &DiffRequest<'_>,
+    rel: &Path,
+    target_knowledge: TargetDirKnowledge<'_>,
+    plan: &mut SyncPlan,
+) -> io::Result<(Vec<ProofListEntry>, Vec<ProofListEntry>)> {
+    let DiffRequest {
         src,
         src_root,
         dst,
         dst_root,
         opts,
-        cancel,
-        metadata,
         exclusions,
-        conservative_names,
-        ordinary_content,
-        file_dacl_ready,
+        ..
     } = *request;
-    check_cancel(cancel)?;
     let mut src_entries = complete_listing(src, &src_root.join(rel))?;
     // Mirror bilanziert Ausschlüsse bereits in den beiden Vollscans.
     let report_exclusions = opts.mode != SyncMode::Mirror;
@@ -1363,702 +1428,665 @@ fn diff_dir(
         }
     });
     dst_entries.sort_by(|a, b| a.entry.name.cmp(&b.entry.name));
+    Ok((src_entries, dst_entries))
+}
+
+struct DirectoryNameIndex<'a> {
+    targets: HashMap<&'a str, &'a ProofListEntry>,
+    folded_targets: HashSet<String>,
+    folded_sources: HashMap<String, usize>,
+}
+
+fn index_directory_names<'a>(
+    source: &[ProofListEntry],
+    target: &'a [ProofListEntry],
+    conservative_names: bool,
+) -> DirectoryNameIndex<'a> {
     // Ziel-Einträge nach Namen greifbar machen — nur sicher dekodierte: ein lossy
     // Ziel-Name darf nie mit einem (gültigen) Quellnamen gleichen Strings matchen,
     // sonst würde der Plan den falschen Dateisystem-Eintrag adressieren.
-    let dst_by_name: std::collections::HashMap<&str, &ProofListEntry> = dst_entries
+    let targets: HashMap<&str, &ProofListEntry> = target
         .iter()
         .filter(|e| e.safely_decoded)
         .map(|e| (e.entry.name.as_str(), e))
         .collect();
-    let folded_targets: std::collections::HashSet<_> = dst_entries
+    let folded_targets: HashSet<_> = target
         .iter()
         .filter(|item| item.safely_decoded)
         .map(|item| crate::remote_rename::folded_name(&item.entry.name))
         .collect();
-    let mut folded_sources = std::collections::HashMap::<String, usize>::new();
+    let mut folded_sources = HashMap::<String, usize>::new();
     if conservative_names {
-        for item in src_entries.iter().filter(|item| item.safely_decoded) {
+        for item in source.iter().filter(|item| item.safely_decoded) {
             *folded_sources
                 .entry(crate::remote_rename::folded_name(&item.entry.name))
                 .or_default() += 1;
         }
     }
 
-    // Merken, welche Ziel-Namen die Quelle „abdeckt" — der Rest ist im Mirror-Modus
-    // überzählig und wird gelöscht.
-    let mut covered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    DirectoryNameIndex {
+        targets,
+        folded_targets,
+        folded_sources,
+    }
+}
 
-    for src_item in &src_entries {
-        check_cancel(cancel)?;
-        let se = &src_item.entry;
-        let child_rel = rel.join(&se.name);
-        let child_str = rel_to_string(&child_rel);
+struct SourceEntryPair<'a> {
+    source: &'a Entry,
+    target: Option<&'a ProofListEntry>,
+    relative: PathBuf,
+    path: String,
+}
 
-        // Auch ausgelassene Einträge decken ihren Namen ab. „Überspringen" muss heißen,
-        // dass das gleichnamige Zielobjekt unangetastet bleibt — nicht, dass Mirror es
-        // anschließend als überzählig löscht.
-        covered.insert(se.name.as_str());
-
-        // Nur sicher dekodierte Namen dürfen einander zugeordnet werden. Für diese
-        // Einträge steht das Ziel aber schon vor den Auslassungsprüfungen bereit,
-        // damit auch eine Symlink-/Spezialdateizeile beide Seiten korrekt zeigt.
-        let de_item = src_item
-            .safely_decoded
-            .then(|| dst_by_name.get(se.name.as_str()).copied())
-            .flatten();
-        let de = de_item.map(|item| &item.entry);
-        if file_dacl_ready && metadata.windows_dacl {
-            if let Some(target) = de_item.filter(|target| {
-                target.entry.is_file
-                    && !target.entry.is_symlink
-                    && target.entry.inode.is_some_and(|id| id != 0)
-            }) {
-                let source_metadata = if se.is_file && !se.is_symlink {
-                    Some(src.metadata_manifest(&src_root.join(&child_rel))?)
-                } else {
-                    None
-                };
-                plan.file_dacl_selections
-                    .push(crate::file_dacl::FileDaclSelection {
-                        path: child_str.clone(),
-                        file_id: target.entry.inode.unwrap(),
-                        object_namespace: crate::file_dacl_registry::object_namespace(
-                            &dst.root_identity(dst_root)?,
-                        )?,
-                        target_proof: super::SyncTargetProof::from_listed(target)?,
-                        source_metadata,
-                    });
-            }
+fn classify_source_entry<'a>(
+    request: &DiffRequest<'_>,
+    rel: &Path,
+    src_item: &'a ProofListEntry,
+    names: &DirectoryNameIndex<'a>,
+    plan: &mut SyncPlan,
+) -> io::Result<Option<SourceEntryPair<'a>>> {
+    let DiffRequest {
+        src,
+        src_root,
+        dst,
+        dst_root,
+        metadata,
+        conservative_names,
+        file_dacl_ready,
+        ..
+    } = *request;
+    let se = &src_item.entry;
+    let child_rel = rel.join(&se.name);
+    let child_str = rel_to_string(&child_rel);
+    // Nur sicher dekodierte Namen dürfen einander zugeordnet werden. Für diese
+    // Einträge steht das Ziel aber schon vor den Auslassungsprüfungen bereit,
+    // damit auch eine Symlink-/Spezialdateizeile beide Seiten korrekt zeigt.
+    let de_item = src_item
+        .safely_decoded
+        .then(|| names.targets.get(se.name.as_str()).copied())
+        .flatten();
+    let de = de_item.map(|item| &item.entry);
+    if file_dacl_ready && metadata.windows_dacl {
+        if let Some(target) = de_item.filter(|target| {
+            target.entry.is_file
+                && !target.entry.is_symlink
+                && target.entry.inode.is_some_and(|id| id != 0)
+        }) {
+            let source_metadata = if se.is_file && !se.is_symlink {
+                Some(src.metadata_manifest(&src_root.join(&child_rel))?)
+            } else {
+                None
+            };
+            plan.file_dacl_selections
+                .push(crate::file_dacl::FileDaclSelection {
+                    path: child_str.clone(),
+                    file_id: target.entry.inode.unwrap(),
+                    object_namespace: crate::file_dacl_registry::object_namespace(
+                        &dst.root_identity(dst_root)?,
+                    )?,
+                    target_proof: super::SyncTargetProof::from_listed(target)?,
+                    source_metadata,
+                });
         }
+    }
 
-        // Ein normalisiert zurückgelesener Name ist weder ein freies Ziel noch
-        // eine bestätigte Ersetzung. Den Konflikt sichtbar auslassen, damit
-        // unabhängige Additionen nicht erst nach einem Teilcommit daran scheitern.
-        let folded = crate::remote_rename::folded_name(&se.name);
-        // Exakte lokale Listings beweisen keine Case-Sensitivität. Ein echter
-        // Stat unterscheidet den Alias auf APFS/exFAT vom freien ext4-Namen.
-        let folded_target_collision = src_item.safely_decoded
-            && de_item.is_none()
-            && folded_targets.contains(&folded)
-            && (conservative_names
-                || !dst.has_exact_names()
-                || optional_stat(dst, &dst_root.join(&child_rel))?.is_some());
-        if src_item.safely_decoded
-            && (folded_target_collision
-                || folded_sources.get(&folded).is_some_and(|count| *count > 1))
-        {
+    // Ein normalisiert zurückgelesener Name ist weder ein freies Ziel noch
+    // eine bestätigte Ersetzung. Den Konflikt sichtbar auslassen, damit
+    // unabhängige Additionen nicht erst nach einem Teilcommit daran scheitern.
+    let folded = crate::remote_rename::folded_name(&se.name);
+    // Exakte lokale Listings beweisen keine Case-Sensitivität. Ein echter
+    // Stat unterscheidet den Alias auf APFS/exFAT vom freien ext4-Namen.
+    let folded_target_collision = src_item.safely_decoded
+        && de_item.is_none()
+        && names.folded_targets.contains(&folded)
+        && (conservative_names
+            || !dst.has_exact_names()
+            || optional_stat(dst, &dst_root.join(&child_rel))?.is_some());
+    if src_item.safely_decoded
+        && (folded_target_collision
+            || names
+                .folded_sources
+                .get(&folded)
+                .is_some_and(|count| *count > 1))
+    {
+        push_planned_action(
+            plan,
+            Action::SkipConflict { path: child_str },
+            Some(se),
+            None,
+        );
+        plan.skip_count = plan.skip_count.saturating_add(1);
+        return Ok(None);
+    }
+
+    // Nicht sicher dekodierbare Quellnamen konservativ auslassen, BEVOR sie
+    // gegen die Ziel-Map gematcht werden (siehe Funktionskommentar).
+    if !src_item.safely_decoded {
+        push_planned_action(
+            plan,
+            Action::SkipUnsupported { path: child_str },
+            Some(se),
+            None,
+        );
+        plan.skip_count = plan.skip_count.saturating_add(1);
+        return Ok(None);
+    }
+
+    // Symlinks überspringen (v0.1).
+    if se.is_symlink {
+        push_planned_action(plan, Action::SkipSymlink { path: child_str }, Some(se), de);
+        plan.skip_count = plan.skip_count.saturating_add(1);
+        return Ok(None);
+    }
+    if !se.is_dir && !se.is_file {
+        push_planned_action(
+            plan,
+            Action::SkipUnsupported { path: child_str },
+            Some(se),
+            de,
+        );
+        plan.skip_count = plan.skip_count.saturating_add(1);
+        return Ok(None);
+    }
+
+    // Ziel-Symlinks und andere Spezialdateien werden nie automatisch geöffnet,
+    // verfolgt oder ersetzt. Das verhindert insbesondere Schreibzugriffe außerhalb
+    // einer Sandbox über einen Symlink im Zielbaum.
+    if let Some(d) = de {
+        if d.is_symlink {
             push_planned_action(
                 plan,
-                Action::SkipConflict { path: child_str },
+                Action::SkipSymlink { path: child_str },
                 Some(se),
-                None,
+                Some(d),
             );
             plan.skip_count = plan.skip_count.saturating_add(1);
-            continue;
+            return Ok(None);
         }
-
-        // Nicht sicher dekodierbare Quellnamen konservativ auslassen, BEVOR sie
-        // gegen die Ziel-Map gematcht werden (siehe Funktionskommentar).
-        if !src_item.safely_decoded {
+        if !d.is_dir && !d.is_file {
             push_planned_action(
                 plan,
                 Action::SkipUnsupported { path: child_str },
                 Some(se),
-                None,
+                Some(d),
             );
             plan.skip_count = plan.skip_count.saturating_add(1);
-            continue;
+            return Ok(None);
         }
+    }
 
-        // Symlinks überspringen (v0.1).
-        if se.is_symlink {
-            push_planned_action(plan, Action::SkipSymlink { path: child_str }, Some(se), de);
-            plan.skip_count = plan.skip_count.saturating_add(1);
-            continue;
-        }
-        if !se.is_dir && !se.is_file {
-            push_planned_action(
+    Ok(Some(SourceEntryPair {
+        source: se,
+        target: de_item,
+        relative: child_rel,
+        path: child_str,
+    }))
+}
+
+fn reconcile_source_directory(
+    request: &DiffRequest<'_>,
+    pair: SourceEntryPair<'_>,
+    hardlinks: &mut SourceMetadataPlanState,
+    plan: &mut SyncPlan,
+) -> io::Result<()> {
+    let DiffRequest {
+        src,
+        src_root,
+        dst,
+        dst_root,
+        opts,
+        metadata,
+        ordinary_content,
+        ..
+    } = *request;
+    let SourceEntryPair {
+        source: se,
+        target: de_item,
+        relative: child_rel,
+        path: child_str,
+    } = pair;
+    let de = de_item.map(|item| &item.entry);
+    match de {
+        // Ziel hat gleichnamiges Verzeichnis → hineinabsteigen.
+        Some(d) if d.is_dir => {
+            let action_start = plan.actions.len();
+            diff_dir(
+                request,
+                &child_rel,
+                TargetDirKnowledge::Present(d),
+                hardlinks,
                 plan,
-                Action::SkipUnsupported { path: child_str },
-                Some(se),
-                de,
-            );
-            plan.skip_count = plan.skip_count.saturating_add(1);
-            continue;
-        }
-
-        // Ziel-Symlinks und andere Spezialdateien werden nie automatisch geöffnet,
-        // verfolgt oder ersetzt. Das verhindert insbesondere Schreibzugriffe außerhalb
-        // einer Sandbox über einen Symlink im Zielbaum.
-        if let Some(d) = de {
-            if d.is_symlink {
-                push_planned_action(
-                    plan,
-                    Action::SkipSymlink { path: child_str },
-                    Some(se),
-                    Some(d),
-                );
-                plan.skip_count = plan.skip_count.saturating_add(1);
-                continue;
-            }
-            if !d.is_dir && !d.is_file {
-                push_planned_action(
-                    plan,
-                    Action::SkipUnsupported { path: child_str },
-                    Some(se),
-                    Some(d),
-                );
-                plan.skip_count = plan.skip_count.saturating_add(1);
-                continue;
-            }
-        }
-
-        if se.is_dir {
-            match de {
-                // Ziel hat gleichnamiges Verzeichnis → hineinabsteigen.
-                Some(d) if d.is_dir => {
-                    let action_start = plan.actions.len();
-                    diff_dir(
-                        request,
-                        &child_rel,
-                        TargetDirKnowledge::Present(d),
-                        hardlinks,
-                        plan,
-                    )?;
-                    if opts.mode != SyncMode::AddOnly {
-                        if metadata.collect {
-                            let mut transfer = plan_metadata_transfer(
-                                src,
-                                &src_root.join(&child_rel),
-                                MetadataTarget {
-                                    vfs: dst,
-                                    path: &dst_root.join(&child_rel),
-                                    existing: true,
-                                    relative: &child_str,
-                                },
-                                metadata.for_directory().for_entry(se),
-                                None,
-                                hardlinks,
-                            )?
-                            .ok_or_else(|| {
-                                io::Error::other(
-                                    "Aktivierte Metadatenrichtlinie lieferte kein Manifest",
-                                )
-                            })?;
-                            bind_metadata_observation(plan, hardlinks, &child_str, &transfer)?;
-                            if let Some(streams) = &mut transfer.directory_streams {
-                                streams.target_proof = Some(super::SyncTargetProof::from_listed(
-                                    de_item.expect("Zielordner stammt aus demselben Listing"),
-                                )?);
-                            }
-                            if let Some(crate::windows_dacl::WindowsDaclTransfer::DirectoryExact(
-                                dacl,
-                            )) = &mut transfer.windows_dacl
-                            {
-                                dacl.target_proof = Some(super::SyncTargetProof::from_listed(
-                                    de_item.expect("Zielordner stammt aus demselben Listing"),
-                                )?);
-                                dacl.validate()?;
-                            }
-                            if let Some(issue) = directory_stream_observation_issue(
-                                &child_str,
-                                &transfer,
-                                metadata.observe_source_named_streams,
-                            ) {
-                                plan.metadata_report.issues.push(issue);
-                            }
-                            // Kind-Renames ändern die Ordner-mtime auch dann, wenn
-                            // sie vor dem Lauf bereits gleich war. Den Abschluss
-                            // deshalb samt altem Zielmanifest vorab bestätigen.
-                            let changes_children =
-                                plan.actions[action_start..]
-                                    .iter()
-                                    .any(|action| match action {
-                                        Action::CreateDir { path, .. }
-                                        | Action::CopyFile { path, .. }
-                                        | Action::UpdateFile { path, .. }
-                                        | Action::CreateHardlink { path, .. }
-                                        | Action::DeleteFile { path, .. }
-                                        | Action::DeleteDir { path, .. } => {
-                                            Path::new(path).parent() == Some(child_rel.as_path())
-                                        }
-                                        _ => false,
-                                    });
-                            let has_directory_effect = transfer.owner
-                                || transfer.acl
-                                || transfer.normal_mode
-                                || transfer.special_mode_bits
-                                || transfer.xattrs
-                                || transfer.directory_streams.is_some()
-                                || dst.supports_mtime_write();
-                            if metadata_transfer_differs(&transfer)
-                                || (has_directory_effect
-                                    && ((dst.supports_mtime_write()
-                                        && directory_mtime_differs(se, d, opts))
-                                        || changes_children))
-                            {
-                                plan.bytes_to_transfer = plan.bytes_to_transfer.saturating_add(
-                                    planned_directory_stream_bytes(Some(&transfer)),
-                                );
-                                push_planned_action(
-                                    plan,
-                                    Action::SetDirectoryMetadata {
-                                        path: child_str,
-                                        source_mtime: se.mtime,
-                                        target_mtime: d.mtime,
-                                        metadata: transfer,
-                                    },
-                                    Some(se),
-                                    Some(d),
-                                );
-                                plan.metadata_count = plan.metadata_count.saturating_add(1);
-                            } else {
-                                if let Some(issue) =
-                                    directory_named_stream_issue(&child_str, &transfer)
-                                {
-                                    plan.metadata_report.issues.push(issue);
-                                }
-                                plan.metadata_report
-                                    .issues
-                                    .extend(observed_metadata_issues(&child_str, &transfer, false));
-                            }
-                        } else if let Some(source_mode) =
-                            changed_mode(se, d, metadata.target_mode_writable)
-                        {
-                            push_planned_action(
-                                plan,
-                                Action::SetMode {
-                                    path: child_str,
-                                    source_mode,
-                                    target_mode: d.mode,
-                                    is_dir: true,
-                                    content_hash: None,
-                                },
-                                Some(se),
-                                Some(d),
-                            );
-                            plan.metadata_count = plan.metadata_count.saturating_add(1);
-                        }
-                    }
-                }
-                // Ziel hat gleichnamige DATEI → nicht automatisch destruktiv auflösen.
-                Some(file) => {
-                    push_planned_action(
-                        plan,
-                        Action::SkipConflict { path: child_str },
-                        Some(se),
-                        Some(file),
-                    );
-                    plan.skip_count = plan.skip_count.saturating_add(1);
-                }
-                // Im Ziel nicht vorhanden → Verzeichnis anlegen und rekursiv füllen.
-                None => {
-                    let mut metadata_transfer = plan_metadata_transfer(
+            )?;
+            if opts.mode != SyncMode::AddOnly {
+                if metadata.collect {
+                    let mut transfer = plan_metadata_transfer(
                         src,
                         &src_root.join(&child_rel),
                         MetadataTarget {
                             vfs: dst,
                             path: &dst_root.join(&child_rel),
-                            existing: false,
+                            existing: true,
                             relative: &child_str,
                         },
                         metadata.for_directory().for_entry(se),
                         None,
                         hardlinks,
-                    )?;
-                    if ordinary_content && opts.metadata == MetadataProfile::NativeBestEffort {
-                        if let Some(transfer) = &mut metadata_transfer {
-                            use crate::windows_dacl::{
-                                WindowsDaclOmission as O, WindowsDaclTransfer as T,
-                                WindowsDaclWriteSupport as S,
-                            };
-                            if let Some(crate::metadata::Acl::WindowsDacl(after)) =
-                                &transfer.source.acl
-                            {
-                                // Nur diese zusätzliche Eignungsbeobachtung ist optional.
-                                // Das folgende diff_dir verlangt weiter sein vollständiges Listing.
-                                let eligible = match src.list_complete(&src_root.join(&child_rel)) {
-                                    Ok(listing) if !listing.complete => Err(O::CreatedDirectoryListingUnobserved),
-                                    Ok(listing) => match &transfer.source.named_streams {
-                                        None => Err(O::CreatedDirectoryStreamsUnobserved),
-                                        Some(v) if !v.is_empty() => Err(O::CreatedDirectoryStreamsNonempty),
-                                        Some(_) if listing.entries.is_empty() => Ok(None),
-                                        Some(_) => match crate::created_directory_dacl::CreatedDirectoryChildrenProof::from_listing(&listing) {
-                                            Ok(proof) => Ok(Some(proof)),
-                                            Err(_) => Err(O::CreatedDirectoryListingUnobserved),
-                                        },
-                                    },
-                                    Err(error) if matches!(crate::error_code(&error), crate::ErrorCode::Interrupted | crate::ErrorCode::PlanDrift) => return Err(error),
-                                    Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
-                                        return Err(crate::real_mode::plan_drift("Quellordner verschwand während der zusätzlichen Rechtebeobachtung"))
-                                    }
-                                    Err(_) => Err(O::CreatedDirectoryListingUnobserved),
-                                };
-                                transfer.windows_dacl = Some(match eligible {
-                                    Err(issue) => T::Omitted(issue),
-                                    Ok(children) => {
-                                        match dst.created_directory_dacl_write_support()? {
-                                            S::Unavailable(issue) => T::Omitted(O::Target(issue)),
-                                            S::Ready(context) => {
-                                                let issue = if children.is_some() {
-                                                    after.directory_before_children_write_issue(
-                                                        context.namespace,
-                                                        &context.owner,
-                                                    )
-                                                } else {
-                                                    after.directory_write_issue(
-                                                        context.namespace,
-                                                        &context.owner,
-                                                    )
-                                                };
-                                                match issue {
-                                                Some(issue) => T::Omitted(O::Source(issue)),
-                                                None => match children {
-                                                    None => T::CreatedDirectoryExact(Box::new(crate::created_directory_dacl::CreatedDirectoryDaclSelection {
-                                                        after: after.clone(), probe_context: context,
-                                                    })),
-                                                    Some(source_children) => T::CreatedDirectoryBeforeChildrenExact(Box::new(crate::created_directory_dacl::CreatedDirectoryBeforeChildrenSelection {
-                                                        after: after.clone(), probe_context: context, source_children,
-                                                    })),
-                                                },
-                                            }
-                                            }
-                                        }
-                                    }
-                                });
-                                transfer.acl = matches!(
-                                    transfer.windows_dacl,
-                                    Some(
-                                        T::CreatedDirectoryExact(_)
-                                            | T::CreatedDirectoryBeforeChildrenExact(_)
-                                    )
-                                );
-                            }
-                        }
+                    )?
+                    .ok_or_else(|| {
+                        io::Error::other("Aktivierte Metadatenrichtlinie lieferte kein Manifest")
+                    })?;
+                    bind_metadata_observation(plan, hardlinks, &child_str, &transfer)?;
+                    if let Some(streams) = &mut transfer.directory_streams {
+                        streams.target_proof = Some(super::SyncTargetProof::from_listed(
+                            de_item.expect("Zielordner stammt aus demselben Listing"),
+                        )?);
                     }
-                    if let Some(issue) = metadata_transfer.as_ref().and_then(|transfer| {
-                        directory_stream_observation_issue(
-                            &child_str,
-                            transfer,
-                            metadata.observe_source_named_streams,
-                        )
-                    }) {
+                    if let Some(crate::windows_dacl::WindowsDaclTransfer::DirectoryExact(dacl)) =
+                        &mut transfer.windows_dacl
+                    {
+                        dacl.target_proof = Some(super::SyncTargetProof::from_listed(
+                            de_item.expect("Zielordner stammt aus demselben Listing"),
+                        )?);
+                        dacl.validate()?;
+                    }
+                    if let Some(issue) = directory_stream_observation_issue(
+                        &child_str,
+                        &transfer,
+                        metadata.observe_source_named_streams,
+                    ) {
                         plan.metadata_report.issues.push(issue);
                     }
-                    plan.bytes_to_transfer = plan
-                        .bytes_to_transfer
-                        .saturating_add(planned_directory_stream_bytes(metadata_transfer.as_ref()));
-                    push_planned_action(
-                        plan,
-                        Action::CreateDir {
-                            path: child_str,
-                            source_mode: se.mode.filter(|_| metadata.target_mode_writable),
-                            source_mtime: se.mtime,
-                            metadata: metadata_transfer,
-                        },
-                        Some(se),
-                        None,
-                    );
-                    diff_dir(
-                        request,
-                        &child_rel,
-                        TargetDirKnowledge::Absent,
-                        hardlinks,
-                        plan,
-                    )?;
-                }
-            }
-        } else {
-            // Quelle ist eine Datei.
-            hardlinks.selected_files = hardlinks.selected_files.saturating_add(1).min(2);
-            let hardlink_group = hardlinks.group_for(se, metadata.observe_hardlinks);
-            if let Some((group_id, Some((link_to, anchor_will_replace)))) =
-                hardlink_group.as_ref().filter(|_| metadata.hardlinks)
-            {
-                match de {
-                    Some(d) if d.is_dir => {
+                    // Kind-Renames ändern die Ordner-mtime auch dann, wenn
+                    // sie vor dem Lauf bereits gleich war. Den Abschluss
+                    // deshalb samt altem Zielmanifest vorab bestätigen.
+                    let changes_children =
+                        plan.actions[action_start..]
+                            .iter()
+                            .any(|action| match action {
+                                Action::CreateDir { path, .. }
+                                | Action::CopyFile { path, .. }
+                                | Action::UpdateFile { path, .. }
+                                | Action::CreateHardlink { path, .. }
+                                | Action::DeleteFile { path, .. }
+                                | Action::DeleteDir { path, .. } => {
+                                    Path::new(path).parent() == Some(child_rel.as_path())
+                                }
+                                _ => false,
+                            });
+                    let has_directory_effect = transfer.owner
+                        || transfer.acl
+                        || transfer.normal_mode
+                        || transfer.special_mode_bits
+                        || transfer.xattrs
+                        || transfer.directory_streams.is_some()
+                        || dst.supports_mtime_write();
+                    if metadata_transfer_differs(&transfer)
+                        || (has_directory_effect
+                            && ((dst.supports_mtime_write()
+                                && directory_mtime_differs(se, d, opts))
+                                || changes_children))
+                    {
+                        plan.bytes_to_transfer = plan
+                            .bytes_to_transfer
+                            .saturating_add(planned_directory_stream_bytes(Some(&transfer)));
                         push_planned_action(
                             plan,
-                            Action::SkipConflict { path: child_str },
-                            Some(se),
-                            Some(d),
-                        );
-                        plan.skip_count = plan.skip_count.saturating_add(1);
-                        continue;
-                    }
-                    Some(_) if opts.mode == SyncMode::AddOnly => continue,
-                    _ => {}
-                }
-                if !anchor_will_replace {
-                    if let Some(target) = de {
-                        let anchor = dst.stat(&dst_root.join(link_to))?;
-                        if target.device.is_some()
-                            && (target.device, target.inode) == (anchor.device, anchor.inode)
-                        {
-                            // Der bereits korrekte Alias benötigt keine Aktion,
-                            // behält aber seine konkrete Metadatenauslassung.
-                            plan_metadata_transfer(
-                                src,
-                                &src_root.join(&child_rel),
-                                MetadataTarget {
-                                    vfs: dst,
-                                    path: &dst_root.join(&child_rel),
-                                    existing: true,
-                                    relative: &child_str,
-                                },
-                                metadata.for_entry(se),
-                                Some(*group_id),
-                                hardlinks,
-                            )?;
-                            continue;
-                        }
-                    }
-                }
-                let source_path = src_root.join(&child_rel);
-                let target_path = dst_root.join(&child_rel);
-                let source_hash = plan_file_hash(src, &source_path, se, opts, plan, cancel)?
-                    .ok_or_else(|| io::Error::other("Hardlink-Plan benötigt ContentHash"))?;
-                let target_hash = de
-                    .map(|entry| plan_file_hash(dst, &target_path, entry, opts, plan, cancel))
-                    .transpose()?
-                    .flatten();
-                if let Some(target) = de {
-                    let equal = target_hash.as_deref() == Some(source_hash.as_str());
-                    if !equal && !should_update(se, target, opts, false) {
-                        if opts.mode == SyncMode::Update
-                            && (ordinary_content || se.mtime.is_none() || target.mtime.is_none())
-                        {
-                            push_planned_action(
-                                plan,
-                                Action::SkipConflict { path: child_str },
-                                Some(se),
-                                Some(target),
-                            );
-                            plan.skip_count = plan.skip_count.saturating_add(1);
-                        }
-                        continue;
-                    }
-                }
-                let metadata_transfer = plan_metadata_transfer(
-                    src,
-                    &source_path,
-                    MetadataTarget {
-                        vfs: dst,
-                        path: &target_path,
-                        existing: de.is_some(),
-                        relative: &child_str,
-                    },
-                    metadata.for_entry(se),
-                    Some(*group_id),
-                    hardlinks,
-                )?
-                .ok_or_else(|| io::Error::other("Hardlink-Plan benötigt Metadatenmanifest"))?;
-                hardlinks.observe_manifest_facts(&child_str, &metadata_transfer.source);
-                push_planned_action(
-                    plan,
-                    Action::CreateHardlink {
-                        path: child_str,
-                        link_to: link_to.clone(),
-                        size: se.size,
-                        source_mtime: se.mtime,
-                        source_mode: se.mode,
-                        source_hash,
-                        target_size: de.map(|entry| entry.size),
-                        target_mtime: de.and_then(|entry| entry.mtime),
-                        target_mode: de.and_then(|entry| entry.mode),
-                        target_proof: de_item
-                            .map(super::SyncTargetProof::from_listed)
-                            .transpose()?,
-                        target_hash,
-                        metadata: metadata_transfer,
-                    },
-                    Some(se),
-                    de,
-                );
-                if de.is_some() {
-                    plan.update_count = plan.update_count.saturating_add(1);
-                } else {
-                    plan.copy_count = plan.copy_count.saturating_add(1);
-                }
-                continue;
-            }
-            let group_id = hardlink_group.map(|(id, _)| id);
-            let mut target_will_match = false;
-            let mut target_will_replace = false;
-            match de {
-                // Ziel hat gleichnamige Datei → nur bei Unterschied aktualisieren.
-                Some(d) if !d.is_dir => {
-                    if opts.mode == SyncMode::AddOnly {
-                        continue;
-                    }
-                    let source_path = src_root.join(&child_rel);
-                    let target_path = dst_root.join(&child_rel);
-                    let comparison = compare_existing_files(
-                        FileComparisonRequest {
-                            src,
-                            src_path: &source_path,
-                            src_entry: se,
-                            dst,
-                            dst_path: &target_path,
-                            dst_entry: d,
-                            opts,
-                            cancel,
-                        },
-                        plan,
-                    )?;
-                    let mut metadata_transfer = plan_metadata_transfer(
-                        src,
-                        &source_path,
-                        MetadataTarget {
-                            vfs: dst,
-                            path: &target_path,
-                            existing: true,
-                            relative: &child_str,
-                        },
-                        metadata.for_entry(se),
-                        group_id,
-                        hardlinks,
-                    )?;
-                    if let Some(transfer) = &metadata_transfer {
-                        bind_metadata_observation(plan, hardlinks, &child_str, transfer)?;
-                    }
-                    let metadata_changed = metadata_transfer
-                        .as_ref()
-                        .is_some_and(metadata_transfer_differs);
-                    let metadata_only = comparison.equal && metadata_changed;
-                    if file_dacl_ready && comparison.equal && !metadata_changed {
-                        if let Some(file_plan) = plan_existing_file_dacl(
-                            dst,
-                            dst_root,
-                            &child_str,
-                            de_item.expect("Gelistete Zieldatei"),
-                            metadata_transfer.as_mut(),
-                            comparison.target_hash.as_deref(),
-                        )? {
-                            // Die DACL ist selbst die angeforderte Abweichung. Auch
-                            // bei gleichem Inhalt braucht Update eine bekannte Zeitordnung.
-                            if !should_update(se, d, opts, false) {
-                                push_planned_action(
-                                    plan,
-                                    Action::SkipConflict {
-                                        path: child_str.clone(),
-                                    },
-                                    Some(se),
-                                    Some(d),
-                                );
-                                plan.skip_count = plan.skip_count.saturating_add(1);
-                                continue;
-                            }
-                            if let Some(transfer) = &metadata_transfer {
-                                plan.metadata_report
-                                    .issues
-                                    .extend(sparse_metadata_issues(&child_str, transfer, false));
-                            }
-                            push_planned_action(
-                                plan,
-                                Action::SetFileDacl {
-                                    path: child_str.clone(),
-                                    source_hash: comparison.source_hash.clone().ok_or_else(
-                                        || io::Error::other("Datei-DACL benötigt ContentHash"),
-                                    )?,
-                                    source_metadata: metadata_transfer
-                                        .as_ref()
-                                        .unwrap()
-                                        .source
-                                        .clone(),
-                                    plan: file_plan,
-                                },
-                                Some(se),
-                                Some(d),
-                            );
-                            plan.metadata_count = plan.metadata_count.saturating_add(1);
-                            continue;
-                        }
-                    }
-                    let fork_bytes = planned_fork_bytes(metadata_transfer.as_ref());
-                    if should_update(se, d, opts, comparison.equal && !metadata_changed) {
-                        push_planned_action(
-                            plan,
-                            Action::UpdateFile {
-                                path: child_str.clone(),
-                                size: se.size,
+                            Action::SetDirectoryMetadata {
+                                path: child_str,
                                 source_mtime: se.mtime,
-                                source_mode: se.mode,
-                                target_size: d.size,
                                 target_mtime: d.mtime,
-                                target_mode: d.mode,
-                                target_proof: super::SyncTargetProof::from_listed(
-                                    de_item.expect("Zieldatei stammt aus demselben Listing"),
-                                )?,
-                                source_hash: comparison.source_hash,
-                                target_hash: comparison.target_hash,
-                                metadata_only,
-                                metadata: metadata_transfer,
+                                metadata: transfer,
                             },
                             Some(se),
                             Some(d),
                         );
-                        plan.update_count = plan.update_count.saturating_add(1);
-                        if metadata_only {
-                            plan.metadata_count = plan.metadata_count.saturating_add(1);
+                        plan.metadata_count = plan.metadata_count.saturating_add(1);
+                    } else {
+                        if let Some(issue) = directory_named_stream_issue(&child_str, &transfer) {
+                            plan.metadata_report.issues.push(issue);
                         }
-                        plan.bytes_to_transfer = plan
-                            .bytes_to_transfer
-                            .saturating_add(se.size.saturating_add(fork_bytes));
-                        target_will_match = true;
-                        target_will_replace = true;
-                    } else if comparison.equal && !metadata_changed {
-                        target_will_match = true;
-                        if let Some(transfer) = &mut metadata_transfer {
-                            if matches!(
-                                transfer.windows_dacl,
-                                Some(crate::windows_dacl::WindowsDaclTransfer::Exact(_))
-                            ) {
-                                transfer.acl = false;
-                                transfer.windows_dacl =
-                                    Some(crate::windows_dacl::WindowsDaclTransfer::Omitted(
-                                        crate::windows_dacl::WindowsDaclOmission::AclOnlyChange,
-                                    ));
-                            }
-                        }
-                        if let Some(transfer) = &metadata_transfer {
-                            plan.metadata_report
-                                .issues
-                                .extend(observed_metadata_issues(&child_str, transfer, false));
-                        }
-                        if metadata_transfer.as_ref().is_some_and(|transfer| {
-                            !transfer.named_streams && observed_named_streams_differ(transfer)
-                        }) {
-                            plan.metadata_report.issues.push(MetadataIssue {
-                                path: child_str.clone(),
-                                class: MetadataClass::NamedStreams,
-                                kind: MetadataIssueKind::Unsupported,
-                                reason: "Der Zieladapter bietet keinen geprüften Schreibzugriff auf benannte Datenströme. Der gleiche Hauptinhalt wird nicht erneut kopiert; vorhandene Zielströme bleiben unverändert".into(),
-                            });
-                        }
-                        if let Some(source_mode) =
-                            changed_mode(se, d, metadata.target_mode_writable)
-                        {
-                            push_planned_action(
-                                plan,
-                                Action::SetMode {
-                                    path: child_str.clone(),
-                                    source_mode,
-                                    target_mode: d.mode,
-                                    is_dir: false,
-                                    content_hash: comparison.source_hash,
+                        plan.metadata_report
+                            .issues
+                            .extend(observed_metadata_issues(&child_str, &transfer, false));
+                    }
+                } else if let Some(source_mode) = changed_mode(se, d, metadata.target_mode_writable)
+                {
+                    push_planned_action(
+                        plan,
+                        Action::SetMode {
+                            path: child_str,
+                            source_mode,
+                            target_mode: d.mode,
+                            is_dir: true,
+                            content_hash: None,
+                        },
+                        Some(se),
+                        Some(d),
+                    );
+                    plan.metadata_count = plan.metadata_count.saturating_add(1);
+                }
+            }
+        }
+        // Ziel hat gleichnamige DATEI → nicht automatisch destruktiv auflösen.
+        Some(file) => {
+            push_planned_action(
+                plan,
+                Action::SkipConflict { path: child_str },
+                Some(se),
+                Some(file),
+            );
+            plan.skip_count = plan.skip_count.saturating_add(1);
+        }
+        // Im Ziel nicht vorhanden → Verzeichnis anlegen und rekursiv füllen.
+        None => {
+            let mut metadata_transfer = plan_metadata_transfer(
+                src,
+                &src_root.join(&child_rel),
+                MetadataTarget {
+                    vfs: dst,
+                    path: &dst_root.join(&child_rel),
+                    existing: false,
+                    relative: &child_str,
+                },
+                metadata.for_directory().for_entry(se),
+                None,
+                hardlinks,
+            )?;
+            if ordinary_content && opts.metadata == MetadataProfile::NativeBestEffort {
+                if let Some(transfer) = &mut metadata_transfer {
+                    use crate::windows_dacl::{
+                        WindowsDaclOmission as O, WindowsDaclTransfer as T,
+                        WindowsDaclWriteSupport as S,
+                    };
+                    if let Some(crate::metadata::Acl::WindowsDacl(after)) = &transfer.source.acl {
+                        // Nur diese zusätzliche Eignungsbeobachtung ist optional.
+                        // Das folgende diff_dir verlangt weiter sein vollständiges Listing.
+                        let eligible = match src.list_complete(&src_root.join(&child_rel)) {
+                            Ok(listing) if !listing.complete => Err(O::CreatedDirectoryListingUnobserved),
+                            Ok(listing) => match &transfer.source.named_streams {
+                                None => Err(O::CreatedDirectoryStreamsUnobserved),
+                                Some(v) if !v.is_empty() => Err(O::CreatedDirectoryStreamsNonempty),
+                                Some(_) if listing.entries.is_empty() => Ok(None),
+                                Some(_) => match crate::created_directory_dacl::CreatedDirectoryChildrenProof::from_listing(&listing) {
+                                    Ok(proof) => Ok(Some(proof)),
+                                    Err(_) => Err(O::CreatedDirectoryListingUnobserved),
                                 },
-                                Some(se),
-                                Some(d),
-                            );
-                            plan.metadata_count = plan.metadata_count.saturating_add(1);
-                        }
-                    } else if opts.mode == SyncMode::Update
-                        && (ordinary_content || se.mtime.is_none() || d.mtime.is_none())
-                    {
-                        // Ein abweichender Inhalt ohne zeitliche Versionsordnung
-                        // ist eine offene Entscheidung, kein unverändertes Paar.
+                            },
+                            Err(error) if matches!(crate::error_code(&error), crate::ErrorCode::Interrupted | crate::ErrorCode::PlanDrift) => return Err(error),
+                            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+                                return Err(crate::real_mode::plan_drift("Quellordner verschwand während der zusätzlichen Rechtebeobachtung"))
+                            }
+                            Err(_) => Err(O::CreatedDirectoryListingUnobserved),
+                        };
+                        transfer.windows_dacl = Some(match eligible {
+                            Err(issue) => T::Omitted(issue),
+                            Ok(children) => match dst.created_directory_dacl_write_support()? {
+                                S::Unavailable(issue) => T::Omitted(O::Target(issue)),
+                                S::Ready(context) => {
+                                    let issue = if children.is_some() {
+                                        after.directory_before_children_write_issue(
+                                            context.namespace,
+                                            &context.owner,
+                                        )
+                                    } else {
+                                        after.directory_write_issue(
+                                            context.namespace,
+                                            &context.owner,
+                                        )
+                                    };
+                                    match issue {
+                                        Some(issue) => T::Omitted(O::Source(issue)),
+                                        None => match children {
+                                            None => T::CreatedDirectoryExact(Box::new(crate::created_directory_dacl::CreatedDirectoryDaclSelection {
+                                                after: after.clone(), probe_context: context,
+                                            })),
+                                            Some(source_children) => T::CreatedDirectoryBeforeChildrenExact(Box::new(crate::created_directory_dacl::CreatedDirectoryBeforeChildrenSelection {
+                                                after: after.clone(), probe_context: context, source_children,
+                                            })),
+                                        },
+                                    }
+                                }
+                            },
+                        });
+                        transfer.acl = matches!(
+                            transfer.windows_dacl,
+                            Some(
+                                T::CreatedDirectoryExact(_)
+                                    | T::CreatedDirectoryBeforeChildrenExact(_)
+                            )
+                        );
+                    }
+                }
+            }
+            if let Some(issue) = metadata_transfer.as_ref().and_then(|transfer| {
+                directory_stream_observation_issue(
+                    &child_str,
+                    transfer,
+                    metadata.observe_source_named_streams,
+                )
+            }) {
+                plan.metadata_report.issues.push(issue);
+            }
+            plan.bytes_to_transfer = plan
+                .bytes_to_transfer
+                .saturating_add(planned_directory_stream_bytes(metadata_transfer.as_ref()));
+            push_planned_action(
+                plan,
+                Action::CreateDir {
+                    path: child_str,
+                    source_mode: se.mode.filter(|_| metadata.target_mode_writable),
+                    source_mtime: se.mtime,
+                    metadata: metadata_transfer,
+                },
+                Some(se),
+                None,
+            );
+            diff_dir(
+                request,
+                &child_rel,
+                TargetDirKnowledge::Absent,
+                hardlinks,
+                plan,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_source_file(
+    request: &DiffRequest<'_>,
+    pair: SourceEntryPair<'_>,
+    hardlinks: &mut SourceMetadataPlanState,
+    plan: &mut SyncPlan,
+) -> io::Result<()> {
+    let DiffRequest {
+        src,
+        src_root,
+        dst,
+        dst_root,
+        opts,
+        cancel,
+        metadata,
+        ordinary_content,
+        file_dacl_ready,
+        ..
+    } = *request;
+    let SourceEntryPair {
+        source: se,
+        target: de_item,
+        relative: child_rel,
+        path: child_str,
+    } = pair;
+    let de = de_item.map(|item| &item.entry);
+    // Quelle ist eine Datei.
+    hardlinks.selected_files = hardlinks.selected_files.saturating_add(1).min(2);
+    let hardlink_group = hardlinks.group_for(se, metadata.observe_hardlinks);
+    if let Some((group_id, Some((link_to, anchor_will_replace)))) =
+        hardlink_group.as_ref().filter(|_| metadata.hardlinks)
+    {
+        match de {
+            Some(d) if d.is_dir => {
+                push_planned_action(
+                    plan,
+                    Action::SkipConflict { path: child_str },
+                    Some(se),
+                    Some(d),
+                );
+                plan.skip_count = plan.skip_count.saturating_add(1);
+                return Ok(());
+            }
+            Some(_) if opts.mode == SyncMode::AddOnly => return Ok(()),
+            _ => {}
+        }
+        if !anchor_will_replace {
+            if let Some(target) = de {
+                let anchor = dst.stat(&dst_root.join(link_to))?;
+                if target.device.is_some()
+                    && (target.device, target.inode) == (anchor.device, anchor.inode)
+                {
+                    // Der bereits korrekte Alias benötigt keine Aktion,
+                    // behält aber seine konkrete Metadatenauslassung.
+                    plan_metadata_transfer(
+                        src,
+                        &src_root.join(&child_rel),
+                        MetadataTarget {
+                            vfs: dst,
+                            path: &dst_root.join(&child_rel),
+                            existing: true,
+                            relative: &child_str,
+                        },
+                        metadata.for_entry(se),
+                        Some(*group_id),
+                        hardlinks,
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        let source_path = src_root.join(&child_rel);
+        let target_path = dst_root.join(&child_rel);
+        let source_hash = plan_file_hash(src, &source_path, se, opts, plan, cancel)?
+            .ok_or_else(|| io::Error::other("Hardlink-Plan benötigt ContentHash"))?;
+        let target_hash = de
+            .map(|entry| plan_file_hash(dst, &target_path, entry, opts, plan, cancel))
+            .transpose()?
+            .flatten();
+        if let Some(target) = de {
+            let equal = target_hash.as_deref() == Some(source_hash.as_str());
+            if !equal && !should_update(se, target, opts, false) {
+                if opts.mode == SyncMode::Update
+                    && (ordinary_content || se.mtime.is_none() || target.mtime.is_none())
+                {
+                    push_planned_action(
+                        plan,
+                        Action::SkipConflict { path: child_str },
+                        Some(se),
+                        Some(target),
+                    );
+                    plan.skip_count = plan.skip_count.saturating_add(1);
+                }
+                return Ok(());
+            }
+        }
+        let metadata_transfer = plan_metadata_transfer(
+            src,
+            &source_path,
+            MetadataTarget {
+                vfs: dst,
+                path: &target_path,
+                existing: de.is_some(),
+                relative: &child_str,
+            },
+            metadata.for_entry(se),
+            Some(*group_id),
+            hardlinks,
+        )?
+        .ok_or_else(|| io::Error::other("Hardlink-Plan benötigt Metadatenmanifest"))?;
+        hardlinks.observe_manifest_facts(&child_str, &metadata_transfer.source);
+        push_planned_action(
+            plan,
+            Action::CreateHardlink {
+                path: child_str,
+                link_to: link_to.clone(),
+                size: se.size,
+                source_mtime: se.mtime,
+                source_mode: se.mode,
+                source_hash,
+                target_size: de.map(|entry| entry.size),
+                target_mtime: de.and_then(|entry| entry.mtime),
+                target_mode: de.and_then(|entry| entry.mode),
+                target_proof: de_item
+                    .map(super::SyncTargetProof::from_listed)
+                    .transpose()?,
+                target_hash,
+                metadata: metadata_transfer,
+            },
+            Some(se),
+            de,
+        );
+        if de.is_some() {
+            plan.update_count = plan.update_count.saturating_add(1);
+        } else {
+            plan.copy_count = plan.copy_count.saturating_add(1);
+        }
+        return Ok(());
+    }
+    let group_id = hardlink_group.map(|(id, _)| id);
+    let mut target_will_match = false;
+    let mut target_will_replace = false;
+    match de {
+        // Ziel hat gleichnamige Datei → nur bei Unterschied aktualisieren.
+        Some(d) if !d.is_dir => {
+            if opts.mode == SyncMode::AddOnly {
+                return Ok(());
+            }
+            let source_path = src_root.join(&child_rel);
+            let target_path = dst_root.join(&child_rel);
+            let comparison = compare_existing_files(
+                FileComparisonRequest {
+                    src,
+                    src_path: &source_path,
+                    src_entry: se,
+                    dst,
+                    dst_path: &target_path,
+                    dst_entry: d,
+                    opts,
+                    cancel,
+                },
+                plan,
+            )?;
+            let mut metadata_transfer = plan_metadata_transfer(
+                src,
+                &source_path,
+                MetadataTarget {
+                    vfs: dst,
+                    path: &target_path,
+                    existing: true,
+                    relative: &child_str,
+                },
+                metadata.for_entry(se),
+                group_id,
+                hardlinks,
+            )?;
+            if let Some(transfer) = &metadata_transfer {
+                bind_metadata_observation(plan, hardlinks, &child_str, transfer)?;
+            }
+            let metadata_changed = metadata_transfer
+                .as_ref()
+                .is_some_and(metadata_transfer_differs);
+            let metadata_only = comparison.equal && metadata_changed;
+            if file_dacl_ready && comparison.equal && !metadata_changed {
+                if let Some(file_plan) = plan_existing_file_dacl(
+                    dst,
+                    dst_root,
+                    &child_str,
+                    de_item.expect("Gelistete Zieldatei"),
+                    metadata_transfer.as_mut(),
+                    comparison.target_hash.as_deref(),
+                )? {
+                    // Die DACL ist selbst die angeforderte Abweichung. Auch
+                    // bei gleichem Inhalt braucht Update eine bekannte Zeitordnung.
+                    if !should_update(se, d, opts, false) {
                         push_planned_action(
                             plan,
                             Action::SkipConflict {
@@ -2068,101 +2096,179 @@ fn diff_dir(
                             Some(d),
                         );
                         plan.skip_count = plan.skip_count.saturating_add(1);
+                        return Ok(());
                     }
-                }
-                // Ziel hat gleichnamiges VERZEICHNIS → nicht automatisch rekursiv löschen.
-                Some(dir) => {
-                    push_planned_action(
-                        plan,
-                        Action::SkipConflict {
-                            path: child_str.clone(),
-                        },
-                        Some(se),
-                        Some(dir),
-                    );
-                    plan.skip_count = plan.skip_count.saturating_add(1);
-                }
-                // Im Ziel nicht vorhanden → neu kopieren.
-                None => {
-                    let source_hash =
-                        plan_file_hash(src, &src_root.join(&child_rel), se, opts, plan, cancel)?;
-                    let metadata_transfer = plan_metadata_transfer(
-                        src,
-                        &src_root.join(&child_rel),
-                        MetadataTarget {
-                            vfs: dst,
-                            path: &dst_root.join(&child_rel),
-                            existing: false,
-                            relative: &child_str,
-                        },
-                        metadata.for_entry(se),
-                        group_id,
-                        hardlinks,
-                    )?;
                     if let Some(transfer) = &metadata_transfer {
-                        hardlinks.observe_manifest_facts(&child_str, &transfer.source);
+                        plan.metadata_report
+                            .issues
+                            .extend(sparse_metadata_issues(&child_str, transfer, false));
                     }
-                    let fork_bytes = planned_fork_bytes(metadata_transfer.as_ref());
                     push_planned_action(
                         plan,
-                        Action::CopyFile {
+                        Action::SetFileDacl {
                             path: child_str.clone(),
-                            size: se.size,
-                            source_mtime: se.mtime,
-                            source_mode: se.mode,
-                            source_hash,
-                            metadata: metadata_transfer,
+                            source_hash: comparison.source_hash.clone().ok_or_else(|| {
+                                io::Error::other("Datei-DACL benötigt ContentHash")
+                            })?,
+                            source_metadata: metadata_transfer.as_ref().unwrap().source.clone(),
+                            plan: file_plan,
                         },
                         Some(se),
-                        None,
+                        Some(d),
                     );
-                    plan.copy_count = plan.copy_count.saturating_add(1);
-                    plan.bytes_to_transfer = plan
-                        .bytes_to_transfer
-                        .saturating_add(se.size.saturating_add(fork_bytes));
-                    target_will_match = true;
-                    target_will_replace = true;
+                    plan.metadata_count = plan.metadata_count.saturating_add(1);
+                    return Ok(());
                 }
             }
-            if target_will_match && group_id.is_some() {
-                hardlinks.set_anchor(se, child_str, target_will_replace);
+            let fork_bytes = planned_fork_bytes(metadata_transfer.as_ref());
+            if should_update(se, d, opts, comparison.equal && !metadata_changed) {
+                push_planned_action(
+                    plan,
+                    Action::UpdateFile {
+                        path: child_str.clone(),
+                        size: se.size,
+                        source_mtime: se.mtime,
+                        source_mode: se.mode,
+                        target_size: d.size,
+                        target_mtime: d.mtime,
+                        target_mode: d.mode,
+                        target_proof: super::SyncTargetProof::from_listed(
+                            de_item.expect("Zieldatei stammt aus demselben Listing"),
+                        )?,
+                        source_hash: comparison.source_hash,
+                        target_hash: comparison.target_hash,
+                        metadata_only,
+                        metadata: metadata_transfer,
+                    },
+                    Some(se),
+                    Some(d),
+                );
+                plan.update_count = plan.update_count.saturating_add(1);
+                if metadata_only {
+                    plan.metadata_count = plan.metadata_count.saturating_add(1);
+                }
+                plan.bytes_to_transfer = plan
+                    .bytes_to_transfer
+                    .saturating_add(se.size.saturating_add(fork_bytes));
+                target_will_match = true;
+                target_will_replace = true;
+            } else if comparison.equal && !metadata_changed {
+                target_will_match = true;
+                if let Some(transfer) = &mut metadata_transfer {
+                    if matches!(
+                        transfer.windows_dacl,
+                        Some(crate::windows_dacl::WindowsDaclTransfer::Exact(_))
+                    ) {
+                        transfer.acl = false;
+                        transfer.windows_dacl =
+                            Some(crate::windows_dacl::WindowsDaclTransfer::Omitted(
+                                crate::windows_dacl::WindowsDaclOmission::AclOnlyChange,
+                            ));
+                    }
+                }
+                if let Some(transfer) = &metadata_transfer {
+                    plan.metadata_report
+                        .issues
+                        .extend(observed_metadata_issues(&child_str, transfer, false));
+                }
+                if metadata_transfer.as_ref().is_some_and(|transfer| {
+                    !transfer.named_streams && observed_named_streams_differ(transfer)
+                }) {
+                    plan.metadata_report.issues.push(MetadataIssue {
+                        path: child_str.clone(),
+                        class: MetadataClass::NamedStreams,
+                        kind: MetadataIssueKind::Unsupported,
+                        reason: "Der Zieladapter bietet keinen geprüften Schreibzugriff auf benannte Datenströme. Der gleiche Hauptinhalt wird nicht erneut kopiert; vorhandene Zielströme bleiben unverändert".into(),
+                    });
+                }
+                if let Some(source_mode) = changed_mode(se, d, metadata.target_mode_writable) {
+                    push_planned_action(
+                        plan,
+                        Action::SetMode {
+                            path: child_str.clone(),
+                            source_mode,
+                            target_mode: d.mode,
+                            is_dir: false,
+                            content_hash: comparison.source_hash,
+                        },
+                        Some(se),
+                        Some(d),
+                    );
+                    plan.metadata_count = plan.metadata_count.saturating_add(1);
+                }
+            } else if opts.mode == SyncMode::Update
+                && (ordinary_content || se.mtime.is_none() || d.mtime.is_none())
+            {
+                // Ein abweichender Inhalt ohne zeitliche Versionsordnung
+                // ist eine offene Entscheidung, kein unverändertes Paar.
+                push_planned_action(
+                    plan,
+                    Action::SkipConflict {
+                        path: child_str.clone(),
+                    },
+                    Some(se),
+                    Some(d),
+                );
+                plan.skip_count = plan.skip_count.saturating_add(1);
             }
         }
-    }
-
-    // Überzählige Einträge im Ziel — nur im Mirror-Modus löschen.
-    if opts.mode == SyncMode::Mirror {
-        for de_item in &dst_entries {
-            check_cancel(cancel)?;
-            let de = &de_item.entry;
-            if covered.contains(de.name.as_str()) {
-                continue;
-            }
-            let child_rel = rel.join(&de.name);
-            // Ein ganzes Zielverzeichnis darf nur dann als eine DeleteDir-Aktion in
-            // die Quarantäne wandern, wenn darin kein bewusst ausgeschlossener
-            // Nachfahre liegt. Andernfalls bleibt der Ordner als Hülle stehen und nur
-            // seine sichtbaren Kinder werden granular geplant.
-            let node = scan_target_only_node(
-                dst,
-                dst_root,
-                child_rel,
-                de_item.clone(),
-                exclusions,
-                cancel,
-            )?;
-            plan_target_only_node(
-                dst,
-                dst_root,
-                opts,
-                &node,
+        // Ziel hat gleichnamiges VERZEICHNIS → nicht automatisch rekursiv löschen.
+        Some(dir) => {
+            push_planned_action(
                 plan,
-                cancel,
-                request.ordinary_content,
+                Action::SkipConflict {
+                    path: child_str.clone(),
+                },
+                Some(se),
+                Some(dir),
+            );
+            plan.skip_count = plan.skip_count.saturating_add(1);
+        }
+        // Im Ziel nicht vorhanden → neu kopieren.
+        None => {
+            let source_hash =
+                plan_file_hash(src, &src_root.join(&child_rel), se, opts, plan, cancel)?;
+            let metadata_transfer = plan_metadata_transfer(
+                src,
+                &src_root.join(&child_rel),
+                MetadataTarget {
+                    vfs: dst,
+                    path: &dst_root.join(&child_rel),
+                    existing: false,
+                    relative: &child_str,
+                },
+                metadata.for_entry(se),
+                group_id,
+                hardlinks,
             )?;
+            if let Some(transfer) = &metadata_transfer {
+                hardlinks.observe_manifest_facts(&child_str, &transfer.source);
+            }
+            let fork_bytes = planned_fork_bytes(metadata_transfer.as_ref());
+            push_planned_action(
+                plan,
+                Action::CopyFile {
+                    path: child_str.clone(),
+                    size: se.size,
+                    source_mtime: se.mtime,
+                    source_mode: se.mode,
+                    source_hash,
+                    metadata: metadata_transfer,
+                },
+                Some(se),
+                None,
+            );
+            plan.copy_count = plan.copy_count.saturating_add(1);
+            plan.bytes_to_transfer = plan
+                .bytes_to_transfer
+                .saturating_add(se.size.saturating_add(fork_bytes));
+            target_will_match = true;
+            target_will_replace = true;
         }
     }
-
+    if target_will_match && group_id.is_some() {
+        hardlinks.set_anchor(se, child_str, target_will_replace);
+    }
     Ok(())
 }
 
@@ -2175,6 +2281,7 @@ struct TargetOnlyNode {
     item: ProofListEntry,
     children: Vec<TargetOnlyNode>,
     contains_excluded: bool,
+    contains_undecodable: bool,
     entries: u64,
     bytes: u64,
 }
@@ -2198,6 +2305,7 @@ fn scan_target_only_node(
         relative,
         children: Vec::new(),
         contains_excluded: false,
+        contains_undecodable: !item.safely_decoded,
         entries: 1,
         bytes,
         item,
@@ -2214,6 +2322,7 @@ fn scan_target_only_node(
             let child =
                 scan_target_only_node(dst, dst_root, child_relative, child, exclusions, cancel)?;
             node.contains_excluded |= child.contains_excluded;
+            node.contains_undecodable |= child.contains_undecodable;
             node.entries = node.entries.saturating_add(child.entries);
             node.bytes = node.bytes.saturating_add(child.bytes);
             node.children.push(child);
@@ -2247,7 +2356,7 @@ fn plan_target_only_node(
     } else if entry.is_dir {
         let unavailable =
             ordinary_content && dst.best_effort_permanent_delete_blocker(true).is_some();
-        if node.contains_excluded || unavailable {
+        if node.contains_excluded || node.contains_undecodable || unavailable {
             for child in &node.children {
                 plan_target_only_node(dst, dst_root, opts, child, plan, cancel, ordinary_content)?;
             }

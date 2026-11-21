@@ -93,4 +93,50 @@ mod tests {
         assert!(serde_json::from_value::<FinderTagEditRequest>(invalid).is_err());
         assert!(require_local("sftp").is_err());
     }
+
+    #[test]
+    fn file_property_wire_tags() {
+        use doppeldecker_core::file_properties::{FinderTag, FinderTagState};
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/file-property-wire.json"))
+                .unwrap();
+        let fixture = &fixture["tags"];
+        let read: FinderTagReadRequest =
+            serde_json::from_value(fixture["read"]["request"].clone()).unwrap();
+        let edit: FinderTagEditRequest =
+            serde_json::from_value(fixture["edit"]["request"].clone()).unwrap();
+        assert_eq!(read.names, edit.names);
+        let read = FinderTagReadRow {
+            name: read.names[0].clone(),
+            state: Some(FinderTagState {
+                tags: vec![
+                    FinderTag {
+                        name: "Projekt <b>".into(),
+                        color: 4,
+                    },
+                    FinderTag {
+                        name: "Archiv".into(),
+                        color: 0,
+                    },
+                ],
+                legacy_color: 6,
+            }),
+            code: None,
+            message: String::new(),
+        };
+        let edit = FinderTagEditRow {
+            name: edit.names[0].clone(),
+            changed: false,
+            code: None,
+            message: "Tags bestätigt".into(),
+        };
+        assert_eq!(
+            serde_json::to_value([read]).unwrap(),
+            fixture["read"]["rows"]
+        );
+        assert_eq!(
+            serde_json::to_value([edit]).unwrap(),
+            fixture["edit"]["rows"]
+        );
+    }
 }

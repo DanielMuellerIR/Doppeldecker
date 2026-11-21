@@ -2,6 +2,7 @@ import { confirmContentSync, contentSyncPlanPresentation, identityDisplay } from
 import { fingerprint } from "./connections-ui.js";
 import { hideModal, showOwnedModal } from "./modal.js";
 import { syncExclusionReportHtml } from "./plan-view.js";
+import { remoteSyncCommands } from "./provider-command-names.js";
 import { invoke } from "./tauri-api.js";
 import { $, digestHex, escapeHtml, fmtTransferBytes } from "./ui-utils.js";
 
@@ -34,8 +35,56 @@ function mountSummary(identity) {
   return `${mount.fs_type} · Mount ${mount.mount_id}${volume} · Flags 0x${Number(mount.mount_flags).toString(16)}`;
 }
 
+/** @typedef {import("./real-mode-wire.js").RemoteSyncContext} RemoteSyncContext */
+/** @typedef {import("./real-mode-wire.js").RemoteSyncPreparationRequest} RemoteSyncPreparationRequest */
+/** @typedef {import("./real-mode-wire.js").PreparedRemoteSyncWire} PreparedRemoteSyncWire */
+/** @typedef {import("./real-mode-wire.js").PreparedRealModeWire} PreparedRealModeWire */
+/** @typedef {import("./real-mode-wire.js").RealRunPreviewWire} RealRunPreviewWire */
+/** @typedef {import("./real-mode-wire.js").ContentSyncPreviewWire} ContentSyncPreviewWire */
+/** @typedef {import("./local-sync-wire.js").SyncOptionsWire} SyncOptionsWire */
+
+/**
+ * @param {RemoteSyncContext} remote
+ * @param {SyncOptionsWire} options
+ * @returns {RemoteSyncPreparationRequest}
+ */
+function remotePreparationRequest(remote, options) {
+  const { protocol } = remote;
+  if (protocol === "content" || protocol === "provider") {
+    return { protocol, request: { source: remote.source, target: remote.target, options } };
+  }
+  const { profileId, profileRevision, direction, localRoot, remoteRoot } = remote;
+  return { protocol, request: { profileId, profileRevision, direction, localRoot, remoteRoot, options } };
+}
+
+/**
+ * @param {RemoteSyncPreparationRequest} preparation
+ * @returns {Promise<PreparedRemoteSyncWire>}
+ */
+async function prepareRemote({ protocol, request }) {
+  if (protocol === "content") {
+    return { protocol, preview: await invoke("prepare_content_sync", { request }) };
+  }
+  if (protocol === "provider") {
+    return { protocol, preview: await invoke("prepare_provider_sync", { request }) };
+  }
+  return { protocol, preview: await invoke(remoteSyncCommands(protocol).prepare, { request }) };
+}
+
 /** Verwaltet ausschließlich den sichtbaren Realmodus-Assistenten und dessen
- * kurzlebigen Frontendzustand. Das nicht serialisierbare Permit bleibt im Backend. */
+ * kurzlebigen Frontendzustand. Das nicht serialisierbare Permit bleibt im Backend.
+ * @param {{
+ * currentSourceTarget: () => {source: string, target: string},
+ * dockRevision?: () => number, syncScope: () => string, endProgress: () => void,
+ * ensureContentHash: () => void, mode: () => import("./local-sync-wire.js").SyncModeWire,
+ * onProgressStart: (plan: import("./local-sync-wire.js").SyncPlanWire) => void,
+ * remoteSyncContext: () => RemoteSyncContext | null, running: () => boolean,
+ * showDock: (message: string, options: {closable?: boolean}) => void,
+ * showError: (title: string, error: unknown) => void,
+ * showPlan: (plan: import("./local-sync-wire.js").SyncPlanWire, options?: {permanentRemovals?: boolean | null}) => void,
+ * syncOptions: () => SyncOptionsWire,
+ * }} dependencies
+ */
 export function createRealModeUi({
   currentSourceTarget,
   dockRevision = () => 0,
@@ -52,24 +101,30 @@ export function createRealModeUi({
   syncOptions,
 }) {
   let available = false;
+  /** @type {PreparedRealModeWire | null} */
   let prepared = null;
-  let remoteProtocol = null;
+  /** @type {string | null} */
   let preparedKey = null;
   let runActive = false;
+  /** @type {ReturnType<typeof setInterval> | null} */
   let bannerTimer = null;
+  /** @type {string | null} */
   let preparedScope = null;
   let preparationRevision = 0;
+  /** @type {Promise<unknown>} */
   let preparationTail = Promise.resolve();
   let starting = false;
 
   // Vorbereitung, Dialog und Discard teilen einen Besitzer. Ein Discard einer
   // verspäteten Antwort muss fertig sein, bevor die nächste Vorbereitung beginnt.
+  /** @template T @param {() => T | PromiseLike<T>} action */
   function withPreparation(action) {
     const result = preparationTail.then(action);
     preparationTail = result.catch(() => {});
     return result;
   }
 
+  /** @template T @param {() => T | PromiseLike<T>} action */
   function withStart(action) {
     if (starting || running()) return;
     starting = true;
@@ -82,6 +137,7 @@ export function createRealModeUi({
     return () => scope === syncScope() && revision === preparationRevision;
   }
 
+  /** @param {() => boolean} current */
   async function checkCurrent(current) {
     if (current()) return true;
     await discardPrepared();
@@ -101,11 +157,10 @@ export function createRealModeUi({
 
   async function discardPrepared() {
     if (!prepared || runActive) return;
-    const command = remoteProtocol ? `discard_${remoteProtocol}_sync` : "discard_real_sync";
+    const command = prepared.protocol ? remoteSyncCommands(prepared.protocol).discard : "discard_real_sync";
     try {
       await invoke(command);
       prepared = null;
-      remoteProtocol = null;
       preparedKey = null;
       preparedScope = null;
       hideBanner();
@@ -115,6 +170,7 @@ export function createRealModeUi({
     }
   }
 
+  /** @param {RealRunPreviewWire | ContentSyncPreviewWire} preview */
   function showBanner(preview, active = false) {
     if (bannerTimer) clearInterval(bannerTimer);
     const banner = $("#real-mode-banner");
@@ -135,6 +191,7 @@ export function createRealModeUi({
     if (!active) bannerTimer = setInterval(render, 1000);
   }
 
+  /** @param {boolean} value */
   function setAvailable(value) {
     available = Boolean(value);
     const button = $("#btn-real");
@@ -149,13 +206,13 @@ export function createRealModeUi({
     // Invoke-Promises eintreffen; deshalb muss auch dieser Pfad den gehaltenen
     // Frontendverweis löschen, bevor das Schließen des Sync-Modus `discard` ruft.
     prepared = null;
-    remoteProtocol = null;
     preparedKey = null;
     preparedScope = null;
     runActive = false;
     hideBanner();
   }
 
+  /** @param {RemoteSyncContext} remote */
   function prepareRemotePreview(remote) {
     if (remote.protocol === "content" && mode() !== "AddOnly" || remote.protocol === "webdav"
       || remote.source?.provider === "webdav"
@@ -167,21 +224,19 @@ export function createRealModeUi({
       if (prepared) throw new Error("Die vorige Backendvorbereitung konnte nicht verworfen werden");
       if (!current()) return;
       const scope = syncScope();
-      const { protocol, ...request } = remote;
-      const requestWithOptions = { ...request, options: syncOptions() };
-      const args = { request: requestWithOptions };
-      const next = await invoke(`prepare_${protocol}_sync`, args);
+      const request = remotePreparationRequest(remote, syncOptions());
+      const next = await prepareRemote(request);
       prepared = next;
-      remoteProtocol = protocol;
-      preparedKey = stableKey({ protocol, request: requestWithOptions });
+      preparedKey = stableKey(request);
       preparedScope = scope;
       if (!await checkCurrent(current)) return;
-      showBanner(next);
-      showPlan(next.plan, protocol === "content" ? contentSyncPlanPresentation(next) : {});
-      return next;
+      showBanner(next.preview);
+      showPlan(next.preview.plan, next.protocol === "content" ? contentSyncPlanPresentation(next.preview) : {});
+      return next.preview;
     });
   }
 
+  /** @param {RemoteSyncContext} remote */
   function runRemote(remote) {
     if (mode() !== "AddOnly" || remote.protocol === "webdav"
       || remote.source?.provider === "webdav"
@@ -190,12 +245,12 @@ export function createRealModeUi({
     return withStart(() => runRemoteCurrent(remote, current));
   }
 
+  /** @param {RemoteSyncContext} remote @param {() => boolean} current */
   async function runRemoteCurrent(remote, current) {
     if (running() || !current()) return;
     const protocol = remote.protocol;
     const scope = syncScope();
     const label = protocol === "content" ? "Dateisync" : protocol === "provider" ? "REMOTE↔REMOTE" : protocol.toUpperCase();
-    const { protocol: _protocol, ...request } = remote;
     const identityCheck = protocol === "sftp"
       ? "Hostkey"
       : protocol === "ftps"
@@ -206,9 +261,9 @@ export function createRealModeUi({
             ? "Server-GUID-Pin, SMB 3.1.1, Signing und Verschlüsselung"
             : "beide öffentlichen Provideridentitäten, Capabilities und vollständige Listings";
     showDock(`<span class="pill delete">${label}-Sicherheitsprüfung</span>${identityCheck}, Provideridentität und vollständige Listings werden gebunden …`, {});
-    const requestWithOptions = { ...request, options: syncOptions() };
-    const actionKey = stableKey({ protocol, request: requestWithOptions });
-    let next = preparedKey === actionKey && remoteProtocol === protocol
+    const request = remotePreparationRequest(remote, syncOptions());
+    const actionKey = stableKey(request);
+    let next = preparedKey === actionKey && prepared?.protocol === protocol
       && preparedScope === syncScope() ? prepared : null;
     if (!next) {
       await discardPrepared();
@@ -217,35 +272,34 @@ export function createRealModeUi({
       }
       if (!current()) return;
       try {
-        next = await invoke(`prepare_${protocol}_sync`, { request: requestWithOptions });
+        next = await prepareRemote(request);
       } catch (error) {
         return showError(`${label} gesperrt`, error);
       }
       prepared = next;
-      remoteProtocol = protocol;
       preparedKey = actionKey;
       preparedScope = scope;
     }
     if (!await checkCurrent(current)) return;
-    showBanner(next);
-    showPlan(next.plan, protocol === "content" ? contentSyncPlanPresentation(next) : {});
-    if (!next.plan.actions.length) {
+    showBanner(next.preview);
+    showPlan(next.preview.plan, next.protocol === "content" ? contentSyncPlanPresentation(next.preview) : {});
+    if (!next.preview.plan.actions.length) {
       await discardPrepared();
       return;
     }
-    const confirmation = protocol === "content"
-      ? await confirmContentSync(next) : await confirmationModal(next, `${label}-Sync ausführen`);
-    if (protocol === "content" && confirmation) confirmation.preparationDigest = next.digest;
+    const confirmation = next.protocol === "content"
+      ? { protocol: next.protocol, effects: await confirmContentSync(next.preview), digest: next.preview.digest }
+      : { protocol: next.protocol, effects: await confirmationModal(next.preview, `${label}-Sync ausführen`) };
     if (!await checkCurrent(current)) return;
-    if (!confirmation) {
+    if (!confirmation.effects) {
       await discardPrepared();
       return showDock(`<span class="pill none">${label}-Lauf verworfen</span>Es wurde nichts verändert.`, { closable: true });
     }
-    if (protocol === "content") {
+    if (confirmation.protocol === "content") {
       try {
         const presentation = dockRevision();
-        await invoke("enqueue_content_sync", confirmation);
-        prepared = null; remoteProtocol = null; preparedKey = null; preparedScope = null; hideBanner();
+        await invoke("enqueue_content_sync", { ...confirmation.effects, preparationDigest: confirmation.digest });
+        prepared = null; preparedKey = null; preparedScope = null; hideBanner();
         if (current() && dockRevision() === presentation) {
           showDock('<span class="pill copy">Eingereiht</span>Dateisync wartet in der Fensterqueue.', { closable: true });
         }
@@ -253,23 +307,26 @@ export function createRealModeUi({
       } catch (error) { showError("Dateisync", error); return; }
     }
     runActive = true;
-    showBanner(next, true);
-    onProgressStart(next.plan);
+    showBanner(next.preview, true);
+    onProgressStart(next.preview.plan);
     try {
-      await invoke(`run_${protocol}_sync`, confirmation);
+      await invoke(remoteSyncCommands(confirmation.protocol).start, confirmation.effects);
       prepared = null;
-      remoteProtocol = null;
       preparedKey = null;
       preparedScope = null;
     } catch (error) {
       runActive = false;
-      showBanner(next);
+      showBanner(next.preview);
       endProgress();
       $("#progress").hidden = true;
       showError(`${label}-Fehler`, error);
     }
   }
 
+  /**
+   * @param {RealRunPreviewWire} preview
+   * @returns {Promise<{effectsConfirmed: true} | null>}
+   */
   function confirmationModal(preview, title = "Sync ausführen") {
     return new Promise(resolve => {
       showOwnedModal("real-mode", leaseToken => {
@@ -347,6 +404,7 @@ export function createRealModeUi({
     return withStart(() => runLocal(current));
   }
 
+  /** @param {() => boolean} current */
   async function runLocal(current) {
     if (running() || !current()) return;
     const scope = syncScope();
@@ -360,8 +418,8 @@ export function createRealModeUi({
     showDock("<span class=\"pill delete\">Realmodus-Prüfung</span>Mount-Identitäten, vollständige Listings, BLAKE3, Speicher und Restore-Pfad werden geprüft …", {});
     const request = { source, target, options: syncOptions() };
     const actionKey = stableKey({ protocol: "local", request });
-    let next = preparedKey === actionKey && remoteProtocol == null
-      && preparedScope === syncScope() ? prepared : null;
+    let next = preparedKey === actionKey && prepared?.protocol === null
+      && preparedScope === syncScope() ? prepared.preview : null;
     if (!next) {
       await discardPrepared();
       if (prepared) {
@@ -373,8 +431,7 @@ export function createRealModeUi({
       } catch (error) {
         return showError("Realmodus gesperrt", error);
       }
-      prepared = next;
-      remoteProtocol = null;
+      prepared = { protocol: null, preview: next };
       preparedKey = actionKey;
       preparedScope = scope;
     }

@@ -1,0 +1,186 @@
+{
+  "sftp": {
+    "profile": {
+      "id": "mock_sftp",
+      "name": "Mock-SFTP",
+      "revision": 11,
+      "connection": {
+        "host": "sftp.mock.test",
+        "port": 22,
+        "username": "tester",
+        "requested_root": "/daten",
+        "alternate_hosts": [
+          "2001:db8::8"
+        ],
+        "host_key": {
+          "algorithm": "ssh-ed25519",
+          "sha256": [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+        },
+        "authentication": {
+          "type": "password",
+          "secret": {
+            "service": "Doppeldecker-Test",
+            "account": "mock_sftp"
+          }
+        }
+      }
+    },
+    "status": {
+      "profile_revision": 11,
+      "identity": {
+        "host": "sftp.mock.test",
+        "port": 22,
+        "host_key": {
+          "algorithm": "ssh-ed25519",
+          "sha256": [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+        },
+        "canonical_root": "/daten",
+        "sftp_version": 3,
+        "extensions_digest": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+      },
+      "quarantine_capabilities": {
+        "listing": false,
+        "restore": false,
+        "purge": false
+      }
+    }
+  },
+  "ftps": {
+    "profile": {
+      "id": "mock_ftps",
+      "name": "Mock-FTPS",
+      "revision": 21,
+      "connection": {
+        "host": "ftps.mock.test",
+        "port": 21,
+        "username": "tester",
+        "requested_root": "/daten",
+        "transport_security": "explicit_tls",
+        "certificate": {
+          "sha256": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+        },
+        "certificate_policy": "pinned_certificate",
+        "password_reference": {
+          "service": "Doppeldecker-Test",
+          "account": "mock_ftps"
+        }
+      }
+    },
+    "status": {
+      "profile_revision": 21,
+      "identity": {
+        "host": "ftps.mock.test",
+        "port": 21,
+        "transport_security": "explicit_tls",
+        "certificate": {
+          "sha256": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+        },
+        "canonical_root": "/daten",
+        "features_digest": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
+        "welcome_digest": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+      },
+      "quarantine_capabilities": {
+        "listing": false,
+        "restore": false,
+        "purge": false
+      },
+      "security": "tls_identity_externally_verified"
+    }
+  },
+  "webdav": {
+    "profile": {
+      "id": "mock_webdav",
+      "name": "Mock-WebDAV",
+      "revision": 31,
+      "connection": {
+        "origin": "https://dav.mock.test",
+        "username": "tester",
+        "requested_root": "/daten",
+        "certificate": {
+          "sha256": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+        },
+        "certificate_policy": "pinned_certificate",
+        "password_reference": {
+          "service": "Doppeldecker-Test",
+          "account": "mock_webdav"
+        }
+      }
+    },
+    "status": {
+      "profile_revision": 31,
+      "identity": {
+        "origin": "https://dav.mock.test",
+        "certificate": {
+          "sha256": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+        },
+        "account_digest": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+        "canonical_root": "/daten",
+        "dav_header_digest": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+        "server_header_digest": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+      },
+      "quarantine_capabilities": {
+        "listing": false,
+        "restore": false,
+        "purge": false
+      }
+    }
+  },
+  "smb": {
+    "profile": {
+      "id": "mock_smb",
+      "name": "Mock-SMB",
+      "revision": 41,
+      "connection": {
+        "host": "smb.mock.test",
+        "port": 445,
+        "server_guid": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+        "share": "Daten",
+        "username": "tester",
+        "requested_root": "/daten",
+        "domain": "WORKGROUP",
+        "password_reference": {
+          "service": "Doppeldecker-Test",
+          "account": "mock_smb"
+        }
+      }
+    },
+    "status": {
+      "profile_revision": 41,
+      "identity": {
+        "host": "smb.mock.test",
+        "port": 445,
+        "server_guid": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+        "share": "Daten",
+        "account_digest": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+        "canonical_root": "/daten",
+        "dialect": 785,
+        "signing_active": true,
+        "encryption_active": true,
+        "signing_algorithm": "AesGmac",
+        "encryption_cipher": "Aes128Gcm"
+      },
+      "quarantine_capabilities": {
+        "listing": true,
+        "restore": false,
+        "purge": false
+      }
+    }
+  },
+  "capabilities": {
+    "complete_listing": false,
+    "exclusive_directory_create": false,
+    "exclusive_create": false,
+    "atomic_noreplace_rename": false,
+    "best_effort_rename": false,
+    "best_effort_file_commit": false,
+    "best_effort_file_replace": false,
+    "atomic_replace_rename": false,
+    "durable_file_flush": false,
+    "verified_file_commit": false,
+    "durable_directory_flush": false,
+    "quarantine": false,
+    "entry_delete": false,
+    "permanent_delete": false,
+    "available_space": false
+  }
+}

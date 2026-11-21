@@ -8,6 +8,9 @@ edition.workspace = true
 license.workspace = true
 description = "Eleganter, plattformübergreifender Dual-Pane-Dateimanager (macOS + Linux)"
 
+[lints]
+workspace = true
+
 [build-dependencies]
 cc = "1"
 tauri-build = { version = "2", features = [] }
@@ -46,5 +49,9 @@ tempfile = "3" # kurzlebiger Administratorhelfer außerhalb des FUSE-Mounts
 tauri = { version = "2", features = ["image-png"] }
 
 [dev-dependencies]
+heck = "0.5"
+quote = "1"
+syn = { version = "2", features = ["full", "visit"] }
+tauri = { version = "2", features = ["test"] }
 tempfile = "3" # isolierte Tests der markierten Sandbox-Pfadprüfung
 plist = "1" # macOS-Info.plist samt LAN-Deklaration strukturell prüfen

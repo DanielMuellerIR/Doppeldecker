@@ -65,6 +65,8 @@ impl SparseWrite for std::fs::File {
                 fp_offset: offset,
                 fp_length: length,
             };
+            // SAFETY: Der gehaltene File-Deskriptor bleibt offen, hole ist der initialisierte
+            // und beschreibbare Parameterblock für F_PUNCHHOLE.
             let result = unsafe { libc::fcntl(self.as_raw_fd(), libc::F_PUNCHHOLE, &mut hole) };
             if result == -1 {
                 return Err(io::Error::last_os_error());
@@ -266,6 +268,14 @@ pub struct Entry {
     pub device: Option<u64>,
     pub inode: Option<u64>,
     pub hard_links: Option<u64>,
+}
+
+/// Das Pane-Listing und die Sitzungsgeneration werden gemeinsam gelesen, damit
+/// ein paralleler Reconnect die alten Zeilen nicht der neuen Sitzung zuordnet.
+#[derive(Clone, Debug)]
+pub struct RemoteInteractiveDirectoryListing {
+    pub entries: Vec<Entry>,
+    pub session_generation: u64,
 }
 
 /// Letzte Dateiendung für die Darstellungs-Spalte. Die Funktion ist bewusst im

@@ -1,0 +1,144 @@
+{
+  "tags": {
+    "read": {
+      "request": { "provider": "local", "root": "/mock/quelle", "names": ["Alpha.txt"] },
+      "rows": [{
+        "name": "Alpha.txt",
+        "state": { "tags": [{ "name": "Projekt <b>", "color": 4 }, { "name": "Archiv", "color": 0 }], "legacyColor": 6 },
+        "code": null,
+        "message": ""
+      }]
+    },
+    "edit": {
+      "request": {
+        "requestId": "bound", "provider": "local", "root": "/mock/quelle", "names": ["Alpha.txt"],
+        "edit": { "type": "upsert", "tag": { "name": "Fertig ü", "color": 2 }, "previousName": "Projekt <b>" }
+      },
+      "rows": [{ "name": "Alpha.txt", "changed": false, "code": null, "message": "Tags bestätigt" }]
+    }
+  },
+  "comments": {
+    "read": {
+      "request": { "provider": "local", "root": "/mock/quelle", "names": ["Alpha.txt"], "requestPermission": true },
+      "rows": [{
+        "name": "Alpha.txt",
+        "state": { "text": "Alt <script>alert(\"x\")</script> ä\nZweite Zeile", "metadataDiffers": true },
+        "permissionRequired": false, "code": null,
+        "message": "Finder-Zugriff ist nicht freigegeben"
+      }]
+    },
+    "edit": {
+      "request": {
+        "requestId": "bound", "provider": "local", "root": "/mock/quelle", "names": ["Alpha.txt"], "text": "Neu ä \" <&>\n"
+      },
+      "rows": [{
+        "name": "Alpha.txt", "state": null, "changed": true, "code": null,
+        "message": "Finder-Kommentar und Metadaten bestätigt"
+      }]
+    }
+  },
+  "flags": {
+    "read": {
+      "request": { "provider": "local", "root": "/mock/quelle", "names": ["Alpha.txt"], "kind": "locked" },
+      "rows": [{ "name": "Alpha.txt", "state": false, "changed": false, "code": null, "message": "" }]
+    },
+    "edit": {
+      "request": {
+        "requestId": "bound", "provider": "local", "root": "/mock/quelle", "names": ["Alpha.txt"], "kind": "locked", "enabled": true
+      },
+      "rows": [{ "name": "Alpha.txt", "state": true, "changed": true, "code": null, "message": "Eigenschaft bestätigt" }]
+    }
+  },
+  "visibility": {
+    "read": {
+      "request": { "provider": "local", "root": "/mock/quelle", "names": ["Alpha.txt"] },
+      "rows": [{ "name": "Alpha.txt", "state": { "marked": false, "byName": true }, "code": null, "message": "" }]
+    },
+    "edit": {
+      "request": {
+        "requestId": "bound", "provider": "local", "root": "/mock/quelle", "names": ["Alpha.txt"], "hidden": true
+      },
+      "rows": [{
+        "name": "Alpha.txt", "state": { "marked": true, "byName": true }, "changed": true, "code": null,
+        "message": "Markierung bestätigt"
+      }]
+    }
+  }
+,
+  "permissions": {
+    "request": {
+      "requestId": "bound",
+      "provider": "local",
+      "root": "/mock/quelle",
+      "names": [
+        "Alpha.txt"
+      ],
+      "mode": "640",
+      "recursive": false,
+      "administrator": true,
+      "profileId": null,
+      "profileRevision": null
+    },
+    "rows": [
+      {
+        "name": "Alpha.txt",
+        "mode": 416,
+        "changed": true,
+        "code": null,
+        "message": "Änderung bestätigt"
+      }
+    ]
+  },
+  "ownership": {
+    "request": {
+      "requestId": "bound",
+      "provider": "local",
+      "root": "/mock/quelle",
+      "names": [
+        "Alpha.txt"
+      ],
+      "owner": "root",
+      "group": "",
+      "administrator": true
+    },
+    "rows": [
+      {
+        "name": "Alpha.txt",
+        "owner": "root",
+        "group": "wheel",
+        "uid": 0,
+        "gid": 0,
+        "specialBitsChanged": false,
+        "changed": true,
+        "code": null,
+        "message": "Änderung bestätigt"
+      }
+    ]
+  },
+  "administrator": {
+    "read": {
+      "available": true,
+      "state": "notRegistered",
+      "message": "Administratorhelfer noch nicht eingerichtet."
+    },
+    "toggle": {
+      "enabled": true
+    },
+    "toggled": {
+      "available": true,
+      "state": "requiresApproval",
+      "message": "Systemfreigabe erforderlich"
+    }
+  },
+  "capabilities": {
+    "permissions": "boolean",
+    "recursivePermissions": "boolean",
+    "ownership": "boolean",
+    "administration": "boolean",
+    "tags": "boolean",
+    "visibility": "boolean",
+    "nativeFlags": "boolean",
+    "comments": "boolean",
+    "limitations": "array"
+  }
+}

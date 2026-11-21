@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }   # Serialisierung der DTOs für die UI
 serde_json = "1"
@@ -13,7 +16,7 @@ socket2 = "0.6.4"                                    # geteilter mDNS-Empfangspo
 filetime = "0.2"                                     # mtime plattformübergreifend setzen
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] } # vorhandener Rust-Deflate-Backend für ZIP-Streaming
 tar = { version = "0.4", default-features = false }
-zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2"] } # ausschließlich ZIP-Erzeugung; fremde Archive werden nicht geparst
+zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2"] } # ZIP-Erzeugung; vorhandene ZIP-Archive liest rawzip
 blake3 = "1"                                         # kopierte Temp-Dateien vor dem atomaren Commit verifizieren
 getrandom = "0.3"                                    # nicht vorhersagbare Realmodus-Nonces und Probeinhalte
 rustix = { version = "1.1.4", features = ["fs", "process"] } # openat/renameat/unlinkat + echte Nutzer-ID fuer sichere Trash-Rechte

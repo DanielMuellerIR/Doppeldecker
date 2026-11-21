@@ -1,8 +1,16 @@
+// @ts-check
+
 import { invoke } from "./tauri-api.js";
 import { hideModal, showOwnedModal } from "./modal.js";
 import { $, errText, escapeHtml } from "./ui-utils.js";
 
+/** @param {{
+ * showDock: (html: string, options: {closable: boolean}) => void,
+ * showError: (label: string, error: unknown) => void,
+ * refreshQueue: () => unknown,
+ * }} dependencies */
 export function createRemoteEditUi({ showDock, showError, refreshQueue }) {
+  /** @type {import("./file-opening-wire.js").RemoteEditViewWire[]} */
   let entries = [];
   let refreshGeneration = 0;
 
@@ -22,7 +30,7 @@ export function createRemoteEditUi({ showDock, showError, refreshQueue }) {
   async function open() {
     try { await refresh(); }
     catch (error) { showError("Remote-Bearbeitung", error); return; }
-    showOwnedModal("remote-edits", token => {
+    showOwnedModal("remote-edits", /** @param {symbol} token */ (token) => {
       $("#modal-title").textContent = "Remote-Bearbeitung";
       const body = $("#modal-body");
       body.innerHTML = '<p class="modal-description">In der externen Anwendung speichern, dann hier zurückspeichern. Zwischenzeitliche Serveränderungen werden als Konflikt gemeldet.</p><div class="remote-edit-list"></div><p role="status" class="modal-description"></p><p class="quarantine-meta">Diese Liste gilt bis zum Fensterende oder App-Neustart. Lokale Arbeitskopien bleiben im privaten Cache.</p>';
@@ -32,6 +40,7 @@ export function createRemoteEditUi({ showDock, showError, refreshQueue }) {
       const render = () => {
         list.innerHTML = entries.length ? entries.map((entry, index) => `<section class="remote-edit-entry"><h3>${escapeHtml(entry.name)}</h3><p class="remote-edit-endpoint">${escapeHtml(entry.endpointLabel)}</p><p>${entry.lastOperationId ? "Rückupload in der Queue verzeichnet" : "Noch kein Rückupload"}${entry.dirty ? " · Lokale Änderungen" : ""}</p>${entry.limitations?.length ? `<details class="operation-error-details"><summary>Verbindungsdetails</summary><textarea class="listing-omissions-text" aria-label="Verbindungsdetails" readonly>${escapeHtml(entry.limitations.join("\n"))}</textarea></details>` : ""}${entry.saveBlocker ? `<p>${escapeHtml(entry.saveBlocker)}</p>` : ""}<p>${entry.replaceBestEffort ? "Rückspeichern ersetzt die Altversion dauerhaft ohne Quarantäne (Best Effort)." : "Rückspeichern ersetzt die Serverdatei nach frischer Konfliktprüfung."}</p><div class="remote-edit-actions"><button class="btn primary" data-save="${index}" ${entry.saveAvailable === false ? "disabled" : ""}>Zurückspeichern</button><button class="btn ghost" data-close="${index}">Bearbeitung beenden</button></div></section>`).join("") : '<p>Keine geöffneten Remote-Bearbeitungen.</p>';
       };
+      /** @param {boolean} value */
       const busy = value => {
         pending = value;
         for (const button of list.querySelectorAll("button")) {
@@ -39,9 +48,9 @@ export function createRemoteEditUi({ showDock, showError, refreshQueue }) {
           button.disabled = value || entry?.saveAvailable === false;
         }
       };
-      list.addEventListener("click", async event => {
+      list.addEventListener("click", /** @param {MouseEvent} event */ async (event) => {
         if (pending) return;
-        const button = event.target.closest("button");
+        const button = event.target instanceof Element ? event.target.closest("button") : null;
         if (!button) return;
         const saving = button.hasAttribute("data-save");
         const entry = entries[Number(saving ? button.dataset.save : button.dataset.close)];
@@ -49,12 +58,13 @@ export function createRemoteEditUi({ showDock, showError, refreshQueue }) {
         busy(true);
         status.textContent = saving ? "Serveroriginal wird geprüft und Rückupload vorbereitet …" : "Bearbeitung wird beendet …";
         try {
-          const result = await invoke(saving ? "save_remote_edit" : "close_remote_edit", { request: { id: entry.id } });
+          const request = { id: entry.id };
           if (saving) {
-            entry.lastOperationId = result;
+            entry.lastOperationId = await invoke("save_remote_edit", { request });
             entry.saveAvailable = false;
             entry.saveBlocker = "Rückupload eingereiht. Nach seinem Abschluss die Übersicht aktualisieren.";
           } else {
+            await invoke("close_remote_edit", { request });
             entries = entries.filter(current => current.id !== entry.id);
             updateBadge();
           }
@@ -102,6 +112,7 @@ export function createRemoteEditUi({ showDock, showError, refreshQueue }) {
     });
   }
 
+  /** @param {{editId?: string | null, name: string}} snapshot */
   async function onOpened(snapshot) {
     if (!snapshot.editId) return;
     try { await refresh(); }

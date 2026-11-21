@@ -547,27 +547,14 @@ pub(crate) fn ensure_resume_profile_current(
     bindings: &[crate::RemoteProfileBinding],
     config: &SftpConnectionConfig,
 ) -> io::Result<()> {
-    let [binding] = bindings else {
-        return Err(drift(
-            "SFTP-Auftrag benötigt genau ein gespeichertes Profil.",
-        ));
-    };
-    let directory = queue
-        .parent()
-        .ok_or_else(|| drift("SFTP-Profilbindung besitzt keinen Konfigurationsordner."))?;
-    let profiles = crate::load_sftp_profiles_versioned(&directory.join("sftp-profiles.json"))?;
-    if binding.protocol != crate::RemoteProfileProtocol::Sftp
-        || !profiles.iter().any(|profile| {
-            profile.profile.id == binding.profile_id
-                && profile.revision == binding.revision
-                && &profile.profile.connection == config
-        })
-    {
-        return Err(drift(
-            "SFTP-Profil hat sich geändert. Teilkopie bleibt erhalten.",
-        ));
-    }
-    Ok(())
+    crate::connections::ensure_bound_profile_current(
+        queue,
+        bindings,
+        crate::RemoteProfileProtocol::Sftp,
+        "SFTP",
+        crate::load_sftp_profiles_versioned,
+        |profile| &profile.connection == config,
+    )
 }
 
 impl ContentReader {

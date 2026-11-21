@@ -1,15 +1,44 @@
 //! Tauri-Commands für die Schnellzugriff-Favoriten.
 
 use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
 
 use doppeldecker_core::{Favorite, FavoriteProvider};
+use tauri::async_runtime::Mutex;
 
 use crate::{app_config_dir, AppError};
+
+static FAVORITES_IO: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
 
 /// Pfad der Favoriten-Ablage im App-Konfigurationsordner.
 fn favorites_store(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
     let dir = app_config_dir(app)?;
     Ok(dir.join("favorites.json"))
+}
+
+async fn run_favorites_io<T: Send + 'static>(
+    action: impl FnOnce() -> Result<T, AppError> + Send + 'static,
+) -> Result<T, AppError> {
+    // Auch die Finder-Vorprüfung gehört zum Auftrag. Ein späterer Löschwunsch
+    // muss nach dem Import wirksam werden, sonst könnte der Import ihn rückgängig machen.
+    let guard = Arc::clone(&FAVORITES_IO).lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        action()
+    })
+    .await
+    .map_err(|_| AppError::new("app", "Worker für die Favoriten wurde unterbrochen"))?
+}
+
+async fn update_favorites(
+    app: tauri::AppHandle,
+    update: impl FnOnce(&mut Vec<Favorite>) -> bool + Send + 'static,
+) -> Result<Vec<Favorite>, AppError> {
+    run_favorites_io(move || {
+        let store = favorites_store(&app)?;
+        doppeldecker_core::favorites::update(&store, update).map_err(AppError::from)
+    })
+    .await
 }
 
 /// Beim ersten Start den Benutzerordner und vorhandene Standardordner anbieten.
@@ -35,27 +64,29 @@ fn seed_favorites() -> Vec<Favorite> {
 }
 
 #[tauri::command]
-pub(crate) fn list_favorites(app: tauri::AppHandle) -> Result<Vec<Favorite>, AppError> {
-    let store = favorites_store(&app)?;
-    doppeldecker_core::favorites::load_or_initialize(&store, &seed_favorites())
-        .map_err(AppError::from)
+pub(crate) async fn list_favorites(app: tauri::AppHandle) -> Result<Vec<Favorite>, AppError> {
+    run_favorites_io(move || {
+        let store = favorites_store(&app)?;
+        doppeldecker_core::favorites::load_or_initialize(&store, &seed_favorites())
+            .map_err(AppError::from)
+    })
+    .await
 }
 
 #[tauri::command]
-pub(crate) fn add_favorite(
+pub(crate) async fn add_favorite(
     app: tauri::AppHandle,
     name: String,
     path: String,
 ) -> Result<Vec<Favorite>, AppError> {
-    let store = favorites_store(&app)?;
-    doppeldecker_core::favorites::update(&store, |favorites| {
+    update_favorites(app, move |favorites| {
         doppeldecker_core::favorites::add(favorites, &name, &path)
     })
-    .map_err(AppError::from)
+    .await
 }
 
 #[tauri::command]
-pub(crate) fn add_remote_favorite(
+pub(crate) async fn add_remote_favorite(
     app: tauri::AppHandle,
     name: String,
     provider: FavoriteProvider,
@@ -68,8 +99,7 @@ pub(crate) fn add_remote_favorite(
             "Remote-Favorit benötigt einen Remote-Provider",
         ));
     }
-    let store = favorites_store(&app)?;
-    doppeldecker_core::favorites::update(&store, |favorites| {
+    update_favorites(app, move |favorites| {
         doppeldecker_core::favorites::add_endpoint(
             favorites,
             &name,
@@ -78,20 +108,19 @@ pub(crate) fn add_remote_favorite(
             &path,
         )
     })
-    .map_err(AppError::from)
+    .await
 }
 
 /// Reihenfolge per Drag-Sortierung der Seitenleiste ändern.
 #[tauri::command]
-pub(crate) fn move_favorite(
+pub(crate) async fn move_favorite(
     app: tauri::AppHandle,
     provider: FavoriteProvider,
     profile_id: Option<String>,
     path: String,
     index: usize,
 ) -> Result<Vec<Favorite>, AppError> {
-    let store = favorites_store(&app)?;
-    doppeldecker_core::favorites::update(&store, |favorites| {
+    update_favorites(app, move |favorites| {
         doppeldecker_core::favorites::move_endpoint(
             favorites,
             provider,
@@ -100,7 +129,7 @@ pub(crate) fn move_favorite(
             index,
         )
     })
-    .map_err(AppError::from)
+    .await
 }
 
 /// Ergebnisbilanz eines Finder-Imports Richtung Frontend. Übersprungenes wird
@@ -203,8 +232,14 @@ fn read_finder_favorites_file(file: &std::path::Path) -> Result<Vec<u8>, AppErro
 /// übersprungen, entfernt wird nie etwas. Nur existierende Ordner werden
 /// übernommen; im Finder ausgeblendete oder unlesbare Einträge werden gezählt.
 #[tauri::command]
-pub(crate) fn import_finder_favorites(
+pub(crate) async fn import_finder_favorites(
     app: tauri::AppHandle,
+) -> Result<FinderImportSummary, AppError> {
+    run_favorites_io(move || import_finder_favorites_blocking(&app)).await
+}
+
+fn import_finder_favorites_blocking(
+    app: &tauri::AppHandle,
 ) -> Result<FinderImportSummary, AppError> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -216,7 +251,7 @@ pub(crate) fn import_finder_favorites(
     }
     #[cfg(target_os = "macos")]
     {
-        let bytes = read_finder_favorites_file(&finder_favorites_file(&app)?)?;
+        let bytes = read_finder_favorites_file(&finder_favorites_file(app)?)?;
         let parsed = doppeldecker_core::finder_favorites::parse_favorite_items(&bytes)
             .map_err(AppError::from)?;
 
@@ -244,7 +279,7 @@ pub(crate) fn import_finder_favorites(
 
         let mut added = 0usize;
         let mut skipped_existing = 0usize;
-        let store = favorites_store(&app)?;
+        let store = favorites_store(app)?;
         let favorites = doppeldecker_core::favorites::update(&store, |favorites| {
             let mut changed = false;
             for candidate in &candidates {
@@ -271,14 +306,13 @@ pub(crate) fn import_finder_favorites(
 }
 
 #[tauri::command]
-pub(crate) fn remove_favorite(
+pub(crate) async fn remove_favorite(
     app: tauri::AppHandle,
     provider: FavoriteProvider,
     profile_id: Option<String>,
     path: String,
 ) -> Result<Vec<Favorite>, AppError> {
-    let store = favorites_store(&app)?;
-    doppeldecker_core::favorites::update(&store, |favorites| {
+    update_favorites(app, move |favorites| {
         doppeldecker_core::favorites::remove_endpoint(
             favorites,
             provider,
@@ -286,12 +320,87 @@ pub(crate) fn remove_favorite(
             &path,
         )
     })
-    .map_err(AppError::from)
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spaeterer_loeschwunsch_wird_nach_dem_import_verarbeitet() {
+        use doppeldecker_core::favorites::{add, load, remove_endpoint, update};
+        use std::future::Future;
+        use std::sync::mpsc::channel;
+        use std::task::{Context, Poll, Waker};
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("favorites.json");
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let import_store = store.clone();
+        let import = tauri::async_runtime::spawn(run_favorites_io(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            update(&import_store, |favorites| add(favorites, "Fotos", "/fotos"))
+                .map_err(AppError::from)
+        }));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let removal_store = store.clone();
+        let mut remove = Box::pin(run_favorites_io(move || {
+            update(&removal_store, |favorites| {
+                remove_endpoint(favorites, FavoriteProvider::Local, None, "/fotos")
+            })
+            .map_err(AppError::from)
+        }));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(remove.as_mut().poll(&mut context), Poll::Pending));
+        assert!(!store.exists());
+        release_tx.send(()).unwrap();
+        tauri::async_runtime::block_on(async {
+            assert_eq!(import.await.unwrap().unwrap().len(), 1);
+            assert!(remove.await.unwrap().is_empty());
+        });
+        assert!(load(&store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn favoriten_serialisieren_denselben_vertrag_wie_die_browserbruecke() {
+        use crate::browser_commands::assert_wire_object;
+        use serde_json::{json, to_value, Value};
+
+        let wire: Value =
+            serde_json::from_str(include_str!("../../tools/tests/favorite-wire.json")).unwrap();
+        let providers = [
+            FavoriteProvider::Local,
+            FavoriteProvider::Sftp,
+            FavoriteProvider::Ftps,
+            FavoriteProvider::Webdav,
+            FavoriteProvider::Smb,
+        ];
+        assert_eq!(to_value(providers).unwrap(), wire["providers"]);
+        assert!(serde_json::from_value::<FavoriteProvider>(json!("SFTP")).is_err());
+        let local = Favorite::local("Dokumente", "/daten");
+        let remote = Favorite {
+            provider: FavoriteProvider::Sftp,
+            profile_id: Some("profil".into()),
+            ..local.clone()
+        };
+        let summary = FinderImportSummary {
+            favorites: vec![local, remote],
+            added: 1,
+            skipped_existing: 1,
+            skipped_missing: 0,
+            skipped_hidden: 0,
+            skipped_unreadable: 0,
+        };
+        let value = to_value(summary).unwrap();
+        assert_wire_object(&value, &wire["finderImport"]);
+        assert_wire_object(&value["favorites"][0], &wire["local"]);
+        assert_wire_object(&value["favorites"][1], &wire["remote"]);
+        assert_eq!(value["favorites"][1]["profile_id"], json!("profil"));
+    }
 
     #[test]
     #[ignore = "nur im isolierten Gegenlauf nach Austausch der ausgewählten Testdatei"]
@@ -349,7 +458,9 @@ mod tests {
         let preserved = base.join("preserved-original");
         std::fs::rename(&selected, &preserved).unwrap();
         let fifo = std::ffi::CString::new(selected.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // SAFETY: fifo hält den nullterminierten Pfad bis mkfifo zurückkehrt.
+        let created = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+        assert_eq!(created, 0);
         std::fs::write(area.path().join("selected"), selected.to_str().unwrap()).unwrap();
         let name = "favorites_commands::tests::finder_fifo_child";
         let binary = std::env::current_exe().unwrap();

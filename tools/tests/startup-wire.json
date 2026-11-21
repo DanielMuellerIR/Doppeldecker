@@ -1,0 +1,12 @@
+{
+  "directories": { "left": "string", "right": "string" },
+  "safety": {
+    "real_enabled": "boolean",
+    "real_mode_available": "boolean",
+    "real_mode_pending": "boolean",
+    "sandbox": "string|null",
+    "max_delete_entries": "number",
+    "max_delete_fraction": "number",
+    "quarantine_retention_days": "number"
+  }
+}

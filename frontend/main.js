@@ -1,12 +1,10 @@
+// Verbindet Ansichten, Tauri-Ereignisse und Befehle der App.
 import { createArchiveExtractUi } from "./archive-extract-ui.js";
 import { metadataClassLabels } from "./metadata-labels.js";
 import { createArchiveReadUi } from "./archive-read-ui.js";
 import { createArchivePackUi } from "./archive-pack-ui.js";
 import { wireFileDrops } from "./file-drops.js";
 import { createDuplicateActions } from "./duplicate-actions.js";
-// Doppeldecker — Frontend-Logik (Grundgerüst: Navigation, Auswahl, Sortierung,
-// Type-ahead, versteckte Dateien, native Menü-Events + Sync-Vorschau/Testlauf).
-// Nutzt ES-Module ohne Bundler; Tauri stellt die native API weiterhin global bereit.
 
 import { invoke } from "./tauri-api.js";
 import { createBatchRenameUi } from "./batch-rename-ui.js";
@@ -28,6 +26,7 @@ import { createNetworkDiscoveryUi } from "./network-discovery-ui.js";
 import { createOneWaySyncUi } from "./one-way-sync-ui.js";
 import { createLocalSyncUi } from "./local-sync-ui.js";
 import { createPaneController } from "./pane-controller.js";
+import { paneEndpoint } from "./pane-endpoint.js";
 import { choiceModal, onModalKeyDown } from "./modal.js";
 import { byteUnitsMode, initByteUnits, setByteUnits } from "./byte-units.js";
 import { initTheme, setTheme, themePreference } from "./theme.js";
@@ -58,6 +57,7 @@ import {
 // -------------------------------------------------------------------------
 // Zustand
 // -------------------------------------------------------------------------
+/** @type {import("./window-session-wire.js").PaneSide} */
 let activeSide = "left";
 let operationRunning = false;
 let startupQueueErrorActive = false;
@@ -180,6 +180,7 @@ const {
   dockRevision,
   end: endProgressUi,
   showDock,
+  showDownloadPreparation,
   startFile: startOpUi,
   startSync: startProgressUi,
   update: onProgress,
@@ -193,14 +194,17 @@ const {
 });
 
 /** Einheitliche Fehleranzeige im Dock (ersetzt die früher ~20-fach duplizierte
- *  showDock-Fehlerzeile). */
+ *  showDock-Fehlerzeile).
+ * @param {string} label
+ * @param {unknown} e
+ */
 function showError(label, e, { foldDetails = false } = {}) {
   // Das Backend akzeptiert für das Log nur einen kurzen Kontext und stabilen Code.
   // Der Fehlertext selbst kann Providerantworten oder Pfade enthalten und wird nie
   // an den Logger gesendet.
   void invoke("record_app_error", {
     context: label,
-    code: typeof e?.code === "string" ? e.code : "app",
+    code: errCode(e) ?? "app",
   }).catch(() => {});
   // Wartet der Auftrag auf eine Bestätigung, führt ein Knopf direkt dorthin. Die
   // Queue hängt sonst nur an einem kleinen Symbol im Seitenleistenkopf; im
@@ -295,6 +299,7 @@ const updateUi = createUpdateUi({
 // -------------------------------------------------------------------------
 // Pane-Aktivierung
 // -------------------------------------------------------------------------
+/** @param {import("./window-session-wire.js").PaneSide} side */
 function setActive(side, { focus = true } = {}) {
   activeSide = side;
   for (const s of ["left", "right"]) panes[s].el.classList.toggle("active", s === side);
@@ -331,6 +336,7 @@ const fileActions = createFileActions({
   enqueueBlocked: isBrowsingBlocked,
   loadPane,
   showDock,
+  showDownloadPreparation,
   showError,
 });
 const selectedEntries = (side) => fileActions.selectedEntries(side);
@@ -342,7 +348,9 @@ const archivePackUi = createArchivePackUi({ panes, activeSide: () => activeSide,
 const archivePackSelection = side => archivePackUi.open(side);
 const archiveExtractUi = createArchiveExtractUi({ panes, activeSide: () => activeSide, selectedEntries,
   blocked: isBrowsingBlocked, showDock, showError });
-const archiveExtractSelection = side => archiveExtractUi.open(side);
+const archiveExtractSelection = (side = activeSide) => panes[side].provider === "local"
+  ? archiveExtractUi.open(side)
+  : archiveReadUi.open(side, { extractAll: true });
 
 const refreshBothPanes = context => fileActions.refreshBothPanes(context);
 const transferToOther = (kind) => fileActions.transferToOther(kind);
@@ -362,13 +370,6 @@ fileInformationUi = createFileInformationUi({
 const showInformation = side => fileInformationUi.open(side);
 const showViewOptions = side => openViewOptions(side);
 
-function paneEndpoint(pane) {
-  return pane.provider === "local"
-    ? { provider: "local", root: pane.path }
-    : { provider: pane.provider, profileId: pane.profileId,
-      profileRevision: pane.profileRevision, root: pane.path };
-}
-
 const filePreviewUi = createFilePreviewUi({ panes, selectedEntries, endpointFor: paneEndpoint, showDock, showError });
 const showPreview = side => filePreviewUi.open(side);
 const archiveReadUi = createArchiveReadUi({ panes, selectedEntries, showDock, blocked: isBrowsingBlocked, extractSelectionReady: (side, response) => archiveExtractUi.openPrepared(side, response) });
@@ -383,6 +384,9 @@ for (const side of ["left", "right"]) {
 const batchRenameUi = createBatchRenameUi({ panes, selectedEntries, endpointFor: paneEndpoint, showDock, refreshPanes: refreshBothPanes });
 const showBatchRename = side => batchRenameUi.open(side);
 
+/** @param {"left" | "right"} side
+ * @returns {import("./file-opening-wire.js").DiffFileRequestWire | null}
+ */
 function selectedDiffFile(side) {
   const pane = panes[side];
   const [entry] = selectedEntries(side);
@@ -406,6 +410,7 @@ async function compareFiles() {
   } catch (error) { showError("Dateivergleich", error); }
 }
 
+/** @param {import("./window-session-wire.js").PaneStartLocationWire} pane */
 function paneStartLocation(pane) {
   return {
     provider: pane.provider,
@@ -416,6 +421,7 @@ function paneStartLocation(pane) {
   };
 }
 
+/** @param {import("./window-session-wire.js").PaneStartLocationWire} pane */
 function paneSessionLocation(pane) {
   // codereview-ok: Der Sitzungsvertrag speichert absichtlich nur Endpunkt-ID,
   // Revision und Pfad. Nach dem Löschen eines Profils ist dessen ID der sichere
@@ -437,6 +443,9 @@ async function newWindow() {
       side => frozen[side].provider === "local" && !frozen[side].path,
     );
     const defaults = needsDefaults.length ? await invoke("default_dirs") : null;
+    /** @param {import("./window-session-wire.js").PaneSide} side
+     * @returns {import("./window-session-wire.js").PaneStartLocationWire}
+     */
     const location = side => needsDefaults.includes(side)
       ? { provider: "local", profileId: null, profileRevision: null,
         profileName: null, path: defaults[side] }
@@ -474,6 +483,7 @@ connectionsUi = createConnectionsUi({
   updateProfileName,
 });
 const renderConnections = (...args) => connectionsUi.render(...args);
+/** @param {import("./connection-profile-api.js").SaveProfileArgs} args */
 const saveConnectionProfile = (...args) => connectionsUi.save(...args);
 let loadingConnections = null;
 const loadConnections = () => {
@@ -596,6 +606,7 @@ const contextMenu = createContextMenu({
   addFavorite,
   transfer: transferToOther,
   resumableCopy: fileActions.resumableCopy,
+  canResumeCopy: fileActions.canResumeCopy,
   duplicate: duplicateSelection,
   archivePack: archivePackSelection,
   archiveExtract: archiveExtractSelection,
@@ -723,11 +734,7 @@ function remoteSyncContext() {
   const current = currentSourceTarget();
   const remoteCount = [current.sourcePane, current.targetPane].filter((pane) => pane.provider !== "local").length;
   if (remoteCount === 0) return null;
-  const endpoint = pane => pane.provider === "local"
-    ? { provider: "local", root: pane.path }
-    : { provider: pane.provider, profileId: pane.profileId,
-      profileRevision: pane.profileRevision, root: pane.path };
-  return { protocol: "content", source: endpoint(current.sourcePane), target: endpoint(current.targetPane) };
+  return { protocol: "content", source: paneEndpoint(current.sourcePane), target: paneEndpoint(current.targetPane) };
 }
 function syncOptions() {
   return syncView.options();
@@ -956,16 +963,22 @@ async function init() {
     // Die Sitzungsdatei enthält je Remote-Endpunkt nur Protokoll, Profil-ID,
     // Revision und Pfad. Der Profilname wird beim Start ohnehin aus dem Profil
     // aufgelöst und würde in der Datei nach einer Umbenennung nur veralten.
-    currentWindow: () => {
+    rememberWindow: () => {
       const tabs = paneController.tabsSnapshot();
-      const locations = Object.fromEntries(["left", "right"].map(side => {
+      if (!tabs) return;
+      /** @param {import("./window-session-wire.js").PaneSide} side */
+      const sessionLocation = side => {
         const saved = tabs[side];
         const pane = panes[side];
         const active = saved?.tabs.find(tab => tab.id === saved.activeId);
         const location = active && saved.activeId !== pane.tabs.active.id ? active.location : pane;
-        return [side, paneSessionLocation(location)];
-      }));
-      return { panes: locations, tabs, activeSide };
+        return paneSessionLocation(location);
+      };
+      const locations = { left: sessionLocation("left"), right: sessionLocation("right") };
+      if (locations.left.path && locations.right.path) {
+        void invoke("remember_window", { panes: locations, tabs, activeSide })
+          .catch(error => showError("Sitzungsstand", error));
+      }
     },
     legacyPreferences: () => ({
       theme: themePreference(),

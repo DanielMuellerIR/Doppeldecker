@@ -1,0 +1,5 @@
+{
+  "protocol": "string",
+  "profile_id": "string",
+  "revision": "number"
+}

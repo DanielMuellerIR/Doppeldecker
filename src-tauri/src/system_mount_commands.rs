@@ -137,13 +137,16 @@ pub(crate) fn command_output_with_timeout(
 
 fn set_nonblocking(stdout: &ChildStdout) -> std::io::Result<()> {
     let fd = stdout.as_raw_fd();
-    // SAFETY: `fd` gehört der lebenden `ChildStdout`. F_GETFL liest nur die
-    // Descriptor-Flags; F_SETFL ergänzt ausschließlich O_NONBLOCK.
+    // SAFETY: `fd` gehört der lebenden `ChildStdout`. F_GETFL liest die
+    // Dateistatusflags und erwartet kein drittes Argument.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags == -1 {
         return Err(std::io::Error::last_os_error());
     }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+    // SAFETY: F_SETFL erwartet beim weiterhin gültigen fd ein c_int. Es
+    // übernimmt die zuvor gelesenen Statusflags mit zusätzlich O_NONBLOCK.
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if result == -1 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
@@ -312,6 +315,73 @@ fn eject_system_mount_blocking(id: String) -> Result<Vec<SystemMount>, AppError>
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn system_mounts_match_the_browser_wire_fixture() {
+        use doppeldecker_core::{system_mounts::SystemMountSpaceError, ErrorCode, SystemMountKind};
+
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/small-control-wire.json"))
+                .unwrap();
+        let base = SystemMount {
+            id: "a".repeat(64),
+            name: "Systemvolume".into(),
+            path: Some("/".into()),
+            kind: SystemMountKind::Internal,
+            filesystem: "apfs".into(),
+            total_bytes: 1_000_000_000_000,
+            available_bytes: 400_000_000_000,
+            space_error: None,
+            read_only: false,
+            ejectable: false,
+            unmount: None,
+        };
+        let backup = SystemMount {
+            id: "b".repeat(64),
+            name: "Backup".into(),
+            path: Some("/Volumes/Backup".into()),
+            kind: SystemMountKind::External,
+            total_bytes: 1_000_000_000,
+            available_bytes: 500_000_000,
+            ejectable: true,
+            unmount: Some(SystemUnmount::MacDiskutil {
+                mount_path: "/Volumes/Backup".into(),
+            }),
+            ..base.clone()
+        };
+        let team = SystemMount {
+            id: "c".repeat(64),
+            name: "Team".into(),
+            path: Some("/Volumes/Team".into()),
+            kind: SystemMountKind::Network,
+            filesystem: "smbfs".into(),
+            total_bytes: 2_000_000_000,
+            available_bytes: 750_000_000,
+            ejectable: true,
+            unmount: Some(SystemUnmount::LinuxGio {
+                mount_path: "/Volumes/Team".into(),
+            }),
+            ..base.clone()
+        };
+        assert_eq!(
+            serde_json::to_value([base, backup, team.clone()]).unwrap(),
+            wire["mounts"]["list"]
+        );
+        let unavailable = SystemMount {
+            total_bytes: 0,
+            available_bytes: 0,
+            space_error: Some(SystemMountSpaceError {
+                code: ErrorCode::ConnectionLost,
+                message: "Speicherabfrage hat ihr Zeitlimit erreicht <img src=x onerror=alert(1)>"
+                    .into(),
+            }),
+            ..team
+        };
+        assert_eq!(
+            serde_json::to_value(unavailable).unwrap(),
+            wire["mounts"]["spaceError"]
+        );
+    }
 
     fn command_parts(command: &Command) -> (String, Vec<String>) {
         (

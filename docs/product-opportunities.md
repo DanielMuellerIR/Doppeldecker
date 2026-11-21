@@ -26,4 +26,4 @@ Provideranfragen, Journalbytes und UI-Frames messen. Große flache/tiefe Bäume,
 hohe Netzlatenz und große Queues gehören zur Messung. Keine vermutete
 Beschleunigung als Befund ausgeben; Vertragsänderungen ausdrücklich entscheiden.
 
-[Frühere Analyse und Entwürfe](product-opportunities-history-2026-10.md).
+[Frühere Analyse und Entwürfe](history/product-opportunities-history-2026-10.md).

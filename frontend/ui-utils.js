@@ -144,6 +144,7 @@ export function fmtDate(seconds) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/** @param {string} base @param {string} name */
 export function joinPath(base, name) {
   return base.endsWith("/") ? base + name : `${base}/${name}`;
 }
@@ -181,9 +182,12 @@ export function errText(error) {
   return String(error);
 }
 
-/** Stabiler Command-Fehlercode, ohne auf übersetzte Anzeigetexte zu matchen. */
+/** Stabiler Command-Fehlercode, ohne auf übersetzte Anzeigetexte zu matchen.
+ * @param {unknown} error
+ * @returns {string | null}
+ */
 export function errCode(error) {
-  return error && typeof error === "object" && typeof error.code === "string"
+  return error !== null && typeof error === "object" && "code" in error && typeof error.code === "string"
     ? error.code
     : null;
 }
@@ -219,6 +223,9 @@ export function writeStoredValue(key, value) {
   }
 }
 
+/** @param {string[]} [notes]
+ * @param {{files: number, directories: number, omitted: unknown[]} | null} [tree]
+ */
 export function sourceReadReport(notes = [], tree = null) {
   const parts = [];
   if (notes.length) parts.push(escapeHtml(notes[0]));

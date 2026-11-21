@@ -164,6 +164,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aktive_verbindung_serialisiert_denselben_browservertrag() {
+        let connection = ActiveConnection {
+            protocol: doppeldecker_core::RemoteProfileProtocol::Smb,
+            profile_id: "profil-eins".into(),
+            revision: 41,
+        };
+        let value = serde_json::to_value(connection).unwrap();
+        let contract = serde_json::from_str(include_str!(
+            "../../tools/tests/active-connection-wire.json"
+        ))
+        .unwrap();
+        crate::browser_commands::assert_wire_object(&value, &contract);
+        assert_eq!(value["protocol"], "smb");
+        assert_eq!(value["profile_id"], "profil-eins");
+        assert_eq!(value["revision"], 41);
+    }
+
+    #[test]
     fn verbindungsereignis_traegt_protokoll_profil_revision_und_aenderung() {
         let update = ConnectionUpdate {
             protocol: doppeldecker_core::RemoteProfileProtocol::Webdav,

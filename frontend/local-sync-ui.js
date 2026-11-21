@@ -3,6 +3,12 @@ import { syncExclusionReportHtml } from "./plan-view.js";
 import { invoke } from "./tauri-api.js";
 import { $, escapeHtml, fmtTransferBytes } from "./ui-utils.js";
 
+/** @typedef {import("./local-sync-wire.js").LocalSyncPreviewWire} LocalSyncPreviewWire */
+
+/**
+ * @param {LocalSyncPreviewWire} preview
+ * @returns {Promise<boolean>}
+ */
 export function confirmLocalSync(preview) {
   return new Promise(resolve => {
     showOwnedModal("local-sync", token => {
@@ -64,6 +70,15 @@ export function confirmLocalSync(preview) {
   });
 }
 
+/** @param {{
+ * currentSourceTarget: () => {source: string, target: string},
+ * syncOptions: () => import("./local-sync-wire.js").SyncOptionsWire,
+ * ensureContentHash: () => void,
+ * showPlan: (plan: import("./local-sync-wire.js").SyncPlanWire) => void,
+ * showDock: (message: string, options: {closable?: boolean}) => void,
+ * showError: (title: string, error: unknown) => void,
+ * dockRevision: () => number,
+ * }} dependencies */
 export function createLocalSyncUi({ currentSourceTarget, syncOptions, ensureContentHash,
   showPlan, showDock, showError, dockRevision }) {
   let tail = Promise.resolve();
@@ -74,6 +89,7 @@ export function createLocalSyncUi({ currentSourceTarget, syncOptions, ensureCont
   };
   const discard = () => serial(() => invoke("discard_local_sync"));
 
+  /** @param {() => boolean} current */
   function run(current) {
     return serial(async () => {
       let transferred = false;

@@ -893,8 +893,6 @@ impl Vfs for SftpVfs {
         reject_unbound_sftp_read("Root-Identität", &[path])
     }
 }
-// SFTP-VFS-BLOCK-ENDE — der Guard-Test unten schneidet die letzte Methode an dieser
-// Marke ab. Sie darf nur einmal im Produktionsteil vorkommen.
 
 /// Harte Frist für den gesamten SFTP-Verbindungsaufbau.
 ///
@@ -1448,89 +1446,251 @@ mod tests {
         );
     }
 
-    /// SFTP war das einzige Protokoll ohne Frist für den Verbindungsaufbau; FTPS,
-    /// WebDAV und SMB haben je dieselben 15 Sekunden. Ohne sie stand die Oberfläche
-    /// bei einem vertippten oder gefilterten Host bis zum TCP-Default des Systems.
     #[test]
-    fn jeder_verbindungsaufbau_traegt_die_frist() {
-        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(15));
+    fn verbindungsaufbau_und_hostkey_ermittlung_begrenzen_ein_stummes_gegenueber() {
+        use std::net::{Ipv4Addr, TcpListener};
+        use std::thread;
+        use std::time::Instant;
 
-        let quelle = include_str!("sftp.rs");
-        // Zusammengesetzt, damit die Suchzeichenkette nicht selbst als Treffer zählt.
-        let ungebunden = format!("connect_{}(config", "once");
-        let treffer: Vec<&str> = quelle
-            .lines()
-            .filter(|zeile| zeile.contains(&ungebunden))
-            .collect();
-        assert_eq!(
-            treffer.len(),
-            1,
-            "connect_once darf nur aus connect_once_bounded aufgerufen werden, gefunden: {treffer:?}"
-        );
-        assert!(
-            treffer[0].contains("tokio::time::timeout"),
-            "der einzige Aufruf muss unter der Frist stehen: {}",
-            treffer[0]
-        );
-        assert!(
-            quelle.contains("SFTP-Hostkey-Ermittlung überschritt"),
-            "auch die Hostkey-Ermittlung braucht die Frist"
-        );
+        struct NoSecrets;
+        impl SecretResolver for NoSecrets {
+            fn resolve(&self, _: &KeychainSecretReference) -> io::Result<SecretString> {
+                Err(io::Error::other(
+                    "Der Testserver führt keine Anmeldung durch",
+                ))
+            }
+        }
+
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(15));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::scope(|scope| {
+            let discovery = scope.spawn(|| {
+                let started = Instant::now();
+                let error = discover_sftp_host_key("127.0.0.1", port).unwrap_err();
+                (error, started.elapsed())
+            });
+            let connection = scope.spawn(|| {
+                let started = Instant::now();
+                let config = SftpConnectionConfig {
+                    host: "127.0.0.1".into(),
+                    alternate_hosts: Vec::new(),
+                    port,
+                    username: "synthetic".into(),
+                    requested_root: "/".into(),
+                    host_key: SftpHostKeyPin {
+                        algorithm: "ssh-ed25519".into(),
+                        sha256: [1; 32],
+                    },
+                    authentication: SftpAuthenticationReference::SshAgent {
+                        public_key_sha256: [1; 32],
+                    },
+                };
+                let error = SftpVfs::connect(config, Arc::new(NoSecrets)).err().unwrap();
+                (error, started.elapsed())
+            });
+            // Die angenommenen Sockets senden weder SSH-Version noch Hostkey.
+            // Ein fehlender Client-Timeout endet durch den getrennten Test-Cutoff.
+            let deadline = Instant::now() + CONNECT_TIMEOUT + Duration::from_secs(5);
+            let mut connections = Vec::new();
+            while !(discovery.is_finished() && connection.is_finished())
+                && Instant::now() < deadline
+            {
+                match listener.accept() {
+                    Ok((socket, _)) => connections.push(socket),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("Künstliches Gegenüber: {error}"),
+                }
+            }
+            drop(connections);
+            for (error, elapsed) in [discovery.join().unwrap(), connection.join().unwrap()] {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+                assert!(elapsed >= CONNECT_TIMEOUT.saturating_sub(Duration::from_millis(50)));
+            }
+        });
     }
 
     #[test]
     fn sicherheitskritische_lesewege_starten_keine_ungebundene_sftp_operation() {
-        fn method<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-            let start = source.find(start).expect("VFS-Methode fehlt");
-            let rest = &source[start..];
-            let end = rest.find(end).expect("nächste VFS-Methode fehlt");
-            &rest[..end]
+        struct SshTestPeer;
+        impl russh::server::Handler for SshTestPeer {
+            type Error = russh::Error;
         }
 
-        // Nur der Produktionsteil zählt. Sonst findet ein Marker, den es im Code gar
-        // nicht mehr gibt, sich selbst in einem Testliteral weiter unten: Das
-        // Schnittfenster wurde dann mehrere hundert Zeilen lang und der Assert griff
-        // nur noch zufällig, weil zufällig genau ein passender Aufruf darin lag.
-        let full = include_str!("sftp.rs");
-        let source = &full[..full
-            .find("#[cfg(test)]\nmod tests {")
-            .expect("Testmodul fehlt")];
-        for (start, end) in [
-            (
-                "fn list(&self, path: &Path)",
-                "fn list_complete(&self, path: &Path)",
-            ),
-            (
-                "fn list_complete(&self, path: &Path)",
-                "fn stat(&self, path: &Path)",
-            ),
-            (
-                "fn stat(&self, path: &Path)",
-                "fn exists(&self, path: &Path)",
-            ),
-            (
-                "fn open_read(&self, path: &Path)",
-                "fn open_write(&self, _path: &Path)",
-            ),
-            (
-                "fn sync_dir(&self, path: &Path)",
-                "fn set_mtime(&self, path: &Path",
-            ),
-            (
-                "fn available_bytes(&self, path: &Path)",
-                "fn root_identity(&self, path: &Path)",
-            ),
-            (
-                "fn root_identity(&self, path: &Path)",
-                "// SFTP-VFS-BLOCK-ENDE",
-            ),
+        struct SftpTestPeer(Arc<std::sync::atomic::AtomicUsize>);
+        impl russh_sftp::server::Handler for SftpTestPeer {
+            type Error = StatusCode;
+
+            fn unimplemented(&self) -> Self::Error {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OpUnsupported
+            }
+        }
+
+        struct NoSecrets;
+        impl SecretResolver for NoSecrets {
+            fn resolve(&self, _: &KeychainSecretReference) -> io::Result<SecretString> {
+                panic!("Strikte VFS-Lesewege benötigen keine neue Verbindung")
+            }
+        }
+
+        // Ein gepinntes SSH-Gegenüber und zwei SFTP-Kanäle im Speicher. Auch ein
+        // versehentlicher SFTP-Request erreicht keinen Netzwerkserver.
+        use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
+        let key = russh::keys::PrivateKey::new(
+            KeypairData::Ed25519(Ed25519Keypair::from_seed(&[0x41; 32])),
+            "strikte VFS-Lesegrenze",
+        )
+        .unwrap();
+        let pin = SftpHostKeyPin {
+            algorithm: key.algorithm().as_str().to_owned(),
+            sha256: key
+                .public_key()
+                .fingerprint(HashAlg::Sha256)
+                .sha256()
+                .unwrap(),
+        };
+        let runtime = Arc::new(
+            RuntimeBuilder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connection = runtime.block_on(async {
+            let (ssh_client, ssh_server) = tokio::io::duplex(64 * 1024);
+            runtime.spawn(async move {
+                let server_config = Arc::new(russh::server::Config {
+                    keys: vec![key],
+                    ..Default::default()
+                });
+                if let Ok(session) =
+                    russh::server::run_stream(server_config, ssh_server, SshTestPeer).await
+                {
+                    let _ = session.await;
+                }
+            });
+            let ssh = tokio::time::timeout(
+                Duration::from_secs(2),
+                client::connect_stream(
+                    Arc::new(client::Config::default()),
+                    ssh_client,
+                    HostKeyVerifier {
+                        expected: pin.clone(),
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let (typed_client, typed_server) = tokio::io::duplex(1024);
+            let (raw_client, raw_server) = tokio::io::duplex(1024);
+            runtime.spawn(russh_sftp::server::run(
+                typed_server,
+                SftpTestPeer(requests.clone()),
+            ));
+            runtime.spawn(russh_sftp::server::run(
+                raw_server,
+                SftpTestPeer(requests.clone()),
+            ));
+            let (sftp, read_session) = tokio::time::timeout(Duration::from_secs(2), async {
+                let sftp = SftpSession::new(typed_client).await.unwrap();
+                let raw = RawSftpSession::new(raw_client);
+                raw.init().await.unwrap();
+                (sftp, raw)
+            })
+            .await
+            .unwrap();
+            Connection {
+                _ssh: ssh,
+                sftp: Arc::new(sftp),
+                read_session: Arc::new(read_session),
+                identity: SftpServerIdentity {
+                    host: "127.0.0.1".into(),
+                    port: 1,
+                    host_key: pin.clone(),
+                    canonical_root: "/".into(),
+                    sftp_version: 3,
+                    extensions_digest: [0; 32],
+                },
+                fsync: false,
+                posix_rename: false,
+                display_principal_names: Arc::new(AtomicBool::new(false)),
+            }
+        });
+        let vfs = SftpVfs {
+            runtime,
+            config: SftpConnectionConfig {
+                host: "127.0.0.1".into(),
+                port: 1,
+                alternate_hosts: Vec::new(),
+                username: "synthetic".into(),
+                requested_root: "/".into(),
+                host_key: pin,
+                authentication: SftpAuthenticationReference::SshAgent {
+                    public_key_sha256: [1; 32],
+                },
+            },
+            secrets: Arc::new(NoSecrets),
+            state: Mutex::new(ProviderState {
+                connection,
+                generation: 1,
+                capabilities: initial_capabilities(),
+            }),
+            reconnect: Mutex::new(()),
+            lost_interactive_read_generation: AtomicU64::new(0),
+        };
+        let strict: &dyn Vfs = &vfs;
+        let path = Path::new("/pane/entry");
+        for (operation, result) in [
+            ("list", strict.list(path).map(|_| ())),
+            ("list_complete", strict.list_complete(path).map(|_| ())),
+            ("stat", strict.stat(path).map(|_| ())),
+            ("open_read", strict.open_read(path).map(|_| ())),
+            ("sync_dir", strict.sync_dir(path)),
+            ("available_bytes", strict.available_bytes(path).map(|_| ())),
+            ("root_identity", strict.root_identity(path).map(|_| ())),
         ] {
-            let body = method(source, start, end);
-            assert!(
-                body.contains("reject_unbound_sftp_read"),
-                "{start} gab eine pfadbasierte SFTP-v3-Lesewirkung als streng gebunden aus"
+            let error = result.expect_err(operation);
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::Unsupported,
+                "{operation}: {error}"
             );
         }
+        for entry_delete in [false, true] {
+            lock(&vfs.state).capabilities = RemoteCapabilities {
+                complete_listing: true,
+                entry_delete,
+                exclusive_create: !entry_delete,
+                verified_file_commit: !entry_delete,
+                ..RemoteCapabilities::default()
+            };
+            assert_eq!(vfs.capabilities().permits_add_only(), !entry_delete);
+            for result in [
+                strict.remove_file(path),
+                strict.remove_dir_all(path),
+                strict.remove_dir(path),
+            ] {
+                let error = result.unwrap_err();
+                if entry_delete {
+                    // Die Löschprüfung ist bestanden. Die ungebundene Operation
+                    // selbst wird weiterhin vor dem Providerzugriff abgelehnt.
+                    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                } else {
+                    assert_eq!(
+                        crate::error_code(&error),
+                        crate::ErrorCode::CapabilityProbeRequired
+                    );
+                }
+            }
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
     }
 
     #[test]

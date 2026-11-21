@@ -17,8 +17,23 @@ function limitationsHtml(title, label, values, expanded = false) {
   return `<details class="operation-error-details" ${expanded ? "open" : ""}><summary tabindex="0">${escapeHtml(title)}</summary><textarea class="listing-omissions-text" aria-label="${escapeHtml(label)}" tabindex="0" readonly>${escapeHtml(values.join("\n"))}</textarea></details>`;
 }
 
+/** @typedef {import("./file-transfer-wire.js").ConflictEntryWire} ConflictEntryWire */
+/** @typedef {{relative_name: string, left?: ConflictEntryWire, right?: ConflictEntryWire,
+ * source?: ConflictEntryWire, target?: ConflictEntryWire}} ConflictView */
+/** @typedef {{label: string, value?: string | number, explanation?: string,
+ * disabled?: boolean, danger?: boolean, wide?: boolean}} ConflictChoice */
+/** @typedef {{choices: ConflictChoice[], replacementBlockers?: string[]}} LoadedChoices */
+
 /** Gemeinsam für Sync und Copy/Move. Alle Pfade und Optionen kommen aus dem
- * Backend; Rollenwechsel betrifft ausschließlich die sichtbaren Spalten. */
+ * Backend; Rollenwechsel betrifft ausschließlich die sichtbaren Spalten.
+ * @param {{
+ * title: string, conflicts: ConflictView[], choices: ConflictChoice[],
+ * leftRole?: string, rightRole?: string, note?: string, replacementBlockers?: string[],
+ * sourceReadLimitations?: string[], loadChoices?: (() => Promise<LoadedChoices | null>) | null,
+ * signal?: AbortSignal | null
+ * }} options
+ * @returns {Promise<string | number | null | undefined>}
+ */
 export function conflictChoiceModal({ title, conflicts, leftRole = "Quelle", rightRole = "Ziel", choices, note = "", replacementBlockers = [], sourceReadLimitations = [], loadChoices = null, signal = null }) {
   return new Promise(resolve => {
     let modalToken = null;

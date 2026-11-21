@@ -2,10 +2,14 @@
 // Echte Oberfläche, kontrollierte Leseantworten; keine Nutzerdateien oder Appdaten.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { once } from "node:events";
 import { createServer } from "node:net";
 import { chromium } from "playwright";
 import { createBrowserCleanup } from "./browser-cleanup.mjs";
+
+const readResults = JSON.parse(await readFile(new URL("./tests/command-read-results.json", import.meta.url)));
+const searchWire = JSON.parse(await readFile(new URL("./tests/name-search-wire.json", import.meta.url)));
 
 const probe = createServer(); probe.listen(0, "127.0.0.1"); await once(probe, "listening");
 const port = probe.address().port; probe.close(); await once(probe, "close");
@@ -78,6 +82,13 @@ try {
     await new Promise(resolve => setTimeout(resolve, 25));
   }
   browser = await cleanup.launch(chromium, { headless: true, executablePath: process.env.DOPPELDECKER_PLAYWRIGHT_EXECUTABLE || undefined });
+  await test("Startantwort der Namenssuche entspricht dem Rust-IPC-Vertrag", async page => {
+    const started = await page.evaluate(async request => {
+      const { startNameSearch } = await import("/name-search-api.js");
+      return startNameSearch(request);
+    }, searchWire);
+    assert.deepEqual(started, readResults.nameSearchStarted);
+  });
   for (const method of ["Klick", "Enter"]) {
     await test(`Start per ${method} hält den Dialogfokus und Escape cancelt vor der Lauf-ID`, async page => {
       await page.evaluate(() => { window.__SEARCH_HOLD__ = true; });
@@ -210,6 +221,38 @@ try {
       assert.equal(await path.inputValue(), "/from");
     });
   }
+  await test("SFTP-Namenssuche erhält ihre Bindung und bricht nur den aktuellen Lauf ab", async page => {
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    await page.locator('[data-side="left"] .row.dir').filter({ hasText: "remote" }).waitFor();
+    const path = page.locator('[data-side="left"] .path');
+    await path.fill(searchWire.endpoint.root);
+    await path.press("Enter");
+    await page.waitForFunction(root => document.querySelector('[data-side="left"] .path').value === root, searchWire.endpoint.root);
+
+    const dialog = await open(page);
+    await dialog.getByLabel("Groß-/Kleinschreibung beachten").check();
+    await dialog.getByLabel("Versteckte Namen und Ordner einbeziehen").check();
+    await start(page, dialog, searchWire.options.query);
+    const [request] = await page.evaluate(() => window.__SEARCH_CALLS__);
+    assert.ok(Number.isSafeInteger(request.clientToken));
+    assert.deepEqual(request, { ...searchWire, clientToken: request.clientToken });
+
+    await page.evaluate(() => window.__SEARCH_EMIT__(0, { code: "plan_drift", message: "Die Verbindung wechselte während der Suche." }, true));
+    await dialog.getByRole("status").filter({ hasText: "Unvollständige Suche" }).waitFor();
+    await dialog.getByRole("alert").filter({ hasText: "Die Verbindung wechselte" }).waitFor();
+
+    await start(page, dialog, searchWire.options.query, 2);
+    const retry = await page.evaluate(() => window.__SEARCH_CALLS__[1]);
+    assert.ok(retry.clientToken > request.clientToken);
+    assert.deepEqual(retry, { ...searchWire, clientToken: retry.clientToken });
+    await dialog.getByRole("button", { name: "Suche abbrechen", exact: true }).click();
+    await page.waitForFunction(() => window.__SEARCH_CANCELS__.length === 1);
+    assert.deepEqual(await page.evaluate(() => window.__SEARCH_CANCELS__), [{ clientToken: retry.clientToken }]);
+    await emit(page, 0, update("complete", [hit("Veraltet.txt", searchWire.endpoint.root)]));
+    await emit(page, 1, update("cancelled"));
+    await dialog.getByRole("status").filter({ hasText: "Suche abgebrochen" }).waitFor();
+    assert.equal(await dialog.locator(".name-search-hit").count(), 0);
+  });
   await test("Schmaler dunkler Suchdialog bleibt ohne Überlauf bedienbar", async page => {
     await page.setViewportSize({ width: 800, height: 600 });
     await page.evaluate(async () => { (await import("/theme.js")).setTheme("dark"); });

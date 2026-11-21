@@ -37,6 +37,7 @@ pub(crate) struct ExitSnapshot {
     /// Dieses Zeichen verrät weder Profil noch Secret. Es verhindert nur, dass
     /// der Prozess mitten zwischen Schlüsselbund- und Profildatei-Wirkung endet.
     pub(crate) profile_transaction_active: bool,
+    pub(crate) cli_install_active: bool,
 }
 
 impl ExitSnapshot {
@@ -49,7 +50,9 @@ impl ExitSnapshot {
     }
 
     pub(crate) fn has_active_operations(&self) -> bool {
-        self.profile_transaction_active || self.windows.iter().any(|window| window.active_operation)
+        self.profile_transaction_active
+            || self.cli_install_active
+            || self.windows.iter().any(|window| window.active_operation)
     }
 
     pub(crate) fn failures(&self) -> impl Iterator<Item = &ExitFailure> {
@@ -162,6 +165,7 @@ pub(crate) fn assess_exit_with_pending(
     ExitSnapshot {
         windows,
         profile_transaction_active,
+        cli_install_active: false,
     }
 }
 
@@ -171,7 +175,7 @@ pub(crate) fn assess_app_exit(app: &tauri::AppHandle, state: &AppState) -> ExitS
     if labels.is_empty() {
         labels.push("main".into());
     }
-    assess_exit_with_pending(
+    let mut snapshot = assess_exit_with_pending(
         &labels,
         state.profile_transaction_active.load(Ordering::Acquire),
         |label| {
@@ -189,7 +193,9 @@ pub(crate) fn assess_app_exit(app: &tauri::AppHandle, state: &AppState) -> ExitS
             });
             (active, pending, queue)
         },
-    )
+    );
+    snapshot.cli_install_active = crate::cli_setup::cli_install_active();
+    snapshot
 }
 
 pub(crate) fn issue_exit_confirmation(

@@ -59,4 +59,4 @@ laufende Arbeit zu übergehen.
 Die Abnahme und die jeweils belegten Plattformgrenzen stehen im Releaseplan.
 ZIP bleibt das unterstützte Archivformat; Finder-Funktionen benötigen macOS. Zusätzliche
 Protokoll- und Metadatengrenzen stehen in der [Funktionsmatrix](function-audit.md).
-[Alle Änderungen](../CHANGELOG.md#01125---2026-11-08) · [Kandidatenabnahme](release-plan.md).
+[Alle Änderungen](history/changelog-preview.md#01125---2026-11-08) · [Kandidatenabnahme](release-plan.md).

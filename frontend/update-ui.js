@@ -7,8 +7,10 @@ import { escapeHtml } from "./ui-utils.js";
  * Klick darf den im Backend gebundenen Release installieren. */
 export function createUpdateUi({ beginActivity, running, showDock, showError }) {
   let busy = false;
+  /** @type {import("./update-wire.js").UpdateCheckWire | null} */
   let pendingResult = null;
 
+  /** @param {string} version */
   async function install(version) {
     const finishActivity = beginActivity("update-install");
     if (!finishActivity) {

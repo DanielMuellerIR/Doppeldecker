@@ -837,7 +837,9 @@ fn direkte_symlinks_und_spezialdateien_sperren_unabhaengige_dateiadditionen_nich
     let case = Case::new();
     std::os::unix::fs::symlink("Direkt.txt", case.source.join("Link")).unwrap();
     let fifo = std::ffi::CString::new(case.source.join("FIFO").as_os_str().as_bytes()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    // SAFETY: fifo hält den nullterminierten Pfad bis zur Rückkehr.
+    let created = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+    assert_eq!(created, 0);
     let op = case.prepared(&["Link", "Direkt.txt", "FIFO"]);
     let (_, result) = case.run(op, &Cancel::new(), &mut |_| {});
     let Ok(QueueExecutionResult::File(stats)) = result else {

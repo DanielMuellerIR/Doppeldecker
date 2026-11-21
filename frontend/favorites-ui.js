@@ -1,4 +1,6 @@
-import { invoke } from "./tauri-api.js";
+import {
+  addLocalFavorite, addRemoteFavorite, importFinderFavorites, listFavorites, moveFavorite, removeFavorite,
+} from "./favorites-api.js";
 import { openMenu } from "./context-menu.js";
 import { $, escapeHtml } from "./ui-utils.js";
 
@@ -81,7 +83,7 @@ export function createFavoritesUi({
   async function load({ afterChange = false } = {}) {
     const request = ++loadGeneration;
     try {
-      const current = await invoke("list_favorites");
+      const current = await listFavorites();
       if (request !== loadGeneration) return;
       favorites = current;
       render();
@@ -97,9 +99,9 @@ export function createFavoritesUi({
     const displayName = (name || baseName(path) || path).trim();
     try {
       if ((endpoint.provider || "local") === "local") {
-        await invoke("add_favorite", { name: displayName, path });
+        await addLocalFavorite({ name: displayName, path });
       } else {
-        await invoke("add_remote_favorite", {
+        await addRemoteFavorite({
           name: displayName,
           provider: endpoint.provider,
           profileId: endpoint.profileId,
@@ -118,7 +120,7 @@ export function createFavoritesUi({
   async function remove(favorite) {
     const endpoint = endpointOf(favorite);
     try {
-      await invoke("remove_favorite", endpoint);
+      await removeFavorite(endpoint);
       await load({ afterChange: true });
     } catch (error) {
       showError("Fehler", error);
@@ -128,7 +130,7 @@ export function createFavoritesUi({
   async function moveTo(favorite, index) {
     const endpoint = endpointOf(favorite);
     try {
-      await invoke("move_favorite", { ...endpoint, index });
+      await moveFavorite({ ...endpoint, index });
       await load({ afterChange: true });
     } catch (error) {
       showError("Fehler", error);
@@ -140,7 +142,7 @@ export function createFavoritesUi({
    * backend-seitig übersprungen; die Bilanz wird sichtbar gemeldet. */
   async function importFromFinder() {
     try {
-      const summary = await invoke("import_finder_favorites");
+      const summary = await importFinderFavorites();
       const skipped = [];
       if (summary.skipped_existing) skipped.push(`${summary.skipped_existing} bereits vorhanden`);
       if (summary.skipped_missing) skipped.push(`${summary.skipped_missing} kein (vorhandener) Ordner`);

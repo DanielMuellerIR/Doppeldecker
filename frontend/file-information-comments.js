@@ -1,13 +1,27 @@
-import { invoke } from "./tauri-api.js";
-import { $, escapeHtml, isEntryNameSafe } from "./ui-utils.js";
+// @ts-check
+
+import { editFinderComments, readFinderComments } from "./file-property-api.js";
+import { $, errText, escapeHtml, isEntryNameSafe } from "./ui-utils.js";
+
+/** @typedef {import("./file-information.js").FilePropertySnapshot} FilePropertySnapshot */
+/** @typedef {FilePropertySnapshot & {
+ * commentRows?: import("./file-property-wire.js").FinderCommentReadRowWire[],
+ * commentReadPage?: number, commentReadStatus?: string, commentReading?: boolean,
+ * commentLoaded?: boolean, commentPermissionDenied?: boolean, commentDraft?: string, commentsStatus?: string
+ * }} EditorSnapshot */
+/** @typedef {import("./file-information.js").FilePropertyEditorCallbacks<
+ * EditorSnapshot, {text: string},
+ * import("./file-property-wire.js").FinderCommentEditRowWire>} EditorOptions */
 
 const PAGE_SIZE = 40;
+/** @param {EditorOptions} options */
 export function createFinderCommentEditor({ getCurrent, scopeMatches, isBusy, refresh, applyEdit }) {
   let generation = 0;
+  /** @param {EditorSnapshot} snapshot */
   const names = snapshot => snapshot.entries.filter(isEntryNameSafe).map(entry => entry.name);
   function html() {
     const snapshot = getCurrent();
-    if (!snapshot.propertyCapabilities?.comments || !names(snapshot).length) return "";
+    if (!snapshot?.propertyCapabilities?.comments || !names(snapshot).length) return "";
     const selected = names(snapshot), rows = snapshot.commentRows || [];
     const page = snapshot.commentReadPage || 0, pages = Math.ceil(selected.length / PAGE_SIZE);
     const editable = !snapshot.commentReading && rows.some(row => row.state);
@@ -33,8 +47,8 @@ export function createFinderCommentEditor({ getCurrent, scopeMatches, isBusy, re
     snapshot.commentReading = true; snapshot.commentRows = []; snapshot.commentPermissionDenied = false;
     snapshot.commentReadStatus = "Finder-Kommentare werden gelesen …"; refresh();
     try {
-      const rows = await invoke("get_file_finder_comments", { request: { provider: snapshot.provider, root: snapshot.parent,
-        names: selected.slice(snapshot.commentReadPage * PAGE_SIZE, (snapshot.commentReadPage + 1) * PAGE_SIZE), requestPermission } });
+      const rows = await readFinderComments({ provider: snapshot.provider, root: snapshot.parent,
+        names: selected.slice(snapshot.commentReadPage * PAGE_SIZE, (snapshot.commentReadPage + 1) * PAGE_SIZE), requestPermission });
       if (getCurrent() !== snapshot || generation !== requestGeneration || !scopeMatches()) return;
       snapshot.commentRows = rows;
       snapshot.commentPermissionDenied = rows.some(row => row.permissionRequired);
@@ -42,40 +56,55 @@ export function createFinderCommentEditor({ getCurrent, scopeMatches, isBusy, re
       if (selected.length === 1) snapshot.commentDraft = rows[0]?.state?.text || "";
     } catch (error) {
       if (getCurrent() !== snapshot || generation !== requestGeneration || !scopeMatches()) return;
-      snapshot.commentReadStatus = error.message || String(error);
+      snapshot.commentReadStatus = errText(error) || String(error);
     } finally {
       if (getCurrent() === snapshot && generation === requestGeneration) {
         snapshot.commentLoaded = true; snapshot.commentReading = false; refresh();
       }
     }
   }
+  /** @param {string} text */
   async function change(text) {
     const snapshot = getCurrent();
-    const report = await applyEdit("comments", "change_file_finder_comments", { text }, "Finder-Kommentare werden gespeichert … Abbruch bleibt möglich.");
+    if (!snapshot) return;
+    const report = await applyEdit(
+      "comments",
+      editFinderComments,
+      { text },
+      "Finder-Kommentare werden gespeichert … Abbruch bleibt möglich.",
+    );
     if (report && getCurrent() === snapshot && scopeMatches()) await load(snapshot.commentReadPage || 0);
   }
+  /** @param {Event} event */
   function click(event) {
+    if (!(event.target instanceof Element)) return false;
     const button = event.target.closest("button");
-    if (!button || !Object.keys(button.dataset).some(key => key.startsWith("comment"))) return false;
-    if (isBusy() || !scopeMatches()) return true;
+    if (!(button instanceof HTMLButtonElement) || !Object.keys(button.dataset).some(key => key.startsWith("comment"))) return false;
     const snapshot = getCurrent();
+    if (!snapshot || isBusy() || !scopeMatches()) return true;
     if (button.hasAttribute("data-comment-authorize")) void load(snapshot.commentReadPage || 0, true);
     else if (button.hasAttribute("data-comment-reload")) void load(snapshot.commentReadPage || 0);
     else if (button.hasAttribute("data-comment-page")) void load((snapshot.commentReadPage || 0) + Number(button.dataset.commentPage));
     else if (button.hasAttribute("data-comment-clear")) void change("");
     else if (button.hasAttribute("data-comment-save")) {
-      const text = $("#file-info-comment-text").value;
+      const input = $("#file-info-comment-text");
+      if (!(input instanceof HTMLTextAreaElement)) return true;
+      const text = input.value;
       if (!text.length) { snapshot.commentsStatus = "Zum Leeren bitte „Kommentar entfernen“ wählen."; refresh(); }
       else void change(text);
     }
     return true;
   }
+  /** @param {Element} body */
   function connect(body) {
     const snapshot = getCurrent();
-    body.querySelector('[data-file-info-editor="comments"]')?.addEventListener("toggle", event => {
-      if (event.target.open && getCurrent() === snapshot && !snapshot.commentLoaded && !snapshot.commentReading) void load();
+    if (!snapshot) return;
+    const details = body.querySelector('[data-file-info-editor="comments"]');
+    if (details instanceof HTMLDetailsElement) details.addEventListener("toggle", () => {
+      if (details.open && getCurrent() === snapshot && !snapshot.commentLoaded && !snapshot.commentReading) void load();
     });
-    body.querySelector("#file-info-comment-text")?.addEventListener("input", event => { snapshot.commentDraft = event.target.value; });
+    const input = body.querySelector("#file-info-comment-text");
+    if (input instanceof HTMLTextAreaElement) input.addEventListener("input", () => { snapshot.commentDraft = input.value; });
   }
   return { html, load, click, connect };
 }

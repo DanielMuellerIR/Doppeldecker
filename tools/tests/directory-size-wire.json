@@ -1,0 +1,17 @@
+{
+  "local": {
+    "side": "left",
+    "endpoint": { "provider": "local", "root": "/mock/quelle" },
+    "names": ["Bilder"],
+    "recalculate": false,
+    "clientToken": 3
+  },
+  "remote": {
+    "side": "left",
+    "endpoint": { "provider": "sftp", "profileId": "mock_sftp", "profileRevision": 11, "root": "/" },
+    "names": ["remote"],
+    "sessionGeneration": 1,
+    "recalculate": false,
+    "clientToken": 4
+  }
+}

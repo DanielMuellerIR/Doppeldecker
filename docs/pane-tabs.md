@@ -16,7 +16,7 @@ nächste, am rechten Ende der vorherige Tab aktiv.
 
 Providerverbindungen bleiben prozessweit sichtbar. Operations-Queue,
 Single-Flight, Vorbereitungen und Permits bleiben je Fenster, gemäß dem
-[Mehrfenstervertrag](goal-mehrere-fenster.md). Ein Tab erzeugt keine weitere Queue
+[Mehrfenstervertrag](multi-window.md). Ein Tab erzeugt keine weitere Queue
 und übernimmt keinen fremden Permit. Laufende Dateioperationen verwenden weiterhin
 ihren bereits bestätigten Endpunkt; ein Tab-Wechsel darf ihn nicht umdeuten.
 

@@ -1,0 +1,10 @@
+{
+  "request": {
+    "endpoint": { "provider": "sftp", "profileId": "mock_sftp", "profileRevision": 11, "root": "/" },
+    "path": "/remote.txt"
+  },
+  "response": { "bytes": "number", "content": "object", "limitations": "array" },
+  "text": { "kind": "string", "text": "string" },
+  "image": { "kind": "string", "data_url": "string", "width": "number", "height": "number" },
+  "unsupported": { "kind": "string", "reason": "string" }
+}

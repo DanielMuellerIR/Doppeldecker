@@ -4,7 +4,7 @@ Stand: 2026-11-01. ZIP-Erzeugung ist als eigener Core-/Fensterqueue-Ablauf umges
 Core-, CLI- und App-Suiten, Clippy und der gesperrte Fuzz-Check bestehen auf
 macOS und Linux. Native Bedienläufe auf beiden Plattformen prüfen Abbruch,
 Deflate-/Stored-Inhalte, Leerordner, Kollision und Quelländerung;
-[Umfang und Prüfgrenzen](roadmap-2026-10-23.md#zip-erstellung-und-lesekern).
+[Umfang und Prüfgrenzen](history/roadmap-2026-10-23.md#zip-erstellung-und-lesekern).
 
 Eine entfernte Gegenpane ist als Ziel wählbar; dafür gilt der
 [zweiphasige Archivupload](remote-pack.md). Dieser Vertrag beschreibt die lokale Erzeugung.

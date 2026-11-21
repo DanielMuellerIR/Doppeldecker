@@ -1,0 +1,146 @@
+{
+  "request": {
+    "items": ["/mock/quelle/Alpha.txt"],
+    "destDir": "/mock/ziel",
+    "overwrite": false,
+    "expectedConflicts": ["/mock/ziel/Alpha.txt"],
+    "keepBothPreparationId": "mock-keep-both",
+    "conflictPreparationId": "mock-file-conflict",
+    "replaceBestEffortExpected": false
+  },
+  "preview": {
+    "sourceReadLimitations": "array",
+    "sourceTree": "object|null",
+    "conflicts": "array",
+    "conflictDetails": "array",
+    "keepBothPreparationId": "string|null",
+    "conflictPreparationId": "string|null",
+    "keepBothNames": "array",
+    "keepBothBlocker": "string|null",
+    "targetCapabilities": "object",
+    "sourceCapabilities": "object|null",
+    "skipOnly": "boolean",
+    "sourceRemovalRequired": "boolean",
+    "requiresConflictChoice": "boolean"
+  },
+  "capabilities": {
+    "provider": "string",
+    "copyNew": "boolean",
+    "copyNewBestEffort": "boolean",
+    "replace": "boolean",
+    "replaceBestEffort": "boolean",
+    "removeSource": "boolean",
+    "removeSourceBestEffort": "boolean",
+    "renameNoreplace": "boolean",
+    "limitations": "array",
+    "blockers": "array"
+  },
+  "providerTransfer": {
+    "request": {
+      "kind": "move",
+      "source": {
+        "provider": "ftps",
+        "profileId": "mock_ftps",
+        "profileRevision": 21,
+        "root": "/from"
+      },
+      "target": {
+        "provider": "ftps",
+        "profileId": "mock_ftps",
+        "profileRevision": 21,
+        "root": "/to"
+      },
+      "items": [
+        "/from/remote.txt"
+      ],
+      "destination": "/to"
+    },
+    "choice": {
+      "id": "mock-ap21-1",
+      "policy": "inspect"
+    },
+    "enqueue": {
+      "kind": "move",
+      "source": {
+        "provider": "ftps",
+        "profileId": "mock_ftps",
+        "profileRevision": 21,
+        "root": "/from"
+      },
+      "target": {
+        "provider": "ftps",
+        "profileId": "mock_ftps",
+        "profileRevision": 21,
+        "root": "/to"
+      },
+      "items": [
+        "/from/remote.txt"
+      ],
+      "destination": "/to",
+      "overwrite": true,
+      "expectedConflicts": [
+        "/to/remote.txt"
+      ],
+      "keepBothPreparationId": null,
+      "conflictPreparationId": "mock-ap21-2",
+      "copyNewBestEffortExpected": true,
+      "replaceBestEffortExpected": true,
+      "removeSourceBestEffortExpected": true
+    },
+    "intent": {
+      "kind": "copy",
+      "source": {
+        "provider": "sftp",
+        "profileId": "mock_sftp",
+        "profileRevision": 11,
+        "root": "/"
+      },
+      "target": {
+        "provider": "local",
+        "root": "/mock/ziel"
+      },
+      "items": [
+        "/remote.txt"
+      ],
+      "destination": "/mock/ziel"
+    },
+    "generated": {
+      "kind": "copy",
+      "source": {
+        "provider": "local",
+        "root": ""
+      },
+      "target": {
+        "provider": "local",
+        "root": ""
+      },
+      "items": [],
+      "destination": "",
+      "generatedOperationId": "mock-generated"
+    },
+    "conflict": {
+      "relative_name": "string",
+      "source": "object",
+      "target": "object"
+    },
+    "conflictEntry": {
+      "endpoint": "string",
+      "exists": "boolean",
+      "kind": "string|null",
+      "size": "number|null",
+      "mtime": "number|null"
+    },
+    "sourceTree": {
+      "digest": "string",
+      "entries": "number",
+      "files": "number",
+      "directories": "number",
+      "bytes": "number",
+      "omitted": "array"
+    },
+    "omission": {
+      "path": "string",
+      "reason": "string"
+    }
+  }
+}

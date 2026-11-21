@@ -193,7 +193,7 @@ impl ClaimRun {
         let journal = Journal {
             version: 2,
             run_id: run_id.clone(),
-            effective_uid: unsafe { libc::geteuid() },
+            effective_uid: rustix::process::geteuid().as_raw(),
             journal_parent,
             sandbox: layout.sandbox.as_ref().map(snapshot).transpose()?,
             area_intent: Some(intent),
@@ -696,7 +696,7 @@ fn directory_evidence(root: &RootHandle, private: bool) -> io::Result<DirectoryE
     let evidence = snapshot(root)?;
     let acl = crate::acl::read_fd(root.fd())?;
     if acl_evidence(acl.as_ref())? != evidence.acl
-        || evidence.owner != unsafe { libc::geteuid() }
+        || evidence.owner != rustix::process::geteuid().as_raw()
         || evidence.mode & if private { 0o077 } else { 0o022 } != 0
         || !acl_safe(acl.as_ref(), private)
     {
@@ -1024,19 +1024,26 @@ pub(in crate::trash) mod tests {
     #[ignore = "Nur isoliert als root für den echten UID-Wechsel ausführen"]
     fn fremde_uid_mit_gehaltenen_ordnerhandles_erreicht_den_privaten_claim_nicht() {
         use std::os::fd::AsRawFd;
-        assert_eq!(unsafe { libc::geteuid() }, 0, "Isolierter Root-Test fehlt");
+        assert_eq!(
+            rustix::process::geteuid().as_raw(),
+            0,
+            "Isolierter Root-Test fehlt"
+        );
         let fixture = Fixture::new();
         let mut run = fixture.prepare();
         run.claim(0).unwrap();
         let source_fd = run.source(0).unwrap().fd().as_raw_fd();
         let area_fd = run.area.as_ref().unwrap().fd().as_raw_fd();
-        // Nach fork ausschließlich async-signal-sichere Systemaufrufe verwenden.
         // Selbst ein bereits gehaltener privater Ordner-FD umgeht nach dem
         // UID-Wechsel seine Suchrechte nicht. Der öffentliche Quell-FD bleibt
         // dagegen absichtlich schreibbar.
+        // SAFETY: Das Kind verwendet die geerbten Deskriptoren und statischen
+        // Puffer und beendet sich mit _exit ohne Rust-Destruktoren.
         let pid = unsafe { libc::fork() };
-        assert!(pid >= 0);
         if pid == 0 {
+            // SAFETY: Beide Deskriptoren bleiben durch run offen. Die Namen
+            // sind C-Strings, der Schreibpuffer enthält genau sieben Bytes.
+            // setgroups mit Länge 0 verwendet den NULL-Zeiger nicht.
             unsafe {
                 if libc::setgroups(0, std::ptr::null()) != 0
                     || libc::setgid(65534) != 0
@@ -1063,8 +1070,11 @@ pub(in crate::trash) mod tests {
                 libc::_exit(0);
             }
         }
+        assert!(pid > 0);
         let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        // SAFETY: pid bezeichnet das eigene Kind und status ist schreibbar.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
         run.check_area().unwrap();

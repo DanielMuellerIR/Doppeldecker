@@ -3,6 +3,8 @@ import { operationLabel } from "./queue-ui.js";
 import { invoke } from "./tauri-api.js";
 import { $, errText, escapeHtml } from "./ui-utils.js";
 
+/** @typedef {import("./recovery-trash-wire.js").RecoveryOverviewWire} RecoveryOverviewWire */
+
 const queueReasons = {
   outcome_unclear: "Wirkung ungeklärt",
   settlement_pending: "Abschluss prüfen",
@@ -26,6 +28,7 @@ function row(title, detail, action = "") {
   </div>`;
 }
 
+/** @param {RecoveryOverviewWire["queue"]} queue */
 function queueRows(queue) {
   if (!queue) return note("Die Fensterqueue konnte nicht gelesen werden.");
   if (!queue.length) return note("Keine offenen Befunde.");
@@ -37,6 +40,7 @@ function queueRows(queue) {
   )).join("");
 }
 
+/** @param {RecoveryOverviewWire["trash"]} trash */
 function trashRows(trash) {
   if (trash?.Err) return note(errText(trash.Err));
   if (!trash?.Ok?.length) return note("Keine verbliebenen Papierkorb-Journale.");

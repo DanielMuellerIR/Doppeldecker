@@ -61,13 +61,74 @@ fn check_cancel(cancel: &Cancel) -> io::Result<()> {
         Ok(())
     }
 }
-/// Prüft Auswahl und Optionen vor jedem Providerzugriff; Einzelprobleme bleiben Vorschauzeilen.
-pub(crate) fn validate_remote_batch_rename_request(
-    names: &[String],
-    options: &BatchRenameOptions,
-) -> io::Result<()> {
-    validate_batch_rename_request(names, options)
+
+// Die Protokollfassaden behalten eigene Typen und öffentliche Namen, teilen
+// aber Validierung, Vorschau und Ausführung über denselben Stapel.
+macro_rules! define_remote_batch_rename {
+    ($prepared:ident, $validate:ident, $kind:ident, $wrong_provider:literal) => {
+        use std::io;
+        use $crate::batch_rename::{BatchRenameOptions, BatchRenameReport, BatchRenameRow};
+        use $crate::remote_batch_rename::PreparedRemoteBatchRename;
+        use $crate::{Cancel, ProviderEndpoint, ProviderKind, RenameExecutionClass};
+
+        pub struct $prepared {
+            inner: PreparedRemoteBatchRename,
+        }
+        pub fn $validate(names: &[String], options: &BatchRenameOptions) -> io::Result<()> {
+            crate::batch_rename::validate_batch_rename_request(names, options)
+        }
+        impl $prepared {
+            pub fn prepare(
+                endpoint: &ProviderEndpoint,
+                names: &[String],
+                options: &BatchRenameOptions,
+                cancel: &Cancel,
+            ) -> io::Result<Self> {
+                Ok(Self {
+                    inner: PreparedRemoteBatchRename::prepare(
+                        endpoint,
+                        names,
+                        options,
+                        cancel,
+                        ProviderKind::$kind,
+                        $wrong_provider,
+                    )?,
+                })
+            }
+            pub fn rows(&self) -> &[BatchRenameRow] {
+                self.inner.rows()
+            }
+            pub fn execution_class(&self) -> RenameExecutionClass {
+                self.inner.execution_class()
+            }
+            pub fn limitations(&self) -> &[String] {
+                self.inner.limitations()
+            }
+            pub fn is_expired(&self) -> bool {
+                self.inner.is_expired()
+            }
+            pub fn execute(
+                self,
+                cancel: &Cancel,
+                before_each: &mut dyn FnMut() -> io::Result<()>,
+                on_progress: &mut dyn FnMut(usize, usize),
+            ) -> BatchRenameReport {
+                self.inner.execute(cancel, before_each, on_progress)
+            }
+            pub fn execute_with_queue(
+                self,
+                cancel: &Cancel,
+                before_each: &mut dyn FnMut() -> io::Result<()>,
+                on_progress: &mut dyn FnMut(usize, usize),
+                queue: &crate::OperationQueue,
+            ) -> BatchRenameReport {
+                self.inner
+                    .execute_with_queue(cancel, before_each, on_progress, Some(queue))
+            }
+        }
+    };
 }
+pub(crate) use define_remote_batch_rename;
 impl PreparedRemoteBatchRename {
     /// Hält den gewählten Pane-Bestand und beobachtbare Metadaten, keine Inhalte.
     pub fn prepare(
@@ -75,16 +136,15 @@ impl PreparedRemoteBatchRename {
         names: &[String],
         options: &BatchRenameOptions,
         cancel: &Cancel,
+        expected_provider: ProviderKind,
+        wrong_provider: &'static str,
     ) -> io::Result<Self> {
-        validate_remote_batch_rename_request(names, options)?;
-        if !matches!(
-            endpoint.kind(),
-            ProviderKind::Sftp | ProviderKind::Smb | ProviderKind::Ftps | ProviderKind::WebDav
-        ) {
+        validate_batch_rename_request(names, options)?;
+        if endpoint.kind() != expected_provider {
             return Err(crate::coded_error(
                 io::ErrorKind::Unsupported,
                 ErrorCode::Unsupported,
-                "Dieser Stapel unterstützt SFTP, SMB, FTP/FTPS und WebDAV",
+                wrong_provider,
             ));
         }
         check_cancel(cancel)?;
@@ -937,9 +997,6 @@ fn smb_spelling_candidates(
             match spelling_member(listing, &row.old_name).and_then(|item| {
                 item.provider_token
                     .clone()
-                    .filter(|token| {
-                        token.len() == 16 && token[..8] == item.entry.inode.unwrap().to_le_bytes()
-                    })
                     .ok_or_else(|| drift("SMB-Quellversion fehlt"))
             }) {
                 Ok(token) => Some(token),

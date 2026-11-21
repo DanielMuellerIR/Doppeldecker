@@ -1,0 +1,93 @@
+{
+  "pack": {
+    "request": {
+      "requestId": "pack-request",
+      "provider": "local",
+      "root": "/artificial/source",
+      "items": ["/artificial/source/file.txt"],
+      "targetName": "file.txt.zip",
+      "options": { "compression": "deflate" },
+      "target": { "provider": "sftp", "root": "/remote/Archivziel", "profileId": "target-profile", "profileRevision": 7 }
+    },
+    "response": {
+      "preparationId": "backend-zip-id",
+      "binding": {
+        "digest": [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9],
+        "preview": {
+          "source_root": "/artificial/source",
+          "target": "/private/artificial-workspace/content/result.zip",
+          "files": 1,
+          "directories": 0,
+          "source_bytes": 9,
+          "commit_class": "assured",
+          "file_flush": true,
+          "directory_flush": true,
+          "issues": []
+        }
+      },
+      "uploadTarget": "SFTP · example.invalid:22 · /remote/Archivziel",
+      "uploadNotice": "SFTP · Best Effort: Gleichzeitige serverseitige Pfadänderungen können die Aktion auf ein anderes Ziel im selben Konto umlenken, auch außerhalb dieses Ordners."
+    }
+  },
+  "extract": {
+    "request": {
+      "requestId": "extract-request",
+      "provider": "local",
+      "root": "/künstlich/quelle",
+      "sourcePath": "/künstlich/quelle/Archiv.zip",
+      "targetProvider": "sftp",
+      "targetDir": "/remote/Entpackziel",
+      "target": { "provider": "sftp", "root": "/remote/Entpackziel", "profileId": "target-profile", "profileRevision": 23 }
+    },
+    "selectionRequest": {
+      "requestId": "extract-selection-request",
+      "sessionId": "reader-session",
+      "entryId": "virtual-entry",
+      "targetProvider": "ftps",
+      "targetDir": "/remote/Entpackziel",
+      "target": { "provider": "ftps", "root": "/remote/Entpackziel", "profileId": "target-profile", "profileRevision": 23 }
+    },
+    "response": {
+      "requestId": "extract-selection-request",
+      "preparationId": "extract-preparation-1",
+      "binding": {
+        "digest": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+        "preview": {
+          "source_root": "",
+          "source_path": "",
+          "snapshot": {
+            "reference": {
+              "id": "snapshot-0123456789abcdef0123456789abcdef",
+              "manifest_digest": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+              "bytes": 128,
+              "blake3": "1111111111111111111111111111111111111111111111111111111111111111",
+              "created_unix_ms": 42
+            },
+            "origin": "SFTP · /entfernt/Archiv.zip",
+            "profile": { "protocol": "sftp", "profileId": "artificial-profile", "revision": 17 }
+          },
+          "target_dir": "/private/artificial-extract/content",
+          "selection": { "kind": "entry", "ordinal": 0, "raw_name": [65, 47, 66, 47, 110, 101, 115, 116, 101, 100, 46, 116, 120, 116] },
+          "relative_root": "nested.txt",
+          "selection_path": "A/B/nested.txt",
+          "catalog_complete": true,
+          "known_entries": 1,
+          "files": 1,
+          "directories": 0,
+          "source_bytes": 9,
+          "omitted_entries": 0,
+          "issues": [],
+          "conflicts": [],
+          "type_conflicts": [],
+          "conflict_details": [],
+          "commit_class": "assured",
+          "replace_best_effort": false,
+          "file_flush": true,
+          "directory_flush": true
+        }
+      },
+      "uploadTarget": "FTPS · example.invalid:21 · /remote/Entpackziel",
+      "uploadNotice": null
+    }
+  }
+}

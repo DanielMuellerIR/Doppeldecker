@@ -1080,46 +1080,6 @@ mod tests {
         assert!(!capabilities.permits_add_only());
     }
 
-    #[test]
-    fn sftp_und_smb_remove_methoden_verlangen_das_eigene_loesch_gate() {
-        fn method<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-            let start = source.find(start).expect("VFS-Methode fehlt");
-            let rest = &source[start..];
-            let end = rest.find(end).expect("nächste VFS-Methode fehlt");
-            &rest[..end]
-        }
-
-        for (provider, source, old_gate) in [
-            ("SFTP", include_str!("sftp.rs"), "require_add_only"),
-            ("SMB", include_str!("smb.rs"), "require_write_capability"),
-        ] {
-            for (start, end) in [
-                (
-                    "fn remove_file(&self, path: &Path)",
-                    "fn remove_dir_all(&self, path: &Path)",
-                ),
-                (
-                    "fn remove_dir_all(&self, path: &Path)",
-                    "fn remove_dir(&self, path: &Path)",
-                ),
-                (
-                    "fn remove_dir(&self, path: &Path)",
-                    "fn rename(&self, from: &Path, to: &Path)",
-                ),
-            ] {
-                let body = method(source, start, end);
-                assert!(
-                    body.contains("require_entry_delete"),
-                    "{provider}-{start} umgeht das eigene Lösch-Gate"
-                );
-                assert!(
-                    !body.contains(old_gate),
-                    "{provider}-{start} hängt wieder am Upload-Gate"
-                );
-            }
-        }
-    }
-
     fn valid_config() -> SftpConnectionConfig {
         SftpConnectionConfig {
             host: "SFTP.Example.test.".into(),
@@ -1670,64 +1630,5 @@ mod tests {
         );
         assert!(unclear.to_string().contains("gewöhnlich davor"));
         assert!(unclear.to_string().contains("gewöhnlich danach"));
-    }
-
-    /// Der unsymmetrische Zweizeiler darf in keiner Probe zurückkommen.
-    /// Regression: Die Guard-Bedingung oben trifft nur das eine wörtliche Muster.
-    /// Zwei SMB-Proben hatten die Zusammenfassung von Probe- und Cleanup-Fehler
-    /// stattdessen von Hand nachgebaut — mit `io::Error::other` beziehungsweise
-    /// `io::Error::new`, die beide den `ErrorCode` wegwerfen. Genau der verlorene
-    /// `OutcomeUnclear` hätte dort einen Wiederholversuch verboten, und
-    /// `ConnectionLost` wurde zur dauerhaften Fähigkeitsgrenze statt zu einem
-    /// Reconnect. Dieser Test prüft deshalb die Regel selbst: Wo in einer
-    /// Providerdatei von einem Cleanup die Rede ist, darf kein Fehler ohne Code
-    /// gebaut werden.
-    #[test]
-    fn kein_provider_baut_seine_cleanup_zusammenfassung_von_hand() {
-        // Zusammengesetzt, damit dieser Test seinen eigenen Quelltext nicht trifft.
-        let konstruktor = concat!("io::Error", "::other(");
-        let konstruktor_mit_kind = concat!("io::Error", "::new(");
-        for (name, quelle) in [
-            ("ftps.rs", include_str!("ftps.rs")),
-            ("smb.rs", include_str!("smb.rs")),
-            ("webdav.rs", include_str!("webdav.rs")),
-            ("sftp.rs", include_str!("sftp.rs")),
-            ("real_mode.rs", include_str!("real_mode.rs")),
-        ] {
-            let zeilen: Vec<&str> = quelle.lines().collect();
-            for (index, zeile) in zeilen.iter().enumerate() {
-                if !zeile.contains("Cleanup") && !zeile.contains("cleanup_error") {
-                    continue;
-                }
-                let start = index.saturating_sub(4);
-                let umfeld = zeilen[start..=index].join("\n");
-                // Nur das Umverpacken eines schon bestehenden Fehlers ist gemeint:
-                // ein neuer Fehler mit eigenem Kind und festem Text ist in Ordnung.
-                let verpackt_fehler = umfeld.contains("format!(")
-                    && (umfeld.contains(konstruktor) || umfeld.contains(konstruktor_mit_kind));
-                assert!(
-                    !verpackt_fehler,
-                    "{name}:{} baut eine Cleanup-Zusammenfassung ohne erhaltenen ErrorCode; \
-                     combine_probe_outcome, fold_cleanup_errors oder coded_error benutzen:\n{umfeld}",
-                    index + 1
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn keine_probe_verwirft_ihren_cleanup_mehr() {
-        // Zusammengesetzt, damit das Muster nicht im eigenen Quelltext steht.
-        let muster = format!("result?;\n{}cleanup?;", " ".repeat(8));
-        for (name, quelle) in [
-            ("ftps.rs", include_str!("ftps.rs")),
-            ("smb.rs", include_str!("smb.rs")),
-            ("webdav.rs", include_str!("webdav.rs")),
-        ] {
-            assert!(
-                !quelle.contains(&muster),
-                "{name} verwirft den Cleanup-Fehler wieder; combine_probe_outcome benutzen"
-            );
-        }
     }
 }

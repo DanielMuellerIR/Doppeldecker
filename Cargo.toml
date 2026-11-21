@@ -16,9 +16,18 @@ smb2 = { path = "vendor/smb2" }
 
 # Gemeinsame Metadaten, damit Version/Edition an einer Stelle stehen.
 [workspace.package]
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "MIT"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
 
 # Automatische Testläufe brauchen Dateiname und Zeile für verständliche Backtraces,
 # aber keine vollständigen Variablen- und Typinformationen für einen Debugger.

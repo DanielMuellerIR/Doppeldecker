@@ -1,5 +1,7 @@
 //! Kleiner Wiederanlaufbeleg für den laufenden Transfer einer Fensterqueue.
 
+use std::io::Read;
+
 use super::*;
 use crate::resumable_copy::{CopyCheckpoint, ResumeCopyPlan};
 
@@ -99,7 +101,7 @@ impl OperationQueue {
         plan: &ResumeCopyPlan,
         checkpoint: CopyCheckpoint,
     ) -> io::Result<()> {
-        let journal = self.journal.lock().unwrap();
+        let journal = self.lock_queue_state(&self.journal)?;
         self.require_current_config()?;
         if self.journal_outcome_unclear.load(Ordering::Acquire) {
             return Err(crate::coded_error(
@@ -126,7 +128,7 @@ impl OperationQueue {
             ));
         };
         plan.validate(Some(&checkpoint))?;
-        let mut latest = self.resume_progress.lock().unwrap();
+        let mut latest = self.lock_queue_state(&self.resume_progress)?;
         let previous = latest
             .as_ref()
             .filter(|record| record.operation == operation && record.attempt == entry.attempts)

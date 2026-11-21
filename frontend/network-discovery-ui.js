@@ -1,6 +1,8 @@
 import { invoke } from "./tauri-api.js";
 import { $, escapeHtml, readStoredValue, writeStoredValue } from "./ui-utils.js";
 
+/** @typedef {import("./command-read-results.js").DiscoveredNetworkServiceWire} DiscoveredNetworkServiceWire */
+
 const STORAGE_KEY = "doppeldecker-network-discovery-enabled";
 const MIN_REFRESH_INTERVAL_MS = 5_000;
 const PROTOCOL_LABELS = { smb: "SMB", sftp: "SFTP", webdav: "WebDAV" };
@@ -13,9 +15,16 @@ function initialEnabled() {
 
 /** Sichtbare LAN-Suche für DNS-SD-Funde. Ein Ergebnis öffnet nur den bestehenden
  * leeren Editor mit Vorschlagswerten; Verbinden, Secretzugriff und Identitäts-Pins
- * bleiben außerhalb dieser Komponente. */
+ * bleiben außerhalb dieser Komponente.
+ * @param {{
+ * onEnabledChange?: (enabled: boolean) => void,
+ * openService: (service: DiscoveredNetworkServiceWire) => void,
+ * showError: (title: string, error: unknown) => void
+ * }} callbacks
+ */
 export function createNetworkDiscoveryUi({ onEnabledChange, openService, showError }) {
   let enabled = initialEnabled();
+  /** @type {DiscoveredNetworkServiceWire[]} */
   let services = [];
   let running = false;
   let generation = 0;

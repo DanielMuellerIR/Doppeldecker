@@ -15,9 +15,10 @@ use crate::bidirectional_commands::{
     BidirectionalEndpointRequest,
 };
 use crate::mutex::MutexExt;
+use crate::queue_runtime::with_queue_extension_access;
 use crate::{
-    app_config_dir, emit_queue_snapshot, enqueue_operation_with_readback, sandbox_root,
-    start_queue_worker, with_queue_extension, with_reserved_operation, AppError, AppState,
+    app_config_dir, emit_queue_snapshot, sandbox_root, start_queue_worker, with_queue_extension,
+    with_reserved_operation, AppError, AppState,
 };
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -453,19 +454,13 @@ pub(crate) async fn enqueue_provider_delete(
                     "Bestätigung für das endgültige Remote-Löschen stimmt nicht exakt überein",
                 ));
             }
-            let (queue, entry) = with_queue_extension(&state, &window_state, || {
+            let (queue, entry) = with_queue_extension_access(&state, &window_state, |extension| {
                 let operation = QueueOperation::ProviderDelete {
                     endpoint,
                     mode: preview.mode,
                     expected_plan: Box::new(preview.plan),
                 };
-                crate::queue_runtime::enqueue_operation_with_profile_bindings(
-                    &app,
-                    &window_state,
-                    label,
-                    &operation,
-                    &profile_bindings,
-                )
+                extension.enqueue_with_profile_bindings(&app, label, &operation, &profile_bindings)
             })?;
             emit_queue_snapshot(&app, label, &queue);
             Ok(entry.operation_id)
@@ -597,13 +592,16 @@ fn validate_generated_file_request(request: &ProviderFileRequest) -> Result<(), 
 fn generated_upload_source_label(
     reference: &doppeldecker_core::generated_source::GeneratedSourceReference,
 ) -> String {
-    let kind = match reference.kind {
-        doppeldecker_core::generated_source::GeneratedSourceKind::Zip => "Erzeugtes ZIP",
-        doppeldecker_core::generated_source::GeneratedSourceKind::ZipExtraction => {
-            "Entpackte Auswahl"
-        }
+    let extracted =
+        reference.kind == doppeldecker_core::generated_source::GeneratedSourceKind::ZipExtraction;
+    let kind = if extracted {
+        "Entpackte Auswahl"
+    } else {
+        "Erzeugtes ZIP"
     };
-    format!("{kind} · {}", reference.label)
+    let label =
+        crate::frontend_payload::generated_source_display_label(&reference.label, extracted);
+    format!("{kind} · {label}")
 }
 
 fn bind_generated_file_request(
@@ -1218,7 +1216,7 @@ pub(crate) async fn enqueue_provider_file_operation(
                 }
                 None
             };
-            let (queue, entry) = with_queue_extension(&state, &window_state, || {
+            let (queue, entry) = with_queue_extension_access(&state, &window_state, |extension| {
                 file_preparation_not_cancelled(cancel)?;
                 let operation = QueueOperation::ProviderFile {
                     kind,
@@ -1241,13 +1239,9 @@ pub(crate) async fn enqueue_provider_file_operation(
                     replace_best_effort_expected: request.replace_best_effort_expected,
                     remove_source_best_effort_expected,
                 };
-                if let Some(previous) = generated_previous {
-                    let queue = crate::operation_queue(&app, &window_state, label)?;
-                    let entry = queue.resume_generated_upload(&previous, operation, profile_bindings, cancel)?;
-                    Ok((queue,entry))
-                } else {
-                    crate::queue_runtime::enqueue_operation_with_profile_bindings(&app, &window_state, label, &operation, &profile_bindings)
-                }
+                extension.enqueue_provider_file(
+                    &app, label, operation, profile_bindings, generated_previous, cancel,
+                )
             })?;
             emit_queue_snapshot(&app, label, &queue);
             Ok(entry.operation_id)
@@ -1430,7 +1424,7 @@ fn enqueue_file_operation(
     };
     let label = window.label();
     let window_state = state.window(label);
-    let (queue, entry) = with_queue_extension(state, &window_state, || {
+    let (queue, entry) = with_queue_extension_access(state, &window_state, |extension| {
         let operation = QueueOperation::File {
             kind: request.kind,
             items: item_paths
@@ -1445,7 +1439,7 @@ fn enqueue_file_operation(
             local_replace_best_effort_expected,
             local_copy_new_best_effort_expected: None,
         };
-        enqueue_operation_with_readback(&app, &window_state, label, &operation)
+        extension.enqueue_with_readback(&app, label, &operation)
     })?;
     emit_queue_snapshot(&app, label, &queue);
     start_queue_worker(app, label.to_owned());
@@ -1496,6 +1490,60 @@ pub(crate) async fn copy_paths(
     .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
+#[derive(Default)]
+pub(crate) struct ResumePreparationSlot {
+    active: Option<(String, doppeldecker_core::Cancel)>,
+    cancelled: std::collections::VecDeque<String>,
+}
+
+impl ResumePreparationSlot {
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    fn begin(&mut self, id: String) -> Result<doppeldecker_core::Cancel, AppError> {
+        if self.cancelled.contains(&id) {
+            return Err(resume_preparation_cancelled());
+        }
+        if self.is_active() {
+            return Err(AppError::new(
+                "busy",
+                "Ein fortsetzbarer Download wird bereits vorbereitet",
+            ));
+        }
+        let cancel = doppeldecker_core::Cancel::new();
+        self.active = Some((id, cancel.clone()));
+        Ok(cancel)
+    }
+
+    fn cancel(&mut self, id: String) {
+        if id.is_empty() || id.len() > 64 {
+            return;
+        }
+        if let Some((_, cancel)) = self.active.as_ref().filter(|(active, _)| active == &id) {
+            cancel.cancel();
+        }
+        // Die IPC-Nachricht kann den Start der zugehörigen Anfrage überholen.
+        if !self.cancelled.contains(&id) {
+            if self.cancelled.len() == 32 {
+                self.cancelled.pop_front();
+            }
+            self.cancelled.push_back(id);
+        }
+    }
+}
+
+struct ResumableCopyPreparation {
+    window: std::sync::Arc<crate::queue_runtime::WindowState>,
+    cancel: doppeldecker_core::Cancel,
+}
+
+impl Drop for ResumableCopyPreparation {
+    fn drop(&mut self) {
+        self.window.resumable_copy_preparation.lock_recover().active = None;
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn enqueue_resumable_copy(
     app: tauri::AppHandle,
@@ -1504,17 +1552,46 @@ pub(crate) async fn enqueue_resumable_copy(
     source_paths: Vec<String>,
     target_root: String,
     remote_source: Option<crate::bidirectional_commands::BidirectionalEndpointRequest>,
+    request_id: Option<String>,
 ) -> Result<Vec<String>, AppError> {
     for path in &source_paths {
         crate::browser_commands::validate_diff_path(&source_root, path)?;
     }
+    let state = app.state::<AppState>();
+    let window_state = state.window(window.label());
+    let preparation = if remote_source.is_some() {
+        let id = request_id
+            .filter(|id| !id.is_empty() && id.len() <= 64)
+            .ok_or_else(|| {
+                AppError::new(
+                    "invalid_input",
+                    "Fortsetzbarer Download benötigt eine Anfragekennung",
+                )
+            })?;
+        Some(with_queue_extension(&state, &window_state, || {
+            let cancel = window_state
+                .resumable_copy_preparation
+                .lock_recover()
+                .begin(id)?;
+            Ok(ResumableCopyPreparation {
+                window: window_state.clone(),
+                cancel,
+            })
+        })?)
+    } else {
+        None
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let label = window.label();
         let state = app.state::<AppState>();
         let window_state = state.window(label);
         let sandbox = sandbox_root()?;
         let target = expand_home_path(&target_root);
-        let (plans, bindings) = if let Some(request) = &remote_source {
+        let (plans, bindings) = if let (Some(request), Some(preparation)) =
+            (&remote_source, &preparation)
+        {
+            let cancel = &preparation.cancel;
+            ensure_resume_preparation_active(cancel)?;
             if !matches!(
                 request,
                 crate::bidirectional_commands::BidirectionalEndpointRequest::Webdav { .. }
@@ -1527,23 +1604,23 @@ pub(crate) async fn enqueue_resumable_copy(
                     "Fortsetzbarer Download benötigt das aktuelle WebDAV-, FTPS- oder SFTP-Pane",
                 ));
             }
-            let (source, endpoint, bindings) =
-                crate::bidirectional_commands::resolve_endpoint(&app, &state, request)?;
+            let resolved = crate::bidirectional_commands::resolve_endpoint(&app, &state, request);
+            ensure_resume_preparation_active(cancel)?;
+            let (source, endpoint, bindings) = resolved?;
             let sources = source_paths
                 .into_iter()
                 .map(PathBuf::from)
                 .collect::<Vec<_>>();
-            let plans = source
-                .prepare_remote_resumable_copies(
-                    endpoint.as_ref(),
-                    &sources,
-                    &target,
-                    sandbox.as_deref(),
-                    &doppeldecker_core::Cancel::new(),
-                )
-                .map_err(AppError::from)?;
+            let plans = source.prepare_remote_resumable_copies(
+                endpoint.as_ref(),
+                &sources,
+                &target,
+                sandbox.as_deref(),
+                cancel,
+            );
+            ensure_resume_preparation_active(cancel)?;
             crate::queue_runtime::ensure_profile_bindings_current(&app, &bindings)?;
-            (plans, bindings)
+            (plans.map_err(AppError::from)?, bindings)
         } else {
             let sources: Vec<_> = source_paths.iter().map(expand_home_path).collect();
             let plans = doppeldecker_core::resumable_copy::prepare_resume_copies(
@@ -1555,6 +1632,15 @@ pub(crate) async fn enqueue_resumable_copy(
             (plans, Vec::new())
         };
         let (queue, ids) = with_queue_extension(&state, &window_state, || {
+            // Abbruch und Queuecommit haben dieselbe Reihenfolge am Slot.
+            let _slot = preparation
+                .as_ref()
+                .map(|preparation| {
+                    let slot = window_state.resumable_copy_preparation.lock_recover();
+                    ensure_resume_preparation_active(&preparation.cancel)?;
+                    Ok::<_, AppError>(slot)
+                })
+                .transpose()?;
             let queue = crate::operation_queue(&app, &window_state, label)?;
             let ids = queue
                 .enqueue_resumable_copies(plans, &bindings)
@@ -1567,6 +1653,30 @@ pub(crate) async fn enqueue_resumable_copy(
     })
     .await
     .map_err(|error| AppError::new("app", error.to_string()))?
+}
+
+fn ensure_resume_preparation_active(cancel: &doppeldecker_core::Cancel) -> Result<(), AppError> {
+    if cancel.is_cancelled() {
+        return Err(resume_preparation_cancelled());
+    }
+    Ok(())
+}
+
+fn resume_preparation_cancelled() -> AppError {
+    AppError::new("interrupted", "Downloadvorbereitung abgebrochen")
+}
+
+#[tauri::command]
+pub(crate) fn cancel_resumable_copy_preparation(
+    window: WebviewWindow,
+    state: State<AppState>,
+    request_id: String,
+) {
+    state
+        .window(window.label())
+        .resumable_copy_preparation
+        .lock_recover()
+        .cancel(request_id);
 }
 
 #[tauri::command]
@@ -1837,6 +1947,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn trash_stats_match_the_browser_wire_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/recovery-trash-wire.json"))
+                .unwrap();
+        let complete = TrashStats {
+            trashed: 1,
+            ..Default::default()
+        };
+        let partial = TrashStats {
+            trashed: 1,
+            failed: 1,
+            unclear: 1,
+            recovery_paths: vec!["/mock/quelle/Prüfpfad".into()],
+            errors: vec![
+                "Zugriff verweigert".into(),
+                "Wirkung für <Prüfpfad> ungeklärt".into(),
+            ],
+        };
+        for (name, stats) in [("complete", complete), ("partial", partial)] {
+            assert_eq!(serde_json::to_value(stats).unwrap(), fixture["trash"][name]);
+        }
+    }
+
+    #[test]
+    fn downloadvorbereitung_bindet_fruehen_und_spaeten_abbruch_an_die_anfrage() {
+        let mut left = ResumePreparationSlot::default();
+        let mut right = ResumePreparationSlot::default();
+        left.cancel("frueh".to_owned());
+        assert_eq!(
+            left.begin("frueh".to_owned()).err().unwrap().code,
+            "interrupted"
+        );
+        let current = left.begin("aktuell".to_owned()).unwrap();
+        let other = right.begin("aktuell".to_owned()).unwrap();
+        left.cancel("frueh".to_owned());
+        assert!(!current.is_cancelled());
+        left.cancel("aktuell".to_owned());
+        assert!(current.is_cancelled() && !other.is_cancelled());
+        assert!(
+            left.is_active(),
+            "Der Worker hält seine Reservierung bis zum Ende"
+        );
+    }
+
+    #[test]
     fn erzeugte_konfliktquelle_zeigt_herkunft_statt_internem_cachepfad() {
         use doppeldecker_core::generated_source::{GeneratedSourceKind, GeneratedSourceReference};
         let mut reference:GeneratedSourceReference=serde_json::from_value(serde_json::json!({"id":"generated-00000000000000000000000000000000","manifest_digest":vec![9;32],"kind":"zip","label":"Ergebnis.zip","files":1,"directories":0,"bytes":42,"issues":[]})).unwrap();
@@ -1900,29 +2055,38 @@ mod tests {
         }
     }
 
-    /// Tauri benennt **verschachtelte** JSON-Felder nicht zuverlässig so um wie
-    /// Top-Level-Argumente. Genau daran scheiterte 2026-07-28 das Remote-Löschen mit
-    /// einem fehlenden `profile_id`. Diese drei Request-Strukturen hatten seither
-    /// keinen eigenen Regressionstest; geprüft wird deshalb der Payload, den das
-    /// Frontend wirklich sendet.
+    const FILE_TRANSFER_WIRE: &str = include_str!("../../tools/tests/file-transfer-wire.json");
+
+    /// Dieselbe Anfrage wie im AP02-Browserfall: Beide Identitäten kommen aus
+    /// der Vorschau und binden die späteren Copy-/Move-Commands.
     #[test]
     fn lokale_konfliktentscheidung_deserialisiert_backend_ids_in_frontend_schreibweise() {
-        let request: LocalFileTransferRequest = serde_json::from_value(serde_json::json!({
-            "items": ["/quelle/Datei.txt"], "destDir": "/ziel", "overwrite": false,
-            "expectedConflicts": ["/ziel/Datei.txt"], "keepBothPreparationId": "alias-id",
-            "conflictPreparationId": "snapshot-id", "replaceBestEffortExpected": false,
-        }))
-        .unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(FILE_TRANSFER_WIRE).unwrap();
+        let request: LocalFileTransferRequest =
+            serde_json::from_value(fixture["request"].clone()).unwrap();
+        assert_eq!(request.items, ["/mock/quelle/Alpha.txt"]);
+        assert_eq!(request.dest_dir, "/mock/ziel");
+        assert!(!request.overwrite);
+        assert_eq!(request.expected_conflicts, ["/mock/ziel/Alpha.txt"]);
         assert_eq!(
             request.keep_both_preparation_id.as_deref(),
-            Some("alias-id")
+            Some("mock-keep-both")
         );
         assert_eq!(
             request.conflict_preparation_id.as_deref(),
-            Some("snapshot-id")
+            Some("mock-file-conflict")
         );
-        assert_eq!(request.dest_dir, "/ziel");
         assert_eq!(request.replace_best_effort_expected, Some(false));
+
+        let mut optional = fixture["request"].clone();
+        let options = optional.as_object_mut().unwrap();
+        options.insert("keepBothPreparationId".into(), serde_json::Value::Null);
+        options.insert("conflictPreparationId".into(), serde_json::Value::Null);
+        options.remove("replaceBestEffortExpected");
+        let request: LocalFileTransferRequest = serde_json::from_value(optional).unwrap();
+        assert!(request.keep_both_preparation_id.is_none());
+        assert!(request.conflict_preparation_id.is_none());
+        assert!(request.replace_best_effort_expected.is_none());
     }
 
     #[test]
@@ -2177,6 +2341,140 @@ mod tests {
     }
 
     #[test]
+    fn routine_file_responses_match_the_browser_wire_fixture() {
+        use doppeldecker_core::{
+            DirectoryCreateExecutionClass, DirectoryCreateReport, RemoteDeleteItem,
+            RemoteDeleteRecord, RemoteDeleteSourceProof, RenameExecutionClass, RenameOutcome,
+            RootIdentity, SftpHostKeyPin, SftpRootIdentity, SftpServerIdentity,
+        };
+
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/routine-file-wire.json")).unwrap();
+        let endpoint = &wire["endpoint"];
+        let limits = vec![doppeldecker_core::sftp::SFTP_WRITE_LIMITATION.to_owned()];
+        let plan = RemoteDeletePlan {
+            root: "/".into(),
+            root_identity: RootIdentity::Sftp(SftpRootIdentity {
+                server: SftpServerIdentity {
+                    host: "sftp.example.invalid".into(),
+                    port: 22,
+                    host_key: SftpHostKeyPin {
+                        algorithm: "ssh-ed25519".into(),
+                        sha256: [9; 32],
+                    },
+                    canonical_root: "/daten".into(),
+                    sftp_version: 3,
+                    extensions_digest: [6; 32],
+                },
+                virtual_root: "/".into(),
+                session_generation: 1,
+            }),
+            items: vec![RemoteDeleteItem {
+                path: "/remote.txt".into(),
+                is_dir: false,
+                entries: 1,
+                bytes: 8,
+                digest: [1; 32],
+                source_proof: RemoteDeleteSourceProof {
+                    raw_name: b"remote.txt".to_vec(),
+                    provider_token: Some(vec![5, 7]),
+                    is_dir: false,
+                    is_file: true,
+                    is_symlink: false,
+                    size: 8,
+                    mtime: Some(1),
+                    mode: Some(420),
+                    device: None,
+                    inode: None,
+                },
+                records: vec![RemoteDeleteRecord {
+                    path: "/remote.txt".into(),
+                    is_dir: false,
+                    size: 8,
+                    provider_token: Some(vec![5, 7]),
+                    content_digest: Some([7; 32]),
+                }],
+            }],
+            entries: 1,
+            bytes: 8,
+            digest: [4; 32],
+        };
+        let preview = ProviderDeletePreview {
+            capabilities: ProviderDeleteCapabilities {
+                provider: ProviderKind::Sftp,
+                quarantine: false,
+                permanent: true,
+                limitations: vec![
+                    doppeldecker_core::sftp::SFTP_WRITE_LIMITATION.into(),
+                    doppeldecker_core::sftp::SFTP_DELETE_LIMITATION.into(),
+                ],
+                blockers: Vec::new(),
+            },
+            mode: RemoteDeleteMode::Permanent,
+            plan: plan.clone(),
+            confirmation: None,
+        };
+        let delete_wire = &wire["delete"];
+        assert_eq!(
+            serde_json::to_value(preview).unwrap(),
+            delete_wire["preview"]
+        );
+        let request: EnqueueProviderDeleteRequest = serde_json::from_value(serde_json::json!({
+            "endpoint": endpoint,
+            "items": delete_wire["items"],
+            "mode": delete_wire["preview"]["mode"],
+            "expectedPlan": delete_wire["preview"]["plan"],
+            "confirmation": null,
+            "effectsConfirmed": true
+        }))
+        .unwrap();
+        assert_eq!(request.expected_plan, plan);
+        assert_eq!(request.endpoint.provider_kind(), ProviderKind::Sftp);
+        assert!(request.effects_confirmed);
+
+        let rename_wire = &wire["rename"];
+        let rename_request: RenameProviderPathRequest =
+            serde_json::from_value(rename_wire["request"].clone()).unwrap();
+        assert_eq!(
+            rename_request.expected_execution_class,
+            Some(RenameExecutionClass::BestEffort)
+        );
+        let contract = provider_rename_contract(rename_request.endpoint).unwrap();
+        assert_eq!(
+            serde_json::to_value(contract).unwrap(),
+            rename_wire["contract"]
+        );
+        let rename = RenameProviderPathResponse {
+            outcome: RenameOutcome::Renamed,
+            class: RenameExecutionClass::BestEffort,
+            limitations: limits.clone(),
+            new_path: Some("/Umbenannt.txt".into()),
+            existing_is_dir: None,
+            verified_after_reconnect: false,
+        };
+        assert_eq!(
+            serde_json::to_value(rename).unwrap(),
+            rename_wire["response"]
+        );
+
+        let folder_wire = &wire["folder"];
+        let contract = provider_folder_contract(serde_json::from_value(endpoint.clone()).unwrap());
+        assert_eq!(
+            serde_json::to_value(contract).unwrap(),
+            folder_wire["contract"]
+        );
+        let folder = DirectoryCreateReport {
+            path: "/Künstlicher Ordner".into(),
+            execution_class: DirectoryCreateExecutionClass::BestEffort,
+            limitations: limits,
+        };
+        assert_eq!(
+            serde_json::to_value(folder).unwrap(),
+            folder_wire["response"]
+        );
+    }
+
+    #[test]
     fn verschachtelte_request_felder_folgen_dem_frontend() {
         let delete: ProviderDeleteRequest = serde_json::from_value(serde_json::json!({
             "endpoint": {
@@ -2313,15 +2611,64 @@ mod tests {
     /// Remote-Übertragungen mit `undefined`-Fähigkeiten.
     #[test]
     fn provider_file_preview_serialisiert_camel_case_fuer_das_frontend() {
+        use doppeldecker_core::{
+            conflict_view::ConflictEntryView,
+            fileops::{FileConflictProof, FileConflictView},
+            vfs::{InteractiveSourceTree, SourceReadOmission},
+        };
+
+        let proof = FileConflictProof {
+            path: "/daten/Datei".into(),
+            raw_name: b"Datei".to_vec(),
+            provider_token: None,
+            is_dir: false,
+            is_file: true,
+            is_symlink: false,
+            size: 11,
+            mtime: None,
+            mode: None,
+            device: None,
+            inode: None,
+            content_hash: None,
+            parent_inheritance: None,
+        };
         let preview = ProviderFilePreview {
             source_read_limitations: Vec::new(),
-            source_tree: None,
-            conflict_details: Vec::new(),
+            source_tree: Some(InteractiveSourceTree {
+                digest: "ab".repeat(32),
+                entries: 3,
+                files: 1,
+                directories: 2,
+                bytes: 11,
+                omitted: vec![SourceReadOmission {
+                    path: "/daten/Link".into(),
+                    reason: "Symlink wird nicht verfolgt".into(),
+                }],
+            }),
+            conflict_details: vec![FileConflictView {
+                source_proof: proof.clone(),
+                target_proof: proof,
+                relative_name: "Datei".into(),
+                source: ConflictEntryView {
+                    endpoint: "Quelle".into(),
+                    exists: true,
+                    kind: Some("file".into()),
+                    size: Some(11),
+                    mtime: None,
+                },
+                target: ConflictEntryView {
+                    endpoint: "Ziel".into(),
+                    exists: true,
+                    kind: Some("file".into()),
+                    size: Some(23),
+                    mtime: Some(1792108800),
+                },
+            }],
             keep_both_preparation_id: None,
             conflict_preparation_id: None,
             keep_both_names: Vec::new(),
             keep_both_blocker: None,
-            conflicts: Vec::new(),
+            conflicts: vec!["Datei".into()],
             target_capabilities: ProviderFileCapabilities {
                 provider: doppeldecker_core::ProviderKind::Ftps,
                 copy_new: false,
@@ -2342,7 +2689,18 @@ mod tests {
             conflict_metadata_only: false,
         };
         let value = serde_json::to_value(&preview).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(FILE_TRANSFER_WIRE).unwrap();
+        crate::browser_commands::assert_wire_object(&value, &fixture["preview"]);
+        let shapes = &fixture["providerTransfer"];
+        let conflict = &value["conflictDetails"][0];
+        crate::browser_commands::assert_wire_object(conflict, &shapes["conflict"]);
+        crate::browser_commands::assert_wire_object(&conflict["source"], &shapes["conflictEntry"]);
+        crate::browser_commands::assert_wire_object(&conflict["target"], &shapes["conflictEntry"]);
+        let tree = &value["sourceTree"];
+        crate::browser_commands::assert_wire_object(tree, &shapes["sourceTree"]);
+        crate::browser_commands::assert_wire_object(&tree["omitted"][0], &shapes["omission"]);
         let target = &value["targetCapabilities"];
+        crate::browser_commands::assert_wire_object(target, &fixture["capabilities"]);
         assert_eq!(target["copyNew"], false);
         assert_eq!(target["copyNewBestEffort"], true);
         assert_eq!(target["replaceBestEffort"], true);
@@ -2350,6 +2708,37 @@ mod tests {
         assert_eq!(target["removeSourceBestEffort"], false);
         assert_eq!(target["renameNoreplace"], false);
         assert_eq!(target["limitations"][0], "Testeinschränkung");
+    }
+
+    #[test]
+    fn file_transfer_wire_provider_requests_match_frontend() {
+        let fixture: serde_json::Value = serde_json::from_str(FILE_TRANSFER_WIRE).unwrap();
+        let fixture = &fixture["providerTransfer"];
+        for name in ["request", "generated"] {
+            let request: ProviderFileRequest =
+                serde_json::from_value(fixture[name].clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), fixture[name]);
+        }
+        let choice: ProviderFileChoiceRequest =
+            serde_json::from_value(fixture["choice"].clone()).unwrap();
+        assert_eq!(choice.policy, "inspect");
+        assert_eq!(choice.id, "mock-ap21-1");
+        let enqueue: EnqueueProviderFileRequest =
+            serde_json::from_value(fixture["enqueue"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(enqueue.operation).unwrap(),
+            fixture["request"]
+        );
+        assert!(enqueue.overwrite);
+        assert_eq!(enqueue.expected_conflicts, ["/to/remote.txt"]);
+        assert_eq!(enqueue.keep_both_preparation_id, None);
+        assert_eq!(
+            enqueue.conflict_preparation_id.as_deref(),
+            Some("mock-ap21-2")
+        );
+        assert_eq!(enqueue.copy_new_best_effort_expected, Some(true));
+        assert_eq!(enqueue.replace_best_effort_expected, Some(true));
+        assert_eq!(enqueue.remove_source_best_effort_expected, Some(true));
     }
 
     #[test]

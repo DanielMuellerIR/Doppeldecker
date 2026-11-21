@@ -1,4 +1,4 @@
-# Builddaten und Agentenausgaben begrenzen
+# Builddaten und Testartefakte begrenzen
 
 Stand: 2026-11-18.
 

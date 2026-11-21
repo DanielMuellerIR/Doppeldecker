@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { assertFilePropertyWire } from "./file-property-wire.mjs";
 
 export async function runFileFlagCases(runCase) {
   for (const [theme, width] of [["light", 650], ["dark", 390]]) {
@@ -10,10 +11,16 @@ export async function runFileFlagCases(runCase) {
           const original = window.__TAURI__.core.invoke;
           window.__FLAG_CALLS__ = []; window.__FLAG_VALUES__ = {locked:false,hiddenExtension:false};
           window.__TAURI__.core.invoke = async (command,args) => {
-            if (command === "get_file_flags") return args.request.names.map(name=>({name,state:window.__FLAG_VALUES__[args.request.kind],changed:false,code:null,message:""}));
+            if (command === "get_file_flags") {
+              const rows = args.request.names.map(name => ({ name, state: window.__FLAG_VALUES__[args.request.kind], changed: false, code: null, message: "" }));
+              if (args.request.kind === "locked") window.__FLAG_WIRE_READ__ ??= { request: structuredClone(args.request), rows };
+              return rows;
+            }
             if (command !== "change_file_flag") return original(command,args);
             window.__FLAG_CALLS__.push(structuredClone(args.request));window.__FLAG_VALUES__[args.request.kind]=args.request.enabled;
-            return args.request.names.map(name=>({name,state:args.request.enabled,changed:true,code:null,message:"Eigenschaft bestätigt"}));
+            const rows = args.request.names.map(name => ({ name, state: args.request.enabled, changed: true, code: null, message: "Eigenschaft bestätigt" }));
+            window.__FLAG_WIRE_EDIT__ ??= { request: structuredClone(args.request), rows };
+            return rows;
           };
         },theme);
         await page.getByRole("listbox",{name:/Linke Dateiliste/}).getByRole("option",{name:/Alpha.txt/}).click();
@@ -31,6 +38,7 @@ export async function runFileFlagCases(runCase) {
         await checkbox.uncheck();await editor.getByRole("button",{name:id==="locked"?"Dateisperre anwenden":"Erweiterungsanzeige anwenden",exact:true}).click();
         await page.waitForFunction(()=>window.__FLAG_CALLS__.length===2);
         assert.equal(await checkbox.isChecked(),false);
+        if (kind === "locked") assertFilePropertyWire("flags", ...await page.evaluate(() => [window.__FLAG_WIRE_READ__, window.__FLAG_WIRE_EDIT__]));
         const calls=await page.evaluate(()=>window.__FLAG_CALLS__);
         assert.deepEqual(calls.map(({requestId,...request})=>request),[true,false].map(enabled=>({provider:"local",root:"/mock/quelle",names:["Alpha.txt"],kind,enabled})));
         assert(calls.every(call=>call.requestId));assert.equal(await dialog.evaluate(n=>n.scrollWidth<=n.clientWidth),true);

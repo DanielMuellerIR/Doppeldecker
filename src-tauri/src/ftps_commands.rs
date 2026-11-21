@@ -10,22 +10,21 @@ use std::time::{Duration, Instant};
 
 use doppeldecker_core::{
     load_ftps_profiles as core_load_profiles, prepare_ftps_download, prepare_ftps_queue_entry,
-    prepare_ftps_upload, Entry, FtpSecurityStatus, FtpsProfile, FtpsServerIdentity, FtpsVfs,
+    prepare_ftps_upload, FtpSecurityStatus, FtpsProfile, FtpsServerIdentity, FtpsVfs,
     OperationQueue, Progress, QueueEntry, QueueExecutionResult, QueueOperation, RealRunPreview,
-    RemoteCapabilities, RemoteProfileBinding, RemoteProfileProtocol, SftpQueueDirection,
-    SftpQueuePreparation, SyncOptions, SyncPlan, VersionedProfile,
+    RemoteCapabilities, RemoteProfileBinding, RemoteProfileProtocol, SftpQueuePreparation,
+    VersionedProfile,
 };
 use tauri::{Manager, State, WebviewWindow};
 
 use crate::queue_runtime::{
-    cached_remote_connection, enqueue_bound_pending, CachedRemoteConnection, PendingRemoteRealRun,
-    QueueTerminalEvent,
+    cached_remote_connection, enqueue_protocol_sync, CachedRemoteConnection,
+    EnqueueRemoteSyncRequest, PendingRemoteRealRun, QueueTerminalEvent,
 };
 use crate::sftp_commands::KeyringResolver;
 use crate::{
-    app_config_dir, enqueue_operation_with_profile_bindings, finish_operation, operation_queue,
-    take_pending_for_operation, with_queue_extension, with_reserved_operation, AppError, AppState,
-    MutexExt,
+    app_config_dir, finish_operation, operation_queue, take_pending_for_operation,
+    with_reserved_operation, AppError, AppState, MutexExt,
 };
 use crate::{emit_queue_snapshot, start_queue_worker};
 
@@ -189,9 +188,11 @@ pub(crate) async fn save_ftps_profile(
                 .map_err(AppError::from)
             },
             || {
-                core_load_profiles(&path)
-                    .map_err(AppError::from)
-                    .map(|profiles| profiles.into_iter().find(|profile| profile.id == id))
+                crate::sftp_commands::load_profile_for_readback(
+                    &path,
+                    doppeldecker_core::load_ftps_profiles_versioned,
+                    |profile| profile.id == id,
+                )
             },
             || {
                 state.ftps_connections.lock_recover().remove(&id);
@@ -233,13 +234,11 @@ pub(crate) async fn remove_ftps_profile(
             &state,
             window.label(),
             || {
-                core_load_profiles(&path)
-                    .map_err(AppError::from)
-                    .map(|profiles| {
-                        profiles
-                            .into_iter()
-                            .find(|profile| profile.id == profile_id)
-                    })
+                crate::sftp_commands::load_profile_for_readback(
+                    &path,
+                    doppeldecker_core::load_ftps_profiles_versioned,
+                    |profile| profile.id == profile_id,
+                )
             },
             || {
                 doppeldecker_core::remove_ftps_profile_versioned_if_current(
@@ -286,6 +285,22 @@ pub(crate) struct FtpsConnectionStatus {
         doppeldecker_core::remote_real_mode::ProviderQuarantineManagementCapabilities,
 }
 
+#[cfg(test)]
+#[test]
+fn connection_profile_wire_ftps() {
+    crate::ipc_signature_contract::assert_connection_profile_wire::<FtpsProfile, _, _>(
+        "ftps",
+        doppeldecker_core::ProviderKind::Ftps,
+        |profile_revision, identity, capabilities, quarantine_capabilities| FtpsConnectionStatus {
+            profile_revision,
+            identity,
+            capabilities,
+            quarantine_capabilities,
+            security: FtpSecurityStatus::TlsIdentityExternallyVerified,
+        },
+    );
+}
+
 #[tauri::command]
 pub(crate) async fn connect_ftps_profile(
     app: tauri::AppHandle,
@@ -317,12 +332,49 @@ pub(crate) async fn connect_ftps_profile(
 
 #[derive(serde::Serialize)]
 pub(crate) struct FtpsDirListing {
-    profile_revision: u64,
-    path: String,
-    parent: Option<String>,
-    entries: Vec<Entry>,
-    session_generation: u64,
+    #[serde(flatten)]
+    listing: crate::browser_commands::RemoteDirListing,
     security: FtpSecurityStatus,
+}
+
+#[cfg(test)]
+#[test]
+fn ftps_listing_exposes_the_wire_security_status() {
+    use crate::browser_commands::{assert_wire_object, remote_dir_wire_contract, RemoteDirListing};
+    use doppeldecker_core::vfs::RemoteInteractiveDirectoryListing;
+
+    let contract = remote_dir_wire_contract();
+    let mut shape = contract["listing"].clone();
+    shape
+        .as_object_mut()
+        .unwrap()
+        .extend(contract["ftps"].as_object().unwrap().clone());
+    let security_values = [
+        FtpSecurityStatus::Plaintext,
+        FtpSecurityStatus::TlsIdentityUnverified,
+        FtpSecurityStatus::TlsIdentityExternallyVerified,
+        FtpSecurityStatus::TlsIdentityVerified,
+    ];
+    assert_eq!(
+        serde_json::to_value(security_values).unwrap(),
+        contract["ftpsSecurity"]
+    );
+    let listing = RemoteDirListing::from_interactive(
+        11,
+        "/".into(),
+        true,
+        RemoteInteractiveDirectoryListing {
+            entries: Vec::new(),
+            session_generation: 7,
+        },
+    );
+    let response = serde_json::to_value(FtpsDirListing {
+        listing,
+        security: FtpSecurityStatus::Plaintext,
+    })
+    .unwrap();
+    assert_wire_object(&response, &shape);
+    assert!(response["parent"].is_null());
 }
 
 #[tauri::command]
@@ -348,30 +400,18 @@ pub(crate) async fn scan_ftps_dir(
             || connection.reconnect(),
         )
         .map_err(AppError::from)?;
-        let mut entries = listing.entries;
-        if !show_hidden {
-            entries.retain(|entry| !entry.name.starts_with('.'));
-        }
-        entries.sort_by(|left, right| {
-            right
-                .is_dir
-                .cmp(&left.is_dir)
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-        });
-        let parent = remote_path
-            .parent()
-            .map(|parent| parent.to_string_lossy().into_owned())
-            .filter(|parent| !parent.is_empty());
+        let listing = crate::browser_commands::RemoteDirListing::from_interactive(
+            binding.revision,
+            path,
+            show_hidden,
+            listing,
+        );
         crate::queue_runtime::ensure_profile_bindings_current(
             &app,
             std::slice::from_ref(&binding),
         )?;
         Ok(FtpsDirListing {
-            profile_revision: binding.revision,
-            path,
-            parent,
-            entries,
-            session_generation: listing.session_generation,
+            listing,
             security: connection.security_status(),
         })
     })
@@ -520,18 +560,8 @@ pub(crate) async fn run_ftps_sync(
     .map_err(|_| AppError::new("app", "FTPS-Worker wurde unterbrochen"))?
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct EnqueueFtpsRequest {
-    profile_id: String,
-    #[serde(default)]
-    profile_revision: Option<u64>,
-    direction: SftpQueueDirection,
-    local_root: String,
-    remote_root: String,
-    options: SyncOptions,
-    expected_plan: SyncPlan,
-}
+pub(crate) type EnqueueFtpsRequest =
+    EnqueueRemoteSyncRequest<doppeldecker_core::FtpsConnectionConfig>;
 
 #[tauri::command]
 pub(crate) async fn enqueue_ftps_sync(
@@ -543,47 +573,8 @@ pub(crate) async fn enqueue_ftps_sync(
         let state = app.state::<AppState>();
         let label = window.label();
         let window_state = state.window(label);
-        let queue = with_queue_extension(&state, &window_state, || {
-            let connection = find_profile(&app, &request.profile_id)?.connection;
-            let requested_operation = QueueOperation::FtpsSync {
-                direction: request.direction,
-                connection: Box::new(connection),
-                local_root: request.local_root,
-                remote_root: request.remote_root,
-                options: request.options,
-                expected_plan: Box::new(request.expected_plan),
-            };
-            let mut pending_slot = window_state.pending_ftps_real.lock_recover();
-            let bindings = pending_slot
-                .as_ref()
-                .ok_or_else(|| {
-                    AppError::new("app", "Keine FTPS-Vorbereitung zum Einreihen vorhanden")
-                })?
-                .profile_bindings
-                .clone();
-            crate::queue_runtime::ensure_pending_profile_binding(
-                &bindings,
-                RemoteProfileProtocol::Ftps,
-                &request.profile_id,
-                request.profile_revision,
-            )?;
-            enqueue_bound_pending(
-                &mut pending_slot,
-                &requested_operation,
-                |pending| &pending.operation,
-                "Keine FTPS-Vorbereitung zum Einreihen vorhanden",
-                "FTPS-Queueanfrage stimmt nicht exakt mit der vorbereiteten Operation überein",
-                |operation| {
-                    enqueue_operation_with_profile_bindings(
-                        &app,
-                        &window_state,
-                        label,
-                        operation,
-                        &bindings,
-                    )
-                    .map(|(queue, _)| queue)
-                },
-            )
+        let queue = enqueue_protocol_sync(&app, label, &state, &window_state, request, |id| {
+            find_profile(&app, id).map(|profile| profile.connection)
         })?;
         emit_queue_snapshot(&app, label, &queue);
         start_queue_worker(app, label.to_owned());

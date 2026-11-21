@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { chromium } from "playwright";
 import { createBrowserCleanup } from "../browser-cleanup.mjs";
 const probe=createServer();probe.listen(0,"127.0.0.1");await once(probe,"listening");const port=probe.address().port;probe.close();await once(probe,"close");
@@ -14,7 +14,9 @@ const server=spawn("python3",["tools/mock-ui-server.py","--port",String(port)],{
 let serverDiagnostics="";server.stderr.on("data",chunk=>{serverDiagnostics=(serverDiagnostics+chunk).slice(-8000);});
 const cleanup=createBrowserCleanup(server);const url=`http://127.0.0.1:${port}`;
 const evidence=process.env.DOPPELDECKER_ARCHIVE_EXTRACT_SCREENSHOTS||"/tmp/doppeldecker-archive-extract-check";
+const extractWire=JSON.parse(await readFile(new URL("./archive-mutation-wire.json",import.meta.url))).extract;
 const mock=`(() => {
+const wire=${JSON.stringify(extractWire)};
 const original=window.__TAURI__.core.invoke;
 window.__EXTRACT_CALLS__=[];window.__EXTRACT_CONFIG__={};window.__EXTRACT_HOLDS__=[];window.__EXTRACT_PREVIEW_HOLDS__=[];let sequence=0;
 window.__EXTRACT_PREVIEW__=request=>({source_root:request.root,source_path:request.sourcePath,target_dir:request.targetDir,catalog_complete:!window.__EXTRACT_CONFIG__.partial,
@@ -22,6 +24,10 @@ known_entries:98,files:6,directories:3,source_bytes:9437184,omitted_entries:2,co
 issues:Array.from({length:window.__EXTRACT_CONFIG__.few?2:95},(_,i)=>({path:i===0?'../außen.txt':i===1?'Typkonflikt/':'Ordner/'+('langerName-'.repeat(5))+i,reason:i===0?'Unsicherer Archivpfad':i===1?'Datei-/Ordner-Typkonflikt: bleibt unverändert':'Metadaten werden nicht wiederhergestellt',content_omitted:i<2})),
 type_conflicts:window.__EXTRACT_CONFIG__.typeOnly?['/künstlich/ziel/Typkonflikt']:[],conflicts:window.__EXTRACT_CONFIG__.conflicts?['Text.txt']:[],conflict_details:window.__EXTRACT_CONFIG__.conflicts?[{path:request.targetDir+'/Text.txt',relative_name:'Text.txt',source_bytes:9,target_bytes:12,target_mtime:1}]:[]});
 window.__TAURI__.core.invoke=async(command,args)=>{
+ if(command==='scan_sftp_dir'&&window.__EXTRACT_CONFIG__.tarContextMenu){
+ const listing=await original(command,args);
+ return {...listing,entries:[{name:'Archiv.tar',is_file:true,is_dir:false,is_symlink:false,size:10240,mtime:1}]};
+ }
  if(command==='list_operation_queue'&&window.__EXTRACT_QUEUE__)return window.__EXTRACT_QUEUE__;
  if(['approve_queue_entry','acknowledge_archive_extract_outcome'].includes(command)&&window.__EXTRACT_QUEUE__){window.__EXTRACT_CALLS__.push({command,args});if(command==='acknowledge_archive_extract_outcome'){window.__EXTRACT_QUEUE__.entries[0].state='Cancelled';window.__EXTRACT_QUEUE__.revision++;}return window.__EXTRACT_QUEUE__;}
  if(command==='preview_archive_entry'){window.__EXTRACT_CALLS__.push({command,args});await new Promise(resolve=>window.__EXTRACT_PREVIEW_HOLDS__.push(resolve));return {requestId:args.requestId,sessionId:args.sessionId,entryId:args.entryId,preview:{bytes:9,content:{kind:'text',text:'Verifiziert'},limitations:[]}};}
@@ -37,14 +43,16 @@ window.__TAURI__.core.invoke=async(command,args)=>{
  if(window.__EXTRACT_CONFIG__.tar)preview.format='tar';
  if(command==='prepare_archive_extract_selection'){
  const scope=args.request.entryId?'entry':args.request.directoryId==='root'?'all':'subtree';
- preview.selection={kind:scope};preview.relative_root=scope==='entry'?'nested.txt':scope==='subtree'?'B':'';preview.selection_path=scope==='entry'?'A/B/nested.txt':scope==='subtree'?'A/B':'';
- if(window.__EXTRACT_CONFIG__.snapshot){preview.source_root='';preview.source_path='';preview.snapshot={origin:window.__EXTRACT_CONFIG__.snapshotOrigin};preview.files=scope==='all'?2:1;preview.directories=scope==='entry'?0:2;preview.source_bytes=scope==='all'?18:9;preview.known_entries=scope==='all'?4:scope==='subtree'?2:1;preview.omitted_entries=0;preview.issues=[];}}
+ if(scope==='entry'){preview.selection=wire.response.binding.preview.selection;preview.relative_root='nested.txt';preview.selection_path='A/B/nested.txt';}
+ if(scope==='subtree'){preview.selection={kind:'subtree',prefix:'A/B'};preview.relative_root='B';preview.selection_path='A/B';}
+ if(window.__EXTRACT_CONFIG__.snapshot){preview.source_root='';preview.source_path='';preview.snapshot={...wire.response.binding.preview.snapshot,origin:window.__EXTRACT_CONFIG__.snapshotOrigin};preview.files=scope==='all'?2:1;preview.directories=scope==='entry'?0:2;preview.source_bytes=scope==='all'?18:9;preview.known_entries=scope==='all'?4:scope==='subtree'?2:1;preview.omitted_entries=0;preview.issues=[];}}
  if(window.__EXTRACT_CONFIG__.hold)await new Promise(resolve=>window.__EXTRACT_HOLDS__.push({resolve,request:args.request}));
  if(command==='prepare_archive_extract'&&args.request.provider!=='local'||args.request.targetProvider!=='local'&&(!args.request.target?.profileId||args.request.target.root!==args.request.targetDir))throw {code:'invalid_input',message:'ZIP-Entpacken unterstützt derzeit nur gebundene Archive und Zielprofile.'};
  if(!args.request.targetDir)throw {code:'invalid_input',message:'Quelle oder Ziel zeigt keinen geöffneten Ordner.'};
  if(window.__EXTRACT_CONFIG__.invalid)throw {code:'invalid_data',message:'Kein gültiges ZIP-Zentralverzeichnis.'};
+ if(window.__EXTRACT_CONFIG__.useWireFixture)return {...wire.response,requestId:args.request.requestId};
  if(args.request.target){preview.target_dir='/private/artificial-extract/content';preview.conflicts=[];preview.conflict_details=[];preview.type_conflicts=[];}
- return {requestId:window.__EXTRACT_CONFIG__.foreign?'foreign':args.request.requestId,preparationId:id,binding:{digest:Array(32).fill(7),preview},uploadTarget:args.request.target?args.request.target.provider.toUpperCase()+' · '+args.request.target.root:null};
+ return {requestId:window.__EXTRACT_CONFIG__.foreign?'foreign':args.request.requestId,preparationId:id,binding:{digest:Array(32).fill(7),preview},uploadTarget:args.request.target?args.request.target.provider.toUpperCase()+' · '+args.request.target.root:null,uploadNotice:null};
  }
  if(window.__EXTRACT_CONFIG__.confirmHold)await new Promise(resolve=>window.__EXTRACT_CONFIRM_RELEASE__=resolve);
  if(window.__EXTRACT_CONFIG__.cacheMissing)throw {code:'not_found',message:'Momentaufnahme ist nicht mehr verfügbar; Archiv erneut öffnen.'};
@@ -58,7 +66,7 @@ try {
  const dialog=page=>page.getByRole('dialog',{name:'ZIP entpacken',exact:true});
  async function pageFor(config={},theme='light',width=1100){
  const page=await browser.newPage({viewport:{width,height:850}});const errors=[];page.on('pageerror',error=>errors.push(error.message));if(config.queueWideActions)await page.route("**/styles.css",async route=>{const response=await route.fetch();await route.fulfill({response,body:(await response.text())+'\n.queue-popover [data-queue-action="extract-ack"] { width: 264px; }\n'});});await page.route("**/mock-tauri.js",async route=>{const response=await route.fetch();await route.fulfill({response,body:(await response.text())+mock});});await page.goto(url+"?keyboard=1",{waitUntil:"networkidle"});await page.getByRole('listbox',{name:/Linke Dateiliste/}).waitFor();
- await page.evaluate(async({config,theme})=>{const {setTheme}=await import('/theme.js');setTheme(theme);Object.assign(window.__EXTRACT_CONFIG__,config,{snapshotOrigin:({sftp:'SFTP',ftps:'FTP/FTPS',webdav:'WebDAV',smb:'SMB'})[config.provider||'sftp']+' · /entfernt/Archiv.zip'});
+ await page.evaluate(async({config,theme})=>{const {setTheme}=await import('/theme.js');setTheme(theme);Object.assign(window.__EXTRACT_CONFIG__,config,{snapshotOrigin:({sftp:'SFTP',ftps:'FTP/FTPS',webdav:'WebDAV',smb:'SMB'})[config.provider||'sftp']+' · /entfernt/Archiv.'+(config.tar?'tar':'zip')});
  window.__EXTRACT_PANES__={left:{provider:'local',path:'/künstlich/quelle',navigationRevision:1,tabs:{active:{id:'quelle-a'}}},right:{provider:'local',path:'/künstlich/ziel',navigationRevision:1,tabs:{active:{id:'ziel-a'}}}};
  if(config.targetProvider)Object.assign(window.__EXTRACT_PANES__.right,{provider:config.targetProvider,profileId:'target-profile',profileRevision:23,path:'/remote/Entpackziel'});
  if(config.snapshot)Object.assign(window.__EXTRACT_PANES__.left,{provider:config.provider||'sftp',profileId:'artificial-profile',profileRevision:17});
@@ -83,6 +91,23 @@ try {
  await page.waitForFunction(()=>window.__EXTRACT_DOCK__.length>0);
  assert.equal((await calls(page,'prepare_archive_extract_selection'))[0].args.request.entryId,'virtual-entry');
  assert.equal((await calls(page,'confirm_archive_extract')).length,1);await finish(page,errors);
+ });
+ await test('TAR im SFTP-Kontextmenü bereitet das ganze gebundene Archiv vor', async () => {
+   const {page, errors} = await pageFor({few:true,tar:true,snapshot:true,tarContextMenu:true});
+   const left = page.getByRole('listbox', {name:'Linke Dateiliste'});
+   await left.click();
+   await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+   await left.getByRole('option', {name:/Archiv\.tar/}).click();
+   await page.keyboard.press('Shift+F10');
+   await page.getByRole('menuitem', {name:'Archiv entpacken …', exact:true}).click();
+   const extract = page.getByRole('dialog', {name:'TAR entpacken', exact:true});
+   await extract.getByText(/Momentaufnahme von SFTP · \/entfernt\/Archiv\.tar/).waitFor();
+   const request = (await calls(page, 'prepare_archive_extract_selection'))[0].args.request;
+   assert.equal(request.directoryId, 'root');
+   assert.equal(request.sessionId, 'reader-session');
+   assert.equal(request.targetDir, '/mock/ziel');
+   assert.equal((await calls(page, 'prepare_archive_extract')).length, 0);
+   await finish(page, errors);
  });
  for(const [provider,theme,width] of [['sftp','light',1100],['ftps','dark',390],['webdav','light',390],['smb','dark',1100]])await test('Momentaufnahme '+provider+' bindet Dateiauswahl und sichtbare Herkunft '+width,async()=>{
  const {page,errors}=await pageFor({few:true,snapshot:true,conflicts:true,provider},theme,width);const view=await browse(page);
@@ -118,7 +143,7 @@ try {
  const {page,errors}=await pageFor({snapshot:true,partial:true,few:true});const view=await browse(page);await view.getByRole('button',{name:'Ganzes Archiv entpacken …',exact:true}).click();await ready(page,true);assert.match(await dialog(page).innerText(),/Teilkatalog: Nur der bekannte/);await dialog(page).getByRole('button',{name:'Bekannten Teil entpacken',exact:true}).click();await page.waitForFunction(()=>window.__EXTRACT_DOCK__.length>0);assert.equal((await calls(page,'confirm_archive_extract'))[0].args.allowPartial,true);await finish(page,errors);
  });
  for(const [scope,targetProvider,snapshot,theme,width] of [['all','sftp',false,'light',800],['entry','ftps',true,'dark',390],['subtree','webdav',true,'light',390],['all','smb',true,'dark',800]])await test('Entpacken und Upload '+scope+' nach '+targetProvider,async()=>{
- const {page,errors}=await pageFor({few:true,snapshot,targetProvider},theme,width);
+ const {page,errors}=await pageFor({few:true,snapshot,targetProvider,useWireFixture:scope==='entry'},theme,width);
  if(scope==='all'&&!snapshot){await open(page);}else{const view=await browse(page);if(scope==='entry'){await view.getByRole('option').first().click();await view.getByRole('button',{name:'Datei entpacken …',exact:true}).click();}else if(scope==='subtree'){await view.getByRole('option').filter({hasText:'B'}).dblclick();await view.getByRole('button',{name:'Geöffneten Ordner entpacken …',exact:true}).click();}else await view.getByRole('button',{name:'Ganzes Archiv entpacken …',exact:true}).click();}
  await dialog(page).getByRole('button',{name:'Entpacken und hochladen',exact:true}).waitFor();
  assert.match(await dialog(page).innerText(),/remote\/Entpackziel/);assert.doesNotMatch(await dialog(page).innerText(),/private\/artificial-extract/);assert.match(await dialog(page).innerText(),/Zielkonflikte werden vor dem Upload entschieden/);
@@ -126,6 +151,12 @@ try {
  await page.screenshot({path:evidence+'/extract-upload-'+scope+'-'+targetProvider+'-'+theme+'-'+width+'.png'});
  const command=scope==='all'&&!snapshot?'prepare_archive_extract':'prepare_archive_extract_selection';const request=(await calls(page,command))[0].args.request;
  assert.deepEqual(request.target,{provider:targetProvider,root:'/remote/Entpackziel',profileId:'target-profile',profileRevision:23});
+ if(scope==='all'&&!snapshot)assert.deepEqual(request,{...extractWire.request,requestId:request.requestId});
+ if(scope==='entry'){
+  assert.deepEqual(request,{...extractWire.selectionRequest,requestId:request.requestId});
+  assert.match(await dialog(page).innerText(),/Ausgewählte Datei: A\/B\/nested.txt/);
+  await dialog(page).getByText('Momentaufnahme von '+extractWire.response.binding.preview.snapshot.origin,{exact:true}).waitFor();
+ }
  await dialog(page).getByRole('button',{name:'Entpacken und hochladen',exact:true}).click();await page.waitForFunction(()=>window.__EXTRACT_DOCK__.length>0);
  const confirmation=(await calls(page,'confirm_archive_extract'))[0].args;assert.deepEqual(Object.keys(confirmation).sort(),['preparationId','overwrite','allowPartial'].sort());assert.equal(confirmation.overwrite,false);assert.equal((await calls(page,'prepare_archive_extract')).length,command==='prepare_archive_extract'?1:0);await finish(page,errors);
  });

@@ -32,7 +32,10 @@ export function identityDisplay(root) {
 }
 
 
-/** Alle Wirkungsangaben stammen aus dem gebundenen Backendplan. */
+/** Alle Wirkungsangaben stammen aus dem gebundenen Backendplan.
+ * @param {import("./real-mode-wire.js").ContentSyncPreviewWire} preview
+ * @returns {Promise<false | {effectsConfirmed: true, removalPhrase: string | null}>}
+ */
 export function confirmContentSync(preview) {
   return new Promise(resolve => showOwnedModal("content-sync", token => {
     const modal = $("#modal .modal");
@@ -51,7 +54,7 @@ export function confirmContentSync(preview) {
     const savedReplacements = preview.quarantined_replacements || 0;
     const savedRemovals = preview.quarantined_removals || 0;
     const changes = plan.actions.filter(action => ["UpdateFile", "DeleteFile", "DeleteDir"].includes(action.type));
-    const providerLabel = provider => ({ Local: "Lokal", local: "Lokal", Sftp: "SFTP", sftp: "SFTP", Ftps: "FTP/FTPS", ftps: "FTP/FTPS", WebDav: "WebDAV", webdav: "WebDAV", Smb: "SMB", smb: "SMB" })[provider] || provider;
+    const providerLabel = provider => ({ Local: "Lokal", local: "Lokal", Sftp: "SFTP", sftp: "SFTP", Ftps: "FTP/FTPS", ftps: "FTP/FTPS", WebDav: "WebDAV", webdav: "WebDAV", web_dav: "WebDAV", Smb: "SMB", smb: "SMB" })[provider] || provider;
     const actionLabel = action => ({ UpdateFile: "Dateiversion ersetzen", DeleteFile: "Datei entfernen", DeleteDir: "Ordner entfernen" })[action] || action;
     const root = (role, provider, identity, path) => `<div class="real-card"><strong>${role} · ${escapeHtml(providerLabel(provider))}</strong><code>${escapeHtml(identity ? identityDisplay(identity) : path)}</code></div>`;
     $("#modal-body").innerHTML = `<section class="local-sync-content" tabindex="0" aria-label="Sync-Wirkung und Einschränkungen">` +

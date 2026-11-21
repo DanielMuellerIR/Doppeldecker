@@ -11,16 +11,68 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 #[cfg(target_os = "macos")]
 use std::{fs, io, os::unix::fs::PermissionsExt, path::Path};
 
 use crate::AppError;
+#[cfg(any(test, target_os = "macos"))]
+use crate::{AppState, MutexExt};
 
 #[cfg(target_os = "macos")]
 const CLI_NAME: &str = "doppeldecker-cli";
 const DECLINED_MARKER: &str = "cli-install-declined";
 #[cfg(target_os = "macos")]
 const SYSTEM_CLI: &str = "/usr/local/bin/doppeldecker-cli";
+
+// Einrichtung und Marker gelten für alle Fenster. Auch während eines offenen
+// Administrator-Dialogs darf kein zweiter Worker den Zustand ändern.
+static CLI_SETUP: Mutex<()> = Mutex::new(());
+static CLI_INSTALL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn cli_install_active() -> bool {
+    CLI_INSTALL_ACTIVE.load(Ordering::Acquire)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+struct CliInstallGuard;
+
+#[cfg(any(test, target_os = "macos"))]
+impl CliInstallGuard {
+    fn reserve(state: &AppState) -> Result<Self, AppError> {
+        let _barrier = state.exit_barrier.lock_recover();
+        if state.exit_in_progress.load(Ordering::Acquire)
+            || CLI_INSTALL_ACTIVE.swap(true, Ordering::AcqRel)
+        {
+            return Err(AppError::new(
+                "busy",
+                "CLI-Einrichtung oder Beenden läuft bereits",
+            ));
+        }
+        Ok(Self)
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+impl Drop for CliInstallGuard {
+    fn drop(&mut self) {
+        CLI_INSTALL_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+async fn run_cli_setup<T: Send + 'static>(
+    action: impl FnOnce() -> Result<T, AppError> + Send + 'static,
+) -> Result<T, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = CLI_SETUP
+            .lock()
+            .map_err(|_| AppError::new("app", "Zustand der CLI-Einrichtung ist unklar"))?;
+        action()
+    })
+    .await
+    .map_err(|_| AppError::new("app", "Worker für die CLI-Einrichtung wurde unterbrochen"))?
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,20 +95,55 @@ pub(crate) struct CliInstallStatus {
     state: CliInstallState,
 }
 
+#[cfg(test)]
+#[test]
+fn command_read_results_cli_install_status() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../tools/tests/command-read-results.json")).unwrap();
+    let cases = [
+        #[cfg(target_os = "macos")]
+        (CliInstallState::Installed, "installed"),
+        #[cfg(target_os = "macos")]
+        (CliInstallState::Offer, "offer"),
+        #[cfg(target_os = "macos")]
+        (CliInstallState::Declined, "declined"),
+        #[cfg(target_os = "macos")]
+        (CliInstallState::Conflict, "conflict"),
+        #[cfg(target_os = "macos")]
+        (CliInstallState::OutsideApplications, "outside_applications"),
+        (CliInstallState::Unavailable, "unavailable"),
+    ];
+    for (state, key) in cases {
+        assert_eq!(
+            serde_json::to_value(CliInstallStatus { state }).unwrap(),
+            fixture["cliInstall"][key]
+        );
+    }
+}
+
 /// Meldet nur einen festen Zustand ans Frontend. Absolute Bundle- oder Nutzerpfade
 /// verlassen das Backend nicht.
 #[tauri::command]
-pub(crate) fn cli_install_status(app: tauri::AppHandle) -> Result<CliInstallStatus, AppError> {
-    Ok(CliInstallStatus {
-        state: current_cli_install_state(&app)?,
+pub(crate) async fn cli_install_status(
+    app: tauri::AppHandle,
+) -> Result<CliInstallStatus, AppError> {
+    run_cli_setup(move || {
+        Ok(CliInstallStatus {
+            state: current_cli_install_state(&app)?,
+        })
     })
+    .await
 }
 
 /// Speichert die ausdrückliche Wahl „Nicht mehr fragen“ im normalen App-
 /// Konfigurationsordner. GUI-Sandbox-Tests werden dadurch automatisch isoliert.
 #[tauri::command]
-pub(crate) fn decline_cli_install(app: tauri::AppHandle) -> Result<(), AppError> {
-    let marker = declined_marker(&app)?;
+pub(crate) async fn decline_cli_install(app: tauri::AppHandle) -> Result<(), AppError> {
+    run_cli_setup(move || write_declined_marker(&app)).await
+}
+
+fn write_declined_marker(app: &tauri::AppHandle) -> Result<(), AppError> {
+    let marker = declined_marker(app)?;
     let mut options = OpenOptions::new();
     options
         .create(true)
@@ -73,7 +160,21 @@ pub(crate) fn decline_cli_install(app: tauri::AppHandle) -> Result<(), AppError>
 /// Administrator-Dialog ausschließlich `mkdir` und eine nicht überschreibende
 /// Symlinkanlage; Passwörter oder andere Secrets passieren diesen Code nie.
 #[tauri::command]
-pub(crate) fn install_cli(app: tauri::AppHandle) -> Result<(), AppError> {
+pub(crate) async fn install_cli(app: tauri::AppHandle) -> Result<(), AppError> {
+    #[cfg(target_os = "macos")]
+    let reservation = {
+        use tauri::Manager;
+        CliInstallGuard::reserve(&app.state::<AppState>())?
+    };
+    run_cli_setup(move || {
+        #[cfg(target_os = "macos")]
+        let _reservation = reservation;
+        install_cli_blocking(&app)
+    })
+    .await
+}
+
+fn install_cli_blocking(app: &tauri::AppHandle) -> Result<(), AppError> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = app;
@@ -86,7 +187,7 @@ pub(crate) fn install_cli(app: tauri::AppHandle) -> Result<(), AppError> {
     #[cfg(target_os = "macos")]
     {
         let paths = cli_paths()?;
-        match cli_install_state(&paths, declined_marker(&app)?.is_file())? {
+        match cli_install_state(&paths, declined_marker(app)?.is_file())? {
             CliInstallState::Installed => return Ok(()),
             CliInstallState::Offer => {}
             CliInstallState::Conflict => {
@@ -176,6 +277,58 @@ fn current_cli_install_state(app: &tauri::AppHandle) -> Result<CliInstallState, 
             declined_marker(app)?.is_file(),
         )?)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn cli_einrichtung_reserviert_bis_zum_ende_gegen_beenden() {
+    let app = AppState::default();
+    let reservation = CliInstallGuard::reserve(&app).unwrap();
+    assert!(cli_install_active());
+    assert!(CliInstallGuard::reserve(&app).is_err());
+    drop(reservation);
+    assert!(!cli_install_active());
+    app.exit_in_progress.store(true, Ordering::Release);
+    assert!(CliInstallGuard::reserve(&app).is_err());
+    assert!(!cli_install_active());
+}
+
+#[cfg(test)]
+#[test]
+fn cli_einrichtung_haelt_das_ergebnis_bis_zum_worker_ende_zurueck() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (result_tx, result_rx) = channel();
+    let install = tauri::async_runtime::spawn(async move {
+        let result = run_cli_setup(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Err::<(), _>(AppError::new("permission_denied", "Testabbruch"))
+        })
+        .await;
+        result_tx.send(result.unwrap_err().code).unwrap();
+    });
+    let timeout = Duration::from_secs(5);
+    started_rx.recv_timeout(timeout).unwrap();
+    let (other_tx, other_rx) = channel();
+    let other = tauri::async_runtime::spawn(async move { other_tx.send(()).unwrap() });
+    other_rx.recv_timeout(timeout).unwrap();
+    assert!(matches!(
+        result_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        result_rx.recv_timeout(timeout).unwrap(),
+        "permission_denied"
+    );
+    tauri::async_runtime::block_on(async {
+        install.await.unwrap();
+        other.await.unwrap();
+    });
 }
 
 #[cfg(target_os = "macos")]

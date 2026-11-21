@@ -1,0 +1,30 @@
+{
+  "local": {
+    "request": {
+      "provider": "local",
+      "root": "/mock/quelle",
+      "items": ["/mock/quelle/Alpha.txt"]
+    },
+    "response": {
+      "supported": true,
+      "preparationId": "0123456789abcdef0123456789abcdef",
+      "parent": "/mock/quelle",
+      "mappings": [{ "sourceName": "Alpha.txt", "targetName": "Alpha (Kopie 20261121T000000Z 0123abcd).txt" }],
+      "blockers": []
+    }
+  },
+  "remote": {
+    "request": {
+      "provider": "sftp",
+      "root": "/",
+      "items": ["/remote.txt"]
+    },
+    "response": {
+      "supported": false,
+      "preparationId": null,
+      "parent": "/",
+      "mappings": [],
+      "blockers": ["Duplizieren ist derzeit für lokale Dateien und Ordner umgesetzt. Entfernte Duplikate sind noch nicht verfügbar; normale Kopieraktionen bleiben erreichbar."]
+    }
+  }
+}

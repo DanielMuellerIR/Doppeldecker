@@ -1,5 +1,11 @@
 import { confirmModal } from "./modal.js";
 import { openMenu } from "./context-menu.js";
+import {
+  disconnectProfile as disconnectRemoteProfile,
+  listProfiles,
+  removeProfile as removeRemoteProfile,
+  saveProfile,
+} from "./connection-profile-api.js";
 import { invoke } from "./tauri-api.js";
 import { $, escapeHtml } from "./ui-utils.js";
 
@@ -137,7 +143,7 @@ export function createConnectionsUi({
     const token = invalidateProfileLoads(protocol);
     const running = (async () => {
       try {
-        const loaded = await invoke(`list_${protocol}_profiles`);
+        const loaded = await listProfiles(protocol);
         if (profileLoadSequences[protocol] !== token) return;
         profiles[protocol] = loaded;
       } catch (error) {
@@ -194,17 +200,15 @@ export function createConnectionsUi({
     }));
   }
 
-  async function save(protocol, profile, secretId = null, profileRevision = null) {
+  /** @param {import("./connection-profile-api.js").SaveProfileArgs} args */
+  async function save(...args) {
+    const [protocol, profile] = args;
     const previous = profiles[protocol].find(candidate => candidate.id === profile.id);
     // Profil und optionaler neuer Schlüsselbundwert gehen in denselben Command.
     // Nur das Backend kann beide Speicherwirkungen gemeinsam zurücksetzen.
     let savedProfiles;
     try {
-      savedProfiles = await invoke(`save_${protocol}_profile`, {
-        profile,
-        secretId,
-        profileRevision,
-      });
+      savedProfiles = await saveProfile(...args);
     } catch (error) {
       if (previous && error?.code === "outcome_unclear") {
         // Der atomare Rename kann bereits sichtbar sein, obwohl das abschließende
@@ -347,17 +351,17 @@ export function createConnectionsUi({
     }
   }
 
+  /**
+   * @param {import("./provider-command-names.js").RemoteProvider} protocol
+   * @param {string} id
+   */
   async function disconnectProfile(protocol, id) {
     try {
       // Trennen ist gefahrlos reversibel: Der nächste Klick auf das Profil baut
       // die Sitzung lazy wieder auf. Panes, die das Profil noch zeigen, kehren
       // zu ihrem lokalen Standardordner zurück.
       const profile = findProfile(protocol, id);
-      await invoke("disconnect_remote_profile", {
-        protocol,
-        profileId: id,
-        profileRevision: profile?.revision,
-      });
+      await disconnectRemoteProfile(protocol, id, profile?.revision);
       const affected = disableProfilePanes(protocol, id);
       await moveDisabledPanesToDefaults(affected);
       activeKey = null; // Statusabgleich erzwingen, auch ohne Set-Änderung von außen.
@@ -445,7 +449,7 @@ export function createConnectionsUi({
     );
     if (!confirmed) return;
     try {
-      const removedProfiles = await invoke(`remove_${protocol}_profile`, {
+      const removedProfiles = await removeRemoteProfile(protocol, {
         profileId: profile.id,
         profileRevision: profile.revision,
       });

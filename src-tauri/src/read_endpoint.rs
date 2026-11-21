@@ -2,8 +2,11 @@
 use crate::bidirectional_commands::BidirectionalEndpointRequest;
 use crate::{require_absolute_remote_parent, AppError, AppState, MutexExt};
 use doppeldecker_core::{LocalVfs, Vfs};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use crate::queue_runtime::CachedRemoteConnection;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum EndpointIdentity {
@@ -32,20 +35,28 @@ pub(crate) fn require_generation(expected: Option<u64>, actual: u64) -> Result<(
     }
 }
 
+fn cached_read_connection<T>(
+    pool: &Mutex<HashMap<String, CachedRemoteConnection<T>>>,
+    profile_id: &str,
+) -> Result<CachedRemoteConnection<T>, AppError> {
+    pool.lock_recover().get(profile_id).cloned().ok_or_else(|| {
+        AppError::new(
+            "plan_drift",
+            "Die sichtbare Remote-Sitzung ist nicht mehr verbunden",
+        )
+    })
+}
+
 /// Bindet einen Remote-Endpunkt an genau die Sitzung, die das sichtbare Listing
 /// erzeugt hat.
 ///
-/// Für alle vier Provider ist der Ablauf derselbe: absoluter Elternpfad, gecachte
-/// Verbindung mit geprüfter Profilrevision und dieselbe Sitzungsgeneration wie in
-/// der Anfrage. Nur das Providermodul und die Identitätsvariante unterscheiden
-/// sich. Als vier Kopien hätte eine davon still eine dieser Prüfungen verlieren
-/// können — deshalb steht der Ablauf hier einmal.
+/// Ein fehlender Pool-Eintrag bedeutet Drift. Ein verspäteter Leseauftrag darf
+/// einen vom Benutzer getrennten Server nicht wieder verbinden.
 macro_rules! bind_remote_endpoint {
     (
         $app:expr,
-        $state:expr,
+        $pool:expr,
         $session_generation:expr,
-        $module:ident,
         $identity:ident,
         $profile_id:expr,
         $profile_revision:expr,
@@ -53,11 +64,14 @@ macro_rules! bind_remote_endpoint {
         $sftp:expr $(,)?
     ) => {{
         require_absolute_remote_parent($root)?;
-        let cached =
-            crate::$module::cached_connection_bound($app, $state, $profile_id, $profile_revision)?;
+        let cached = cached_read_connection(&$pool, $profile_id)?;
         crate::queue_runtime::ensure_requested_profile_revision(
             $profile_revision,
             &cached.binding,
+        )?;
+        crate::queue_runtime::ensure_profile_bindings_current(
+            $app,
+            std::slice::from_ref(&cached.binding),
         )?;
         let connection = cached.connection;
         let generation = connection.session_generation();
@@ -73,6 +87,28 @@ macro_rules! bind_remote_endpoint {
             sftp,
         })
     }};
+}
+
+#[cfg(test)]
+#[test]
+fn getrennte_sitzung_wird_beim_gebundenen_lesen_nicht_neu_angelegt() {
+    let connection = CachedRemoteConnection {
+        binding: doppeldecker_core::RemoteProfileBinding::new(
+            doppeldecker_core::RemoteProfileProtocol::Sftp,
+            "profil",
+            1,
+        )
+        .unwrap(),
+        connection: Arc::new(LocalVfs::new()),
+    };
+    let pool = Mutex::new(HashMap::from([("profil".to_owned(), connection)]));
+    assert!(cached_read_connection(&pool, "profil").is_ok());
+    pool.lock_recover().remove("profil");
+    assert_eq!(
+        cached_read_connection(&pool, "profil").err().unwrap().code,
+        "plan_drift"
+    );
+    assert!(pool.lock_recover().is_empty());
 }
 
 pub(crate) fn resolve_read_endpoint(
@@ -98,9 +134,8 @@ pub(crate) fn resolve_read_endpoint(
             root,
         } => bind_remote_endpoint!(
             app,
-            state,
+            state.sftp_connections,
             session_generation,
-            sftp_commands,
             Sftp,
             profile_id,
             *profile_revision,
@@ -113,9 +148,8 @@ pub(crate) fn resolve_read_endpoint(
             root,
         } => bind_remote_endpoint!(
             app,
-            state,
+            state.ftps_connections,
             session_generation,
-            ftps_commands,
             Ftps,
             profile_id,
             *profile_revision,
@@ -128,9 +162,8 @@ pub(crate) fn resolve_read_endpoint(
             root,
         } => bind_remote_endpoint!(
             app,
-            state,
+            state.webdav_connections,
             session_generation,
-            webdav_commands,
             Webdav,
             profile_id,
             *profile_revision,
@@ -143,9 +176,8 @@ pub(crate) fn resolve_read_endpoint(
             root,
         } => bind_remote_endpoint!(
             app,
-            state,
+            state.smb_connections,
             session_generation,
-            smb_commands,
             Smb,
             profile_id,
             *profile_revision,

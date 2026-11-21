@@ -335,6 +335,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn update_responses_and_progress_match_the_browser_wire_fixture() {
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/small-control-wire.json"))
+                .unwrap();
+        let wire = &wire["update"];
+        let available = UpdateCheck {
+            available: true,
+            current_version: "0.1.123".into(),
+            version: Some("0.1.124".into()),
+            notes: Some("Sicherheitskorrektur <img src=x onerror=alert(1)>".into()),
+            date: Some("2026-08-06T12:00:00Z".into()),
+        };
+        let unchanged = UpdateCheck {
+            available: false,
+            current_version: "0.1.123".into(),
+            version: None,
+            notes: None,
+            date: None,
+        };
+        let prepared = PreparedUpdateStatus {
+            available: true,
+            version: available.version.clone(),
+        };
+        let missing = PreparedUpdateStatus {
+            available: false,
+            version: None,
+        };
+        let progress = [
+            UpdateProgress {
+                downloaded: 5,
+                total: Some(10),
+            },
+            UpdateProgress {
+                downloaded: 10,
+                total: Some(10),
+            },
+        ];
+        for (field, value) in [
+            ("available", serde_json::to_value(available)),
+            ("unchanged", serde_json::to_value(unchanged)),
+            ("prepared", serde_json::to_value(prepared)),
+            ("missing", serde_json::to_value(missing)),
+            ("progress", serde_json::to_value(progress)),
+        ] {
+            assert_eq!(value.unwrap(), wire[field], "{field}");
+        }
+    }
+
+    #[test]
     fn update_schranke_ist_appweit_und_wird_freigegeben() {
         let state = UpdateState::default();
         begin(&state, "main").unwrap();

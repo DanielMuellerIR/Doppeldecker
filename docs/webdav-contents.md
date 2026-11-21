@@ -57,7 +57,7 @@ Unix-Symlinks sind nicht erkennbar. Unbekannte Ressourcentypen behalten die
 bestehende Parserabsage. Die neue Klasse behauptet deshalb keine allgemeine
 Symlink- oder Metadatenfreigabe. GUI und CLI erhalten den konkreten
 Best-Effort-Lesehinweis. Der lokale Temp-, No-Replace- und Abschlussvertrag bleibt
-erhalten. [Prüfstand](roadmap-2026-10-24.md#additive-webdav-downloads).
+erhalten. [Prüfstand](history/roadmap-2026-10-24.md#additive-webdav-downloads).
 
 
 ## Fortsetzbarer Download

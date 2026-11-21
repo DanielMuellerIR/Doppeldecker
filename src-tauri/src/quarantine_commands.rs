@@ -10,7 +10,7 @@ use doppeldecker_core::{
     QuarantineScope,
 };
 use serde::Serialize;
-use tauri::{State, WebviewWindow};
+use tauri::{Manager, WebviewWindow};
 
 use crate::{
     bidirectional_commands::{resolve_endpoint, BidirectionalEndpointRequest},
@@ -97,211 +97,311 @@ fn with_provider_quarantine_lease<T>(
 }
 
 #[tauri::command]
-pub(crate) fn list_quarantine_runs(
+pub(crate) async fn list_quarantine_runs(
+    app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     target: Option<String>,
 ) -> Result<Vec<QuarantineRun>, AppError> {
-    require_idle(&state.window(window.label()))?;
-    quarantine_scope(target)?.runs().map_err(AppError::from)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        require_idle(&state.window(window.label()))?;
+        quarantine_scope(target)?.runs().map_err(AppError::from)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn list_quarantine_entries(
+pub(crate) async fn list_quarantine_entries(
+    app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     run_id: String,
     target: Option<String>,
 ) -> Result<Vec<QuarantineEntry>, AppError> {
-    require_idle(&state.window(window.label()))?;
-    quarantine_scope(target)?
-        .entries(&run_id)
-        .map_err(AppError::from)
-}
-
-#[tauri::command]
-pub(crate) fn restore_quarantine_entry(
-    app: tauri::AppHandle,
-    window: WebviewWindow,
-    state: State<AppState>,
-    run_id: String,
-    relative_path: String,
-    target: Option<String>,
-) -> Result<QuarantineRestoreResponse, AppError> {
-    let scope = quarantine_scope(target)?;
-    let label = window.label();
-    let window_state = state.window(label);
-    with_reserved_operation(&app, label, &window_state, || {
-        scope
-            .restore(&run_id, &relative_path)
-            .map(restore_response)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        require_idle(&state.window(window.label()))?;
+        quarantine_scope(target)?
+            .entries(&run_id)
             .map_err(AppError::from)
     })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn purge_quarantine_run(
+pub(crate) async fn restore_quarantine_entry(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
+    run_id: String,
+    relative_path: String,
+    target: Option<String>,
+) -> Result<QuarantineRestoreResponse, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let scope = quarantine_scope(target)?;
+        let label = window.label();
+        let window_state = state.window(label);
+        with_reserved_operation(&app, label, &window_state, || {
+            scope
+                .restore(&run_id, &relative_path)
+                .map(restore_response)
+                .map_err(AppError::from)
+        })
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
+}
+
+#[tauri::command]
+pub(crate) async fn purge_quarantine_run(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
     run_id: String,
     confirmation: String,
     target: Option<String>,
 ) -> Result<(), AppError> {
-    let expected = format!("LEEREN {run_id}");
-    if confirmation != expected {
-        return Err(AppError::new(
-            "confirmation_mismatch",
-            format!("Zum endgültigen Leeren exakt „{expected}“ eingeben"),
-        ));
-    }
-    let scope = quarantine_scope(target)?;
-    let label = window.label();
-    let window_state = state.window(label);
-    with_reserved_operation(&app, label, &window_state, || {
-        scope.purge(&run_id).map_err(AppError::from)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let expected = format!("LEEREN {run_id}");
+        if confirmation != expected {
+            return Err(AppError::new(
+                "confirmation_mismatch",
+                format!("Zum endgültigen Leeren exakt „{expected}“ eingeben"),
+            ));
+        }
+        let scope = quarantine_scope(target)?;
+        let label = window.label();
+        let window_state = state.window(label);
+        with_reserved_operation(&app, label, &window_state, || {
+            scope.purge(&run_id).map_err(AppError::from)
+        })
     })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn list_provider_quarantine_runs(
+pub(crate) async fn list_provider_quarantine_runs(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     endpoint: BidirectionalEndpointRequest,
 ) -> Result<Vec<QuarantineRun>, AppError> {
-    require_idle(&state.window(window.label()))?;
-    let Some((endpoint, base, profile_bindings)) =
-        resolve_remote_quarantine(&app, &state, &endpoint)?
-    else {
-        return Ok(Vec::new());
-    };
-    let (vfs, _) = endpoint.file_context().map_err(AppError::from)?;
-    let runs = list_core_quarantine_runs(vfs.as_ref(), &base, &None).map_err(AppError::from)?;
-    crate::queue_runtime::ensure_profile_bindings_current(&app, &profile_bindings)?;
-    Ok(runs)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        require_idle(&state.window(window.label()))?;
+        let Some((endpoint, base, profile_bindings)) =
+            resolve_remote_quarantine(&app, &state, &endpoint)?
+        else {
+            return Ok(Vec::new());
+        };
+        let (vfs, _) = endpoint.file_context().map_err(AppError::from)?;
+        let runs = list_core_quarantine_runs(vfs.as_ref(), &base, &None).map_err(AppError::from)?;
+        crate::queue_runtime::ensure_profile_bindings_current(&app, &profile_bindings)?;
+        Ok(runs)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn list_provider_quarantine_entries(
+pub(crate) async fn list_provider_quarantine_entries(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     endpoint: BidirectionalEndpointRequest,
     run_id: String,
 ) -> Result<Vec<QuarantineEntry>, AppError> {
-    require_idle(&state.window(window.label()))?;
-    let Some((endpoint, base, profile_bindings)) =
-        resolve_remote_quarantine(&app, &state, &endpoint)?
-    else {
-        return Ok(Vec::new());
-    };
-    let (vfs, target) = endpoint.file_context().map_err(AppError::from)?;
-    let entries =
-        list_quarantine_entries_for_target(vfs.as_ref(), &base, &run_id, &None, Some(&target))
-            .map_err(AppError::from)?;
-    crate::queue_runtime::ensure_profile_bindings_current(&app, &profile_bindings)?;
-    Ok(entries)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        require_idle(&state.window(window.label()))?;
+        let Some((endpoint, base, profile_bindings)) =
+            resolve_remote_quarantine(&app, &state, &endpoint)?
+        else {
+            return Ok(Vec::new());
+        };
+        let (vfs, target) = endpoint.file_context().map_err(AppError::from)?;
+        let entries =
+            list_quarantine_entries_for_target(vfs.as_ref(), &base, &run_id, &None, Some(&target))
+                .map_err(AppError::from)?;
+        crate::queue_runtime::ensure_profile_bindings_current(&app, &profile_bindings)?;
+        Ok(entries)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn restore_provider_quarantine_entry(
+pub(crate) async fn restore_provider_quarantine_entry(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     endpoint: BidirectionalEndpointRequest,
     run_id: String,
     relative_path: String,
 ) -> Result<QuarantineRestoreResponse, AppError> {
-    let label = window.label();
-    let window_state = state.window(label);
-    with_reserved_operation(&app, label, &window_state, || {
-        let Some((endpoint, base, profile_bindings)) =
-            resolve_remote_quarantine(&app, &state, &endpoint)?
-        else {
-            return Err(unsupported_remote_quarantine());
-        };
-        let (vfs, target) = endpoint.file_context().map_err(AppError::from)?;
-        with_provider_quarantine_lease(
-            || {
-                lease_quarantine_run_for_target(vfs.as_ref(), &base, &run_id, &target)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let label = window.label();
+        let window_state = state.window(label);
+        with_reserved_operation(&app, label, &window_state, || {
+            let Some((endpoint, base, profile_bindings)) =
+                resolve_remote_quarantine(&app, &state, &endpoint)?
+            else {
+                return Err(unsupported_remote_quarantine());
+            };
+            let (vfs, target) = endpoint.file_context().map_err(AppError::from)?;
+            with_provider_quarantine_lease(
+                || {
+                    lease_quarantine_run_for_target(vfs.as_ref(), &base, &run_id, &target)
+                        .map_err(AppError::from)
+                },
+                || {
+                    endpoint
+                        .probe_quarantine_restore_capability()
+                        .map_err(AppError::from)?;
+                    crate::queue_runtime::ensure_profile_bindings_current(&app, &profile_bindings)
+                },
+                |lease| {
+                    restore_quarantine_entry_for_target_with_lease(
+                        lease,
+                        vfs.as_ref(),
+                        &base,
+                        &run_id,
+                        &relative_path,
+                        &target,
+                    )
+                    .map(restore_response)
                     .map_err(AppError::from)
-            },
-            || {
-                endpoint
-                    .probe_quarantine_restore_capability()
-                    .map_err(AppError::from)?;
-                crate::queue_runtime::ensure_profile_bindings_current(&app, &profile_bindings)
-            },
-            |lease| {
-                restore_quarantine_entry_for_target_with_lease(
-                    lease,
-                    vfs.as_ref(),
-                    &base,
-                    &run_id,
-                    &relative_path,
-                    &target,
-                )
-                .map(restore_response)
-                .map_err(AppError::from)
-            },
-        )
+                },
+            )
+        })
     })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
-pub(crate) fn purge_provider_quarantine_run(
+pub(crate) async fn purge_provider_quarantine_run(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     endpoint: BidirectionalEndpointRequest,
     run_id: String,
     confirmation: String,
 ) -> Result<(), AppError> {
-    let expected = format!("LEEREN {run_id}");
-    if confirmation != expected {
-        return Err(AppError::new(
-            "confirmation_mismatch",
-            format!("Zum endgültigen Leeren exakt „{expected}“ eingeben"),
-        ));
-    }
-    let label = window.label();
-    let window_state = state.window(label);
-    with_reserved_operation(&app, label, &window_state, || {
-        let Some((endpoint, base, profile_bindings)) =
-            resolve_remote_quarantine(&app, &state, &endpoint)?
-        else {
-            return Err(unsupported_remote_quarantine());
-        };
-        let (vfs, target) = endpoint.file_context().map_err(AppError::from)?;
-        with_provider_quarantine_lease(
-            || {
-                lease_quarantine_run_for_target(vfs.as_ref(), &base, &run_id, &target)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let expected = format!("LEEREN {run_id}");
+        if confirmation != expected {
+            return Err(AppError::new(
+                "confirmation_mismatch",
+                format!("Zum endgültigen Leeren exakt „{expected}“ eingeben"),
+            ));
+        }
+        let label = window.label();
+        let window_state = state.window(label);
+        with_reserved_operation(&app, label, &window_state, || {
+            let Some((endpoint, base, profile_bindings)) =
+                resolve_remote_quarantine(&app, &state, &endpoint)?
+            else {
+                return Err(unsupported_remote_quarantine());
+            };
+            let (vfs, target) = endpoint.file_context().map_err(AppError::from)?;
+            with_provider_quarantine_lease(
+                || {
+                    lease_quarantine_run_for_target(vfs.as_ref(), &base, &run_id, &target)
+                        .map_err(AppError::from)
+                },
+                || {
+                    endpoint
+                        .probe_quarantine_purge_capability()
+                        .map_err(AppError::from)?;
+                    crate::queue_runtime::ensure_profile_bindings_current(&app, &profile_bindings)
+                },
+                |lease| {
+                    purge_quarantine_run_for_target_with_lease(
+                        lease,
+                        vfs.as_ref(),
+                        &base,
+                        &run_id,
+                        &target,
+                    )
                     .map_err(AppError::from)
-            },
-            || {
-                endpoint
-                    .probe_quarantine_purge_capability()
-                    .map_err(AppError::from)?;
-                crate::queue_runtime::ensure_profile_bindings_current(&app, &profile_bindings)
-            },
-            |lease| {
-                purge_quarantine_run_for_target_with_lease(
-                    lease,
-                    vfs.as_ref(),
-                    &base,
-                    &run_id,
-                    &target,
-                )
-                .map_err(AppError::from)
-            },
-        )
+                },
+            )
+        })
     })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quarantaene_verwendet_denselben_ipc_vertrag_wie_die_browserfaelle() {
+        use doppeldecker_core::{
+            quarantine::QuarantineReason, QuarantineRunStatus, QuarantineState,
+        };
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/quarantine-wire.json")).unwrap();
+        let endpoint: BidirectionalEndpointRequest =
+            serde_json::from_value(wire["remoteEndpoint"].clone()).unwrap();
+        assert_eq!(
+            endpoint,
+            BidirectionalEndpointRequest::Smb {
+                profile_id: "mock_smb".into(),
+                profile_revision: Some(41),
+                root: "/".into(),
+            },
+        );
+        let run = QuarantineRun {
+            id: "run-1".into(),
+            created_unix_ms: 1,
+            expires_unix_ms: 2,
+            target_root: "/mock/ziel".into(),
+            state: QuarantineState::Active,
+            status: QuarantineRunStatus::CrashRecovery,
+            items_total: 1,
+            items_available: 1,
+            items_restorable: 1,
+            items_manual_recovery: 0,
+            items_restored: 0,
+            items_recovery_pending: 0,
+            entries_available: 1,
+            bytes_available: 8,
+        };
+        let entry = QuarantineEntry {
+            relative_path: "alt.txt".into(),
+            is_dir: false,
+            reason: QuarantineReason::Replaced,
+            restored: false,
+            available: true,
+            automatic_restore_available: true,
+            manual_recovery_required: false,
+            recovery_pending: false,
+            entries: 1,
+            bytes: 8,
+        };
+        let run = serde_json::to_value(run).unwrap();
+        let entry = serde_json::to_value(entry).unwrap();
+        crate::browser_commands::assert_wire_object(&run, &wire["run"]);
+        crate::browser_commands::assert_wire_object(&entry, &wire["entry"]);
+        assert_eq!(run["state"], "active");
+        assert_eq!(run["status"], "crash_recovery");
+        assert_eq!(entry["reason"], "replaced");
+        for (outcome, expected) in [
+            (QuarantineRestoreOutcome::Restored, "restored"),
+            (QuarantineRestoreOutcome::Reconciled, "reconciled"),
+        ] {
+            let response = serde_json::to_value(restore_response(QuarantineRestoreResult {
+                path: PathBuf::from("/mock/ziel/alt.txt"),
+                outcome,
+            }))
+            .unwrap();
+            crate::browser_commands::assert_wire_object(&response, &wire["restore"]);
+            assert_eq!(response["outcome"], expected);
+        }
+    }
 
     #[test]
     fn live_lease_fehler_bleibt_bis_zum_tauri_payload_maschinenlesbar() {

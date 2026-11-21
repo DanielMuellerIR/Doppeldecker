@@ -334,7 +334,7 @@ Capability-Proben. Das gilt ebenso für Resume und Rollback: Deren Wirkungen lie
 auf den ursprünglichen Zielseiten. Eine unveränderte Seite erhält keine erfundene
 positive Schreibfähigkeit; die vorhandenen Zielgates bleiben vollständig wirksam.
 Eigene Probenreste werden niemals durch einen neuen Snapshot als bestätigter
-Bestand übernommen. Der [AP14-Gegenbeleg](test-stability-2026-10-06.md#ftps-eigene-proben-veränderten-den-leeren-plan)
+Bestand übernommen. Der [AP14-Gegenbeleg](history/test-stability-2026-10-06.md#ftps-eigene-proben-veränderten-den-leeren-plan)
 prüft diese Grenze mit einer verlorenen MKD-Antwort und einem echten Quelldownload.
 
 Damit kann ein Paar asymmetrisch sein. FTPS, WebDAV oder SMB dürfen beispielsweise

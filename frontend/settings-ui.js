@@ -1,28 +1,84 @@
+// @ts-check
+
 import { hideModal, showOwnedModal } from "./modal.js";
-import { invoke, listen } from "./tauri-api.js";
+import {
+  desktopPreferences, diffToolStatus, listenDesktopPreferences, updateDesktopPreferences,
+} from "./desktop-preferences-api.js";
+import { currentTauriWindow, invoke } from "./tauri-api.js";
 import { $, escapeHtml } from "./ui-utils.js";
 
+/** @typedef {import("./desktop-preferences-wire.js").DesktopPreferencesWire} Preferences */
+/** @typedef {import("./desktop-preferences-wire.js").PreferencesSnapshotWire} PreferencesSnapshot */
+/** @typedef {import("./desktop-preferences-wire.js").DiffToolAvailabilityWire} DiffToolAvailability */
+/** @typedef {Pick<Preferences, "theme" | "byteUnits" | "localFolderSizes" | "networkDiscovery">} LegacyPreferences */
+/** @typedef {{
+ * applyByteUnits: (value: Preferences["byteUnits"], persist: boolean) => void,
+ * applyLocalFolderSizes: (value: boolean, persist: boolean) => void,
+ * applyNetworkDiscovery: (value: boolean, persist: boolean) => void,
+ * applyTheme: (value: Preferences["theme"], persist: boolean) => void,
+ * rememberWindow: () => void,
+ * legacyPreferences: () => LegacyPreferences,
+ * showError: (title: string, error: unknown) => void
+ * }} SettingsCallbacks */
+
+/** @type {[Preferences["icon"], string][]} */
 const ICONS = [
   ["blue", "Blauer Himmel"], ["sunset", "Sonnenuntergang"],
   ["aurora", "Polarlichter"], ["turquoise", "Türkiser Himmel"],
   ["rose", "Rosa-lila Himmel"], ["storm", "Gewitter und Goldlicht"],
 ];
+/** @type {[Preferences["diffTool"], string][]} */
 const TOOLS = [["xcode", "Xcode FileMerge"], ["fastra", "Fastra"], ["bbedit", "BBEdit"]];
+/** @type {["localFolderSizes", "networkDiscovery", "restoreSession"]} */
+const CHECKBOX_SETTINGS = ["localFolderSizes", "networkDiscovery", "restoreSession"];
+/** @type {Record<"icon" | "diff-tool", "icon" | "diffTool">} */
 const RADIO_PREFERENCES = { icon: "icon", "diff-tool": "diffTool" };
+
+/** @param {EventTarget | null} target @returns {Partial<Preferences> | undefined} */
+function patchFromControl(target) {
+  if (target instanceof HTMLSelectElement) {
+    const { value } = target;
+    if (target.dataset.setting === "theme" && (value === "auto" || value === "light" || value === "dark")) {
+      return { theme: value };
+    }
+    if (target.dataset.setting === "byteUnits" && (value === "decimal" || value === "binary")) {
+      return { byteUnits: value };
+    }
+  }
+  if (!(target instanceof HTMLInputElement)) return;
+  if (target.type === "checkbox") {
+    const field = CHECKBOX_SETTINGS.find(key => key === target.dataset.setting);
+    if (field) return { [field]: target.checked };
+  }
+  if (target.name === "icon") {
+    const choice = ICONS.find(([id]) => id === target.value);
+    if (choice) return { icon: choice[0] };
+  }
+  if (target.name === "diff-tool") {
+    const choice = TOOLS.find(([id]) => id === target.value);
+    if (choice) return { diffTool: choice[0] };
+  }
+}
+
+/** @param {SettingsCallbacks} callbacks */
 
 export function createSettingsUi({
   applyByteUnits, applyLocalFolderSizes, applyNetworkDiscovery, applyTheme,
-  currentWindow, legacyPreferences, showError,
+  rememberWindow, legacyPreferences, showError,
 }) {
+  /** @type {PreferencesSnapshot | null} */
   let snapshot = null;
+  /** @type {DiffToolAvailability[]} */
   let statuses = [];
+  /** @type {ReturnType<typeof showOwnedModal> | null} */
   let modalToken = null;
   let opening = false;
-  let rememberTimer = null;
+  let rememberTimer = 0;
   // Bis der Start die gespeicherte aktive Pane übernommen hat, darf kein
   // Zwischenstand gespeichert werden; siehe `startRemembering`.
   let rememberEnabled = false;
 
+  /** @param {PreferencesSnapshot} next */
   function accept(next) {
     // Die Revision wächst unter der Backend-Mutex streng monoton. Nur auf
     // Ungleichheit zu prüfen genügt deshalb nicht: Trifft die eigene, ältere
@@ -44,6 +100,7 @@ export function createSettingsUi({
     if (modalToken) syncBody();
   }
 
+  /** @param {Preferences} preferences @param {Preferences | null} [previous] */
   function apply(preferences, previous = null) {
     if (!preferences) return;
     // Theme-Boot und frühe Spaltenmessung lesen weiterhin die bisherigen lokalen
@@ -63,9 +120,10 @@ export function createSettingsUi({
     }
   }
 
+  /** @param {Partial<Preferences>} patch */
   async function update(patch) {
     try {
-      accept(await invoke("update_desktop_preferences", { patch }));
+      accept(await updateDesktopPreferences(patch));
     } catch (error) {
       // Menübefehle stellen Theme und Einheit für direkte Rückmeldung zunächst
       // optimistisch dar. Ein Schreibfehler setzt sie auf den bestätigten Stand.
@@ -84,21 +142,23 @@ export function createSettingsUi({
     }
   }
 
+  /**
+   * @param {Preferences["diffTool"]} id
+   * @param {string} label
+   * @param {boolean} checked
+   * @param {boolean} disabled
+   * @param {string} detail
+   */
   function option(id, label, checked, disabled, detail) {
     return `<label class="settings-tool${disabled ? " disabled" : ""}">
       <input type="radio" name="diff-tool" value="${id}" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}>
       <span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(detail)}</small></span></label>`;
   }
 
-  function radioChecked(preferences, name, value) {
-    return preferences[RADIO_PREFERENCES[name]] === value;
-  }
-
   function renderBody() {
     const body = $("#modal-body");
-    if (!body || !snapshot) return;
+    if (!(body instanceof HTMLElement) || !snapshot) return;
     const p = snapshot.preferences;
-    const status = Object.fromEntries(statuses.map(item => [item.id, item]));
     body.innerHTML = `<div class="settings-sections">
       <fieldset><legend>Erscheinungsbild</legend>
         <label>Darstellung <select data-setting="theme">
@@ -107,7 +167,7 @@ export function createSettingsUi({
           <option value="dark" ${p.theme === "dark" ? "selected" : ""}>Dunkel</option>
         </select></label>
         <div class="icon-choices" role="radiogroup" aria-label="App-Icon">${ICONS.map(([id, label]) => `
-          <label class="icon-choice"><input type="radio" name="icon" value="${id}" ${radioChecked(p, "icon", id) ? "checked" : ""}>
+          <label class="icon-choice"><input type="radio" name="icon" value="${id}" ${p.icon === id ? "checked" : ""}>
             <img src="icons/preview/${id}.png" alt=""><span>${escapeHtml(label)}</span></label>`).join("")}</div>
       </fieldset>
       <fieldset><legend>Dateien und Ordner</legend>
@@ -123,8 +183,8 @@ export function createSettingsUi({
         <small>Gespeicherte Verbindungsprofile werden dabei neu verbunden. Laufende Operationen folgen weiterhin der Queue-Recovery.</small>
       </fieldset>
       <fieldset><legend>Dateivergleich</legend>${TOOLS.map(([id, label]) => {
-        const item = status[id] || { available: false, detail: "Status wird ermittelt …" };
-        return option(id, label, radioChecked(p, "diff-tool", id), !item.available, item.detail);
+        const item = statuses.find(item => item.id === id) || { available: false, detail: "Status wird ermittelt …" };
+        return option(id, label, p.diffTool === id, !item.available, item.detail);
       }).join("")}</fieldset>
     </div>
     <nav class="settings-links" aria-label="Projektinformationen">
@@ -132,22 +192,21 @@ export function createSettingsUi({
       <a href="https://dm0.de/impressum.html" data-project-page="imprint">Impressum</a>
       <a href="https://dm0.de/datenschutz.html#doppeldecker" data-project-page="privacy">Datenschutz</a>
     </nav>`;
-    body.querySelector(".settings-links").addEventListener("click", event => {
+    body.querySelector(".settings-links")?.addEventListener("click", event => {
+      if (!(event.target instanceof Element)) return;
       const link = event.target.closest("[data-project-page]");
-      if (!link) return;
+      if (!(link instanceof HTMLAnchorElement)) return;
+      const page = link.dataset.projectPage;
+      if (page !== "support" && page !== "imprint" && page !== "privacy") return;
       event.preventDefault();
-      void invoke("open_project_page", { page: link.dataset.projectPage })
+      /** @type {{page: "support" | "imprint" | "privacy"}} */
+      const request = { page };
+      void invoke("open_project_page", request)
         .catch(error => showError("Projektinformationen", error));
     });
     body.onchange = event => {
-      const target = event.target;
-      if (RADIO_PREFERENCES[target.name]) {
-        void update({ [RADIO_PREFERENCES[target.name]]: target.value });
-      }
-      else if (target.dataset.setting) {
-        const value = target.type === "checkbox" ? target.checked : target.value;
-        void update({ [target.dataset.setting]: value });
-      }
+      const patch = patchFromControl(event.target);
+      if (patch) void update(patch);
     };
   }
 
@@ -155,16 +214,22 @@ export function createSettingsUi({
    * ohne das DOM neu zu bauen. */
   function syncBody() {
     const body = $("#modal-body");
-    if (!body || !snapshot) return;
+    if (!(body instanceof HTMLElement) || !snapshot) return;
     const p = snapshot.preferences;
     for (const control of body.querySelectorAll("[data-setting]")) {
-      const value = p[control.dataset.setting];
-      if (control.type === "checkbox") control.checked = Boolean(value);
-      else if (control.value !== String(value)) control.value = value;
+      if (control instanceof HTMLInputElement) {
+        const field = CHECKBOX_SETTINGS.find(key => key === control.dataset.setting);
+        if (field) control.checked = p[field];
+      } else if (control instanceof HTMLSelectElement) {
+        const field = control.dataset.setting;
+        if ((field === "theme" || field === "byteUnits") && control.value !== p[field]) {
+          control.value = p[field];
+        }
+      }
     }
     for (const [name, preference] of Object.entries(RADIO_PREFERENCES)) {
       for (const radio of body.querySelectorAll(`input[name="${name}"]`)) {
-        radio.checked = radio.value === p[preference];
+        if (radio instanceof HTMLInputElement) radio.checked = radio.value === p[preference];
       }
     }
   }
@@ -183,7 +248,7 @@ export function createSettingsUi({
     opening = true;
     try {
       const [current, found] = await Promise.all([
-        invoke("desktop_preferences"), invoke("diff_tool_status"),
+        desktopPreferences(), diffToolStatus(),
       ]);
       accept(current);
       statuses = found;
@@ -194,14 +259,16 @@ export function createSettingsUi({
       opening = false;
     }
     modalToken = showOwnedModal("settings", () => {
-      $("#modal .modal").className = "modal settings-modal";
-      $("#modal-title").textContent = "Einstellungen";
+      const modal = $("#modal .modal");
+      const title = $("#modal-title");
+      if (modal) modal.className = "modal settings-modal";
+      if (title) title.textContent = "Einstellungen";
       renderBody();
       const buttons = $("#modal .modal-buttons");
-      buttons.replaceChildren();
+      buttons?.replaceChildren();
       const done = document.createElement("button");
       done.type = "button"; done.className = "btn primary"; done.textContent = "Fertig";
-      done.addEventListener("click", close); buttons.appendChild(done);
+      done.addEventListener("click", close); buttons?.appendChild(done);
       return { focusTarget: $("#modal-body select"), onEscape: close };
     });
   }
@@ -209,12 +276,7 @@ export function createSettingsUi({
   function rememberSoon() {
     if (!rememberEnabled) return;
     clearTimeout(rememberTimer);
-    rememberTimer = setTimeout(() => {
-      const current = currentWindow();
-      if (current.panes.left.path && current.panes.right.path) {
-        void invoke("remember_window", current).catch(error => showError("Sitzungsstand", error));
-      }
-    }, 250);
+    rememberTimer = window.setTimeout(rememberWindow, 250);
   }
 
   /** Erst nach dem vollständigen Start aufrufen. Während der Start-Listings hat
@@ -228,10 +290,8 @@ export function createSettingsUi({
 
   async function init() {
     const [initial] = await Promise.all([
-      invoke("desktop_preferences"),
-      listen("desktop-preferences-changed", event => {
-        accept(event.payload);
-      }),
+      desktopPreferences(),
+      listenDesktopPreferences(accept),
     ]);
     // Die bisherigen globalen Werte lagen pro Fenster in localStorage. Beim ersten
     // Start mit der Backend-Datei übernehmen wir sie einmal, statt eine vorhandene
@@ -242,7 +302,7 @@ export function createSettingsUi({
     if (initial.needsMigration && !initial.loadError) {
       const legacy = legacyPreferences();
       try {
-        migrated = await invoke("update_desktop_preferences", { patch: legacy, onlyIfUninitialized: true });
+        migrated = await updateDesktopPreferences(legacy, true);
       } catch (error) {
         // Noch nicht gespeicherte Vorgaben dürfen die letzte lokale Nutzerwahl
         // nicht verdrängen. Ein späterer Start kann genau diese Werte erneut migrieren.
@@ -251,8 +311,8 @@ export function createSettingsUi({
       }
     }
     accept(migrated);
-    if (snapshot.loadError) showError("Einstellungen", snapshot.loadError);
-    const current = window.__TAURI__?.window?.getCurrentWindow?.();
+    if (snapshot?.loadError) showError("Einstellungen", snapshot.loadError);
+    const current = currentTauriWindow();
     if (current) {
       await Promise.all([current.onMoved(rememberSoon), current.onResized(rememberSoon)]);
     }

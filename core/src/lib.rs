@@ -11,7 +11,7 @@
 //! Aufbau:
 //! - `atomic_write` — gemeinsamer Write/Sync/Rename-Pfad für kleine Journale.
 //! - [`vfs`]       — [`Vfs`]-Trait + lokale Implementierung [`LocalVfs`]. Remote-Provider
-//!   (SFTP, FTP/FTPS, WebDAV und SMB) implementieren später dasselbe Trait.
+//!   (SFTP, FTP/FTPS, WebDAV und SMB) implementieren dasselbe Trait.
 //! - [`sync`]      — Diff-Berechnung (Dry-Run-Plan) und Ausführung.
 //! - [`fileops`]   — interaktive Datei-Operationen (Kopieren/Verschieben/Umbenennen/
 //!   Ordner anlegen) mit Konflikt-Erkennung und Sandbox-Schranke.
@@ -21,7 +21,7 @@
 //! - [`trash`]      — descriptor-relativer Papierkorb mit Claim und Crash-Journal.
 //! - [`quarantine`] — Sync-Läufe auflisten, wiederherstellen und bestätigt leeren.
 //! - [`queue`]      — atomar persistierte Operations-Queue samt Crash-Recovery.
-//! - [`metadata`]   — Stufe-2-Fähigkeiten und kanonische Metadatenmanifeste.
+//! - [`metadata`]   — Dateisystemfähigkeiten für Metadaten und kanonische Manifeste.
 //! - [`path`]       — gemeinsame, verlustfreie Expansion des eigenen Home-Kürzels.
 //! - [`progress`]  — Fortschritts-Meldung und Abbruch-Signal für lang laufende Vorgänge.
 
@@ -39,6 +39,7 @@ pub mod content_sync;
 pub mod created_directory_dacl;
 mod created_directory_dacl_queue;
 mod created_directory_dacl_registry;
+mod dacl_registry_io;
 pub mod directory_dacl;
 pub mod directory_dacl_queue;
 pub mod directory_size;

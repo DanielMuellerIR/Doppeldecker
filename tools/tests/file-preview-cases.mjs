@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 
-async function mockPreview(page, result, { hold = false, error = null } = {}) {
+const wire = JSON.parse(await readFile(new URL("./file-preview-wire.json", import.meta.url)));
+
+async function mockPreview(page, result, assertShape, { hold = false, error = null } = {}) {
+  if (result) {
+    assertShape(result, wire.response);
+    assertShape(result.content, wire[result.content.kind]);
+  }
   await page.evaluate(({ result, hold, error }) => {
     const original = window.__TAURI__.core.invoke;
     window.__TAURI__.core.invoke = async (command, args) => {
@@ -21,13 +27,13 @@ async function selectFile(page) {
   return list;
 }
 
-export async function runFilePreviewCases(runCase) {
+export async function runFilePreviewCases(runCase, assertShape) {
   for (const theme of ["light", "dark"]) for (const width of [1180, 440]) {
     await runCase(`Integrierte Vorschau · passiver Text · ${theme} · ${width}`, "", async page => {
       await page.setViewportSize({ width, height: 760 });
       await page.evaluate(theme => window.__MOCK_EMIT__("menu", `theme_${theme}`), theme);
       const text = '<script>window.previewExecuted = true</script>\n<svg onload="alert(1)">\n' + "Lange Zeile ohne Umbruch ".repeat(40);
-      await mockPreview(page, { bytes: text.length, content: { kind: "text", text }, limitations: [] });
+      await mockPreview(page, { bytes: text.length, content: { kind: "text", text }, limitations: [] }, assertShape);
       const list = await selectFile(page);
       await page.keyboard.press("F3");
       const dialog = page.getByRole("dialog", { name: /Vorschau/ });
@@ -56,7 +62,7 @@ export async function runFilePreviewCases(runCase) {
 
   await runCase("Integrierte Vorschau · Rasterbild unter Produktions-CSP", "", async page => {
     const data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aV1kAAAAASUVORK5CYII=";
-    await mockPreview(page, { bytes: 68, content: { kind: "image", data_url, width: 1, height: 1 }, limitations: [] });
+    await mockPreview(page, { bytes: 68, content: { kind: "image", data_url, width: 1, height: 1 }, limitations: [] }, assertShape);
     await selectFile(page);
     await page.keyboard.press("ContextMenu");
     await page.getByRole("menuitem", { name: "Vorschau (F3)", exact: true }).click();
@@ -67,7 +73,7 @@ export async function runFilePreviewCases(runCase) {
   });
 
   await runCase("Integrierte Vorschau · Fehler und System-App-Alternative", "", async page => {
-    await mockPreview(page, null, { error: { code: "invalid_input", message: "Die integrierte Vorschau liest höchstens 8 MiB." } });
+    await mockPreview(page, null, assertShape, { error: { code: "invalid_input", message: "Die integrierte Vorschau liest höchstens 8 MiB." } });
     await selectFile(page);
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "file_preview"));
     const dialog = page.getByRole("dialog", { name: /Vorschau/ });
@@ -77,7 +83,7 @@ export async function runFilePreviewCases(runCase) {
   });
 
   await runCase("Integrierte Vorschau · Remote-Endpunkt und sichtbare Einschränkung", "?remoteFile=1", async page => {
-    await mockPreview(page, { bytes: 3, content: { kind: "text", text: "remote" }, limitations: ["Best Effort: keine atomare Rootbindung"] });
+    await mockPreview(page, { bytes: 3, content: { kind: "text", text: "remote" }, limitations: ["Best Effort: keine atomare Rootbindung"] }, assertShape);
     await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
     const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
     await list.getByRole("option", { name: /remote\.txt/ }).click();
@@ -85,12 +91,12 @@ export async function runFilePreviewCases(runCase) {
     await page.keyboard.press("F3");
     await page.getByRole("dialog").getByText("Best Effort: keine atomare Rootbindung").waitFor();
     const request = await page.evaluate(() => window.__PREVIEW_REQUEST__);
-    assert.deepEqual(request, { endpoint: { provider: "sftp", profileId: "mock_sftp", profileRevision: 11, root: "/" }, path: "/remote.txt" });
+    assert.deepEqual(request, wire.request);
     await page.keyboard.press("Escape");
   });
 
   await runCase("Integrierte Vorschau · ungeeigneter Inhalt bleibt erklärbar", "", async page => {
-    await mockPreview(page, { bytes: 5, content: { kind: "unsupported", reason: "Keine passive Vorschau für diese Binärdatei verfügbar." }, limitations: [] });
+    await mockPreview(page, { bytes: 5, content: { kind: "unsupported", reason: "Keine passive Vorschau für diese Binärdatei verfügbar." }, limitations: [] }, assertShape);
     await selectFile(page);
     await page.keyboard.press("F3");
     const dialog = page.getByRole("dialog");
@@ -100,7 +106,7 @@ export async function runFilePreviewCases(runCase) {
   });
 
   await runCase("Integrierte Vorschau · geschlossener Dialog ignoriert späte Antwort", "", async page => {
-    await mockPreview(page, { bytes: 3, content: { kind: "text", text: "alt" }, limitations: [] }, { hold: true });
+    await mockPreview(page, { bytes: 3, content: { kind: "text", text: "alt" }, limitations: [] }, assertShape, { hold: true });
     await selectFile(page);
     await page.keyboard.press("F3");
     await page.getByText("Momentaufnahme wird vorbereitet …").waitFor();

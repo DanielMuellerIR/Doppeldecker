@@ -133,4 +133,43 @@ mod tests {
         assert!(read.request_permission);
         assert!(require_local("sftp").is_err());
     }
+
+    #[test]
+    fn file_property_wire_comments() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/file-property-wire.json"))
+                .unwrap();
+        let fixture = &fixture["comments"];
+        let read: FinderCommentReadRequest =
+            serde_json::from_value(fixture["read"]["request"].clone()).unwrap();
+        let edit: FinderCommentEditRequest =
+            serde_json::from_value(fixture["edit"]["request"].clone()).unwrap();
+        assert_eq!(read.names, edit.names);
+        assert!(read.request_permission);
+        let read = FinderCommentReadRow {
+            name: read.names[0].clone(),
+            state: Some(doppeldecker_core::file_properties::FinderCommentState {
+                text: "Alt <script>alert(\"x\")</script> ä\nZweite Zeile".into(),
+                metadata_differs: true,
+            }),
+            permission_required: false,
+            code: None,
+            message: "Finder-Zugriff ist nicht freigegeben".into(),
+        };
+        let edit = FinderCommentEditRow {
+            name: edit.names[0].clone(),
+            state: None,
+            changed: true,
+            code: None,
+            message: "Finder-Kommentar und Metadaten bestätigt".into(),
+        };
+        assert_eq!(
+            serde_json::to_value([read]).unwrap(),
+            fixture["read"]["rows"]
+        );
+        assert_eq!(
+            serde_json::to_value([edit]).unwrap(),
+            fixture["edit"]["rows"]
+        );
+    }
 }

@@ -263,9 +263,9 @@ pub(crate) fn install_native_exit_gate(app: &tauri::AppHandle) -> Result<(), cra
     let parent = delegate_object.class();
     let mut builder = ClassBuilder::new(c"DoppeldeckerExitDelegate", parent)
         .ok_or_else(|| crate::AppError::new("app", "Native Exitklasse ist bereits registriert"))?;
-    // Die Unterklasse fügt keine Ivars hinzu und erhält sämtliche übrigen
-    // Delegate-Methoden und deren Zustand. Nur die passende AppKit-Signatur wird
-    // ergänzt. Installation und Delegatezugriff erfolgen auf dem Hauptthread.
+    // SAFETY: applicationShouldTerminate: erwartet einen Delegate-Empfänger,
+    // den Selektor und genau ein NSApplication-Argument. Die C-unwind-Funktion
+    // nimmt die Objektargumente per Referenz und liefert NSApplicationTerminateReply.
     unsafe {
         builder.add_method(
             sel!(applicationShouldTerminate:),
@@ -276,8 +276,10 @@ pub(crate) fn install_native_exit_gate(app: &tauri::AppHandle) -> Result<(), cra
     assert_eq!(class.instance_size(), parent.instance_size());
     APP.set(app.clone())
         .map_err(|_| crate::AppError::new("app", "Native Exitprüfung ist bereits gebunden"))?;
-    // Identische Instanzgröße, unmittelbare Unterklasse und kompatible Methode;
-    // es gibt vor der Fenstererzeugung keinen parallelen Klassentausch.
+    // SAFETY: class ist die direkte Unterklasse der aktuellen Delegate-Klasse,
+    // hat keine zusätzlichen Ivars und dieselbe geprüfte Instanzgröße. Die
+    // einzige ersetzte Methode hat dieselbe ABI. Die Installation läuft einmalig
+    // mit MainThreadMarker vor der Fenstererzeugung.
     let previous = unsafe { AnyObject::set_class(delegate_object, class) };
     assert!(std::ptr::eq(previous, parent));
     Ok(())

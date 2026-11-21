@@ -36,7 +36,7 @@ pub(crate) async fn get_metadata_admin_status() -> Result<AdminStatus, AppError>
 
 #[cfg(target_os = "macos")]
 fn status() -> AdminStatus {
-    let (state, message) = match unsafe { native::dd_admin_service_status() } {
+    let (state, message) = match native::service_status() {
         0 => (
             "notRegistered",
             "Administratorhelfer noch nicht eingerichtet.",
@@ -98,7 +98,7 @@ pub(crate) async fn set_metadata_admin_service(enabled: bool) -> Result<AdminSta
                     "Eine Administratoränderung läuft noch; Dienst danach ändern",
                 )
             })?;
-            let value = native::take(unsafe { native::dd_admin_service_change(enabled) })?;
+            let value = native::service_change(enabled)?;
             decode(value)?;
             Ok(status())
         })
@@ -115,6 +115,8 @@ pub(crate) async fn set_metadata_admin_service(enabled: bool) -> Result<AdminSta
 pub(crate) fn open_metadata_admin_settings() -> Result<(), AppError> {
     #[cfg(target_os = "macos")]
     {
+        // SAFETY: Die native Funktion erwartet keine Eingaben und öffnet
+        // ausschließlich die Systemeinstellungen über SMAppService.
         unsafe { native::dd_admin_open_settings() };
         Ok(())
     }
@@ -190,8 +192,8 @@ mod native {
     use super::*;
     use std::ffi::{c_char, c_void, CStr};
     unsafe extern "C" {
-        pub(super) fn dd_admin_service_status() -> i32;
-        pub(super) fn dd_admin_service_change(enabled: bool) -> *mut c_char;
+        fn dd_admin_service_status() -> i32;
+        fn dd_admin_service_change(enabled: bool) -> *mut c_char;
         pub(super) fn dd_admin_open_settings();
         fn dd_admin_client_perform(
             bytes: *const c_char,
@@ -200,14 +202,34 @@ mod native {
             context: *mut c_void,
         ) -> *mut c_char;
     }
-    pub(super) fn take(pointer: *mut c_char) -> Result<serde_json::Value, AppError> {
+    pub(super) fn service_status() -> i32 {
+        // SAFETY: Der native Statusaufruf erwartet keine Eingaben und gibt
+        // einen Integerwert zurück.
+        unsafe { dd_admin_service_status() }
+    }
+
+    pub(super) fn service_change(enabled: bool) -> Result<serde_json::Value, AppError> {
+        // SAFETY: Rust bool entspricht C bool. Der native Aufruf gibt NULL
+        // oder einen per strdup neu angelegten C-String an take weiter.
+        unsafe { take(dd_admin_service_change(enabled)) }
+    }
+
+    /// # Safety
+    /// Ein Zeiger ungleich NULL muss auf einen nullterminierten, mit
+    /// libc::free freigebbaren C-String in exklusivem Besitz zeigen.
+    unsafe fn take(pointer: *mut c_char) -> Result<serde_json::Value, AppError> {
         if pointer.is_null() {
             return Err(AppError::new(
                 "outcome_unclear",
                 "Administratorergebnis fehlt; Teilwirkungen prüfen",
             ));
         }
-        let parsed = serde_json::from_slice(unsafe { CStr::from_ptr(pointer) }.to_bytes());
+        // SAFETY: Der Aufrufer garantiert einen gültigen nullterminierten
+        // String. serde_json erzeugt daraus einen eigenen Wert.
+        let reply = unsafe { CStr::from_ptr(pointer) };
+        let parsed = serde_json::from_slice(reply.to_bytes());
+        // SAFETY: Der Aufrufer hat die einzige Besitzreferenz für diese
+        // libc-Allokation übertragen. Der Leseborrow ist abgeschlossen.
         unsafe { libc::free(pointer.cast()) };
         parsed.map_err(|_| {
             AppError::new(
@@ -217,23 +239,52 @@ mod native {
         })
     }
     unsafe extern "C" fn cancelled(context: *mut c_void) -> bool {
-        unsafe { &*context.cast::<Cancel>() }.is_cancelled()
+        // SAFETY: perform übergibt einen lebenden &Cancel. Der native Code
+        // verwendet den Zeiger nur synchron und schreibt nicht darüber.
+        let cancel = unsafe { &*context.cast::<Cancel>() };
+        cancel.is_cancelled()
     }
     pub(super) fn perform(bytes: &[u8], cancel: &Cancel) -> Result<serde_json::Value, AppError> {
-        take(unsafe {
-            dd_admin_client_perform(
+        // SAFETY: Beide Borrows bleiben während des nativen Aufrufs gültig.
+        // macos-admin.m kopiert die Bytes und ruft cancelled nur synchron auf.
+        // Der Rückgabewert ist NULL oder ein per strdup angelegter C-String.
+        unsafe {
+            take(dd_admin_client_perform(
                 bytes.as_ptr().cast(),
                 bytes.len(),
                 cancelled,
                 (cancel as *const Cancel).cast_mut().cast(),
-            )
-        })
+            ))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_ipc_wire_admin_status_matches_frontend() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/file-property-wire.json"))
+                .unwrap();
+        let fixture = &fixture["administrator"];
+        for (key, state, message) in [
+            (
+                "read",
+                "notRegistered",
+                "Administratorhelfer noch nicht eingerichtet.",
+            ),
+            ("toggled", "requiresApproval", "Systemfreigabe erforderlich"),
+        ] {
+            let status = AdminStatus {
+                available: true,
+                state,
+                message,
+            };
+            assert_eq!(serde_json::to_value(status).unwrap(), fixture[key]);
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -242,7 +293,7 @@ mod tests {
         let area = tempfile::tempdir().unwrap();
         let root = area.path().canonicalize().unwrap();
         std::fs::write(root.join("file"), b"unchanged content").unwrap();
-        assert_eq!(unsafe { native::dd_admin_service_status() }, -1);
+        assert_eq!(native::service_status(), -1);
         let request = AdminMetadataRequest::capture(
             "unsigned-test".into(),
             &root,

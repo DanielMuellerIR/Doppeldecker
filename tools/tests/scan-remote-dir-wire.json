@@ -1,0 +1,52 @@
+{
+  "request": {
+    "profileId": "string",
+    "profileRevision": "number",
+    "path": "string",
+    "showHidden": "boolean"
+  },
+  "listing": {
+    "path": "string",
+    "parent": "string|null",
+    "entries": "array",
+    "profile_revision": "number",
+    "session_generation": "number"
+  },
+  "entry": {
+    "name": "string",
+    "is_dir": "boolean",
+    "is_file": "boolean",
+    "is_symlink": "boolean",
+    "size": "number",
+    "mtime": "number|null",
+    "created": "number|null",
+    "owner": "string|null",
+    "group": "string|null",
+    "extension": "string|null",
+    "mode": "number|null",
+    "device": "number|null",
+    "inode": "number|null",
+    "hard_links": "number|null"
+  },
+  "sftp": {
+    "security": "string",
+    "omitted": "array"
+  },
+  "ftps": {
+    "security": "string"
+  },
+  "omission": {
+    "display_name": "string",
+    "is_hidden": "boolean",
+    "reason": "string"
+  },
+  "sftpSecurity": [
+    "sftp_path_best_effort"
+  ],
+  "ftpsSecurity": [
+    "plaintext",
+    "tls_identity_unverified",
+    "tls_identity_externally_verified",
+    "tls_identity_verified"
+  ]
+}

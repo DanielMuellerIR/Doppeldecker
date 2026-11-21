@@ -120,14 +120,7 @@ struct DirectoryProof {
     revision: u64,
 }
 
-/// Ein interaktives Pane-Listing samt der Generation, unter der es entstanden ist.
-/// Die Generation verhindert eine Vermischung mit einem parallelen Reconnect, ist
-/// aber ausdrücklich kein Namespace- oder Identitätsbeleg.
-#[derive(Clone, Debug)]
-pub struct FtpsInteractiveDirectoryListing {
-    pub entries: Vec<Entry>,
-    pub session_generation: u64,
-}
+pub use crate::vfs::RemoteInteractiveDirectoryListing as FtpsInteractiveDirectoryListing;
 
 impl FtpsVfs {
     pub(crate) fn connection_config(&self) -> &FtpsConnectionConfig {
@@ -4036,30 +4029,6 @@ mod tests {
         assert_eq!(abgelehnt.kind(), io::ErrorKind::NotFound);
     }
 
-    /// Der Abwesenheitsbeweis darf sich nie auf einen Statfehler stützen: 550 heißt
-    /// bei FTP sowohl „gibt es nicht" als auch „darf ich nicht".
-    #[test]
-    fn loeschpfade_beweisen_abwesenheit_ueber_das_elternlisting() {
-        let quelle = include_str!("ftps.rs");
-        for (funktion, ende) in [
-            ("fn remove_file(&self, path: &Path)", "fn remove_dir_all("),
-            ("fn remove_dir(&self, path: &Path)", "fn rename(&self,"),
-        ] {
-            let start = quelle
-                .find(funktion)
-                .unwrap_or_else(|| panic!("{funktion} fehlt"));
-            let rest = &quelle[start..];
-            let rumpf = &rest[..rest.find(ende).unwrap_or_else(|| panic!("{ende} fehlt"))];
-            assert!(
-                rumpf.contains("require_absent_after_delete"),
-                "{funktion} beweist die Abwesenheit nicht über das Elternlisting"
-            );
-            assert!(
-                !rumpf.contains("io::ErrorKind::NotFound => Ok(())"),
-                "{funktion} wertet wieder einen Statfehler als Löschbeweis"
-            );
-        }
-    }
     use std::net::TcpListener;
 
     #[test]

@@ -12,10 +12,11 @@ use crate::metadata::Acl;
 mod platform {
     use super::*;
     use crate::metadata::{PosixAcl, PosixAclEntry, PosixAclTag};
+    use std::ffi::CStr;
 
     const VERSION: u32 = 2;
-    const ACCESS: &[u8] = b"system.posix_acl_access\0";
-    const DEFAULT: &[u8] = b"system.posix_acl_default\0";
+    const ACCESS: &CStr = c"system.posix_acl_access";
+    const DEFAULT: &CStr = c"system.posix_acl_default";
     const USER_OBJ: u16 = 0x01;
     const USER: u16 = 0x02;
     const GROUP_OBJ: u16 = 0x04;
@@ -74,15 +75,11 @@ mod platform {
         Ok(())
     }
 
-    fn read_xattr(fd: &OwnedFd, name: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        let size = unsafe {
-            libc::fgetxattr(
-                fd.as_raw_fd(),
-                name.as_ptr().cast(),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
+    fn read_xattr(fd: &OwnedFd, name: &CStr) -> io::Result<Option<Vec<u8>>> {
+        // SAFETY: Der FD bleibt offen und name ist NUL-terminiert. Bei Länge 0
+        // erlaubt fgetxattr einen Nullzeiger für die reine Größenabfrage.
+        let size =
+            unsafe { libc::fgetxattr(fd.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
         if size < 0 {
             let error = io::Error::last_os_error();
             return if matches!(error.raw_os_error(), Some(libc::ENODATA)) {
@@ -92,10 +89,12 @@ mod platform {
             };
         }
         let mut bytes = vec![0u8; size as usize];
+        // SAFETY: Der FD und der C-Name bleiben gültig. bytes stellt den für
+        // die angegebene Länge beschreibbaren Puffer bereit.
         let read = unsafe {
             libc::fgetxattr(
                 fd.as_raw_fd(),
-                name.as_ptr().cast(),
+                name.as_ptr(),
                 bytes.as_mut_ptr().cast(),
                 bytes.len(),
             )
@@ -112,9 +111,10 @@ mod platform {
         Ok(Some(bytes))
     }
 
-    fn write_or_remove(fd: &OwnedFd, name: &[u8], entries: &[PosixAclEntry]) -> io::Result<()> {
+    fn write_or_remove(fd: &OwnedFd, name: &CStr, entries: &[PosixAclEntry]) -> io::Result<()> {
         if entries.is_empty() {
-            let result = unsafe { libc::fremovexattr(fd.as_raw_fd(), name.as_ptr().cast()) };
+            // SAFETY: Der offene FD und der NUL-terminierte C-Name gelten für den ganzen Aufruf.
+            let result = unsafe { libc::fremovexattr(fd.as_raw_fd(), name.as_ptr()) };
             if result != 0 {
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::ENODATA) {
@@ -124,10 +124,12 @@ mod platform {
             return Ok(());
         }
         let bytes = encode(entries);
+        // SAFETY: Der offene FD und der C-Name bleiben gültig. bytes ist für
+        // genau bytes.len() Bytes lesbar und bleibt bis zur Rückkehr erhalten.
         let result = unsafe {
             libc::fsetxattr(
                 fd.as_raw_fd(),
-                name.as_ptr().cast(),
+                name.as_ptr(),
                 bytes.as_ptr().cast(),
                 bytes.len(),
                 0,
@@ -228,6 +230,8 @@ mod platform {
     const ACL_EXTENDED_DENY: libc::c_int = 2;
     const ACL_FLAG_NO_INHERIT: libc::c_int = 1 << 17;
 
+    // SAFETY: Die Deklarationen verwenden die Darwin-ABI aus sys/acl.h,
+    // einschließlich opaker Zeigertypen und der 64-Bit-Berechtigungsmaske.
     unsafe extern "C" {
         fn acl_init(count: libc::c_int) -> *mut c_void;
         fn acl_free(object: *mut c_void) -> libc::c_int;
@@ -256,6 +260,8 @@ mod platform {
     struct OwnedAcl(*mut c_void);
     impl Drop for OwnedAcl {
         fn drop(&mut self) {
+            // SAFETY: OwnedAcl übernimmt nur erfolgreiche, eigene ACL-Zeiger.
+            // Auch ein von acl_create_entry ersetzter Zeiger gehört ihm exklusiv.
             unsafe {
                 acl_free(self.0);
             }
@@ -263,6 +269,8 @@ mod platform {
     }
 
     pub(super) fn read(fd: &OwnedFd) -> io::Result<Option<Acl>> {
+        // SAFETY: Der geliehene OwnedFd hält den Dateideskriptor offen. Der
+        // ACL-Typ ist der Darwin-Wert für erweiterte ACLs.
         let raw = unsafe { acl_get_fd_np(fd.as_raw_fd(), ACL_TYPE_EXTENDED) };
         if raw.is_null() {
             let error = io::Error::last_os_error();
@@ -277,6 +285,8 @@ mod platform {
         let mut entry = std::ptr::null_mut();
         let mut selector = ACL_FIRST_ENTRY;
         loop {
+            // SAFETY: acl besitzt die gültige ACL, der Selector ist FIRST oder NEXT
+            // und entry stellt einen beschreibbaren Zeiger-Slot bereit.
             let result = unsafe { acl_get_entry(acl.0, selector, &mut entry) };
             if result < 0 {
                 let error = io::Error::last_os_error();
@@ -287,6 +297,8 @@ mod platform {
             }
             selector = ACL_NEXT_ENTRY;
             let mut tag = 0;
+            // SAFETY: acl_get_entry war erfolgreich. Die unveränderte ACL hält
+            // den Eintrag gültig und tag nimmt den C-int-Ausgabewert auf.
             check(unsafe { acl_get_tag_type(entry, &mut tag) })?;
             let kind = match tag {
                 ACL_EXTENDED_ALLOW => Nfs4AceKind::Allow,
@@ -298,21 +310,32 @@ mod platform {
                     ))
                 }
             };
+            // SAFETY: Der Eintrag gehört zur lebenden ACL und hat einen gültigen
+            // Allow-/Deny-Tag, für den Darwin einen UUID-Qualifier definiert.
             let qualifier = unsafe { acl_get_qualifier(entry) };
             if qualifier.is_null() {
                 return Err(io::Error::last_os_error());
             }
             let mut uuid = [0u8; 16];
+            // SAFETY: Der nichtleere Qualifier ist eine eigene Darwin-Allokation
+            // mit 16 lesbaren UUID-Bytes. Das Zielarray überlappt sie nicht.
+            // Nach der Kopie wird der Qualifier genau einmal mit acl_free freigegeben.
             unsafe {
                 std::ptr::copy_nonoverlapping(qualifier.cast::<u8>(), uuid.as_mut_ptr(), 16);
                 acl_free(qualifier);
             }
             let mut permissions = 0;
+            // SAFETY: Der Eintrag bleibt an die unveränderte ACL gebunden.
+            // permissions hat die Größe des Darwin-Typs acl_permset_mask_t.
             check(unsafe { acl_get_permset_mask_np(entry, &mut permissions) })?;
             let mut flagset = std::ptr::null_mut();
+            // SAFETY: Der gültige Eintrag lebt in acl. flagset ist ein
+            // beschreibbarer Slot für den geliehenen Flagset-Zeiger.
             check(unsafe { acl_get_flagset_np(entry, &mut flagset) })?;
             let mut flags = 0u32;
             for flag in FLAGS {
+                // SAFETY: Der erfolgreiche Getter hat das Flagset des weiterhin
+                // gültigen Eintrags geliefert. FLAGS enthält Darwin-ACL-Flags.
                 if unsafe { acl_get_flag_np(flagset, flag) } == 1 {
                     flags |= flag as u32;
                 }
@@ -325,7 +348,10 @@ mod platform {
             });
         }
         let mut acl_flags = std::ptr::null_mut();
+        // SAFETY: Die ACL ist noch gültig. acl_flags nimmt den geliehenen
+        // Zeiger auf das ACL-weite Flagset auf.
         check(unsafe { acl_get_flagset_np(acl.0, &mut acl_flags) })?;
+        // SAFETY: Der erfolgreiche Getter lieferte das Flagset der lebenden ACL.
         let flags = if unsafe { acl_get_flag_np(acl_flags, ACL_FLAG_NO_INHERIT) } == 1 {
             ACL_FLAG_NO_INHERIT as u32
         } else {
@@ -358,6 +384,8 @@ mod platform {
         if let Some(acl) = expected {
             acl.validate()?;
         }
+        // SAFETY: Die ACL-Validierung begrenzt die Zahl auf 128 Einträge.
+        // Der Wert passt in c_int und entspricht Darwins ACL_MAX_ENTRIES.
         let raw = unsafe { acl_init(entries.len() as libc::c_int) };
         if raw.is_null() {
             return Err(io::Error::last_os_error());
@@ -368,30 +396,53 @@ mod platform {
             _ => 0,
         };
         let mut acl_flagset = std::ptr::null_mut();
+        // SAFETY: acl besitzt die von acl_init erzeugte ACL. acl_flagset ist
+        // ein beschreibbarer Slot für den geliehenen Zeiger.
         check(unsafe { acl_get_flagset_np(acl.0, &mut acl_flagset) })?;
+        // SAFETY: Der erfolgreiche Getter lieferte das Flagset der eigenen ACL.
+        // Es wird vor acl_create_entry verwendet, das die ACL verlagern darf.
         check(unsafe { acl_clear_flags_np(acl_flagset) })?;
         if global_flags & ACL_FLAG_NO_INHERIT as u32 != 0 {
+            // SAFETY: Das ACL-weite Flagset ist weiterhin gültig und wird hier
+            // vor dem ersten acl_create_entry verwendet.
             check(unsafe { acl_add_flag_np(acl_flagset, ACL_FLAG_NO_INHERIT) })?;
         }
         for item in entries {
             let mut entry = std::ptr::null_mut();
+            // SAFETY: acl.0 ist der Besitzer-Slot für einen ggf. neuen ACL-Zeiger.
+            // entry empfängt den Eintrag. Es werden keine älteren geliehenen
+            // Eintrags- oder Flagset-Zeiger über diesen Aufruf hinweg verwendet.
             check(unsafe { acl_create_entry(&mut acl.0, &mut entry) })?;
             let tag = match item.kind {
                 Nfs4AceKind::Allow => ACL_EXTENDED_ALLOW,
                 Nfs4AceKind::Deny => ACL_EXTENDED_DENY,
             };
+            // SAFETY: acl_create_entry hat den neuen Eintrag in der eigenen ACL
+            // geliefert. tag ist ein gültiger Darwin-Allow-/Deny-Tag.
             check(unsafe { acl_set_tag_type(entry, tag) })?;
+            // SAFETY: Für den gesetzten Tag liest Darwin genau eine UUID aus
+            // dem 16-Byte-Array, das während des Aufrufs gültig bleibt.
             check(unsafe { acl_set_qualifier(entry, item.qualifier.as_ptr().cast()) })?;
+            // SAFETY: Der Eintrag bleibt gültig. Die Berechtigungsmaske wird
+            // als u64 entsprechend acl_permset_mask_t übergeben.
             check(unsafe { acl_set_permset_mask_np(entry, item.permissions) })?;
             let mut flagset = std::ptr::null_mut();
+            // SAFETY: Der gültige Eintrag lebt in acl. flagset ist ein
+            // beschreibbarer Slot für den geliehenen Flagset-Zeiger.
             check(unsafe { acl_get_flagset_np(entry, &mut flagset) })?;
+            // SAFETY: flagset gehört dem aktuellen Eintrag der eigenen ACL und
+            // wird vor der nächsten möglichen ACL-Verlagerung geschrieben.
             check(unsafe { acl_clear_flags_np(flagset) })?;
             for flag in FLAGS {
                 if item.flags & flag as u32 != 0 {
+                    // SAFETY: flagset bleibt bis zum nächsten acl_create_entry gültig.
+                    // flag ist jeweils ein definierter Darwin-Flagwert.
                     check(unsafe { acl_add_flag_np(flagset, flag) })?;
                 }
             }
         }
+        // SAFETY: FD und erweiterte ACL sind während des Aufrufs gültig.
+        // acl_set_fd_np übernimmt weder den FD noch den Besitz der ACL.
         check(unsafe { acl_set_fd_np(fd.as_raw_fd(), acl.0, ACL_TYPE_EXTENDED) })?;
         let actual = read(fd)?;
         if actual.as_ref() != expected {
@@ -475,10 +526,14 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn test_acl() -> Acl {
+        // SAFETY: Signatur aus dem Darwin-Header membership.h mit Zeiger
+        // auf das erste Byte des dort erwarteten uuid_t-Arrays.
         unsafe extern "C" {
             fn mbr_uid_to_uuid(id: libc::uid_t, uu: *mut u8) -> libc::c_int;
         }
         let mut qualifier = [0u8; 16];
+        // SAFETY: geteuid hat keine Zeigerargumente. qualifier bietet die
+        // beschreibbaren 16 Bytes für genau eine Darwin-UUID.
         let result = unsafe { mbr_uid_to_uuid(libc::geteuid(), qualifier.as_mut_ptr()) };
         assert_eq!(result, 0);
         Acl::Nfs4(Nfs4Acl {

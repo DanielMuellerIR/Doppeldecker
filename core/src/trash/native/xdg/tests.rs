@@ -308,7 +308,7 @@ fn echte_xdg_mountlayouts_datenhome_und_stapelgrenzen() {
         mount.current_mount_identity().unwrap(),
         data.ancestor.current_mount_identity().unwrap()
     );
-    let uid = unsafe { libc::geteuid() };
+    let uid = rustix::process::geteuid().as_raw();
     let expected = match case.as_str() {
         "shared" | "shared-default-acl" => volume.join(".Trash").join(uid.to_string()),
         "cross-data-home" => root.join(format!(".Trash-{uid}")),

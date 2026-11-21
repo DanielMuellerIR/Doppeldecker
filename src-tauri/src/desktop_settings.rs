@@ -922,6 +922,8 @@ pub(crate) fn apply_icon(app: &tauri::AppHandle) -> Result<(), AppError> {
                 // Finder-Custom-Icons erzeugen ResourceFork-/FinderInfo-Metadaten am
                 // App-Bundle und verletzen dessen strikte Signaturprüfung. Nur das
                 // Laufzeiticon setzen; die Wahl selbst bleibt in den Einstellungen.
+                // SAFETY: mtm belegt den AppKit-Hauptthread. image ist ein
+                // lebendes NSImage und wird als Some übergeben.
                 unsafe {
                     NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image));
                 }
@@ -994,6 +996,53 @@ fn linux_window_icon(choice: IconChoice) -> Result<tauri::image::Image<'static>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_preferences_wire_matches_the_frontend_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tools/tests/desktop-preferences-wire.json"
+        ))
+        .unwrap();
+        for (field, enum_name) in [
+            ("icon", "IconChoice"),
+            ("theme", "Theme"),
+            ("byteUnits", "ByteUnits"),
+            ("diffTool", "DiffTool"),
+        ] {
+            for value in fixture["enums"][enum_name].as_array().unwrap() {
+                let mut preferences = Preferences::default();
+                preferences.apply(
+                    serde_json::from_value(serde_json::json!({ field.to_string(): value }))
+                        .unwrap(),
+                );
+                assert_eq!(serde_json::to_value(preferences).unwrap()[field], *value);
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let load_error = read_document(directory.path()).err().unwrap();
+        let state = DesktopState::default();
+        let mut store = state.inner.lock_recover();
+        store.path = Some(directory.path().join("settings.json"));
+        store.document.preferences.byte_units = ByteUnits::Decimal;
+        store.load_error = Some(load_error);
+        assert_eq!(
+            serde_json::to_value(store.snapshot()).unwrap(),
+            fixture["failedSnapshot"]
+        );
+        store.load_error = None;
+        drop(store);
+        let patch = fixture["patch"].clone();
+        let (snapshot, _, changed) =
+            update_preferences(&state, serde_json::from_value(patch.clone()).unwrap(), true)
+                .unwrap();
+        assert!(changed);
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap(),
+            serde_json::json!({
+                "preferences": patch, "revision": 1, "needsMigration": false, "loadError": null
+            })
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

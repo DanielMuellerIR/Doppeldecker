@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const propertyWire = JSON.parse(readFileSync(new URL("./file-property-wire.json", import.meta.url), "utf8"));
 
 export async function runAdministratorCases(runCase) {
   await runCase("Linux-Administratorfreigabe verwendet Polkit ohne Diensteinrichtung", "?keyboard=1&administrator=1", async page => {
@@ -79,9 +82,23 @@ export async function runAdministratorCases(runCase) {
         const original=window.__TAURI__.core.invoke;window.__ADMIN_CALLS__=[];window.__ADMIN_STATE__="notRegistered";
         window.__TAURI__.core.invoke=async(command,args)=>{
           if(command==="get_metadata_admin_status")return {available:true,state:window.__ADMIN_STATE__,message:window.__ADMIN_STATE__==="enabled"?"Helfer verfügbar":"Helfer einrichten"};
-          if(command==="set_metadata_admin_service"){window.__ADMIN_CALLS__.push({command,...structuredClone(args)});window.__ADMIN_STATE__=args.enabled?"requiresApproval":"notRegistered";return {available:true,state:window.__ADMIN_STATE__,message:"Systemfreigabe erforderlich"};}
+          if (command === "set_metadata_admin_service") {
+            window.__ADMIN_STATE__ = args.enabled ? "requiresApproval" : "notRegistered";
+            const reply = { available: true, state: window.__ADMIN_STATE__, message: "Systemfreigabe erforderlich" };
+            window.__ADMIN_CALLS__.push({ command, ...structuredClone(args), reply });
+            return reply;
+          }
           if(command==="open_metadata_admin_settings"){window.__ADMIN_CALLS__.push({command});window.__ADMIN_STATE__="enabled";return null;}
-          if(["change_file_permissions","change_file_ownership"].includes(command)){window.__ADMIN_CALLS__.push({command,...structuredClone(args)});return args.request.names.map(name=>({name,changed:true,code:null,mode:0o640,owner:"root",group:"wheel",message:"Änderung bestätigt"}));}
+          if (["change_file_permissions", "change_file_ownership"].includes(command)) {
+            const rows = args.request.names.map(name => ({
+              name, changed: true, code: null, message: "Änderung bestätigt",
+              ...(command === "change_file_permissions"
+                ? { mode: 0o640 }
+                : { owner: "root", group: "wheel", uid: 0, gid: 0, specialBitsChanged: false }),
+            }));
+            window.__ADMIN_CALLS__.push({ command, ...structuredClone(args), rows });
+            return rows;
+          }
           return original(command,args);
         };
       },theme);
@@ -96,6 +113,14 @@ export async function runAdministratorCases(runCase) {
       const ownership=dialog.locator('[data-file-info-editor="ownership"]');await ownership.locator("summary").click();await ownership.getByLabel("Eigentümer (Name oder UID)").fill("root");await ownership.getByRole("checkbox",{name:"Mit Administratorfreigabe ändern",exact:true}).check();await ownership.getByRole("button",{name:"Eigentümer/Gruppe anwenden",exact:true}).click();await dialog.getByRole("region",{name:"Ergebnis der Eigentümeränderung"}).getByText("Änderung bestätigt").waitFor();
       const calls=await page.evaluate(()=>window.__ADMIN_CALLS__);const edits=calls.filter(c=>c.request);assert.equal(edits.length,2);assert(edits.every(c=>c.request.administrator===true&&c.request.provider==="local"&&c.request.names[0]==="Alpha.txt"));assert.notEqual(edits[0].request.requestId,edits[1].request.requestId);
       assert.equal(calls.filter(c=>c.command==="set_metadata_admin_service").length,1);assert.equal(await dialog.evaluate(n=>n.scrollWidth<=n.clientWidth),true);
+      const [permissionEdit, ownershipEdit] = edits;
+      for (const [name, edit] of [["permissions", permissionEdit], ["ownership", ownershipEdit]]) {
+        assert.match(edit.request.requestId, /^[a-f0-9-]{36}$/);
+        assert.deepEqual({ request: { ...edit.request, requestId: "bound" }, rows: edit.rows }, propertyWire[name]);
+      }
+      const [toggle] = calls.filter(call => call.command === "set_metadata_admin_service");
+      assert.deepEqual({ enabled: toggle.enabled }, propertyWire.administrator.toggle);
+      assert.deepEqual(toggle.reply, propertyWire.administrator.toggled);
       await setup.getByRole("button",{name:"Administratorzugriff aktualisieren",exact:true}).click();await setup.getByRole("button",{name:"Systemeinstellungen öffnen",exact:true}).waitFor();
       assert.equal((await page.evaluate(()=>window.__ADMIN_CALLS__)).filter(c=>c.command==="set_metadata_admin_service"&&c.enabled).length,2);
       await setup.getByRole("button",{name:"Administratorzugriff entfernen",exact:true}).click();await setup.getByRole("button",{name:"Administratorzugriff einrichten",exact:true}).waitFor();
@@ -106,7 +131,7 @@ export async function runAdministratorCases(runCase) {
       const original=window.__TAURI__.core.invoke;window.__ADMIN_EDITS__=[];
       window.__TAURI__.core.invoke=async(command,args)=>{
         if(command==="change_file_permissions"){window.__ADMIN_EDITS__.push(structuredClone(args.request));return new Promise(resolve=>{window.__ADMIN_RESOLVE__=resolve;});}
-        if(command==="cancel_file_property_edit"){window.__ADMIN_CANCEL__=args;window.__ADMIN_RESOLVE__([{name:"Alpha.txt",changed:false,code:"outcome_unclear",message:"Antwort verloren; Teilwirkung prüfen"}]);return null;}
+        if(command==="cancel_file_property_edit"){window.__ADMIN_CANCEL__=args;window.__ADMIN_RESOLVE__([{name:"Alpha.txt",changed:false,mode:null,code:"outcome_unclear",message:"Antwort verloren; Teilwirkung prüfen"}]);return null;}
         return original(command,args);
       };
     });

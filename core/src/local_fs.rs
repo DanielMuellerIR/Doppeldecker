@@ -234,6 +234,7 @@ impl RootHandle {
             return Ok(false);
         }
         let stat = fstat(self.fd())?;
+        // SAFETY: geteuid nimmt keine Argumente an und gibt eine UID als Wert zurück.
         if stat.st_uid != unsafe { libc::geteuid() } || stat.st_mode & 0o022 != 0 {
             return Ok(false);
         }
@@ -254,6 +255,7 @@ impl RootHandle {
             return Ok(false);
         }
         let stat = fstat(self.fd())?;
+        // SAFETY: geteuid nimmt keine Argumente an und gibt eine UID als Wert zurück.
         if stat.st_uid != unsafe { libc::geteuid() } || stat.st_mode & 0o077 != 0 {
             return Ok(false);
         }
@@ -397,12 +399,20 @@ impl RootHandle {
 #[cfg(target_os = "linux")]
 pub(crate) fn mount_identity_from_fd(fd: &OwnedFd) -> io::Result<LocalMountIdentity> {
     const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
+    // SAFETY: libc::statfs enthält nur Zahlenfelder und Arrays, für die
+    // eine Nullbitfolge gültig ist.
     let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: fd hält den Deskriptor offen. statfs stellt die passend
+    // ausgerichtete, beschreibbare Ausgabestruktur bereit.
     if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut statfs) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: statx besteht aus Zahlenfeldern, Arrays und numerischen
+    // Zeitstrukturen, die alle nullinitialisiert werden dürfen.
     let mut statx: libc::statx = unsafe { std::mem::zeroed() };
     let mask = libc::STATX_MNT_ID | STATX_MNT_ID_UNIQUE;
+    // SAFETY: Der FD bleibt offen. AT_EMPTY_PATH erlaubt den leeren
+    // C-String und statx bietet Speicher für die native Ergebnisstruktur.
     if unsafe {
         libc::statx(
             fd.as_raw_fd(),
@@ -422,6 +432,9 @@ pub(crate) fn mount_identity_from_fd(fd: &OwnedFd) -> io::Result<LocalMountIdent
             "Linux-Kernel liefert keine Mount-ID für den Realmodus",
         ));
     }
+    // SAFETY: fstatfs lieferte eine initialisierte fsid_t. Sie besteht
+    // aus zwei direkt aneinanderliegenden Ganzzahlen. Die Byteansicht
+    // liest nur dieses Feld und kopiert es vor Ende der Leihe.
     let fsid = unsafe {
         std::slice::from_raw_parts(
             (&statfs.f_fsid as *const libc::fsid_t).cast::<u8>(),
@@ -442,10 +455,17 @@ pub(crate) fn mount_identity_from_fd(fd: &OwnedFd) -> io::Result<LocalMountIdent
 
 #[cfg(target_os = "macos")]
 pub(crate) fn mount_identity_from_fd(fd: &OwnedFd) -> io::Result<LocalMountIdentity> {
+    // SAFETY: libc::statfs enthält nur Zahlenfelder und Arrays, für die
+    // eine Nullbitfolge gültig ist.
     let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: fd hält den Deskriptor offen. statfs stellt die passend
+    // ausgerichtete, beschreibbare Ausgabestruktur bereit.
     if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut statfs) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: fstatfs lieferte eine initialisierte fsid_t. Sie besteht
+    // aus zwei direkt aneinanderliegenden Ganzzahlen. Die Byteansicht
+    // liest nur dieses Feld und kopiert es vor Ende der Leihe.
     let fsid = unsafe {
         std::slice::from_raw_parts(
             (&statfs.f_fsid as *const libc::fsid_t).cast::<u8>(),
@@ -480,6 +500,8 @@ pub(crate) fn mount_identity_from_fd(fd: &OwnedFd) -> io::Result<LocalMountIdent
         length: 0,
         uuid: [0; 16],
     };
+    // SAFETY: Der FD bleibt offen. attrlist und der nach C-Layout
+    // aufgebaute, beschreibbare Puffer gelten für die übergebene Länge.
     if unsafe {
         libc::fgetattrlist(
             fd.as_raw_fd(),
@@ -498,6 +520,8 @@ pub(crate) fn mount_identity_from_fd(fd: &OwnedFd) -> io::Result<LocalMountIdent
             "macOS-Volume-ID-Antwort ist größer als der bereitgestellte Puffer",
         ));
     }
+    // SAFETY: Darwin liefert f_fstypename bei erfolgreichem fstatfs als
+    // NUL-terminiertes Array. statfs lebt bis zur Kopie des Namens.
     let fs_type = unsafe { CStr::from_ptr(statfs.f_fstypename.as_ptr()) }
         .to_string_lossy()
         .into_owned();
@@ -512,7 +536,11 @@ pub(crate) fn mount_identity_from_fd(fd: &OwnedFd) -> io::Result<LocalMountIdent
 }
 
 fn statvfs_from_fd(fd: &OwnedFd) -> io::Result<libc::statvfs> {
+    // SAFETY: statvfs enthält nur Ganzzahlfelder und Arrays, für die
+    // das Nullmuster gültig ist.
     let mut statvfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: Der FD bleibt offen und statvfs ist ein beschreibbarer,
+    // für libc passender Ausgabepuffer.
     if unsafe { libc::fstatvfs(fd.as_raw_fd(), &mut statvfs) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -813,6 +841,8 @@ fn cached_principal(
 pub(crate) fn principal_buffer_size(key: libc::c_int) -> usize {
     // POSIX erlaubt -1 als „unbestimmt". 16 KiB decken übliche lokale und
     // Verzeichnisdienst-Einträge ab; ERANGE wird unten bis 1 MiB vergrößert.
+    // SAFETY: sysconf erhält nur einen ganzzahligen Schlüssel. Auch bei
+    // ungültigem Schlüssel greift libc auf keinen Aufruferzeiger zu.
     let value = unsafe { libc::sysconf(key) };
     usize::try_from(value)
         .unwrap_or(16 * 1024)
@@ -825,6 +855,8 @@ fn lookup_user_name(uid: u32) -> Option<String> {
         let mut record = std::mem::MaybeUninit::<libc::passwd>::zeroed();
         let mut result = std::ptr::null_mut();
         let mut buffer = vec![0_i8; size];
+        // SAFETY: record und result sind passende beschreibbare Ausgaben.
+        // Der eigene Puffer bleibt gültig und buffer.len() begrenzt den Schreibzugriff.
         let status = unsafe {
             libc::getpwuid_r(
                 uid as libc::uid_t,
@@ -841,11 +873,15 @@ fn lookup_user_name(uid: u32) -> Option<String> {
         if status != 0 || result.is_null() {
             return None;
         }
+        // SAFETY: Rückgabewert 0 und ein von Null verschiedener Ergebniszeiger
+        // belegen, dass die reentrante libc-Abfrage den Datensatz initialisiert hat.
         let record = unsafe { record.assume_init() };
         if record.pw_name.is_null() {
             return None;
         }
         return Some(
+            // SAFETY: pw_name ist nach erfolgreicher Abfrage ein NUL-terminierter
+            // Name im noch lebenden Puffer. Null wurde oben ausgeschlossen.
             unsafe { std::ffi::CStr::from_ptr(record.pw_name) }
                 .to_string_lossy()
                 .into_owned(),
@@ -859,6 +895,8 @@ fn lookup_group_name(gid: u32) -> Option<String> {
         let mut record = std::mem::MaybeUninit::<libc::group>::zeroed();
         let mut result = std::ptr::null_mut();
         let mut buffer = vec![0_i8; size];
+        // SAFETY: record und result sind passende beschreibbare Ausgaben.
+        // Der eigene Puffer bleibt gültig und buffer.len() begrenzt den Schreibzugriff.
         let status = unsafe {
             libc::getgrgid_r(
                 gid as libc::gid_t,
@@ -875,11 +913,15 @@ fn lookup_group_name(gid: u32) -> Option<String> {
         if status != 0 || result.is_null() {
             return None;
         }
+        // SAFETY: Rückgabewert 0 und ein von Null verschiedener Ergebniszeiger
+        // belegen, dass die reentrante libc-Abfrage den Datensatz initialisiert hat.
         let record = unsafe { record.assume_init() };
         if record.gr_name.is_null() {
             return None;
         }
         return Some(
+            // SAFETY: gr_name ist nach erfolgreicher Abfrage ein NUL-terminierter
+            // Name im noch lebenden Puffer. Null wurde oben ausgeschlossen.
             unsafe { std::ffi::CStr::from_ptr(record.gr_name) }
                 .to_string_lossy()
                 .into_owned(),
@@ -1635,6 +1677,8 @@ mod mac_resource_fork {
                     "Ressourcen-Fork überschreitet den positionierbaren 32-Bit-Bereich",
                 ));
             }
+            // SAFETY: Der FD bleibt offen und NAME ist NUL-terminiert.
+            // wanted ist höchstens so groß wie der beschreibbare Slice.
             let read = unsafe {
                 libc::fgetxattr(
                     self.fd.as_raw_fd(),
@@ -1697,6 +1741,8 @@ mod mac_resource_fork {
                 ));
             }
             let options = if self.started { 0 } else { libc::XATTR_CREATE };
+            // SAFETY: Der FD bleibt offen und NAME ist NUL-terminiert.
+            // Der Eingabepuffer bleibt für genau buffer.len() Bytes lesbar.
             let result = unsafe {
                 libc::fsetxattr(
                     self.fd.as_raw_fd(),
@@ -1726,6 +1772,8 @@ mod mac_resource_fork {
     }
 
     fn resource_size(fd: &OwnedFd) -> io::Result<Option<u64>> {
+        // SAFETY: Der FD bleibt offen und NAME ist NUL-terminiert.
+        // Nullzeiger und Länge 0 fragen nur die Attributgröße ab.
         let size = unsafe {
             libc::fgetxattr(
                 fd.as_raw_fd(),
@@ -2060,6 +2108,8 @@ pub(crate) fn set_interactive_mode_beneath(
     let result: io::Result<()> = {
         // fchmod lehnt O_PATH ab. fchmodat2 mit EMPTY_PATH adressiert genau den
         // gehaltenen FD, auch ohne Leserecht; kein pfadbasierter chmod-Fallback.
+        // SAFETY: Die Argumente entsprechen fchmodat2. AT_EMPTY_PATH
+        // erlaubt den leeren C-String; fd bleibt für den Aufruf offen.
         let status = unsafe {
             libc::syscall(
                 libc::SYS_fchmodat2,
@@ -2163,6 +2213,8 @@ pub(crate) fn set_interactive_owner_beneath(
             fchown(&fd, uid.map(Uid::from_raw), gid.map(Gid::from_raw)).map_err(Into::into);
         #[cfg(target_os = "linux")]
         let result: io::Result<()> = {
+            // SAFETY: Der gehaltene FD bleibt offen. AT_EMPTY_PATH erlaubt
+            // den leeren C-String. Die IDs werden als Werte übergeben.
             let status = unsafe {
                 libc::fchownat(
                     fd.as_raw_fd(),
@@ -3103,6 +3155,7 @@ mod tests {
                 assert!(stat_beneath(&root, &path).unwrap().is_file);
                 std::fs::remove_file(&path).unwrap();
                 let fifo_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                // SAFETY: fifo_path ist ein gültiger, bis zur Rückkehr lebender CString.
                 assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
                 let entry = path.clone();
                 let result = fifo_call_finishes_with_error(&path, move || {
@@ -3155,6 +3208,7 @@ mod tests {
                 .unwrap();
             std::fs::remove_file(&intent).unwrap();
             let fifo_path = std::ffi::CString::new(intent.as_os_str().as_bytes()).unwrap();
+            // SAFETY: fifo_path ist ein gültiger, bis zur Rückkehr lebender CString.
             assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
             let entry = intent.clone();
             let retained_source = source.clone();

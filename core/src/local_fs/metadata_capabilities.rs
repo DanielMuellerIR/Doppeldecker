@@ -33,7 +33,11 @@ pub(super) fn volume_capabilities(
         length: u32,
         capabilities: libc::vol_capabilities_attr_t,
     }
+    // SAFETY: Die Pufferstruktur besteht aus einer Länge und Arrays aus
+    // Ganzzahlen. Null ist für alle Felder gültig.
     let mut buffer: VolumeCapabilitiesBuffer = unsafe { std::mem::zeroed() };
+    // SAFETY: Der FD bleibt offen und attrlist entspricht der nativen ABI.
+    // Der beschreibbare C-Puffer ist mindestens so groß wie die übergebene Länge.
     if unsafe {
         libc::fgetattrlist(
             directory.as_raw_fd(),
@@ -115,6 +119,8 @@ pub(super) fn read(
     };
     // flistxattr kann auch bei gesperrtem user-Namensraum eine leere Liste
     // liefern. ENODATA der gezielten Leseabfrage beweist dagegen dessen Zugang.
+    // SAFETY: Der Verzeichnis-FD bleibt offen und der Attributname ist
+    // NUL-terminiert. Nullzeiger und Länge 0 lesen nur die Größe.
     let result = unsafe {
         libc::fgetxattr(
             directory.as_raw_fd(),
@@ -171,8 +177,12 @@ fn for_linux_filesystem(filesystem: &str) -> MetadataCapabilities {
 
 #[cfg(target_os = "linux")]
 pub(super) fn linux_filesystem_name(directory: &OwnedFd) -> io::Result<String> {
+    // SAFETY: Alle statx-Felder sind Ganzzahlen, Arrays oder numerische
+    // Zeitstrukturen, für die eine Nullbitfolge gültig ist.
     let mut stat: libc::statx = unsafe { std::mem::zeroed() };
     // mountinfo enthält die normale Mount-ID, nicht STATX_MNT_ID_UNIQUE.
+    // SAFETY: Der offene FD bleibt gültig und AT_EMPTY_PATH erlaubt den
+    // leeren C-String. stat ist ein beschreibbarer libc-Ausgabepuffer.
     if unsafe {
         libc::statx(
             directory.as_raw_fd(),

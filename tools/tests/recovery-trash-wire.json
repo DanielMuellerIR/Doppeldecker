@@ -1,0 +1,70 @@
+{
+  "recovery": {
+    "available": {
+      "queue": [
+        {
+          "reason": "outcome_unclear",
+          "entry": {
+            "file_dacl_recovery": false,
+            "archive_extract_report": null,
+            "operation_id": "review-copy",
+            "operation": {
+              "type": "File",
+              "kind": "Copy",
+              "items": ["/mock/quelle/Alpha.txt"],
+              "destination": "/mock/ziel",
+              "overwrite": false,
+              "expected_conflicts": [],
+              "expected_conflict_proofs": [],
+              "keep_both_targets": [],
+              "local_replace_best_effort_expected": null,
+              "local_copy_new_best_effort_expected": null
+            },
+            "profile_bindings": [],
+            "created_unix_ms": 1800000000000,
+            "state": "Interrupted",
+            "attempts": 1,
+            "progress": {
+              "files_total": 0,
+              "files_done": 0,
+              "bytes_total": 0,
+              "bytes_done": 0,
+              "current": "",
+              "phase": "interrupted"
+            },
+            "attention": null,
+            "error": null,
+            "error_code": "outcome_unclear",
+            "temp_recovery_paths": [],
+            "retained_backup_paths": [],
+            "file_incomplete": false,
+            "recovery_available": false,
+            "bidirectional_completion_recovery": null
+          }
+        }
+      ],
+      "trash": {
+        "Ok": [
+          { "name": "trash-available.json", "entry_count": 2, "effects_unclear": false, "error": null },
+          { "name": "trash-probe.json", "entry_count": null, "effects_unclear": false, "error": "Prüfjournal nicht lesbar" },
+          { "name": "trash-unclear.json", "entry_count": 1, "effects_unclear": true, "error": null }
+        ]
+      }
+    },
+    "empty": { "queue": [], "trash": { "Ok": [] } },
+    "unavailable": {
+      "queue": null,
+      "trash": { "Err": { "code": "busy", "message": "Papierkorb wird gerade verarbeitet. Erneut aktualisieren." } }
+    }
+  },
+  "trash": {
+    "complete": { "trashed": 1, "failed": 0, "unclear": 0, "recovery_paths": [], "errors": [] },
+    "partial": {
+      "trashed": 1,
+      "failed": 1,
+      "unclear": 1,
+      "recovery_paths": ["/mock/quelle/Prüfpfad"],
+      "errors": ["Zugriff verweigert", "Wirkung für <Prüfpfad> ungeklärt"]
+    }
+  }
+}

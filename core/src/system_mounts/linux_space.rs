@@ -3,7 +3,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::{product, Space};
@@ -27,8 +27,14 @@ impl Drop for ProbeLease {
 }
 
 impl ProbePool {
+    fn retired_children(&self) -> MutexGuard<'_, Vec<(Child, ProbeLease)>> {
+        // Kind und Slot werden zusammen gespeichert oder entnommen. Auch nach
+        // einem Panic muss jedes noch nicht reaped Kind seinen Slot behalten.
+        self.retired.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn reap(&self) {
-        let mut retired = self.retired.lock().unwrap();
+        let mut retired = self.retired_children();
         let mut index = 0;
         while index < retired.len() {
             if matches!(retired[index].0.try_wait(), Ok(Some(_))) {
@@ -70,7 +76,7 @@ impl Drop for ProbeProcess<'_> {
             // bis zum tatsächlich beobachteten Exit belegt. Der nächste Abruf reapet
             // nur mit try_wait; auch wiederholte Fensterabrufe erzeugen höchstens
             // vier lebende oder noch nicht eingesammelte Hilfsprozesse.
-            self.pool.retired.lock().unwrap().push((child, lease));
+            self.pool.retired_children().push((child, lease));
         }
     }
 }
@@ -148,6 +154,8 @@ fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
     // SAFETY: Der Descriptor gehört der gehaltenen Pipe. Wir lesen ihre Flags und
     // ergänzen nur O_NONBLOCK; geerbte Schreibenden dürfen kein EOF-Warten erzwingen.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: Der Deskriptor bleibt durch pipe gültig. Der dritte Parameter
+    // von F_SETFL ist ein int, und nur ein erfolgreicher F_GETFL-Wert geht ein.
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }

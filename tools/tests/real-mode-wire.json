@@ -1,0 +1,73 @@
+{
+  "content": {
+    "request": {
+      "source": {
+        "provider": "sftp",
+        "root": "/",
+        "profileId": "mock_sftp",
+        "profileRevision": 11
+      },
+      "target": {
+        "provider": "local",
+        "root": "/mock/ziel"
+      },
+      "options": {
+        "mode": "AddOnly",
+        "compare": "SizeAndTime",
+        "mtime_tolerance": 2,
+        "metadata": "Portable",
+        "exclude": []
+      }
+    },
+    "preview": {
+      "execution_class": "best_effort",
+      "source_root": "/",
+      "target_root": "/mock/ziel",
+      "source_provider": "sftp",
+      "target_provider": "local",
+      "source_identity": {
+        "provider": "Sftp",
+        "identity": {
+          "server": {
+            "host": "sftp.example.invalid",
+            "port": 22,
+            "host_key": {
+              "algorithm": "ssh-ed25519",
+              "sha256": [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+            },
+            "canonical_root": "/daten",
+            "sftp_version": 3,
+            "extensions_digest": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+          },
+          "virtual_root": "/",
+          "session_generation": 1
+        }
+      },
+      "options": {
+        "mode": "AddOnly",
+        "compare": "SizeAndTime",
+        "mtime_tolerance": 2,
+        "metadata": "Portable"
+      },
+      "digest": [31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31],
+      "expires_unix_ms": 4102444800000,
+      "limitations": [
+        "Künstlicher Hinweis für den gebundenen Dateisync."
+      ],
+      "quarantined_replacements": 0,
+      "quarantined_removals": 0,
+      "quarantine_run": null,
+      "restore_probe_ok": false,
+      "local_execution": null,
+      "irreversible_replacements": 0,
+      "irreversible_removals": 0,
+      "irreversible_removal_bytes": 0,
+      "blocked_removals": 0,
+      "removal_confirmation": null
+    }
+  },
+  "legacy": {
+    "prepared_at_unix_ms": 4102444200000,
+    "expires_at_unix_ms": 4102444800000
+  }
+}

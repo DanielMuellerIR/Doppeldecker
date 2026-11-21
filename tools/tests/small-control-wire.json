@@ -1,0 +1,136 @@
+{
+  "mounts": {
+    "list": [
+      {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "name": "Systemvolume",
+        "path": "/",
+        "kind": "internal",
+        "filesystem": "apfs",
+        "total_bytes": 1000000000000,
+        "available_bytes": 400000000000,
+        "read_only": false,
+        "ejectable": false
+      },
+      {
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "name": "Backup",
+        "path": "/Volumes/Backup",
+        "kind": "external",
+        "filesystem": "apfs",
+        "total_bytes": 1000000000,
+        "available_bytes": 500000000,
+        "read_only": false,
+        "ejectable": true
+      },
+      {
+        "id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "name": "Team",
+        "path": "/Volumes/Team",
+        "kind": "network",
+        "filesystem": "smbfs",
+        "total_bytes": 2000000000,
+        "available_bytes": 750000000,
+        "read_only": false,
+        "ejectable": true
+      }
+    ],
+    "spaceError": {
+      "id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "name": "Team",
+      "path": "/Volumes/Team",
+      "kind": "network",
+      "filesystem": "smbfs",
+      "total_bytes": 0,
+      "available_bytes": 0,
+      "read_only": false,
+      "ejectable": true,
+      "space_error": {
+        "code": "connection_lost",
+        "message": "Speicherabfrage hat ihr Zeitlimit erreicht <img src=x onerror=alert(1)>"
+      }
+    }
+  },
+  "syncJob": {
+    "saved": {
+      "id": "11111111111111111111111111111111",
+      "revision": 1,
+      "name": "Wöchentlich",
+      "direction": "rl",
+      "left": {
+        "provider": "local",
+        "path": "/mock/ablage"
+      },
+      "right": {
+        "provider": "local",
+        "path": "/mock/ziel"
+      },
+      "options": {
+        "mode": "Update",
+        "compare": "ContentHash",
+        "metadata": "Portable",
+        "mtime_tolerance": 2,
+        "exclude": [
+          "*.keep"
+        ]
+      }
+    },
+    "edited": {
+      "id": "11111111111111111111111111111111",
+      "revision": 2,
+      "name": "Am Freitag",
+      "direction": "rl",
+      "left": {
+        "provider": "local",
+        "path": "/mock/andere-ablage"
+      },
+      "right": {
+        "provider": "local",
+        "path": "/mock/ziel"
+      },
+      "options": {
+        "mode": "Update",
+        "compare": "ContentHash",
+        "metadata": "Portable",
+        "mtime_tolerance": 2,
+        "exclude": [
+          "*.tmp"
+        ]
+      }
+    }
+  },
+  "update": {
+    "available": {
+      "available": true,
+      "current_version": "0.1.123",
+      "version": "0.1.124",
+      "notes": "Sicherheitskorrektur <img src=x onerror=alert(1)>",
+      "date": "2026-08-06T12:00:00Z"
+    },
+    "unchanged": {
+      "available": false,
+      "current_version": "0.1.123",
+      "version": null,
+      "notes": null,
+      "date": null
+    },
+    "prepared": {
+      "available": true,
+      "version": "0.1.124"
+    },
+    "missing": {
+      "available": false,
+      "version": null
+    },
+    "progress": [
+      {
+        "downloaded": 5,
+        "total": 10
+      },
+      {
+        "downloaded": 10,
+        "total": 10
+      }
+    ]
+  }
+}

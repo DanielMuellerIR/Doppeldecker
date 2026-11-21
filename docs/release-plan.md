@@ -1,7 +1,7 @@
 # Release- und Plattformplan
 
-Stand: 2026-11-18. Die aktuelle Version ist
-[1.0.1](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v1.0.1).
+Stand: 2026-11-21. Die aktuelle Version ist
+[1.0.2](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v1.0.2).
 Künftige Änderungen bleiben unter `Unreleased`.
 
 ## Unterstützte Ziele
@@ -232,7 +232,7 @@ liefert das geprüfte Manifest. Beide READMEs und die Projektseite beziehen sich
 0.1.125; die Website ist nach dem Upload per HTTPS bytegleich geprüft.
 Frühere Paketbelege werden getrennt aufbewahrt und ersetzen keine der hier
 genannten Wiederholungen.
-[Historische Paketbelege](release-history-2026-10.md) bleiben getrennt erhalten.
+[Historische Paketbelege](history/release-history-2026-10.md) bleiben getrennt erhalten.
 
 ## macOS-Paketvertrag
 
@@ -270,5 +270,5 @@ Der aktuelle Kandidat ist auf beiden unterstützten Plattformen installierbar,
 Upgrade und Recovery sind belegt, Paketprüfungen bestehen und die öffentliche
 Beschreibung entspricht seinen tatsächlichen Funktionen und Grenzen.
 
-[Historische Paketbelege](release-history-2026-10.md) bleiben zur Nachvollziehbarkeit
+[Historische Paketbelege](history/release-history-2026-10.md) bleiben zur Nachvollziehbarkeit
 erhalten; die Produktziele stehen ausschließlich in der [Roadmap](roadmap.md).

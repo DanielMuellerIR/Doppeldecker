@@ -1,0 +1,31 @@
+{
+  "remoteStart": {
+    "provider": "sftp", "profileId": "mock_sftp", "profileRevision": 11,
+    "profileName": "Mock-SFTP", "path": "/"
+  },
+  "session": {
+    "panes": {
+      "left": { "provider": "local", "profileId": null, "profileRevision": null, "path": "/mock/quelle" },
+      "right": { "provider": "local", "profileId": null, "profileRevision": null, "path": "/mock/ziel" }
+    },
+    "activeSide": "right"
+  },
+  "selectedEntry": "Beispiel.txt",
+  "tab": {
+    "id": "tab-initial",
+    "location": { "provider": "local", "profileId": null, "profileRevision": null, "profileName": null, "path": "/mock/quelle" },
+    "history": ["/mock/quelle"],
+    "historyIndex": 0,
+    "selectedNames": [],
+    "cursorName": null,
+    "anchorName": null,
+    "scrollTop": 0.0,
+    "sort": { "key": "name", "dir": 1 },
+    "viewOptions": {
+      "columns": { "size": true, "kind": false, "modified": true, "created": false, "owner": false, "group": false, "permissions": false },
+      "foldersFirst": true, "foldersAlphabetical": true, "boldFolders": true,
+      "zebraRows": false, "relativeDates": false, "showHidden": false,
+      "density": "compact", "textSize": "m"
+    }
+  }
+}

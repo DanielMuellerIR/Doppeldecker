@@ -71,4 +71,4 @@ und Fokus. Sie ist in `pnpm test:ui` eingebunden.
 Native macOS-/Linux-Läufe prüfen lokale und echte SFTP-Suche samt Navigation und
 anschließender Vorschau des ausgewählten Treffers. Die anderen Provider verwenden
 in dieser Oberfläche kontrollierte Browserantworten; dieser Schnitt behauptet
-keine neue native Ganzabnahme aller Provider. [Gemeinsamer Prüfstand](roadmap-2026-10-23.md).
+keine neue native Ganzabnahme aller Provider. [Gemeinsamer Prüfstand](history/roadmap-2026-10-23.md).

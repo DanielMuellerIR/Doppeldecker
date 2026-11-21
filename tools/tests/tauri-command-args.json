@@ -1,0 +1,757 @@
+{
+  "acknowledge_archive_extract_outcome": {
+    "effectsReviewed": "bool",
+    "operationId": "String"
+  },
+  "acknowledge_created_directory_dacl_outcome": {
+    "operationId": "String",
+    "possibleEffectReviewed": "bool"
+  },
+  "acknowledge_directory_dacl_outcome": {
+    "operationId": "String",
+    "possibleEffectReviewed": "bool"
+  },
+  "acknowledge_file_dacl_outcome": {
+    "operationId": "String",
+    "possibleEffectReviewed": "bool"
+  },
+  "acknowledge_legacy_webdav_delete": {
+    "operationId": "String",
+    "possibleEffectReviewed": "bool"
+  },
+  "acknowledge_unclear_queue_outcome": {
+    "operationId": "String",
+    "possibleEffectReviewed": "bool"
+  },
+  "add_favorite": {
+    "name": "String",
+    "path": "String"
+  },
+  "add_remote_favorite": {
+    "name": "String",
+    "path": "String",
+    "profileId": "String",
+    "provider": "FavoriteProvider"
+  },
+  "app_version": {},
+  "approve_bidirectional_queue_entry": {
+    "effectsConfirmed": "bool",
+    "operationId": "String"
+  },
+  "approve_content_sync_queue_entry": {
+    "effectsConfirmed": "bool",
+    "operationId": "String",
+    "preparationDigest": "ContentSyncPreparationDigest",
+    "removalPhrase": "Option<String>"
+  },
+  "approve_forward_bidirectional_queue_entry": {
+    "effectsConfirmed": "bool",
+    "operationId": "String",
+    "preparationDigest": "[u8;32]",
+    "removalPhrases": "Vec<String>"
+  },
+  "approve_ftps_queue_entry": {
+    "effectsConfirmed": "bool",
+    "operationId": "String"
+  },
+  "approve_local_sync_queue_entry": {
+    "operationId": "String",
+    "preparationDigest": "LocalSyncPreparationDigest",
+    "replacementsConfirmed": "bool"
+  },
+  "approve_provider_queue_entry": {
+    "effectsConfirmed": "bool",
+    "operationId": "String"
+  },
+  "approve_queue_entry": {
+    "effectsConfirmed": "bool",
+    "expectedAttention": "doppeldecker_core::QueueAttention",
+    "operationId": "String"
+  },
+  "approve_sftp_queue_entry": {
+    "effectsConfirmed": "bool",
+    "operationId": "String"
+  },
+  "approve_smb_queue_entry": {
+    "effectsConfirmed": "bool",
+    "operationId": "String"
+  },
+  "approve_webdav_queue_entry": {
+    "effectsConfirmed": "bool",
+    "operationId": "String"
+  },
+  "cancel_archive_read": {
+    "requestId": "String"
+  },
+  "cancel_batch_rename": {
+    "planId": "String"
+  },
+  "cancel_directory_sizes": {
+    "side": "String"
+  },
+  "cancel_file_property_edit": {
+    "requestId": "String"
+  },
+  "cancel_name_search": {
+    "clientToken": "u64"
+  },
+  "cancel_resumable_copy_preparation": {
+    "requestId": "String"
+  },
+  "cancel_sync": {},
+  "capture_connection_secret": {
+    "profileId": "String",
+    "protocol": "String"
+  },
+  "change_file_finder_comments": {
+    "request": "FinderCommentEditRequest"
+  },
+  "change_file_finder_tags": {
+    "request": "FinderTagEditRequest"
+  },
+  "change_file_flag": {
+    "request": "FileFlagEditRequest"
+  },
+  "change_file_ownership": {
+    "request": "OwnerEditRequest"
+  },
+  "change_file_permissions": {
+    "request": "PermissionEditRequest"
+  },
+  "change_file_visibility": {
+    "request": "VisibilityEditRequest"
+  },
+  "check_conflicts": {
+    "destDir": "String",
+    "items": "Vec<String>"
+  },
+  "check_for_update": {},
+  "check_local_file_operation": {
+    "destDir": "String",
+    "items": "Vec<String>",
+    "kind": "String"
+  },
+  "check_provider_delete": {
+    "request": "ProviderDeleteRequest"
+  },
+  "check_provider_file_operation": {
+    "choice": "Option<ProviderFileChoiceRequest>",
+    "request": "ProviderFileRequest"
+  },
+  "clear_file_clipboard_if_unchanged": {
+    "version": "String"
+  },
+  "cli_install_status": {},
+  "close_archive_read": {
+    "openRequestId": "String",
+    "sessionId": "Option<String>"
+  },
+  "close_remote_edit": {
+    "request": "RemoteEditRequest"
+  },
+  "compare_files": {
+    "request": "CompareFilesRequest"
+  },
+  "confirm_archive_extract": {
+    "allowPartial": "bool",
+    "overwrite": "bool",
+    "preparationId": "String"
+  },
+  "confirm_archive_pack": {
+    "preparationId": "String"
+  },
+  "confirm_duplicate": {
+    "preparationId": "String"
+  },
+  "connect_ftps_profile": {
+    "profileId": "String",
+    "profileRevision": "Option<u64>"
+  },
+  "connect_sftp_profile": {
+    "profileId": "String",
+    "profileRevision": "Option<u64>"
+  },
+  "connect_smb_profile": {
+    "profileId": "String",
+    "profileRevision": "Option<u64>"
+  },
+  "connect_webdav_profile": {
+    "profileId": "String",
+    "profileRevision": "Option<u64>"
+  },
+  "content_sync_queue_preview": {
+    "operationId": "String"
+  },
+  "copy_paths": {
+    "request": "LocalFileTransferRequest"
+  },
+  "create_folder": {
+    "name": "String",
+    "parent": "String"
+  },
+  "create_provider_folder": {
+    "endpoint": "BidirectionalEndpointRequest",
+    "expectedExecutionClass": "doppeldecker_core::DirectoryCreateExecutionClass",
+    "name": "String"
+  },
+  "decline_cli_install": {},
+  "default_dirs": {},
+  "desktop_preferences": {},
+  "diff_tool_status": {},
+  "discard_archive_extract": {
+    "preparationId": "String"
+  },
+  "discard_archive_pack": {
+    "preparationId": "String"
+  },
+  "discard_batch_rename": {
+    "planId": "String"
+  },
+  "discard_bidirectional_recovery_preparation": {
+    "operationId": "String",
+    "recoveryKind": "BidirectionalRecoveryKind",
+    "recoveryPreparationId": "String"
+  },
+  "discard_bidirectional_sync": {},
+  "discard_connection_secret": {
+    "secretId": "String"
+  },
+  "discard_content_sync": {},
+  "discard_duplicate": {
+    "preparationId": "String"
+  },
+  "discard_forward_bidirectional_queue_preparation": {
+    "operationId": "String"
+  },
+  "discard_forward_bidirectional_sync": {},
+  "discard_ftps_sync": {},
+  "discard_local_sync": {},
+  "discard_provider_sync": {},
+  "discard_queue_confirmation": {
+    "operationId": "String"
+  },
+  "discard_real_sync": {},
+  "discard_replan_required_queue_entry": {
+    "operationId": "String"
+  },
+  "discard_resumable_copy": {
+    "operationId": "String"
+  },
+  "discard_sftp_sync": {},
+  "discard_smb_sync": {},
+  "discard_webdav_sync": {},
+  "disconnect_remote_profile": {
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "protocol": "String"
+  },
+  "discover_ftps_certificate": {
+    "host": "String",
+    "port": "u16"
+  },
+  "discover_network_services": {},
+  "discover_sftp_host_key": {
+    "host": "String",
+    "port": "u16"
+  },
+  "discover_smb_server": {
+    "host": "String",
+    "port": "u16"
+  },
+  "discover_webdav_certificate": {
+    "origin": "String"
+  },
+  "eject_system_mount": {
+    "id": "String"
+  },
+  "enqueue_bidirectional_sync": {},
+  "enqueue_content_sync": {
+    "effectsConfirmed": "bool",
+    "preparationDigest": "ContentSyncPreparationDigest",
+    "removalPhrase": "Option<String>"
+  },
+  "enqueue_forward_bidirectional_sync": {
+    "effectsConfirmed": "bool",
+    "preparationDigest": "[u8;32]",
+    "removalPhrases": "Vec<String>"
+  },
+  "enqueue_ftps_sync": {
+    "request": "EnqueueFtpsRequest"
+  },
+  "enqueue_local_sync": {
+    "preparationDigest": "LocalSyncPreparationDigest",
+    "replacementsConfirmed": "bool"
+  },
+  "enqueue_provider_delete": {
+    "request": "EnqueueProviderDeleteRequest"
+  },
+  "enqueue_provider_file_intent": {
+    "request": "FileIntent"
+  },
+  "enqueue_provider_file_operation": {
+    "request": "EnqueueProviderFileRequest"
+  },
+  "enqueue_provider_sync": {},
+  "enqueue_resumable_copy": {
+    "remoteSource": "Option<crate::bidirectional_commands::BidirectionalEndpointRequest>",
+    "requestId": "Option<String>",
+    "sourcePaths": "Vec<String>",
+    "sourceRoot": "String",
+    "targetRoot": "String"
+  },
+  "enqueue_sftp_sync": {
+    "request": "EnqueueSftpRequest"
+  },
+  "enqueue_smb_sync": {
+    "request": "EnqueueSmbRequest"
+  },
+  "enqueue_webdav_sync": {
+    "request": "EnqueueWebDavRequest"
+  },
+  "execute_batch_rename": {
+    "planId": "String"
+  },
+  "finish_bidirectional_completion_recovery": {
+    "operationId": "String"
+  },
+  "finish_forward_bidirectional_pair_completion": {
+    "pairId": "PairId"
+  },
+  "finish_forward_bidirectional_queue_completion": {
+    "operationId": "String"
+  },
+  "forward_bidirectional_pair_status": {
+    "pairId": "PairId"
+  },
+  "forward_bidirectional_queue_preview": {
+    "operationId": "String"
+  },
+  "generated_source_path": {
+    "operationId": "String"
+  },
+  "get_file_finder_comments": {
+    "request": "FinderCommentReadRequest"
+  },
+  "get_file_finder_tags": {
+    "request": "FinderTagReadRequest"
+  },
+  "get_file_flags": {
+    "request": "FileFlagReadRequest"
+  },
+  "get_file_property_capabilities": {
+    "provider": "String"
+  },
+  "get_file_visibility": {
+    "request": "VisibilityReadRequest"
+  },
+  "get_metadata_admin_status": {},
+  "import_finder_favorites": {},
+  "inspect_recovery": {},
+  "install_cli": {},
+  "install_update": {
+    "expectedVersion": "String"
+  },
+  "list_active_connections": {},
+  "list_archive_directory": {
+    "directoryId": "String",
+    "page": "u32",
+    "sessionId": "String"
+  },
+  "list_favorites": {},
+  "list_ftps_profiles": {},
+  "list_operation_queue": {},
+  "list_provider_quarantine_entries": {
+    "endpoint": "BidirectionalEndpointRequest",
+    "runId": "String"
+  },
+  "list_provider_quarantine_runs": {
+    "endpoint": "BidirectionalEndpointRequest"
+  },
+  "list_quarantine_entries": {
+    "runId": "String",
+    "target": "Option<String>"
+  },
+  "list_quarantine_runs": {
+    "target": "Option<String>"
+  },
+  "list_remote_edits": {},
+  "list_saved_sync_jobs": {},
+  "list_sftp_agent_keys": {},
+  "list_sftp_profiles": {},
+  "list_sftp_quarantine_entries": {
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "runId": "String",
+    "target": "String"
+  },
+  "list_sftp_quarantine_runs": {
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "target": "String"
+  },
+  "list_smb_profiles": {},
+  "list_smb_quarantine_entries": {
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "runId": "String",
+    "target": "String"
+  },
+  "list_smb_quarantine_runs": {
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "target": "String"
+  },
+  "list_system_mounts": {},
+  "list_webdav_profiles": {},
+  "local_sync_queue_preview": {
+    "operationId": "String"
+  },
+  "move_favorite": {
+    "index": "usize",
+    "path": "String",
+    "profileId": "Option<String>",
+    "provider": "FavoriteProvider"
+  },
+  "move_paths": {
+    "request": "LocalFileTransferRequest"
+  },
+  "move_queue_entry": {
+    "delta": "i32",
+    "operationId": "String"
+  },
+  "new_app_window": {
+    "left": "PaneStartLocation",
+    "right": "PaneStartLocation"
+  },
+  "open_archive_read": {
+    "request": "ArchiveOpenRequest",
+    "requestId": "String"
+  },
+  "open_metadata_admin_settings": {},
+  "open_path": {
+    "path": "String"
+  },
+  "open_project_page": {
+    "page": "ProjectPage"
+  },
+  "open_remote_snapshot": {
+    "request": "OpenRemoteSnapshotRequest"
+  },
+  "plan_sync": {
+    "options": "SyncOptions",
+    "source": "String",
+    "target": "String"
+  },
+  "prepare_archive_extract": {
+    "request": "ArchiveExtractPrepareRequest"
+  },
+  "prepare_archive_extract_selection": {
+    "request": "ArchiveExtractSelectionPrepareRequest"
+  },
+  "prepare_archive_pack": {
+    "request": "ArchivePackPrepareRequest"
+  },
+  "prepare_batch_rename": {
+    "request": "PrepareBatchRenameRequest"
+  },
+  "prepare_bidirectional_resume": {
+    "operationId": "String"
+  },
+  "prepare_bidirectional_rollback": {
+    "operationId": "String"
+  },
+  "prepare_bidirectional_sync": {
+    "request": "PrepareBidirectionalRequest"
+  },
+  "prepare_content_sync": {
+    "request": "PrepareContentSyncRequest"
+  },
+  "prepare_duplicate": {
+    "request": "DuplicateRequest"
+  },
+  "prepare_file_preview": {
+    "request": "FilePreviewRequest"
+  },
+  "prepare_forward_bidirectional_queue_recovery": {
+    "expectedUnresolvedDigest": "Option<[u8;32]>",
+    "operationId": "String",
+    "resolutions": "Vec<ConflictResolution>"
+  },
+  "prepare_forward_bidirectional_sync": {
+    "request": "ForwardPrepareRequest"
+  },
+  "prepare_ftps_sync": {
+    "request": "crate::sftp_commands::RemoteSyncRequest"
+  },
+  "prepare_local_sync": {
+    "options": "SyncOptions",
+    "source": "String",
+    "target": "String"
+  },
+  "prepare_provider_sync": {
+    "request": "PrepareProviderSyncRequest"
+  },
+  "prepare_real_sync": {
+    "options": "SyncOptions",
+    "source": "String",
+    "target": "String"
+  },
+  "prepare_sftp_sync": {
+    "request": "RemoteSyncRequest"
+  },
+  "prepare_smb_sync": {
+    "request": "crate::sftp_commands::RemoteSyncRequest"
+  },
+  "prepare_webdav_sync": {
+    "request": "crate::sftp_commands::RemoteSyncRequest"
+  },
+  "prepared_update_status": {},
+  "preview_archive_entry": {
+    "entryId": "String",
+    "requestId": "String",
+    "sessionId": "String"
+  },
+  "preview_bidirectional_conflicts": {
+    "expectedPlanDigest": "[u8;32]",
+    "resolutions": "Vec<ConflictResolution>"
+  },
+  "preview_forward_bidirectional_conflicts": {
+    "expectedUnresolvedDigest": "[u8;32]",
+    "operationId": "Option<String>",
+    "resolutions": "Vec<ConflictResolution>"
+  },
+  "provider_folder_contract": {
+    "endpoint": "BidirectionalEndpointRequest"
+  },
+  "provider_rename_contract": {
+    "endpoint": "BidirectionalEndpointRequest"
+  },
+  "purge_provider_quarantine_run": {
+    "confirmation": "String",
+    "endpoint": "BidirectionalEndpointRequest",
+    "runId": "String"
+  },
+  "purge_quarantine_run": {
+    "confirmation": "String",
+    "runId": "String",
+    "target": "Option<String>"
+  },
+  "purge_sftp_quarantine_run": {
+    "confirmation": "String",
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "runId": "String",
+    "target": "String"
+  },
+  "purge_smb_quarantine_run": {
+    "confirmation": "String",
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "runId": "String",
+    "target": "String"
+  },
+  "quit_after_queue_warning": {
+    "token": "String"
+  },
+  "read_file_clipboard": {},
+  "record_app_error": {
+    "code": "Option<String>",
+    "context": "String"
+  },
+  "register_bidirectional_pair": {
+    "left": "BidirectionalEndpointRequest",
+    "right": "BidirectionalEndpointRequest"
+  },
+  "register_forward_bidirectional_pair": {
+    "left": "BidirectionalEndpointRequest",
+    "right": "BidirectionalEndpointRequest"
+  },
+  "remember_window": {
+    "activeSide": "String",
+    "panes": "WindowStartState",
+    "tabs": "Option<crate::pane_tabs::WindowTabs>"
+  },
+  "remove_favorite": {
+    "path": "String",
+    "profileId": "Option<String>",
+    "provider": "FavoriteProvider"
+  },
+  "remove_ftps_profile": {
+    "profileId": "String",
+    "profileRevision": "u64"
+  },
+  "remove_queue_entry": {
+    "operationId": "String"
+  },
+  "remove_sftp_profile": {
+    "profileId": "String",
+    "profileRevision": "u64"
+  },
+  "remove_smb_profile": {
+    "profileId": "String",
+    "profileRevision": "u64"
+  },
+  "remove_webdav_profile": {
+    "profileId": "String",
+    "profileRevision": "u64"
+  },
+  "rename_path": {
+    "newName": "String",
+    "path": "String"
+  },
+  "rename_provider_path": {
+    "request": "RenameProviderPathRequest"
+  },
+  "restore_provider_quarantine_entry": {
+    "endpoint": "BidirectionalEndpointRequest",
+    "relativePath": "String",
+    "runId": "String"
+  },
+  "restore_quarantine_entry": {
+    "relativePath": "String",
+    "runId": "String",
+    "target": "Option<String>"
+  },
+  "restore_sftp_quarantine_entry": {
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "relativePath": "String",
+    "runId": "String",
+    "target": "String"
+  },
+  "restore_smb_quarantine_entry": {
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "relativePath": "String",
+    "runId": "String",
+    "target": "String"
+  },
+  "restored_active_side": {},
+  "restored_pane_tabs": {},
+  "retry_queue_entry": {
+    "operationId": "String"
+  },
+  "run_bidirectional_rollback": {
+    "effectsConfirmed": "bool"
+  },
+  "run_bidirectional_sync": {
+    "effectsConfirmed": "bool"
+  },
+  "run_ftps_sync": {
+    "effectsConfirmed": "bool"
+  },
+  "run_provider_sync": {
+    "effectsConfirmed": "bool"
+  },
+  "run_real_sync": {
+    "effectsConfirmed": "bool"
+  },
+  "run_sftp_sync": {
+    "effectsConfirmed": "bool"
+  },
+  "run_smb_sync": {
+    "effectsConfirmed": "bool"
+  },
+  "run_sync": {
+    "expectedPlan": "SyncPlan",
+    "options": "SyncOptions",
+    "simulation": "Option<bool>",
+    "source": "String",
+    "target": "String"
+  },
+  "run_webdav_sync": {
+    "effectsConfirmed": "bool"
+  },
+  "safety_info": {},
+  "save_ftps_profile": {
+    "profile": "FtpsProfile",
+    "profileRevision": "Option<u64>",
+    "secretId": "Option<String>"
+  },
+  "save_remote_edit": {
+    "request": "RemoteEditRequest"
+  },
+  "save_sftp_profile": {
+    "profile": "SftpProfile",
+    "profileRevision": "Option<u64>",
+    "secretId": "Option<String>"
+  },
+  "save_smb_profile": {
+    "profile": "SmbProfile",
+    "profileRevision": "Option<u64>",
+    "secretId": "Option<String>"
+  },
+  "save_sync_job": {
+    "request": "SaveSyncJobRequest"
+  },
+  "save_webdav_profile": {
+    "profile": "WebDavProfile",
+    "profileRevision": "Option<u64>",
+    "secretId": "Option<String>"
+  },
+  "scan_dir": {
+    "path": "String",
+    "showHidden": "bool"
+  },
+  "scan_ftps_dir": {
+    "path": "String",
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "showHidden": "bool"
+  },
+  "scan_sftp_dir": {
+    "path": "String",
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "showHidden": "bool"
+  },
+  "scan_smb_dir": {
+    "path": "String",
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "showHidden": "bool"
+  },
+  "scan_webdav_dir": {
+    "path": "String",
+    "profileId": "String",
+    "profileRevision": "Option<u64>",
+    "showHidden": "bool"
+  },
+  "set_metadata_admin_service": {
+    "enabled": "bool"
+  },
+  "set_queue_paused": {
+    "paused": "bool"
+  },
+  "set_queue_stop_on_error": {
+    "stop": "bool"
+  },
+  "start_directory_sizes": {
+    "request": "DirectorySizeRequest"
+  },
+  "start_name_search": {
+    "request": "NameSearchRequest"
+  },
+  "sync_native_theme": {
+    "dark": "bool",
+    "preference": "Theme"
+  },
+  "take_startup_app_error": {},
+  "take_startup_queue_error": {},
+  "take_window_start_state": {},
+  "trash_paths": {
+    "items": "Vec<String>"
+  },
+  "update_desktop_preferences": {
+    "onlyIfUninitialized": "Option<bool>",
+    "patch": "PreferencePatch"
+  },
+  "verify_ftps_certificate": {
+    "host": "String",
+    "port": "u16"
+  },
+  "write_file_clipboard": {
+    "cut": "bool",
+    "paths": "Vec<String>"
+  }
+}

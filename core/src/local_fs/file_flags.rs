@@ -77,6 +77,8 @@ pub(crate) fn access(
         (before.st_flags & !libc::UF_IMMUTABLE) | if enabled { libc::UF_IMMUTABLE } else { 0 };
     let mutation: io::Result<()> = match kind {
         FileFlagKind::Locked => {
+            // SAFETY: fd bleibt für den Aufruf offen; die Flagmaske wird
+            // als Wert übergeben und der FD bleibt im Besitz des Aufrufers.
             if unsafe { libc::fchflags(fd.as_raw_fd(), desired_flags) } == 0 {
                 Ok(())
             } else {
@@ -142,6 +144,8 @@ mod tests {
     struct ResetFlags(OwnedFd);
     impl Drop for ResetFlags {
         fn drop(&mut self) {
+            // SAFETY: Der eigene Test-FD ist noch offen, bis nach diesem
+            // Destructor seine Felder freigegeben werden.
             unsafe {
                 libc::fchflags(self.0.as_raw_fd(), 0);
             }
@@ -175,6 +179,7 @@ mod tests {
             set_xattr_for_test(&path, name, value).unwrap();
         }
         assert_eq!(
+            // SAFETY: reset hält den FD der Testdatei offen; die Flagmaske ist ein Wertargument.
             unsafe { libc::fchflags(reset.0.as_raw_fd(), libc::UF_HIDDEN | libc::UF_NODUMP) },
             0
         );
@@ -284,6 +289,7 @@ mod tests {
         .is_err());
         assert_eq!(fstat(&reset.0).unwrap().st_flags, 0);
         assert_eq!(
+            // SAFETY: reset hält die Testdatei beim Setzen des Flags offen.
             unsafe { libc::fchflags(reset.0.as_raw_fd(), libc::UF_IMMUTABLE) },
             0
         );
@@ -298,6 +304,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(finder_info(&reset.0).unwrap().is_none());
+        // SAFETY: reset besitzt den offenen Test-FD, an dem die Flags gelöscht werden.
         assert_eq!(unsafe { libc::fchflags(reset.0.as_raw_fd(), 0) }, 0);
         fs::rename(&path, root.join("old")).unwrap();
         fs::write(&path, b"replacement").unwrap();

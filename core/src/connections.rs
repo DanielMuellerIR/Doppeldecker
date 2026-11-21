@@ -82,7 +82,7 @@ impl FtpsProfile {
     }
 }
 
-trait StoredProfile: Clone + serde::Serialize + DeserializeOwned {
+pub(crate) trait StoredProfile: Clone + serde::Serialize + DeserializeOwned {
     fn id(&self) -> &str;
     fn name(&self) -> &str;
     fn validate_stored(&self) -> io::Result<()>;
@@ -209,6 +209,42 @@ impl RemoteProfileBinding {
     pub fn validate(&self) -> io::Result<()> {
         validate_id(&self.profile_id)
     }
+}
+
+pub(crate) fn ensure_bound_profile_current<T>(
+    queue: &Path,
+    bindings: &[RemoteProfileBinding],
+    protocol: RemoteProfileProtocol,
+    label: &str,
+    load: impl FnOnce(&Path) -> io::Result<Vec<VersionedProfile<T>>>,
+    matches_config: impl Fn(&T) -> bool,
+) -> io::Result<()>
+where
+    T: StoredProfile,
+{
+    let [binding] = bindings else {
+        return Err(crate::real_mode::plan_drift(format!(
+            "{label}-Auftrag benötigt genau ein gespeichertes Profil."
+        )));
+    };
+    let directory = queue.parent().ok_or_else(|| {
+        crate::real_mode::plan_drift(format!(
+            "{label}-Profilbindung besitzt keinen Konfigurationsordner."
+        ))
+    })?;
+    let path = directory.join(format!("{}-profiles.json", protocol.as_str()));
+    if binding.protocol != protocol
+        || !load(&path)?.iter().any(|profile| {
+            profile.profile.id() == binding.profile_id
+                && profile.revision == binding.revision
+                && matches_config(&profile.profile)
+        })
+    {
+        return Err(crate::real_mode::plan_drift(format!(
+            "{label}-Profil hat sich geändert. Teilkopie bleibt erhalten."
+        )));
+    }
+    Ok(())
 }
 
 pub fn load_sftp_profiles(path: &Path) -> io::Result<Vec<SftpProfile>> {

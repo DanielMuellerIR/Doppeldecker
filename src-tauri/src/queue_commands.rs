@@ -394,3 +394,156 @@ pub(crate) fn approve_queue_entry(
             .map_err(AppError::from)
     })
 }
+
+#[cfg(test)]
+#[test]
+fn queue_approval_uses_exact_projected_attention_and_mode_digest() {
+    use crate::content_sync_commands::ContentSyncPreparationDigest;
+    use crate::normal_sync_commands::LocalSyncPreparationDigest;
+    use doppeldecker_core::{OperationQueue, QueueAttention, QueueOperation, QueueState, SyncPlan};
+    use serde_json::{json, Value};
+
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../tools/tests/queue-approval-wire.json")).unwrap();
+    let local_digest: LocalSyncPreparationDigest =
+        serde_json::from_value(fixture["local"]["preparationDigest"].clone()).unwrap();
+    let content_digest: ContentSyncPreparationDigest =
+        serde_json::from_value(fixture["content"]["preparationDigest"].clone()).unwrap();
+    assert_eq!(local_digest, [5; 32]);
+    assert_eq!(content_digest, [9; 32]);
+
+    let plan_fixture: Value =
+        serde_json::from_str(include_str!("../../tools/tests/local-sync-wire.json")).unwrap();
+    let current_plan: SyncPlan = serde_json::from_value(plan_fixture["plan"].clone()).unwrap();
+    let attention = QueueAttention::PlanChanged {
+        reason: "Ein neuer Pfad".into(),
+        confirmation: "gleiche-phrase".into(),
+        current_plan: Box::new(current_plan.clone()),
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let queue = OperationQueue::open(temp.path().join("operations-queue.json")).unwrap();
+    let entry = queue
+        .enqueue_claimed(QueueOperation::Sync {
+            source: "/mock/quelle".into(),
+            target: "/mock/ziel".into(),
+            sandbox: None,
+            options: Default::default(),
+            expected_plan: Box::default(),
+        })
+        .unwrap();
+    queue
+        .require_confirmation(&entry.operation_id, attention.clone())
+        .unwrap();
+    let payload: FrontendQueueSnapshot = queue.snapshot().into();
+    let projected = serde_json::to_value(payload).unwrap();
+    let mut expected = fixture["planChanged"].clone();
+    expected["current_plan"] = plan_fixture["plan"].clone();
+    let proof = &projected["entries"][0]["attention"];
+    assert_eq!(proof, &expected);
+
+    // Die Metadatenbilanz wird unverändert im Beleg mitgesendet, auch wenn der
+    // kurze Queue-Dialog davon nur die Dateiwirkungszahlen darstellt.
+    let mut stale = proof.clone();
+    stale["current_plan"]["metadata_report"]["content_changes"] = json!(99);
+    let stale: QueueAttention = serde_json::from_value(stale).unwrap();
+    let error = queue
+        .approve_attention_effects(&entry.operation_id, &stale, true)
+        .unwrap_err();
+    assert_eq!(
+        doppeldecker_core::error_code(&error),
+        doppeldecker_core::ErrorCode::PlanDrift
+    );
+    assert_eq!(
+        queue.snapshot().entries[0].state,
+        QueueState::AwaitingConfirmation
+    );
+    let proof: QueueAttention = serde_json::from_value(proof.clone()).unwrap();
+    assert_eq!(proof, attention);
+    queue
+        .approve_attention_effects(&entry.operation_id, &proof, true)
+        .unwrap();
+    let after = queue.snapshot();
+    assert_eq!(after.entries[0].state, QueueState::Pending);
+    assert_eq!(after.entries[0].attention, None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_overview_matches_the_browser_wire_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/recovery-trash-wire.json"))
+                .unwrap();
+        let entry: doppeldecker_core::QueueEntry = serde_json::from_value(serde_json::json!({
+            "operation_id": "review-copy",
+            "operation": {
+                "type": "File",
+                "kind": "Copy",
+                "items": ["/mock/quelle/Alpha.txt"],
+                "destination": "/mock/ziel",
+                "overwrite": false,
+                "expected_conflicts": []
+            },
+            "created_unix_ms": 1_800_000_000_000_u64,
+            "state": "Interrupted",
+            "attempts": 1,
+            "progress": doppeldecker_core::Progress {
+                phase: "interrupted".into(),
+                ..Default::default()
+            },
+            "error_code": "outcome_unclear"
+        }))
+        .unwrap();
+        let available = RecoveryOverview {
+            queue: Some(vec![QueueRecoveryReview {
+                reason: entry.recovery_reason().unwrap(),
+                entry,
+            }
+            .into()]),
+            trash: Ok(vec![
+                doppeldecker_core::TrashJournalReview {
+                    name: "trash-available.json".into(),
+                    entry_count: Some(2),
+                    effects_unclear: false,
+                    error: None,
+                },
+                doppeldecker_core::TrashJournalReview {
+                    name: "trash-probe.json".into(),
+                    entry_count: None,
+                    effects_unclear: false,
+                    error: Some("Prüfjournal nicht lesbar".into()),
+                },
+                doppeldecker_core::TrashJournalReview {
+                    name: "trash-unclear.json".into(),
+                    entry_count: Some(1),
+                    effects_unclear: true,
+                    error: None,
+                },
+            ]),
+        };
+        let empty = RecoveryOverview {
+            queue: Some(vec![]),
+            trash: Ok(vec![]),
+        };
+        let unavailable = RecoveryOverview {
+            queue: None,
+            trash: Err(AppError::new(
+                "busy",
+                "Papierkorb wird gerade verarbeitet. Erneut aktualisieren.",
+            )),
+        };
+        for (name, overview) in [
+            ("available", available),
+            ("empty", empty),
+            ("unavailable", unavailable),
+        ] {
+            assert_eq!(
+                serde_json::to_value(overview).unwrap(),
+                fixture["recovery"][name],
+                "{name}"
+            );
+        }
+    }
+}

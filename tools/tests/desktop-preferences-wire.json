@@ -1,0 +1,40 @@
+{
+  "enums": {
+    "IconChoice": ["blue", "sunset", "aurora", "turquoise", "rose", "storm"],
+    "Theme": ["auto", "light", "dark"],
+    "ByteUnits": ["decimal", "binary"],
+    "DiffTool": ["xcode", "fastra", "bbedit"],
+    "ProjectPage": ["support", "imprint", "privacy"]
+  },
+  "patch": {
+    "icon": "aurora",
+    "theme": "dark",
+    "byteUnits": "binary",
+    "localFolderSizes": true,
+    "networkDiscovery": false,
+    "restoreSession": true,
+    "diffTool": "bbedit"
+  },
+  "failedSnapshot": {
+    "preferences": {
+      "icon": "blue",
+      "theme": "auto",
+      "byteUnits": "decimal",
+      "localFolderSizes": false,
+      "networkDiscovery": true,
+      "restoreSession": false,
+      "diffTool": "xcode"
+    },
+    "revision": 0,
+    "needsMigration": true,
+    "loadError": {
+      "code": "invalid_input",
+      "message": "Einstellungsdatei ist keine reguläre Datei"
+    }
+  },
+  "diffToolStatus": [
+    { "id": "xcode", "available": true, "detail": "Xcode FileMerge ist verfügbar." },
+    { "id": "fastra", "available": false, "detail": "Fastras Helfer fehlt noch." },
+    { "id": "bbedit", "available": true, "detail": "BBEdit bbdiff ist verfügbar." }
+  ]
+}

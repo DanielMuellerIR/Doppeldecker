@@ -25,8 +25,8 @@ fn binary() -> &'static str {
 /// 3. `DOPPELDECKER_NO_DEFAULT_USER_PATHS` lässt die CLI einen fehlenden
 ///    `--config-dir` sichtbar abweisen, statt still den echten Ordner zu nehmen.
 ///
-/// Der Test `jeder_cli_start_bekommt_einen_isolierten_konfigurationsordner` hält Regel 1
-/// mechanisch fest, `fehlender_konfigurationsordner_wird_abgewiesen` belegt Regel 3.
+/// Ein Test prüft die erzeugten Argumente und Umgebungswerte. Ein weiterer startet
+/// die CLI ohne Konfigurationsordner und prüft die Ablehnung vor jedem Zugriff.
 struct CliSandbox {
     temp: tempfile::TempDir,
 }
@@ -104,83 +104,39 @@ impl CliSandbox {
 mod metadata_helper_linux;
 
 #[test]
-fn jeder_cli_start_bekommt_einen_isolierten_konfigurationsordner() {
-    // Diese Datei prüft ihren eigenen Quelltext. Die Suchtexte werden aus zwei Stücken
-    // zusammengesetzt, damit der Test nicht seine eigenen Zeilen als Treffer zählt.
-    let source = include_str!("cli_tests.rs");
-    let process_start = concat!("Command", "::new(");
-    let lines: Vec<&str> = source.lines().collect();
-    let hits: Vec<usize> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.contains(process_start))
-        .map(|(index, _)| index + 1)
-        .collect();
+fn cli_sandbox_binds_configuration_and_user_paths() {
+    use std::ffi::{OsStr, OsString};
+
+    let sandbox = CliSandbox::new();
+    let command = sandbox.json_cli();
+    assert_eq!(command.get_program(), binary());
     assert_eq!(
-        hits.len(),
-        1,
-        "Ein CLI-Prozess darf nur in CliSandbox entstehen, gefunden in Zeile(n) {hits:?}"
+        command
+            .get_args()
+            .map(OsStr::to_os_string)
+            .collect::<Vec<_>>(),
+        [
+            OsString::from("--config-dir"),
+            sandbox.config_dir().into_os_string(),
+            OsString::from("--json"),
+        ]
     );
-
-    // Der eine erlaubte Startpunkt muss die Umgebung tatsächlich umlenken.
-    let start = hits[0] - 1;
-    let window = lines[start..(start + 15).min(lines.len())].join("\n");
-    assert!(
-        window.contains("DOPPELDECKER_NO_DEFAULT_USER_PATHS"),
-        "Der CLI-Start muss den Rückfall auf die echten Nutzerpfade verbieten"
-    );
-    assert!(
-        window.contains("\"HOME\""),
-        "Der CLI-Start muss HOME in den Wegwerfbaum umlenken"
-    );
-
-    // Genau drei Vorkommen: Definition, Aufruf in `cli()` und der Gegentest.
-    let raw_name = concat!("command_without", "_config_dir");
+    let env = command
+        .get_envs()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let home = sandbox.home();
+    for (key, path) in [
+        ("HOME", home.clone()),
+        ("XDG_CONFIG_HOME", home.join(".config")),
+        ("XDG_STATE_HOME", home.join(".local/state")),
+        ("XDG_DATA_HOME", home.join(".local/share")),
+    ] {
+        assert_eq!(env[OsStr::new(key)], Some(path.as_os_str()));
+    }
     assert_eq!(
-        source.matches(raw_name).count(),
-        3,
-        "Nur cli() und der Gegentest dürfen einen Aufruf ohne Konfigurationsordner bauen"
+        env[OsStr::new("DOPPELDECKER_NO_DEFAULT_USER_PATHS")],
+        Some(OsStr::new("1"))
     );
-
-    // Eine später hinzugefügte Testdatei darf keinen eigenen Prozessstart mitbringen.
-    // Sie hätte weder die Sandbox noch deren Umleitungen und würde damit wieder am
-    // echten Konfigurationsordner landen.
-    //
-    // Der Scan läuft **rekursiv** über `tests/` und `src/`. Genau der Ort, den der
-    // Kommentar hier früher empfahl — ein geteiltes `tests/common/mod.rs` —, lag
-    // vorher im toten Winkel: `read_dir` liefert das Verzeichnis `common` als
-    // Eintrag ohne Dateiendung, und der Endungsfilter übersprang es samt Inhalt.
-    // Unit-Tests unter `src/` fielen aus demselben Grund gar nicht erst auf.
-    fn sammle_rust_dateien(verzeichnis: &Path, ziel: &mut Vec<PathBuf>) {
-        let Ok(eintraege) = std::fs::read_dir(verzeichnis) else {
-            return;
-        };
-        for eintrag in eintraege {
-            let pfad = eintrag.unwrap().path();
-            if pfad.is_dir() {
-                sammle_rust_dateien(&pfad, ziel);
-            } else if pfad.extension().is_some_and(|kind| kind == "rs") {
-                ziel.push(pfad);
-            }
-        }
-    }
-
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut dateien = Vec::new();
-    sammle_rust_dateien(&crate_dir.join("tests"), &mut dateien);
-    sammle_rust_dateien(&crate_dir.join("src"), &mut dateien);
-    let eigene = crate_dir.join("tests").join("cli_tests.rs");
-    for pfad in dateien {
-        if pfad == eigene {
-            continue;
-        }
-        let other = std::fs::read_to_string(&pfad).unwrap();
-        assert!(
-            !other.contains(process_start),
-            "{} startet einen CLI-Prozess an CliSandbox vorbei",
-            pfad.display()
-        );
-    }
 }
 
 #[test]
@@ -294,6 +250,8 @@ fn papierkorb_journalfehler_erhaelt_den_unklaren_core_code() {
     command.args(["trash", "--item"]).arg(&source);
     // Nur das Kind begrenzen: Die kleine Queue passt, das v2-Papierkorbjournal
     // scheitert beim echten Write. Kein Claim darf danach beginnen.
+    // SAFETY: Der Callback läuft nach fork und nutzt nur signal, setrlimit und die
+    // errno-Abfrage. Er greift auf keine Sperren oder Heap-Daten des Elternprozesses zu.
     unsafe {
         command.pre_exec(|| {
             if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {

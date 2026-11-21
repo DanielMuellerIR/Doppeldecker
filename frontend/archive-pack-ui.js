@@ -1,4 +1,5 @@
 import { invoke } from "./tauri-api.js";
+import { paneEndpoint } from "./pane-endpoint.js";
 import { hideModal, showOwnedModal } from "./modal.js";
 import { $, escapeHtml, fmtTransferBytes, isEntryNameSafe, joinPath } from "./ui-utils.js";
 
@@ -55,17 +56,28 @@ export function bindArchivePackPages(container, preview) {
   container.querySelector("[data-archive-page=next]").addEventListener("click", () => { page = Math.min(pages - 1, page + 1); render(); });
   render();
 }
+/** @typedef {import("./archive-mutation-wire.js").ArchivePane} ArchivePane */
+/** @typedef {import("./archive-mutation-wire.js").ArchivePaneSide} ArchivePaneSide */
+
+/** @param {{
+ * panes: Record<ArchivePaneSide, ArchivePane>, activeSide: () => ArchivePaneSide,
+ * selectedEntries: (side: ArchivePaneSide) => {name: string, safely_decoded?: boolean}[],
+ * blocked: () => boolean, showDock: (message: string, options: {closable: boolean}) => void,
+ * showError: (title: string, error: unknown) => void
+ * }} dependencies */
 export function createArchivePackUi({ panes, activeSide, selectedEntries, blocked, showDock, showError }) {
   function open(side = activeSide()) {
     if (blocked()) return;
     const pane = panes[side];
     const entries = selectedEntries(side);
     if (!entries.length || !pane.path) return;
+    /** @param {ArchivePane} value */
     const capture = value => ({ provider: value.provider, path: value.path, profileId: value.profileId,
       profileRevision: value.profileRevision, navigationRevision: value.navigationRevision, tabId: value.tabs?.active?.id });
     const scope = capture(pane);
     const otherSide = side === "left" ? "right" : "left";
     const other = capture(panes[otherSide]);
+    const otherEndpoint = paneEndpoint(panes[otherSide]);
     const remoteAvailable = other.provider !== "local" && Boolean(other.path && other.profileId);
     if (entries.some(entry => !isEntryNameSafe(entry))) {
       showError("ZIP-Archiv", new Error("Die Auswahl enthält keinen bedienbaren Namen.")); return;
@@ -78,8 +90,9 @@ export function createArchivePackUi({ panes, activeSide, selectedEntries, blocke
         `<div class="archive-pack-options">${remoteAvailable ? `<label for="archive-pack-target">Ziel</label><select id="archive-pack-target" class="modal-input"><option value="local">Dieser Ordner · lokal</option><option value="remote">Andere Pane · ${escapeHtml(other.provider.toUpperCase())} · ${escapeHtml(other.path)}</option></select>` : ""}<label for="archive-pack-name">Archivname</label><input id="archive-pack-name" class="modal-input" type="text" autocomplete="off" spellcheck="false">` +
         `<label for="archive-pack-compression">Kompression</label><select id="archive-pack-compression" class="modal-input"><option value="deflate">Deflate · komprimieren</option><option value="stored">Stored · unkomprimiert</option></select></div>` +
         `<p class="archive-pack-status" role="status">Die Vorschau prüft Quellen, Zielname und mögliche Auslassungen.</p><div class="archive-pack-preview"></div>`;
-      const name = body.querySelector("#archive-pack-name"); name.value = `${entries.length === 1 ? entries[0].name : "Auswahl"}.zip`;
-      const compression = body.querySelector("#archive-pack-compression");
+      const name = /** @type {HTMLInputElement} */ (body.querySelector("#archive-pack-name"));
+      name.value = `${entries.length === 1 ? entries[0].name : "Auswahl"}.zip`;
+      const compression = /** @type {HTMLSelectElement} */ (body.querySelector("#archive-pack-compression"));
       const target = body.querySelector("#archive-pack-target");
       const remote = () => target?.value === "remote";
       const status = body.querySelector(".archive-pack-status");
@@ -88,7 +101,13 @@ export function createArchivePackUi({ panes, activeSide, selectedEntries, blocke
       const cancel = document.createElement("button"); cancel.className = "btn ghost"; cancel.textContent = "Abbrechen";
       const prepare = document.createElement("button"); prepare.className = "btn primary"; prepare.textContent = "Vorschau erstellen";
       buttons.append(cancel, prepare);
-      let closed = false; let preparationId; let requestId; let busy = false;
+      let closed = false;
+      /** @type {string | null} */
+      let preparationId = null;
+      /** @type {string | undefined} */
+      let requestId;
+      let busy = false;
+      /** @param {string | null | undefined} id */
       const discard = id => { if (id) void invoke("discard_archive_pack", { preparationId: id }).catch(() => {}); };
       const finish = () => { if (closed) return; closed = true; discard(preparationId); discard(requestId); hideModal(token); };
       const matches = (snapshot, currentPane) => snapshot.tabId === currentPane.tabs?.active?.id
@@ -108,9 +127,15 @@ export function createArchivePackUi({ panes, activeSide, selectedEntries, blocke
             finish();
           } else {
             requestId = crypto.randomUUID(); status.textContent = "Quellen und Ziel werden geprüft … Abbrechen bleibt möglich.";
-            const response = await invoke("prepare_archive_pack", { request: { requestId, provider: scope.provider, root: scope.path,
-              items: entries.map(entry => joinPath(scope.path, entry.name)), targetName: name.value, options: { compression: compression.value },
-              ...(remote() ? { target: { provider: other.provider, root: other.path, profileId: other.profileId, profileRevision: other.profileRevision } } : {}) } });
+            const compressionMode = compression.value;
+            if (compressionMode !== "deflate" && compressionMode !== "stored") throw new Error("Ungültige ZIP-Kompression.");
+            const request = /** @satisfies {import("./archive-mutation-wire.js").ArchivePackPrepareRequest} */ ({
+              requestId, provider: scope.provider, root: scope.path,
+              items: entries.map(entry => joinPath(scope.path, entry.name)),
+              targetName: name.value, options: { compression: compressionMode },
+              ...(remote() ? { target: otherEndpoint } : {}),
+            });
+            const response = await invoke("prepare_archive_pack", { request });
             if (!current()) { discard(response.preparationId); if (!closed) status.textContent = "Das Pane-Ziel hat sich geändert. Bitte neu öffnen."; return; }
             preparationId = response.preparationId;
             const preview = response.binding.preview;

@@ -162,19 +162,19 @@ fn local_metadata_mounts_report_matches_native_and_exfat() {
         let path = std::ffi::CString::new(sparse.as_os_str().as_bytes()).unwrap();
         // Ein absichtlich vorhandenes xattr belegt die ReadOnly-Grenze auch auf
         // Systemen, die selbst kein com.apple.provenance ergänzen.
-        assert_eq!(
-            unsafe {
-                libc::setxattr(
-                    path.as_ptr(),
-                    c"com.doppeldecker.mount".as_ptr(),
-                    b"Testwert".as_ptr().cast(),
-                    8,
-                    0,
-                    0,
-                )
-            },
-            0
-        );
+        // SAFETY: Pfad und Attributname sind nullterminiert. Der Wertpuffer
+        // enthält genau die übergebenen acht Byte und bleibt lesbar.
+        let status = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                c"com.doppeldecker.mount".as_ptr(),
+                b"Testwert".as_ptr().cast(),
+                8,
+                0,
+                0,
+            )
+        };
+        assert_eq!(status, 0);
     }
     let mut native_options = opts.clone();
     if native_caps.xattrs == Capability::ReadOnly {
@@ -223,10 +223,11 @@ fn local_metadata_mounts_report_matches_native_and_exfat() {
             fn mbr_uid_to_uuid(id: libc::uid_t, uuid: *mut u8) -> libc::c_int;
         }
         let mut qualifier = [0u8; 16];
-        assert_eq!(
-            unsafe { mbr_uid_to_uuid(libc::geteuid(), qualifier.as_mut_ptr()) },
-            0
-        );
+        // SAFETY: qualifier stellt die von mbr_uid_to_uuid verlangten 16
+        // schreibbaren Bytes für die UUID bereit.
+        let status =
+            unsafe { mbr_uid_to_uuid(rustix::process::geteuid().as_raw(), qualifier.as_mut_ptr()) };
+        assert_eq!(status, 0);
         let acl = Acl::Nfs4(Nfs4Acl {
             entries: vec![Nfs4AclEntry {
                 qualifier,

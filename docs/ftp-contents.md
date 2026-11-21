@@ -25,7 +25,9 @@ Dateigröße, Änderungszeit, Server-SHA-256 und den gespeicherten lokalen
 Abschnitt. `REST` fordert anschließend den fehlenden Inhalt über `RETR` an.
 Erst der erfolgreiche Transferabschluss und der SHA-256-Vergleich der
 zusammengesetzten Datei erlauben den atomaren lokalen Abschluss unter dem
-Zielnamen. Änderungen oder ein falsch gelieferter Rest bleiben als
+Zielnamen. Auch eine leere Datei braucht eine positive Antwort nach `RETR`.
+Bei älteren Vollbelegen ohne Transferabschluss liest die App das letzte Byte
+erneut und prüft die Abschlussantwort. Änderungen oder ein falsch gelieferter Rest bleiben als
 Teilkopiefehler in der Queue sichtbar. Ein falsch zusammengesetzter Inhalt
 benötigt einen neuen Lauf. Unverschlüsseltes FTP, ungeprüfte Zertifikate und Server ohne die
 beiden Protokollfähigkeiten verwenden weiterhin die normale Kopieraktion.

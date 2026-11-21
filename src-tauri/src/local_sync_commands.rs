@@ -1,6 +1,7 @@
 //! Lokale Sync-Vorschau, Queue-Enqueue und Realmodus-Assistent.
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::time::Instant;
@@ -14,24 +15,27 @@ use doppeldecker_core::{
 use tauri::{Manager, State, WebviewWindow};
 
 use crate::{
-    app_config_dir, emit_queue_snapshot, enqueue_operation_with_readback, finish_operation,
-    operation_queue, sandbox_root, start_queue_worker, take_pending_for_operation,
-    with_queue_extension, with_reserved_operation, AppError, AppState, MutexExt,
-    MAX_DELETE_ENTRIES, MAX_DELETE_FRACTION,
+    app_config_dir, emit_queue_snapshot, finish_operation, operation_queue, sandbox_root,
+    start_queue_worker, take_pending_for_operation, with_queue_extension_access,
+    with_reserved_operation, AppError, AppState, MutexExt, MAX_DELETE_ENTRIES, MAX_DELETE_FRACTION,
 };
 
 #[tauri::command]
-pub(crate) fn plan_sync(
+pub(crate) async fn plan_sync(
     source: String,
     target: String,
     options: SyncOptions,
 ) -> Result<SyncPlan, AppError> {
-    let (source, target) =
-        validate_local_sync_roots(&expand_home_path(&source), &expand_home_path(&target))
-            .map_err(AppError::from)?;
-    let sandbox = sandbox_root()?;
-    let vfs = local_sync_vfs(sandbox.as_deref(), &source, &target)?;
-    doppeldecker_core::plan(&vfs, &source, &vfs, &target, &options).map_err(AppError::from)
+    tauri::async_runtime::spawn_blocking(move || {
+        let (source, target) =
+            validate_local_sync_roots(&expand_home_path(&source), &expand_home_path(&target))
+                .map_err(AppError::from)?;
+        let sandbox = sandbox_root()?;
+        let vfs = local_sync_vfs(sandbox.as_deref(), &source, &target)?;
+        doppeldecker_core::plan(&vfs, &source, &vfs, &target, &options).map_err(AppError::from)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 fn require_sandbox_child(root: &Path, path: &Path, role: &str) -> Result<(), AppError> {
@@ -68,7 +72,7 @@ pub(crate) fn local_sync_vfs(
 }
 
 #[tauri::command]
-pub(crate) fn run_sync(
+pub(crate) async fn run_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
     source: String,
@@ -77,39 +81,43 @@ pub(crate) fn run_sync(
     expected_plan: SyncPlan,
     simulation: Option<bool>,
 ) -> Result<String, AppError> {
-    let state = app.state::<AppState>();
-    let (source, target) =
-        validate_local_sync_roots(&expand_home_path(&source), &expand_home_path(&target))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let (source, target) =
+            validate_local_sync_roots(&expand_home_path(&source), &expand_home_path(&target))
+                .map_err(AppError::from)?;
+        let sandbox = sandbox_root()?;
+        let vfs = local_sync_vfs(sandbox.as_deref(), &source, &target)?;
+        let current = doppeldecker_core::plan(&vfs, &source, &vfs, &target, &options)
             .map_err(AppError::from)?;
-    let sandbox = sandbox_root()?;
-    let vfs = local_sync_vfs(sandbox.as_deref(), &source, &target)?;
-    let current =
-        doppeldecker_core::plan(&vfs, &source, &vfs, &target, &options).map_err(AppError::from)?;
-    if current != expected_plan {
-        return Err(AppError::new(
-            "plan_drift",
-            "Quelle oder Ziel hat sich seit der Vorschau geändert; bitte neu bestätigen",
-        ));
-    }
-    let label = window.label();
-    let window_state = state.window(label);
-    let (queue, entry) = with_queue_extension(&state, &window_state, || {
-        let operation = QueueOperation::Sync {
-            source: source.to_string_lossy().into_owned(),
-            target: target.to_string_lossy().into_owned(),
-            sandbox: if simulation == Some(true) {
-                None
-            } else {
-                sandbox.map(|root| root.to_string_lossy().into_owned())
-            },
-            options,
-            expected_plan: Box::new(expected_plan),
-        };
-        enqueue_operation_with_readback(&app, &window_state, label, &operation)
-    })?;
-    emit_queue_snapshot(&app, label, &queue);
-    start_queue_worker(app, label.to_owned());
-    Ok(entry.operation_id)
+        if current != expected_plan {
+            return Err(AppError::new(
+                "plan_drift",
+                "Quelle oder Ziel hat sich seit der Vorschau geändert; bitte neu bestätigen",
+            ));
+        }
+        let label = window.label();
+        let window_state = state.window(label);
+        let (queue, entry) = with_queue_extension_access(&state, &window_state, |extension| {
+            let operation = QueueOperation::Sync {
+                source: source.to_string_lossy().into_owned(),
+                target: target.to_string_lossy().into_owned(),
+                sandbox: if simulation == Some(true) {
+                    None
+                } else {
+                    sandbox.map(|root| root.to_string_lossy().into_owned())
+                },
+                options,
+                expected_plan: Box::new(expected_plan),
+            };
+            extension.enqueue_with_readback(&app, label, &operation)
+        })?;
+        emit_queue_snapshot(&app, label, &queue);
+        start_queue_worker(app, label.to_owned());
+        Ok(entry.operation_id)
+    })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[derive(serde::Serialize)]
@@ -131,71 +139,110 @@ pub(crate) fn safety_info(
     let sandbox = sandbox_root()?;
     let window_state = state.window(window.label());
     let real_mode_pending = window_state.pending_real.lock_recover().is_some();
-    Ok(SafetyInfo {
+    Ok(describe_sync_safety(
+        sandbox.map(|path| path.to_string_lossy().into_owned()),
+        real_mode_pending,
+    ))
+}
+
+fn describe_sync_safety(sandbox: Option<String>, real_mode_pending: bool) -> SafetyInfo {
+    SafetyInfo {
         real_enabled: sandbox.is_some(),
         real_mode_available: true,
         real_mode_pending,
-        sandbox: sandbox.map(|path| path.to_string_lossy().into_owned()),
+        sandbox,
         max_delete_entries: MAX_DELETE_ENTRIES,
         max_delete_fraction: MAX_DELETE_FRACTION,
         quarantine_retention_days: QUARANTINE_RETENTION_DAYS,
-    })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn sync_sicherheit_serialisiert_sandbox_und_testmodus_konsistent() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../tools/tests/startup-wire.json")).unwrap();
+    for sandbox in [None, Some("/mock".to_owned())] {
+        let value = serde_json::to_value(describe_sync_safety(sandbox.clone(), false)).unwrap();
+        crate::browser_commands::assert_wire_object(&value, &fixture["safety"]);
+        assert_eq!(value["real_enabled"], sandbox.is_some());
+        assert_eq!(value["sandbox"], serde_json::json!(sandbox));
+    }
 }
 
 #[tauri::command]
-pub(crate) fn prepare_real_sync(
+pub(crate) async fn prepare_real_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     source: String,
     target: String,
     options: SyncOptions,
 ) -> Result<RealRunPreview, AppError> {
-    let sandbox = sandbox_root()?;
-    // Auch der lokale Realmodus schreibt und entfernt eine zufällige Restore-Probe.
-    // Die bisherige Vorab-Abfrage ließ zwischen Prüfung und Probe ein Rennen offen.
-    let label = window.label();
-    let window_state = state.window(label);
-    with_reserved_operation(&app, label, &window_state, || {
-        let queue = operation_queue(&app, &window_state, label)?;
-        if queue.snapshot().entries.iter().any(|entry| {
-            matches!(
-                entry.state,
-                QueueState::Pending
-                    | QueueState::Validating
-                    | QueueState::Running
-                    | QueueState::AwaitingConfirmation
-                    | QueueState::Interrupted
+    let window_state = app.state::<AppState>().window(window.label());
+    let generation = window_state.real_sync_generation.load(Ordering::Acquire);
+    tauri::async_runtime::spawn_blocking(move || {
+        let sandbox = sandbox_root()?;
+        // Auch der lokale Realmodus schreibt und entfernt eine zufällige Restore-Probe.
+        // Die bisherige Vorab-Abfrage ließ zwischen Prüfung und Probe ein Rennen offen.
+        let label = window.label();
+        with_reserved_operation(&app, label, &window_state, || {
+            let queue = operation_queue(&app, &window_state, label)?;
+            if queue.snapshot().entries.iter().any(|entry| {
+                matches!(
+                    entry.state,
+                    QueueState::Pending
+                        | QueueState::Validating
+                        | QueueState::Running
+                        | QueueState::AwaitingConfirmation
+                        | QueueState::Interrupted
+                )
+            }) {
+                return Err(AppError::new(
+                    "busy",
+                    "Realmodus verlangt eine abgearbeitete Queue; offene Einträge zuerst behandeln",
+                ));
+            }
+            {
+                let mut pending = window_state.pending_real.lock_recover();
+                if window_state.real_sync_generation.load(Ordering::Acquire) != generation {
+                    return Err(AppError::new(
+                        "plan_drift",
+                        "Die Realmodus-Vorbereitung wurde inzwischen verworfen",
+                    ));
+                }
+                pending.take();
+            }
+            let prepared = doppeldecker_core::prepare_local_real_run_for_queue(
+                &queue,
+                &expand_home_path(&source),
+                &expand_home_path(&target),
+                options,
+                sandbox.as_deref(),
             )
-        }) {
-            return Err(AppError::new(
-                "busy",
-                "Realmodus verlangt eine abgearbeitete Queue; offene Einträge zuerst behandeln",
-            ));
-        }
-        let mut pending = window_state.pending_real.lock_recover();
-        *pending = None;
-        let prepared = doppeldecker_core::prepare_local_real_run_for_queue(
-            &queue,
-            &expand_home_path(&source),
-            &expand_home_path(&target),
-            options,
-            sandbox.as_deref(),
-        )
-        .map_err(AppError::from)?;
-        let preview = prepared.preview().clone();
-        *pending = Some(prepared);
-        Ok(preview)
+            .map_err(AppError::from)?;
+            let preview = prepared.preview().clone();
+            let mut pending = window_state.pending_real.lock_recover();
+            if window_state.real_sync_generation.load(Ordering::Acquire) != generation {
+                return Err(AppError::new(
+                    "plan_drift",
+                    "Die Realmodus-Vorbereitung wurde inzwischen verworfen",
+                ));
+            }
+            *pending = Some(prepared);
+            Ok(preview)
+        })
     })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
 pub(crate) fn discard_real_sync(window: WebviewWindow, state: State<AppState>) {
-    state
-        .window(window.label())
-        .pending_real
-        .lock_recover()
-        .take();
+    let window_state = state.window(window.label());
+    crate::queue_runtime::discard_sync_preparation(
+        &window_state.pending_real,
+        &window_state.real_sync_generation,
+    );
 }
 
 #[cfg(test)]

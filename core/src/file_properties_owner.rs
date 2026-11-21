@@ -69,6 +69,8 @@ fn resolve_id(input: &str, group: bool) -> io::Result<Option<u32>> {
         let (status, id) = if group {
             let mut record = std::mem::MaybeUninit::<libc::group>::zeroed();
             let mut result = std::ptr::null_mut();
+            // SAFETY: name ist nullterminiert. Datensatz, Puffer und result
+            // sind getrennte schreibbare Ausgaben, die bis zur Rückkehr leben.
             let status = unsafe {
                 libc::getgrnam_r(
                     name.as_ptr(),
@@ -79,7 +81,10 @@ fn resolve_id(input: &str, group: bool) -> io::Result<Option<u32>> {
                 )
             };
             let id = if status == 0 && !result.is_null() {
-                Some(unsafe { record.assume_init() }.gr_gid)
+                // SAFETY: Status 0 und ein Ergebniszeiger belegen laut POSIX
+                // einen befüllten Datensatz. Wir lesen nur die numerische GID.
+                let group = unsafe { record.assume_init() };
+                Some(group.gr_gid)
             } else {
                 None
             };
@@ -87,6 +92,8 @@ fn resolve_id(input: &str, group: bool) -> io::Result<Option<u32>> {
         } else {
             let mut record = std::mem::MaybeUninit::<libc::passwd>::zeroed();
             let mut result = std::ptr::null_mut();
+            // SAFETY: name ist nullterminiert. Datensatz, Puffer und result
+            // sind getrennte schreibbare Ausgaben, die bis zur Rückkehr leben.
             let status = unsafe {
                 libc::getpwnam_r(
                     name.as_ptr(),
@@ -97,7 +104,10 @@ fn resolve_id(input: &str, group: bool) -> io::Result<Option<u32>> {
                 )
             };
             let id = if status == 0 && !result.is_null() {
-                Some(unsafe { record.assume_init() }.pw_uid)
+                // SAFETY: Status 0 und ein Ergebniszeiger belegen laut POSIX
+                // einen befüllten Datensatz. Wir lesen nur die numerische UID.
+                let account = unsafe { record.assume_init() };
+                Some(account.pw_uid)
             } else {
                 None
             };
@@ -197,8 +207,8 @@ mod tests {
     };
     fn own() -> LocalOwnerEdit {
         LocalOwnerEdit {
-            uid: Some(unsafe { libc::geteuid() }),
-            gid: Some(unsafe { libc::getegid() }),
+            uid: Some(rustix::process::geteuid().as_raw()),
+            gid: Some(rustix::process::getegid().as_raw()),
         }
     }
     #[test]
@@ -270,7 +280,7 @@ mod tests {
         .unwrap();
         assert_eq!(report[0].code, Some(ErrorCode::Unsupported));
         assert!(report[1].changed);
-        if unsafe { libc::geteuid() } != 0 {
+        if rustix::process::geteuid().as_raw() != 0 {
             let report = change_local_ownership(
                 &root,
                 &["file".into()],
@@ -287,9 +297,10 @@ mod tests {
                 Some(ErrorCode::PermissionDenied),
                 "{report:?}"
             );
-            assert_eq!(fs::metadata(root.join("file")).unwrap().uid(), unsafe {
-                libc::geteuid()
-            });
+            assert_eq!(
+                fs::metadata(root.join("file")).unwrap().uid(),
+                rustix::process::geteuid().as_raw()
+            );
         }
         let cancel = Cancel::new();
         cancel.cancel();
@@ -358,9 +369,12 @@ mod tests {
     }
     #[test]
     fn permitted_group_change_reports_actual_special_bit_effects() {
+        // SAFETY: Mit Kapazität 0 meldet getgroups nur die benötigte Länge
+        // und greift nicht auf den NULL-Zeiger zu.
         let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
         assert!(count >= 0);
         let mut groups = vec![0; count as usize];
+        // SAFETY: groups stellt count beschreibbare gid_t-Einträge bereit.
         let read = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
         assert_eq!(read, count);
         let area = tempfile::tempdir().unwrap();

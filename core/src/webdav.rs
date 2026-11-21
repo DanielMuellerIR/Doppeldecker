@@ -149,14 +149,7 @@ pub struct WebDavVfs {
     reconnect: Mutex<()>,
 }
 
-/// Ein interaktives Pane-Listing samt der Generation, unter der es entstanden ist.
-/// Die Generation verhindert eine Vermischung mit einem parallelen Reconnect, ist
-/// aber ausdrücklich kein Namespace- oder Identitätsbeleg.
-#[derive(Clone, Debug)]
-pub struct WebDavInteractiveDirectoryListing {
-    pub entries: Vec<Entry>,
-    pub session_generation: u64,
-}
+pub use crate::vfs::RemoteInteractiveDirectoryListing as WebDavInteractiveDirectoryListing;
 
 impl WebDavVfs {
     pub(crate) fn connection_config(&self) -> &WebDavConnectionConfig {
@@ -1308,604 +1301,623 @@ fn parse_multistatus(payload: &[u8]) -> io::Result<Vec<DavResource>> {
     // Struktur-Whitespace unten ausdrücklich, statt ihn global und damit auch aus
     // href, ETag oder Datumsfeldern zu entfernen.
     reader.config_mut().trim_text(false);
-    let mut resources = Vec::new();
-    let mut current: Option<DavResource> = None;
-    let mut field = Vec::<u8>::new();
-    let mut field_value = String::new();
+    let mut parser = DavMultistatus::default();
     let mut buffer = Vec::new();
-    let mut depth = 0usize;
-    let mut root_seen = false;
-    let mut root_closed = false;
-    let mut element_stack = Vec::<(bool, Vec<u8>)>::new();
-    let mut inside_propstat = false;
-    let mut inside_prop = false;
-    // RFC 4918 kennt `collection` ausschließlich als direktes Kind von
-    // `resourcetype`. Ohne diese Verfolgung genügte ein gleichnamiges Element
-    // irgendwo unter `prop`, um eine Datei als Ordner zu bilanzieren — und
-    // `validate_resource` überspränge dann die für Dateien nötigen ETag-,
-    // Größen- und Zeitprüfungen.
-    // Die beiden Tiefenwerte unterscheiden ein direktes XML-Kind von einem nur
-    // irgendwo darunter liegenden Element. Ein boolesches „innerhalb“ wäre hier
-    // zu schwach: `<resourcetype><lockdiscovery><collection/>…` läge ebenfalls
-    // innerhalb, bezeichnet nach RFC 4918 aber keine Collection.
-    let mut prop_depth: Option<usize> = None;
-    let mut resourcetype_depth: Option<usize> = None;
-    let mut propstat_status: Option<u16> = None;
-    let mut propstat_fields = Vec::<(Vec<u8>, String)>::new();
-    let mut propstat_properties = BTreeSet::<Vec<u8>>::new();
-    let mut propstat_collection = false;
-    let mut propstat_prop_count = 0usize;
-    let mut propstat_resourcetype_count = 0usize;
-    let mut propstat_status_error: Option<String> = None;
-    let mut propstat_index = 0usize;
-    let mut response_semantic_errors = Vec::<String>::new();
-    let mut absent_length_propstats = Vec::<usize>::new();
-    let mut absent_collection_etag_propstats = Vec::<usize>::new();
-    let mut multistatus_semantic_errors = Vec::<String>::new();
     loop {
         let (namespace, event) = reader
             .read_resolved_event_into(&mut buffer)
             .map_err(|error| invalid(error.to_string()))?;
         let dav = is_dav_namespace(&namespace);
         match event {
-            Event::Start(event) => {
-                depth = depth.saturating_add(1);
-                if depth > 64 {
-                    return Err(invalid("WebDAV-XML ist zu tief verschachtelt"));
-                }
-                if !field.is_empty() {
-                    return Err(invalid("WebDAV-Skalar enthält verschachteltes XML"));
-                }
-                let name = event.local_name().as_ref().to_vec();
-                if root_closed {
-                    return Err(invalid("WebDAV-XML enthält Inhalt nach multistatus"));
-                }
-                if !root_seen && (!dav || name.as_slice() != b"multistatus") {
-                    return Err(invalid(
-                        "WebDAV-XML besitzt Inhalt vor der multistatus-Wurzel",
-                    ));
-                }
-                if !dav {
-                    if direct_dav_parent(&element_stack, b"prop")
-                        || inside_foreign_property(&element_stack)
-                    {
-                        // Zusätzliche fremde Properties sind laut WebDAV erlaubt.
-                        // Ihr Teilbaum bleibt isoliert: Ein DAV-Pflichtfeld darin
-                        // scheitert später an seiner falschen direkten Elternkante.
-                        element_stack.push((false, name));
-                        buffer.clear();
-                        continue;
-                    }
-                    return Err(invalid("WebDAV-Struktur enthält einen fremden XML-Wrapper"));
-                }
-                match name.as_slice() {
-                    b"multistatus" if !element_stack.is_empty() => {
-                        return Err(invalid("WebDAV-multistatus steht nicht an der Wurzel"));
-                    }
-                    b"response" if !direct_dav_parent(&element_stack, b"multistatus") => {
-                        return Err(invalid(
-                            "WebDAV-response steht nicht direkt unter multistatus",
-                        ));
-                    }
-                    b"href" if !direct_dav_parent(&element_stack, b"response") => {
-                        return Err(invalid("WebDAV-href steht nicht direkt unter response"));
-                    }
-                    b"propstat" if !direct_dav_parent(&element_stack, b"response") => {
-                        return Err(invalid("WebDAV-propstat steht nicht direkt unter response"));
-                    }
-                    b"prop" if !direct_dav_parent(&element_stack, b"propstat") => {
-                        return Err(invalid("WebDAV-prop steht nicht direkt unter propstat"));
-                    }
-                    b"status" if !direct_dav_parent(&element_stack, b"propstat") => {
-                        return Err(invalid("WebDAV-status steht nicht direkt unter propstat"));
-                    }
-                    b"resourcetype" | b"getcontentlength" | b"getlastmodified"
-                    | b"creationdate" | b"getetag"
-                        if !direct_dav_parent(&element_stack, b"prop") =>
-                    {
-                        return Err(invalid("WebDAV-Eigenschaft steht nicht direkt unter prop"));
-                    }
-                    b"collection" if !direct_dav_parent(&element_stack, b"resourcetype") => {
-                        return Err(invalid(
-                            "WebDAV-Collection steht nicht direkt unter resourcetype",
-                        ));
-                    }
-                    b"responsedescription"
-                        if direct_dav_parent(&element_stack, b"multistatus")
-                            || direct_dav_parent(&element_stack, b"response")
-                            || direct_dav_parent(&element_stack, b"propstat") => {}
-                    b"responsedescription" => return Err(invalid(
-                        "WebDAV-Antwortbeschreibung steht nicht an einer erlaubten Strukturkante",
-                    )),
-                    b"multistatus" | b"response" | b"href" | b"propstat" | b"prop" | b"status"
-                    | b"resourcetype" | b"getcontentlength" | b"getlastmodified"
-                    | b"creationdate" | b"getetag" | b"collection" => {}
-                    _ if direct_dav_parent(&element_stack, b"resourcetype") => {
-                        return Err(invalid(
-                            "WebDAV-resourcetype enthält einen unbekannten DAV-Ressourcentyp",
-                        ));
-                    }
-                    _ if direct_dav_parent(&element_stack, b"multistatus")
-                        || direct_dav_parent(&element_stack, b"response")
-                        || direct_dav_parent(&element_stack, b"propstat") =>
-                    {
-                        return Err(invalid(
-                            "WebDAV-Struktur enthält einen unbekannten DAV-Wrapper",
-                        ));
-                    }
-                    _ => {}
-                }
-                element_stack.push((true, name.clone()));
-                match name.as_slice() {
-                    b"multistatus" => {
-                        if root_seen || depth != 1 {
-                            return Err(invalid(
-                                "WebDAV-Multi-Status besitzt keine eindeutige Wurzel",
-                            ));
-                        }
-                        root_seen = true;
-                    }
-                    b"response" => {
-                        if !root_seen || root_closed || current.is_some() {
-                            return Err(invalid("WebDAV-Multi-Status verschachtelt response"));
-                        }
-                        current = Some(DavResource::default());
-                        response_semantic_errors.clear();
-                        absent_length_propstats.clear();
-                        absent_collection_etag_propstats.clear();
-                        propstat_index = 0;
-                    }
-                    b"propstat" => {
-                        if current.is_none() || inside_propstat {
-                            return Err(invalid("WebDAV-propstat steht an falscher Stelle"));
-                        }
-                        inside_propstat = true;
-                        prop_depth = None;
-                        resourcetype_depth = None;
-                        propstat_status = None;
-                        propstat_fields.clear();
-                        propstat_properties.clear();
-                        propstat_collection = false;
-                        propstat_prop_count = 0;
-                        propstat_resourcetype_count = 0;
-                        propstat_status_error = None;
-                    }
-                    b"prop" => {
-                        if !inside_propstat || inside_prop {
-                            return Err(invalid("WebDAV-prop steht an falscher Stelle"));
-                        }
-                        propstat_prop_count = propstat_prop_count.saturating_add(1);
-                        if propstat_prop_count != 1 {
-                            return Err(invalid(
-                                "WebDAV-propstat enthält mehr als ein direktes prop",
-                            ));
-                        }
-                        inside_prop = true;
-                        prop_depth = Some(depth);
-                    }
-                    b"responsedescription" => {
-                        field = name;
-                        field_value.clear();
-                    }
-                    b"href" if current.is_some() && !inside_propstat => {
-                        field = name;
-                        field_value.clear();
-                    }
-                    b"status" if inside_propstat => {
-                        field = name;
-                        field_value.clear();
-                    }
-                    b"resourcetype" if inside_prop && prop_depth == Some(depth - 1) => {
-                        propstat_properties.insert(name);
-                        propstat_resourcetype_count = propstat_resourcetype_count.saturating_add(1);
-                        resourcetype_depth = Some(depth);
-                    }
-                    b"resourcetype" => {
-                        return Err(invalid("WebDAV-resourcetype steht nicht direkt unter prop"));
-                    }
-                    b"getcontentlength" | b"getlastmodified" | b"creationdate" | b"getetag"
-                        if inside_prop && prop_depth == Some(depth - 1) =>
-                    {
-                        propstat_properties.insert(name.clone());
-                        field = name;
-                        field_value.clear();
-                    }
-                    b"getcontentlength" | b"getlastmodified" | b"creationdate" | b"getetag" => {
-                        return Err(invalid("WebDAV-Pflichtfeld steht nicht direkt unter prop"));
-                    }
-                    b"collection" => {
-                        if resourcetype_depth != Some(depth - 1) {
-                            return Err(invalid(
-                                "WebDAV-Collection steht nicht direkt unter resourcetype",
-                            ));
-                        }
-                        propstat_collection = true;
-                    }
-                    _ => {}
-                }
-            }
-            Event::Empty(event) => {
-                if !field.is_empty() {
-                    return Err(invalid("WebDAV-Skalar enthält verschachteltes XML"));
-                }
-                let name = event.local_name().as_ref().to_vec();
-                if !root_seen || root_closed {
-                    return Err(invalid(
-                        "WebDAV-XML enthält ein leeres Element außerhalb von multistatus",
-                    ));
-                }
-                if !dav {
-                    if direct_dav_parent(&element_stack, b"prop")
-                        || inside_foreign_property(&element_stack)
-                    {
-                        buffer.clear();
-                        continue;
-                    }
-                    return Err(invalid(
-                        "WebDAV-Struktur enthält einen leeren fremden XML-Wrapper",
-                    ));
-                }
-                match name.as_slice() {
-                    b"multistatus" | b"response" | b"propstat" | b"prop" | b"status" => {
-                        return Err(invalid(
-                            "WebDAV-Strukturknoten darf kein leeres Element sein",
-                        ));
-                    }
-                    b"href" => {
-                        if !direct_dav_parent(&element_stack, b"response") {
-                            return Err(invalid("WebDAV-href steht nicht direkt unter response"));
-                        }
-                        let resource = current
-                            .as_mut()
-                            .ok_or_else(|| invalid("WebDAV-href steht außerhalb einer response"))?;
-                        // `<href/>` ist dieselbe vorhandene, aber leere Angabe wie
-                        // `<href></href>`. Der Vorkommenszähler muss deshalb gesetzt
-                        // werden. Ein weiteres href bleibt ein semantischer Fehler,
-                        // damit der Parser spätere Responses noch sicher bilanzieren
-                        // kann, statt die Multi-Status-Antwort vorzeitig abzubrechen.
-                        if let Err(error) = apply_resource_field(resource, b"href", String::new()) {
-                            response_semantic_errors.push(error.to_string());
-                        }
-                    }
-                    b"collection" => {
-                        if !direct_dav_parent(&element_stack, b"resourcetype") {
-                            return Err(invalid(
-                                "WebDAV-Collection steht nicht direkt unter resourcetype",
-                            ));
-                        }
-                        propstat_collection = true;
-                    }
-                    b"resourcetype" => {
-                        if !direct_dav_parent(&element_stack, b"prop") {
-                            return Err(invalid(
-                                "WebDAV-resourcetype steht nicht direkt unter prop",
-                            ));
-                        }
-                        propstat_properties.insert(name);
-                        propstat_resourcetype_count = propstat_resourcetype_count.saturating_add(1);
-                    }
-                    b"getcontentlength" | b"getlastmodified" | b"creationdate" | b"getetag" => {
-                        if !direct_dav_parent(&element_stack, b"prop") {
-                            return Err(invalid(
-                                "WebDAV-Pflichtfeld steht nicht direkt unter prop",
-                            ));
-                        }
-                        propstat_properties.insert(name.clone());
-                        propstat_fields.push((name, String::new()));
-                    }
-                    b"responsedescription" if direct_dav_parent(&element_stack, b"multistatus")
-                        || direct_dav_parent(&element_stack, b"response")
-                        || direct_dav_parent(&element_stack, b"propstat") => {}
-                    b"responsedescription" => return Err(invalid(
-                        "Leere WebDAV-Antwortbeschreibung steht nicht an einer erlaubten Strukturkante")),
-                    _ if direct_dav_parent(&element_stack, b"resourcetype") => {
-                        return Err(invalid(
-                            "WebDAV-resourcetype enthält einen leeren unbekannten DAV-Ressourcentyp",
-                        ));
-                    }
-                    _ if direct_dav_parent(&element_stack, b"multistatus")
-                        || direct_dav_parent(&element_stack, b"response")
-                        || direct_dav_parent(&element_stack, b"propstat") =>
-                    {
-                        return Err(invalid(
-                            "WebDAV-Struktur enthält einen leeren unbekannten DAV-Wrapper",
-                        ));
-                    }
-                    _ => {}
-                }
-            }
+            Event::Start(event) => parser.start(dav, event.local_name().as_ref().to_vec())?,
+            Event::Empty(event) => parser.empty(dav, event.local_name().as_ref().to_vec())?,
+            Event::End(event) => parser.end(dav, event.local_name().as_ref().to_vec())?,
             Event::Text(text) => {
-                let value = text
-                    .decode()
-                    .map_err(|error| invalid(error.to_string()))?
-                    .into_owned();
-                if field.is_empty() {
-                    validate_nonfield_xml_value(&value, &element_stack)?;
-                    buffer.clear();
-                    continue;
-                }
-                if current.is_none() && field.as_slice() != b"responsedescription" {
-                    return Err(invalid("WebDAV-Text außerhalb einer response"));
-                }
-                field_value.push_str(&value);
-                if field_value.len() > 8192 {
-                    return Err(invalid("WebDAV-Skalar überschreitet die Größenbegrenzung"));
-                }
+                let value = text.decode().map_err(|error| invalid(error.to_string()))?;
+                parser.scalar_value(&value, "WebDAV-Text außerhalb einer response")?;
             }
             Event::CData(text) => {
-                let value = text
-                    .decode()
-                    .map_err(|error| invalid(error.to_string()))?
-                    .into_owned();
-                if field.is_empty() {
-                    validate_nonfield_xml_value(&value, &element_stack)?;
-                    buffer.clear();
-                    continue;
-                }
-                if current.is_none() && field.as_slice() != b"responsedescription" {
-                    return Err(invalid("WebDAV-CDATA steht außerhalb einer response"));
-                }
-                // CDATA ändert nur die XML-Schreibweise, nicht den Wert des direkt
-                // gebundenen WebDAV-Skalarfelds. Deshalb gelten dieselbe sichere
-                // Dekodierung und dieselbe harte Größenbegrenzung wie für Text.
-                field_value.push_str(&value);
-                if field_value.len() > 8192 {
-                    return Err(invalid("WebDAV-Skalar überschreitet die Größenbegrenzung"));
-                }
+                let value = text.decode().map_err(|error| invalid(error.to_string()))?;
+                // CDATA ändert nur die XML-Schreibweise. Die Grenze des
+                // Skalarfelds gilt für den gesamten dekodierten Wert.
+                parser.scalar_value(&value, "WebDAV-CDATA steht außerhalb einer response")?;
             }
             Event::GeneralRef(reference) => {
-                let value = reference
-                    .decode()
-                    .map_err(|error| invalid(error.to_string()))?;
-                let character = match value.as_ref() {
-                    "amp" => '&',
-                    "lt" => '<',
-                    "gt" => '>',
-                    "quot" => '"',
-                    "apos" => '\'',
-                    _ => reference
-                        .resolve_char_ref()
-                        .map_err(|error| invalid(error.to_string()))?
-                        .ok_or_else(|| invalid("WebDAV-XML enthält eine unbekannte Entität"))?,
-                };
-                if character.is_control() && !matches!(character, '\t' | '\n' | '\r') {
-                    return Err(invalid("WebDAV-XML enthält ein unzulässiges Steuerzeichen"));
-                }
-                if field.is_empty() {
-                    validate_nonfield_xml_value(&character.to_string(), &element_stack)?;
-                    buffer.clear();
-                    continue;
-                }
-                if current.is_none() && field.as_slice() != b"responsedescription" {
-                    return Err(invalid("WebDAV-Entität steht außerhalb einer response"));
-                }
-                field_value.push(character);
-                if field_value.len() > 8192 {
-                    return Err(invalid("WebDAV-Skalar überschreitet die Größenbegrenzung"));
-                }
-            }
-            Event::End(event) => {
-                let closing_name = event.local_name().as_ref().to_vec();
-                let Some((opened_dav, opened_name)) = element_stack.last() else {
-                    return Err(invalid("WebDAV-XML schließt ein Element ohne Anfang"));
-                };
-                if *opened_dav != dav || *opened_name != closing_name {
-                    return Err(invalid(
-                        "WebDAV-XML schließt einen anderen Strukturknoten als geöffnet",
-                    ));
-                }
-                if dav {
-                    match closing_name.as_slice() {
-                        b"responsedescription" => {
-                            field_value.clear();
-                            field.clear();
-                        }
-                        b"href" => {
-                            let resource = current.as_mut().ok_or_else(|| {
-                                invalid("WebDAV-Skalar endet außerhalb einer response")
-                            })?;
-                            if let Err(error) = apply_resource_field(
-                                resource,
-                                &field,
-                                std::mem::take(&mut field_value),
-                            ) {
-                                // Ein doppeltes href ist semantisch falsch, aber die
-                                // XML-Struktur bleibt sicher weiter parsebar. Der
-                                // erste gebundene href bezeichnet die Fehlermeldung;
-                                // spätere Responses werden ebenfalls ausgewertet.
-                                response_semantic_errors.push(error.to_string());
-                            }
-                            field.clear();
-                        }
-                        b"status" => {
-                            match status_line_code(&field_value) {
-                                Ok(status) => {
-                                    if propstat_status.replace(status).is_some() {
-                                        propstat_status_error = Some(
-                                            "WebDAV-propstat enthält mehrere Status".to_owned(),
-                                        );
-                                    }
-                                }
-                                Err(error) => {
-                                    propstat_status_error = Some(error.to_string());
-                                }
-                            }
-                            field_value.clear();
-                            field.clear();
-                        }
-                        b"getcontentlength" | b"getlastmodified" | b"creationdate" | b"getetag" => {
-                            propstat_fields.push((field.clone(), std::mem::take(&mut field_value)));
-                            field.clear();
-                        }
-                        b"resourcetype" if resourcetype_depth == Some(depth) => {
-                            resourcetype_depth = None;
-                        }
-                        b"prop" => {
-                            inside_prop = false;
-                            prop_depth = None;
-                            resourcetype_depth = None;
-                        }
-                        b"propstat" => {
-                            propstat_index = propstat_index.saturating_add(1);
-                            let resource = current
-                                .as_mut()
-                                .ok_or_else(|| invalid("WebDAV-propstat-Ende ohne response"))?;
-                            let mut semantic_errors = Vec::new();
-                            let had_status_error = propstat_status_error.is_some();
-                            if let Some(error) = propstat_status_error.take() {
-                                semantic_errors.push(error);
-                            }
-                            match propstat_status {
-                                Some(200) => {
-                                    if propstat_prop_count != 1 {
-                                        semantic_errors.push(format!(
-                                            "erfolgreicher propstat besitzt {} direkte prop statt genau einem",
-                                            propstat_prop_count
-                                        ));
-                                    }
-                                    if propstat_resourcetype_count > 1 {
-                                        semantic_errors.push(format!(
-                                            "erfolgreicher propstat besitzt {} direkte resourcetype statt höchstens einem",
-                                            propstat_resourcetype_count
-                                        ));
-                                    } else if propstat_resourcetype_count == 1 {
-                                        if let Some(previous) =
-                                            resource.successful_resourcetype
-                                        {
-                                            if previous != propstat_collection {
-                                                semantic_errors.push(
-                                                    "resourcetype widerspricht einem früheren erfolgreichen propstat"
-                                                        .to_owned(),
-                                                );
-                                            } else {
-                                                semantic_errors.push(
-                                                    "resourcetype steht in mehreren erfolgreichen propstat-Blöcken"
-                                                        .to_owned(),
-                                                );
-                                            }
-                                        } else {
-                                            resource.successful_resourcetype =
-                                                Some(propstat_collection);
-                                            resource.is_collection = propstat_collection;
-                                        }
-                                    }
-                                    for (field, value) in &propstat_fields {
-                                        if let Err(error) =
-                                            apply_resource_field(resource, field, value.clone())
-                                        {
-                                            semantic_errors.push(error.to_string());
-                                        }
-                                    }
-                                    resource.successful_propstats =
-                                        resource.successful_propstats.saturating_add(1);
-                                }
-                                Some(404)
-                                    if !propstat_properties.is_empty()
-                                        && propstat_properties.iter().all(|property| property.as_slice() == b"creationdate") => {}
-                                Some(404)
-                                    if !propstat_properties.is_empty()
-                                        && propstat_properties.iter().all(|property| matches!(property.as_slice(), b"creationdate" | b"getcontentlength" | b"getetag")) => {
-                                            // RFC 4918 §15.4/15.6 verlangt Länge und ETag
-                                            // nicht für jede Collection (etwa WsgiDAV).
-                                            // Erst am response-Ende steht der erfolgreiche
-                                            // Ressourcentyp unabhängig von der propstat-Reihenfolge fest.
-                                            if propstat_properties.contains(b"getcontentlength".as_slice()) {
-                                                absent_length_propstats.push(propstat_index);
-                                            }
-                                            if propstat_properties.contains(b"getetag".as_slice()) {
-                                                absent_collection_etag_propstats.push(propstat_index);
-                                            }
-                                        }
-                                Some(status) => semantic_errors.push(format!(
-                                    "Status {status} ist für eine Pflichtmetadatenklasse nicht erfolgreich"
-                                )),
-                                None if !had_status_error => {
-                                    semantic_errors.push(
-                                        "WebDAV-propstat besitzt keinen Status".to_owned(),
-                                    );
-                                }
-                                None => {}
-                            }
-                            if !semantic_errors.is_empty() {
-                                response_semantic_errors.push(format!(
-                                    "propstat {propstat_index}: {}",
-                                    semantic_errors.join(", ")
-                                ));
-                            }
-                            inside_propstat = false;
-                            prop_depth = None;
-                            resourcetype_depth = None;
-                            propstat_status = None;
-                            propstat_fields.clear();
-                            propstat_properties.clear();
-                            propstat_collection = false;
-                            propstat_prop_count = 0;
-                            propstat_resourcetype_count = 0;
-                            propstat_status_error = None;
-                        }
-                        b"response" => {
-                            if inside_propstat || inside_prop {
-                                return Err(invalid(
-                                    "WebDAV-response endet innerhalb von propstat",
-                                ));
-                            }
-                            let resource = current
-                                .take()
-                                .ok_or_else(|| invalid("WebDAV-response-Ende ohne Anfang"))?;
-                            let href = if resource.href.is_empty() {
-                                "<fehlender href>".to_owned()
-                            } else {
-                                resource.href.clone()
-                            };
-                            if resource.successful_resourcetype != Some(true) {
-                                for index in &absent_length_propstats {
-                                    response_semantic_errors.push(format!("propstat {index}: Status 404 für getcontentlength ist nur bei einer bestätigten Collection zulässig"));
-                                }
-                            }
-                            for index in &absent_collection_etag_propstats {
-                                if resource.successful_resourcetype != Some(true) {
-                                    response_semantic_errors.push(format!("propstat {index}: Status 404 für getetag ist nur bei einer bestätigten Collection zulässig"));
-                                } else if resource.etag.is_some() {
-                                    response_semantic_errors.push(format!("propstat {index}: getetag wird zugleich erfolgreich und als fehlend gemeldet"));
-                                }
-                            }
-                            if let Err(error) = validate_resource(&resource) {
-                                response_semantic_errors.push(error.to_string());
-                            }
-                            if !response_semantic_errors.is_empty() {
-                                multistatus_semantic_errors.push(format!(
-                                    "WebDAV-response {href}: {}",
-                                    response_semantic_errors.join("; ")
-                                ));
-                            } else {
-                                resources.push(resource);
-                            }
-                        }
-                        b"multistatus" => root_closed = true,
-                        _ => {}
-                    }
-                }
-                depth = depth.saturating_sub(1);
-                element_stack.pop();
+                let character = decode_dav_reference(&reference)?;
+                parser.scalar_value(
+                    character.encode_utf8(&mut [0; 4]),
+                    "WebDAV-Entität steht außerhalb einer response",
+                )?;
             }
             Event::Eof => break,
-            Event::DocType(_) => {
-                return Err(invalid("WebDAV-XML darf keine DTD enthalten"));
-            }
+            Event::DocType(_) => return Err(invalid("WebDAV-XML darf keine DTD enthalten")),
             _ => {}
         }
         buffer.clear();
     }
-    if current.is_some() || !root_seen || !root_closed || depth != 0 || !element_stack.is_empty() {
-        return Err(invalid("WebDAV-Multi-Status ist unvollständig oder leer"));
+    parser.finish()
+}
+
+fn decode_dav_reference(reference: &quick_xml::events::BytesRef<'_>) -> io::Result<char> {
+    let value = reference
+        .decode()
+        .map_err(|error| invalid(error.to_string()))?;
+    let character = match value.as_ref() {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        _ => reference
+            .resolve_char_ref()
+            .map_err(|error| invalid(error.to_string()))?
+            .ok_or_else(|| invalid("WebDAV-XML enthält eine unbekannte Entität"))?,
+    };
+    if character.is_control() && !matches!(character, '\t' | '\n' | '\r') {
+        return Err(invalid("WebDAV-XML enthält ein unzulässiges Steuerzeichen"));
     }
-    if !multistatus_semantic_errors.is_empty() {
-        return Err(invalid(multistatus_semantic_errors.join("; ")));
+    Ok(character)
+}
+
+fn validate_dav_start(name: &[u8], stack: &[(bool, Vec<u8>)]) -> io::Result<()> {
+    match name {
+        b"multistatus" if !stack.is_empty() => {
+            return Err(invalid("WebDAV-multistatus steht nicht an der Wurzel"));
+        }
+        b"response" if !direct_dav_parent(stack, b"multistatus") => {
+            return Err(invalid(
+                "WebDAV-response steht nicht direkt unter multistatus",
+            ));
+        }
+        b"href" if !direct_dav_parent(stack, b"response") => {
+            return Err(invalid("WebDAV-href steht nicht direkt unter response"));
+        }
+        b"propstat" if !direct_dav_parent(stack, b"response") => {
+            return Err(invalid("WebDAV-propstat steht nicht direkt unter response"));
+        }
+        b"prop" if !direct_dav_parent(stack, b"propstat") => {
+            return Err(invalid("WebDAV-prop steht nicht direkt unter propstat"));
+        }
+        b"status" if !direct_dav_parent(stack, b"propstat") => {
+            return Err(invalid("WebDAV-status steht nicht direkt unter propstat"));
+        }
+        b"resourcetype" | b"getcontentlength" | b"getlastmodified" | b"creationdate"
+        | b"getetag"
+            if !direct_dav_parent(stack, b"prop") =>
+        {
+            return Err(invalid("WebDAV-Eigenschaft steht nicht direkt unter prop"));
+        }
+        b"collection" if !direct_dav_parent(stack, b"resourcetype") => {
+            return Err(invalid(
+                "WebDAV-Collection steht nicht direkt unter resourcetype",
+            ));
+        }
+        b"responsedescription"
+            if direct_dav_parent(stack, b"multistatus")
+                || direct_dav_parent(stack, b"response")
+                || direct_dav_parent(stack, b"propstat") => {}
+        b"responsedescription" => {
+            return Err(invalid(
+                "WebDAV-Antwortbeschreibung steht nicht an einer erlaubten Strukturkante",
+            ))
+        }
+        b"multistatus" | b"response" | b"href" | b"propstat" | b"prop" | b"status"
+        | b"resourcetype" | b"getcontentlength" | b"getlastmodified" | b"creationdate"
+        | b"getetag" | b"collection" => {}
+        _ if direct_dav_parent(stack, b"resourcetype") => {
+            return Err(invalid(
+                "WebDAV-resourcetype enthält einen unbekannten DAV-Ressourcentyp",
+            ));
+        }
+        _ if direct_dav_parent(stack, b"multistatus")
+            || direct_dav_parent(stack, b"response")
+            || direct_dav_parent(stack, b"propstat") =>
+        {
+            return Err(invalid(
+                "WebDAV-Struktur enthält einen unbekannten DAV-Wrapper",
+            ));
+        }
+        _ => {}
     }
-    if resources.is_empty() {
-        return Err(invalid("WebDAV-Multi-Status ist leer"));
+    Ok(())
+}
+
+#[derive(Default)]
+struct DavPropstat {
+    status: Option<u16>,
+    fields: Vec<(Vec<u8>, String)>,
+    properties: BTreeSet<Vec<u8>>,
+    collection: bool,
+    prop_count: usize,
+    resourcetype_count: usize,
+    status_error: Option<String>,
+}
+
+#[derive(Default)]
+struct DavMultistatus {
+    resources: Vec<DavResource>,
+    current: Option<DavResource>,
+    field: Vec<u8>,
+    field_value: String,
+    depth: usize,
+    root_seen: bool,
+    root_closed: bool,
+    element_stack: Vec<(bool, Vec<u8>)>,
+    inside_propstat: bool,
+    inside_prop: bool,
+    // Die Tiefen unterscheiden direkte XML-Kinder von beliebig verschachtelten
+    // Feldern. Insbesondere darf nur ein direktes `collection` unter
+    // `resourcetype` die Datei-ETag-, Größen- und Zeitprüfung entfallen lassen.
+    prop_depth: Option<usize>,
+    resourcetype_depth: Option<usize>,
+    propstat: DavPropstat,
+    propstat_index: usize,
+    response_semantic_errors: Vec<String>,
+    absent_length_propstats: Vec<usize>,
+    absent_collection_etag_propstats: Vec<usize>,
+    semantic_errors: Vec<String>,
+}
+
+impl DavMultistatus {
+    fn start(&mut self, dav: bool, name: Vec<u8>) -> io::Result<()> {
+        self.depth = self.depth.saturating_add(1);
+        if self.depth > 64 {
+            return Err(invalid("WebDAV-XML ist zu tief verschachtelt"));
+        }
+        if !self.field.is_empty() {
+            return Err(invalid("WebDAV-Skalar enthält verschachteltes XML"));
+        }
+        if self.root_closed {
+            return Err(invalid("WebDAV-XML enthält Inhalt nach multistatus"));
+        }
+        if !self.root_seen && (!dav || name.as_slice() != b"multistatus") {
+            return Err(invalid(
+                "WebDAV-XML besitzt Inhalt vor der multistatus-Wurzel",
+            ));
+        }
+        if !dav {
+            if direct_dav_parent(&self.element_stack, b"prop")
+                || inside_foreign_property(&self.element_stack)
+            {
+                // Zusätzliche fremde Properties sind laut WebDAV erlaubt.
+                // Ihr Teilbaum bleibt isoliert: Ein DAV-Pflichtfeld darin
+                // scheitert später an seiner falschen direkten Elternkante.
+                self.element_stack.push((false, name));
+                return Ok(());
+            }
+            return Err(invalid("WebDAV-Struktur enthält einen fremden XML-Wrapper"));
+        }
+        validate_dav_start(&name, &self.element_stack)?;
+        self.element_stack.push((true, name.clone()));
+        match name.as_slice() {
+            b"multistatus" => {
+                if self.root_seen || self.depth != 1 {
+                    return Err(invalid(
+                        "WebDAV-Multi-Status besitzt keine eindeutige Wurzel",
+                    ));
+                }
+                self.root_seen = true;
+            }
+            b"response" => {
+                if !self.root_seen || self.root_closed || self.current.is_some() {
+                    return Err(invalid("WebDAV-Multi-Status verschachtelt response"));
+                }
+                self.current = Some(DavResource::default());
+                self.response_semantic_errors.clear();
+                self.absent_length_propstats.clear();
+                self.absent_collection_etag_propstats.clear();
+                self.propstat_index = 0;
+            }
+            b"propstat" => {
+                if self.current.is_none() || self.inside_propstat {
+                    return Err(invalid("WebDAV-propstat steht an falscher Stelle"));
+                }
+                self.inside_propstat = true;
+                self.prop_depth = None;
+                self.resourcetype_depth = None;
+            }
+            b"prop" => {
+                if !self.inside_propstat || self.inside_prop {
+                    return Err(invalid("WebDAV-prop steht an falscher Stelle"));
+                }
+                self.propstat.prop_count = self.propstat.prop_count.saturating_add(1);
+                if self.propstat.prop_count != 1 {
+                    return Err(invalid(
+                        "WebDAV-propstat enthält mehr als ein direktes prop",
+                    ));
+                }
+                self.inside_prop = true;
+                self.prop_depth = Some(self.depth);
+            }
+            b"responsedescription" => {
+                self.field = name;
+                self.field_value.clear();
+            }
+            b"href" if self.current.is_some() && !self.inside_propstat => {
+                self.field = name;
+                self.field_value.clear();
+            }
+            b"status" if self.inside_propstat => {
+                self.field = name;
+                self.field_value.clear();
+            }
+            b"resourcetype" if self.inside_prop && self.prop_depth == Some(self.depth - 1) => {
+                self.propstat.properties.insert(name);
+                self.propstat.resourcetype_count =
+                    self.propstat.resourcetype_count.saturating_add(1);
+                self.resourcetype_depth = Some(self.depth);
+            }
+            b"resourcetype" => {
+                return Err(invalid("WebDAV-resourcetype steht nicht direkt unter prop"));
+            }
+            b"getcontentlength" | b"getlastmodified" | b"creationdate" | b"getetag"
+                if self.inside_prop && self.prop_depth == Some(self.depth - 1) =>
+            {
+                self.propstat.properties.insert(name.clone());
+                self.field = name;
+                self.field_value.clear();
+            }
+            b"getcontentlength" | b"getlastmodified" | b"creationdate" | b"getetag" => {
+                return Err(invalid("WebDAV-Pflichtfeld steht nicht direkt unter prop"));
+            }
+            b"collection" => {
+                if self.resourcetype_depth != Some(self.depth - 1) {
+                    return Err(invalid(
+                        "WebDAV-Collection steht nicht direkt unter resourcetype",
+                    ));
+                }
+                self.propstat.collection = true;
+            }
+            _ => {}
+        }
+        Ok(())
     }
-    Ok(resources)
+
+    fn empty(&mut self, dav: bool, name: Vec<u8>) -> io::Result<()> {
+        if !self.field.is_empty() {
+            return Err(invalid("WebDAV-Skalar enthält verschachteltes XML"));
+        }
+        if !self.root_seen || self.root_closed {
+            return Err(invalid(
+                "WebDAV-XML enthält ein leeres Element außerhalb von multistatus",
+            ));
+        }
+        if !dav {
+            if direct_dav_parent(&self.element_stack, b"prop")
+                || inside_foreign_property(&self.element_stack)
+            {
+                return Ok(());
+            }
+            return Err(invalid(
+                "WebDAV-Struktur enthält einen leeren fremden XML-Wrapper",
+            ));
+        }
+        match name.as_slice() {
+            b"multistatus" | b"response" | b"propstat" | b"prop" | b"status" => {
+                return Err(invalid(
+                    "WebDAV-Strukturknoten darf kein leeres Element sein",
+                ));
+            }
+            b"href" => {
+                if !direct_dav_parent(&self.element_stack, b"response") {
+                    return Err(invalid("WebDAV-href steht nicht direkt unter response"));
+                }
+                let resource = self
+                    .current
+                    .as_mut()
+                    .ok_or_else(|| invalid("WebDAV-href steht außerhalb einer response"))?;
+                // `<href/>` ist dieselbe vorhandene, aber leere Angabe wie
+                // `<href></href>`. Der Vorkommenszähler muss deshalb gesetzt
+                // werden. Ein weiteres href bleibt ein semantischer Fehler,
+                // damit der Parser spätere Responses noch sicher bilanzieren
+                // kann, statt die Multi-Status-Antwort vorzeitig abzubrechen.
+                if let Err(error) = apply_resource_field(resource, b"href", String::new()) {
+                    self.response_semantic_errors.push(error.to_string());
+                }
+            }
+            b"collection" => {
+                if !direct_dav_parent(&self.element_stack, b"resourcetype") {
+                    return Err(invalid(
+                        "WebDAV-Collection steht nicht direkt unter resourcetype",
+                    ));
+                }
+                self.propstat.collection = true;
+            }
+            b"resourcetype" => {
+                if !direct_dav_parent(&self.element_stack, b"prop") {
+                    return Err(invalid("WebDAV-resourcetype steht nicht direkt unter prop"));
+                }
+                self.propstat.properties.insert(name);
+                self.propstat.resourcetype_count =
+                    self.propstat.resourcetype_count.saturating_add(1);
+            }
+            b"getcontentlength" | b"getlastmodified" | b"creationdate" | b"getetag" => {
+                if !direct_dav_parent(&self.element_stack, b"prop") {
+                    return Err(invalid("WebDAV-Pflichtfeld steht nicht direkt unter prop"));
+                }
+                self.propstat.properties.insert(name.clone());
+                self.propstat.fields.push((name, String::new()));
+            }
+            b"responsedescription"
+                if direct_dav_parent(&self.element_stack, b"multistatus")
+                    || direct_dav_parent(&self.element_stack, b"response")
+                    || direct_dav_parent(&self.element_stack, b"propstat") => {}
+            b"responsedescription" => {
+                return Err(invalid(
+                    "Leere WebDAV-Antwortbeschreibung steht nicht an einer erlaubten Strukturkante",
+                ))
+            }
+            _ if direct_dav_parent(&self.element_stack, b"resourcetype") => {
+                return Err(invalid(
+                    "WebDAV-resourcetype enthält einen leeren unbekannten DAV-Ressourcentyp",
+                ));
+            }
+            _ if direct_dav_parent(&self.element_stack, b"multistatus")
+                || direct_dav_parent(&self.element_stack, b"response")
+                || direct_dav_parent(&self.element_stack, b"propstat") =>
+            {
+                return Err(invalid(
+                    "WebDAV-Struktur enthält einen leeren unbekannten DAV-Wrapper",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn scalar_value(&mut self, value: &str, outside_response: &str) -> io::Result<()> {
+        if self.field.is_empty() {
+            return validate_nonfield_xml_value(value, &self.element_stack);
+        }
+        if self.current.is_none() && self.field.as_slice() != b"responsedescription" {
+            return Err(invalid(outside_response));
+        }
+        self.field_value.push_str(value);
+        if self.field_value.len() > 8192 {
+            return Err(invalid("WebDAV-Skalar überschreitet die Größenbegrenzung"));
+        }
+        Ok(())
+    }
+
+    fn end(&mut self, dav: bool, closing_name: Vec<u8>) -> io::Result<()> {
+        let Some((opened_dav, opened_name)) = self.element_stack.last() else {
+            return Err(invalid("WebDAV-XML schließt ein Element ohne Anfang"));
+        };
+        if *opened_dav != dav || *opened_name != closing_name {
+            return Err(invalid(
+                "WebDAV-XML schließt einen anderen Strukturknoten als geöffnet",
+            ));
+        }
+        if dav {
+            match closing_name.as_slice() {
+                b"responsedescription" => {
+                    self.field_value.clear();
+                    self.field.clear();
+                }
+                b"href" => {
+                    let resource = self
+                        .current
+                        .as_mut()
+                        .ok_or_else(|| invalid("WebDAV-Skalar endet außerhalb einer response"))?;
+                    if let Err(error) = apply_resource_field(
+                        resource,
+                        &self.field,
+                        std::mem::take(&mut self.field_value),
+                    ) {
+                        // Ein doppeltes href ist semantisch falsch, aber die
+                        // XML-Struktur bleibt sicher weiter parsebar. Der
+                        // erste gebundene href bezeichnet die Fehlermeldung;
+                        // spätere Responses werden ebenfalls ausgewertet.
+                        self.response_semantic_errors.push(error.to_string());
+                    }
+                    self.field.clear();
+                }
+                b"status" => {
+                    match status_line_code(&self.field_value) {
+                        Ok(status) => {
+                            if self.propstat.status.replace(status).is_some() {
+                                self.propstat.status_error =
+                                    Some("WebDAV-propstat enthält mehrere Status".to_owned());
+                            }
+                        }
+                        Err(error) => {
+                            self.propstat.status_error = Some(error.to_string());
+                        }
+                    }
+                    self.field_value.clear();
+                    self.field.clear();
+                }
+                b"getcontentlength" | b"getlastmodified" | b"creationdate" | b"getetag" => {
+                    self.propstat
+                        .fields
+                        .push((self.field.clone(), std::mem::take(&mut self.field_value)));
+                    self.field.clear();
+                }
+                b"resourcetype" if self.resourcetype_depth == Some(self.depth) => {
+                    self.resourcetype_depth = None;
+                }
+                b"prop" => {
+                    self.inside_prop = false;
+                    self.prop_depth = None;
+                    self.resourcetype_depth = None;
+                }
+                b"propstat" => self.finish_propstat()?,
+                b"response" => self.finish_response()?,
+                b"multistatus" => self.root_closed = true,
+                _ => {}
+            }
+        }
+        self.depth = self.depth.saturating_sub(1);
+        self.element_stack.pop();
+        Ok(())
+    }
+
+    fn finish_propstat(&mut self) -> io::Result<()> {
+        self.propstat_index = self.propstat_index.saturating_add(1);
+        let resource = self
+            .current
+            .as_mut()
+            .ok_or_else(|| invalid("WebDAV-propstat-Ende ohne response"))?;
+        let mut semantic_errors = Vec::new();
+        let had_status_error = self.propstat.status_error.is_some();
+        if let Some(error) = self.propstat.status_error.take() {
+            semantic_errors.push(error);
+        }
+        match self.propstat.status {
+            Some(200) => {
+                if self.propstat.prop_count != 1 {
+                    semantic_errors.push(format!(
+                        "erfolgreicher propstat besitzt {} direkte prop statt genau einem",
+                        self.propstat.prop_count
+                    ));
+                }
+                if self.propstat.resourcetype_count > 1 {
+                    semantic_errors.push(format!(
+                        "erfolgreicher propstat besitzt {} direkte resourcetype statt höchstens einem",
+                        self.propstat.resourcetype_count
+                    ));
+                } else if self.propstat.resourcetype_count == 1 {
+                    if let Some(previous) = resource.successful_resourcetype {
+                        if previous != self.propstat.collection {
+                            semantic_errors.push(
+                                "resourcetype widerspricht einem früheren erfolgreichen propstat"
+                                    .to_owned(),
+                            );
+                        } else {
+                            semantic_errors.push(
+                                "resourcetype steht in mehreren erfolgreichen propstat-Blöcken"
+                                    .to_owned(),
+                            );
+                        }
+                    } else {
+                        resource.successful_resourcetype = Some(self.propstat.collection);
+                        resource.is_collection = self.propstat.collection;
+                    }
+                }
+                for (property, value) in &self.propstat.fields {
+                    if let Err(error) = apply_resource_field(resource, property, value.clone()) {
+                        semantic_errors.push(error.to_string());
+                    }
+                }
+                resource.successful_propstats = resource.successful_propstats.saturating_add(1);
+            }
+            Some(404)
+                if !self.propstat.properties.is_empty()
+                    && self
+                        .propstat
+                        .properties
+                        .iter()
+                        .all(|property| property.as_slice() == b"creationdate") => {}
+            Some(404)
+                if !self.propstat.properties.is_empty()
+                    && self.propstat.properties.iter().all(|property| {
+                        matches!(
+                            property.as_slice(),
+                            b"creationdate" | b"getcontentlength" | b"getetag"
+                        )
+                    }) =>
+            {
+                // RFC 4918 §15.4/15.6 verlangt Länge und ETag
+                // nicht für jede Collection (etwa WsgiDAV).
+                // Erst am response-Ende steht der erfolgreiche
+                // Ressourcentyp unabhängig von der propstat-Reihenfolge fest.
+                if self
+                    .propstat
+                    .properties
+                    .contains(b"getcontentlength".as_slice())
+                {
+                    self.absent_length_propstats.push(self.propstat_index);
+                }
+                if self.propstat.properties.contains(b"getetag".as_slice()) {
+                    self.absent_collection_etag_propstats
+                        .push(self.propstat_index);
+                }
+            }
+            Some(status) => semantic_errors.push(format!(
+                "Status {status} ist für eine Pflichtmetadatenklasse nicht erfolgreich"
+            )),
+            None if !had_status_error => {
+                semantic_errors.push("WebDAV-propstat besitzt keinen Status".to_owned());
+            }
+            None => {}
+        }
+        if !semantic_errors.is_empty() {
+            self.response_semantic_errors.push(format!(
+                "propstat {}: {}",
+                self.propstat_index,
+                semantic_errors.join(", ")
+            ));
+        }
+        self.inside_propstat = false;
+        self.prop_depth = None;
+        self.resourcetype_depth = None;
+        self.propstat.status = None;
+        self.propstat.fields.clear();
+        self.propstat.properties.clear();
+        self.propstat.collection = false;
+        self.propstat.prop_count = 0;
+        self.propstat.resourcetype_count = 0;
+        Ok(())
+    }
+
+    fn finish_response(&mut self) -> io::Result<()> {
+        if self.inside_propstat || self.inside_prop {
+            return Err(invalid("WebDAV-response endet innerhalb von propstat"));
+        }
+        let resource = self
+            .current
+            .take()
+            .ok_or_else(|| invalid("WebDAV-response-Ende ohne Anfang"))?;
+        let href = if resource.href.is_empty() {
+            "<fehlender href>".to_owned()
+        } else {
+            resource.href.clone()
+        };
+        if resource.successful_resourcetype != Some(true) {
+            for index in &self.absent_length_propstats {
+                self.response_semantic_errors.push(format!("propstat {index}: Status 404 für getcontentlength ist nur bei einer bestätigten Collection zulässig"));
+            }
+        }
+        for index in &self.absent_collection_etag_propstats {
+            if resource.successful_resourcetype != Some(true) {
+                self.response_semantic_errors.push(format!("propstat {index}: Status 404 für getetag ist nur bei einer bestätigten Collection zulässig"));
+            } else if resource.etag.is_some() {
+                self.response_semantic_errors.push(format!(
+                    "propstat {index}: getetag wird zugleich erfolgreich und als fehlend gemeldet"
+                ));
+            }
+        }
+        if let Err(error) = validate_resource(&resource) {
+            self.response_semantic_errors.push(error.to_string());
+        }
+        if !self.response_semantic_errors.is_empty() {
+            self.semantic_errors.push(format!(
+                "WebDAV-response {href}: {}",
+                self.response_semantic_errors.join("; ")
+            ));
+        } else {
+            self.resources.push(resource);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<Vec<DavResource>> {
+        if self.current.is_some()
+            || !self.root_seen
+            || !self.root_closed
+            || self.depth != 0
+            || !self.element_stack.is_empty()
+        {
+            return Err(invalid("WebDAV-Multi-Status ist unvollständig oder leer"));
+        }
+        if !self.semantic_errors.is_empty() {
+            return Err(invalid(self.semantic_errors.join("; ")));
+        }
+        if self.resources.is_empty() {
+            return Err(invalid("WebDAV-Multi-Status ist leer"));
+        }
+        Ok(self.resources)
+    }
 }
 
 fn apply_resource_field(resource: &mut DavResource, field: &[u8], value: String) -> io::Result<()> {

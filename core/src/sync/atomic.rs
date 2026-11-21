@@ -1964,7 +1964,13 @@ pub(super) fn hash_tree(vfs: &dyn Vfs, root: &Path) -> io::Result<(String, u64, 
             let mut children = complete_listing(vfs, path)?;
             children.sort_by(|left, right| left.entry.name.cmp(&right.entry.name));
             for child in children {
-                if child.safely_decoded && crate::resumable_copy::is_stage_name(&child.entry.name) {
+                if !child.safely_decoded {
+                    return Err(plan_changed(
+                        &path.to_string_lossy(),
+                        "ein Name im Löschbaum kann nicht eindeutig gelesen werden",
+                    ));
+                }
+                if crate::resumable_copy::is_stage_name(&child.entry.name) {
                     return Err(plan_changed(
                         &path.to_string_lossy(),
                         "ein Arbeitsordner einer fortsetzbaren Kopie liegt im Löschbaum",

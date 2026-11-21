@@ -59,5 +59,5 @@ verlinkten Verträgen; daraus folgt keine neue Releasefreigabe.
 Roadmap: Ziele und Fertigkriterien. Backlog: offene Aufgaben. Changelog: Änderungen.
 Vertragsdokumente: notwendige technische Grenzen und gebündelte Prüfbelege.
 Historische Abläufe und wiederholte Testzahlen gehören nicht in die aktiven Listen.
-Der frühere Gesamtstand bleibt als [Historie bis 2026-10](roadmap-history-2026-10.md)
+Der frühere Gesamtstand bleibt als [Historie bis 2026-10](history/roadmap-history-2026-10.md)
 erhalten; seine Aufwandszahlen sind keine Schätzung für den heutigen Restumfang.

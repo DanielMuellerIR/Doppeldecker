@@ -5,8 +5,8 @@ use crate::bidirectional_commands::{
 };
 use crate::content_sync_sandbox::Binding;
 use crate::{
-    emit_queue_snapshot, operation_queue, start_queue_worker, with_queue_extension, AppError,
-    AppState, MutexExt,
+    emit_queue_snapshot, operation_queue, start_queue_worker, with_queue_extension,
+    with_queue_extension_access, AppError, AppState, MutexExt,
 };
 use doppeldecker_core::bidirectional::forward::{
     ForwardBidirectionalPreview, PreparedForwardBidirectional,
@@ -302,7 +302,7 @@ pub(crate) async fn enqueue_forward_bidirectional_sync(
         let state = app.state::<AppState>();
         let label = window.label();
         let ws = state.window(label);
-        let (queue, id) = with_queue_extension(&state, &ws, || {
+        let (queue, id) = with_queue_extension_access(&state, &ws, |extension| {
             let mut slot = ws.pending_forward_bidirectional.lock_recover();
             let pending = slot
                 .as_ref()
@@ -315,9 +315,8 @@ pub(crate) async fn enqueue_forward_bidirectional_sync(
                 effects_confirmed,
             )?;
             let mut runs = ws.forward_bidirectional_runs.lock_recover();
-            let (queue, entry) = crate::queue_runtime::enqueue_operation_with_profile_bindings(
+            let (queue, entry) = extension.enqueue_with_profile_bindings(
                 &app,
-                &ws,
                 label,
                 &pending.operation,
                 &pending.profile_bindings,
@@ -909,4 +908,38 @@ mod tests {
         );
         discard_window_preparation(&b).unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn forward_pair_request_flattens_the_bound_pair_and_recovery_flag() {
+    let wire: serde_json::Value =
+        serde_json::from_str(include_str!("../../tools/tests/bidirectional-wire.json")).unwrap();
+    let mut payload = wire["registeredPair"].clone();
+    let fields = payload.as_object_mut().unwrap();
+    fields.remove("visibleLeftRole");
+    fields.insert("resolutions".into(), wire["resolutions"].clone());
+    fields.insert(
+        "expectedUnresolvedDigest".into(),
+        serde_json::to_value([41_u8; 32]).unwrap(),
+    );
+    let ordinary: ForwardPrepareRequest = serde_json::from_value(payload.clone()).unwrap();
+    assert!(!ordinary.recovery);
+    assert_eq!(ordinary.request.expected_unresolved_digest, Some([41; 32]));
+
+    payload["recovery"] = true.into();
+    let recovery: ForwardPrepareRequest = serde_json::from_value(payload).unwrap();
+    assert!(recovery.recovery);
+    assert_eq!(
+        serde_json::to_value(recovery.request.pair_id).unwrap(),
+        wire["registeredPair"]["pairId"]
+    );
+    assert_eq!(
+        serde_json::to_value(recovery.request.right).unwrap(),
+        wire["registeredPair"]["right"]
+    );
+    assert_eq!(
+        serde_json::to_value(recovery.request.resolutions).unwrap(),
+        wire["resolutions"]
+    );
 }

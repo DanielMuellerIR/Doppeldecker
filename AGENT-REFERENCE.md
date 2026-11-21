@@ -23,7 +23,7 @@ Permits; Operationen verschiedener Fenster dürfen parallel laufen. Fortschritt 
 Menüaktionen gehen nur an das verursachende Fenster. Der externe GUI-/CLI-Prozesslock
 bleibt gemeinsam, seine interne Weitergabe verschmilzt die Fensterjournale nicht.
 Vor jeder Arbeit an Fenstern, `AppState` oder der Operations-Queue
-[`docs/goal-mehrere-fenster.md`](docs/goal-mehrere-fenster.md) lesen.
+[`docs/multi-window.md`](docs/multi-window.md) lesen.
 
 Keine Sicherheitslogik im Frontend duplizieren. Das Frontend darf Wirkung erklären
 und bestätigen lassen, aber niemals Pfade, Identitäten, Plan-Digests oder Permits
@@ -222,15 +222,15 @@ Systemen geprüft werden. Konkreter Fall in `core/src/local_fs.rs`: `st_dev as u
 ist auf macOS nötig, auf Linux dagegen ein identischer Cast — und damit unter
 `-D warnings` ein Clippy-Fehler. Ein Lauf auf nur einem System belegt hier nichts.
 
-Die Fuzz-Targets liegen außerhalb des Workspace; nur der eigene `cargo check`
-übersetzt sie. `--locked` deckt zusätzlich auf, wenn `fuzz/Cargo.lock` nicht mehr
-zu den Abhängigkeiten des Kerns passt.
+Die Fuzz-Targets liegen außerhalb des Workspace. `fuzz-check` übersetzt sie,
+`test-fuzz-seeds` führt die Seed-Tests aus. Beide prüfen mit `--locked`, dass
+`fuzz/Cargo.lock` zu den Abhängigkeiten des Kerns passt.
 
 `tools/check-gates.py` bündelt die headless Code-Gates: Exit-Code 0 nur, wenn alle ausgeführten Gates grün sind; `--json`
 schreibt JSON Lines auf stdout. Nach einem vollständigen grünen Lauf bereinigt es
 `target/debug` oberhalb von 6 GiB; Teilgate-Läufe und Release-Artefakte bleiben erhalten.
 Für manuelle Builds, isolierte Kandidaten und deren Abschluss deshalb zusätzlich
-[Builddaten und Agentenausgaben](docs/build-output-retention.md) beachten:
+[Builddaten und Testartefakte](docs/build-output-retention.md) beachten:
 unnötige neue Target-Bäume vermeiden, Ausgaben begrenzen und entbehrliche
 Zwischenprodukte nach Abnahme aufräumen.
 
@@ -243,11 +243,10 @@ Kopie in `/Applications` — atomar, über einen Staging-Pfad daneben. `./releas
 packt daraus das DMG (Modus `macos-release`) und installiert nie; auch dort
 bekommt zuerst die App ihr Ticket, dann das Image.
 
-`tools/tests/test_fleet_rules.py` (läuft im Gate `test-tools`) hält beides an der Quelle
-fest: das Ticket vor dem ersten Schreiben ins Installationsverzeichnis, und keinen
-absoluten Build-Mac-Pfad im ausgelieferten Bundle. Diese Prüfungen nie dadurch
-„belegen“, dass man `./install` oder `./release` als Test aufruft. Die Skripte
-ersetzen die installierte App beziehungsweise reichen eine Apple-Notarisierung ein.
+`tools/tests/test_install_transaction.py` prüft die Installation in einem
+temporären Ordner mit künstlichen Prüfprogrammen. `tools/tests/test_macos_build_contract.py`
+prüft Build-Modus und Bundlepfade. Beide laufen in `test-tools`. `./install` und
+`./release` selbst sind Produktbefehle und verwenden echte Notarisierung.
 
 Das DMG wird dabei bewusst selbst gepackt statt mit `tauri bundle --bundles dmg`:
 Der Tauri-Bundler signiert die App beim Packen neu und löscht sie danach aus
@@ -271,9 +270,8 @@ Journalversion migriert. Deshalb gilt:
 
 - Jeder CLI-Prozess in `cli/tests/cli_tests.rs` entsteht über `CliSandbox`. Die Sandbox
   setzt `--config-dir` in einen Wegwerfbaum, lenkt `HOME` und die XDG-Variablen dorthin
-  um und setzt die Sperrvariable. Der Test
-  `jeder_cli_start_bekommt_einen_isolierten_konfigurationsordner` hält das mechanisch
-  fest, indem er den eigenen Quelltext prüft.
+  um und setzt die Sperrvariable. Der Test `cli_sandbox_binds_configuration_and_user_paths`
+  prüft die erzeugten Argumente und Umgebungswerte.
 - `DOPPELDECKER_NO_DEFAULT_USER_PATHS` verbietet den stillen Rückfall auf die echten
   Nutzerpfade: Ein fehlendes `--config-dir` oder `--audit` scheitert dann sichtbar mit
   `invalid_input`, statt fremde Daten zu berühren. `.cargo/config.toml` setzt die

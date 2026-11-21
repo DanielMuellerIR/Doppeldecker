@@ -10,9 +10,9 @@ use doppeldecker_core::{
 use tauri::{Manager, WebviewWindow};
 
 use crate::{
-    app_config_dir, emit_queue_snapshot, enqueue_operation_with_readback, operation_queue,
-    sandbox_root, start_queue_worker, with_queue_extension, with_reserved_operation, AppError,
-    AppState, MutexExt,
+    app_config_dir, emit_queue_snapshot, operation_queue, sandbox_root, start_queue_worker,
+    with_queue_extension, with_queue_extension_access, with_reserved_operation, AppError, AppState,
+    MutexExt,
 };
 
 pub(crate) struct LocalSyncPreparation {
@@ -77,6 +77,11 @@ fn check_confirmation(prepared: &PreparedLocalSyncRun, confirmed: bool) -> Resul
     Ok(())
 }
 
+// RealRunPreview wird auch für andere Modi serialisiert. Nur diese Antwort ist
+// die Vorschau für den gewöhnlichen lokalen Start.
+pub(crate) type LocalSyncPreview = RealRunPreview;
+pub(crate) type LocalSyncPreparationDigest = [u8; 32];
+
 #[tauri::command]
 pub(crate) async fn prepare_local_sync(
     app: tauri::AppHandle,
@@ -84,7 +89,7 @@ pub(crate) async fn prepare_local_sync(
     source: String,
     target: String,
     options: SyncOptions,
-) -> Result<RealRunPreview, AppError> {
+) -> Result<LocalSyncPreview, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let label = window.label();
@@ -139,14 +144,14 @@ pub(crate) async fn discard_local_sync(
 pub(crate) async fn enqueue_local_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    preparation_digest: [u8; 32],
+    preparation_digest: LocalSyncPreparationDigest,
     replacements_confirmed: bool,
 ) -> Result<String, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let label = window.label();
         let window_state = state.window(label);
-        let (queue, entry) = with_queue_extension(&state, &window_state, || {
+        let (queue, entry) = with_queue_extension_access(&state, &window_state, |extension| {
             let mut pending = window_state.pending_local_sync.lock_recover();
             let preparation = pending.preparation.as_ref().ok_or_else(|| {
                 AppError::new(
@@ -183,8 +188,7 @@ pub(crate) async fn enqueue_local_sync(
             // Den RAM-Beleg unter derselben Transaktion vor dem Workerstart ablegen.
             // Ein fehlgeschlagener Journalcommit lässt die Vorbereitung erhalten.
             let mut runs = window_state.local_sync_runs.lock_recover();
-            let (queue, entry) =
-                enqueue_operation_with_readback(&app, &window_state, label, &operation)?;
+            let (queue, entry) = extension.enqueue_with_readback(&app, label, &operation)?;
             let prepared = pending
                 .preparation
                 .take()
@@ -212,7 +216,7 @@ pub(crate) async fn local_sync_queue_preview(
     app: tauri::AppHandle,
     window: WebviewWindow,
     operation_id: String,
-) -> Result<RealRunPreview, AppError> {
+) -> Result<LocalSyncPreview, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         state
@@ -237,7 +241,7 @@ pub(crate) async fn approve_local_sync_queue_entry(
     app: tauri::AppHandle,
     window: WebviewWindow,
     operation_id: String,
-    preparation_digest: [u8; 32],
+    preparation_digest: LocalSyncPreparationDigest,
     replacements_confirmed: bool,
 ) -> Result<FrontendQueueSnapshot, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -341,6 +345,105 @@ fn core_error(error: AppError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_sync_plan_and_preparation_match_the_browser_wire_fixture() {
+        use doppeldecker_core::{
+            real_mode::LocalSyncExecution, vfs::FileCommitClass, Action, ListingProof,
+            LocalMountIdentity, LocalRootIdentity, RealRunImpact, RootIdentity, SyncPlan,
+        };
+
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/local-sync-wire.json")).unwrap();
+        let options: SyncOptions =
+            serde_json::from_value(wire["request"]["options"].clone()).unwrap();
+        assert_eq!(options, SyncOptions::default());
+        let plan = SyncPlan {
+            actions: vec![Action::CopyFile {
+                path: "Planbeleg.txt".into(),
+                size: 12,
+                source_mtime: Some(1),
+                source_mode: Some(420),
+                source_hash: None,
+                metadata: None,
+            }],
+            copy_count: 1,
+            source_count: 1,
+            bytes_to_transfer: 12,
+            ..SyncPlan::default()
+        };
+        assert_eq!(serde_json::to_value(&plan).unwrap(), wire["plan"]);
+        assert_eq!(
+            serde_json::from_value::<SyncPlan>(wire["plan"].clone()).unwrap(),
+            plan
+        );
+
+        let identity = |path: &str, inode| {
+            RootIdentity::Local(LocalRootIdentity {
+                device: 1,
+                inode,
+                is_directory: true,
+                display_path: path.into(),
+                mount: LocalMountIdentity {
+                    mount_id: 42,
+                    unique_mount_id: true,
+                    fsid: vec![1, 2, 3, 4],
+                    volume_id: Some([7; 16]),
+                    fs_type: "mockfs".into(),
+                    mount_flags: 0,
+                },
+            })
+        };
+        let listing = |root_identity, entries_seen, digest| ListingProof {
+            root_identity,
+            directories_started: 1,
+            directories_completed: 1,
+            entries_seen,
+            listing_digest: [digest; 32],
+            provider_token: None,
+            errors: Vec::new(),
+            complete: true,
+        };
+        let source_identity = identity("/mock/quelle", 10);
+        let target_identity = identity("/mock/ziel", 11);
+        let preview = LocalSyncPreview {
+            source_listing: listing(source_identity.clone(), 1, 3),
+            target_listing: listing(target_identity.clone(), 0, 4),
+            source_identity,
+            target_identity,
+            quarantine_identity: identity("/mock/.doppeldecker-quarantine", 12),
+            plan,
+            options,
+            impact: RealRunImpact {
+                new_files: 1,
+                new_bytes: 12,
+                required_available_bytes: 4108,
+                available_bytes: 1_000_000,
+                available_bytes_known: true,
+                ..RealRunImpact::default()
+            },
+            plan_digest: [23; 32],
+            confirmation_phrase: "REAL ziel ABC123".into(),
+            scope_warnings: vec!["Künstlicher Bereichshinweis".into()],
+            prepared_at_unix_ms: 42,
+            expires_at_unix_ms: 600_042,
+            restore_probe_ok: false,
+            backup_confirmation_required: false,
+            provider_capabilities: None,
+            local_execution: Some(LocalSyncExecution {
+                new_file_commit: FileCommitClass::Assured,
+                file_flush: true,
+                directory_flush: true,
+                irreversible_replacements: 0,
+            }),
+        };
+        let mut expected = wire["preview"].clone();
+        expected["plan"] = wire["plan"].clone();
+        assert_eq!(serde_json::to_value(&preview).unwrap(), expected);
+        let digest: LocalSyncPreparationDigest =
+            serde_json::from_value(expected["plan_digest"].clone()).unwrap();
+        assert_eq!(digest, preview.plan_digest);
+    }
 
     #[test]
     fn verworfene_lokale_vorbereitung_kann_keinen_neueren_slot_ersetzen() {

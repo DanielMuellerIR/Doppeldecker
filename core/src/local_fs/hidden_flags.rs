@@ -73,6 +73,8 @@ pub(crate) fn edit_visibility_beneath(
     }
     // UF_HIDDEN bildet auch die alte FinderInfo-Unsichtbarkeit ab. Der Kernel
     // entfernt dort nötigenfalls das Unsichtbarkeitsbit; andere Attribute bleiben erhalten.
+    // SAFETY: Der gehaltene FD bleibt offen. fchflags erhält die Flagmaske
+    // als Wert und übernimmt den Deskriptor nicht.
     if unsafe { libc::fchflags(fd.as_raw_fd(), desired) } != 0 {
         let error = io::Error::last_os_error();
         if matches!(

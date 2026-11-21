@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
+
+const batchWire = JSON.parse(await readFile(new URL("./batch-rename-wire.json", import.meta.url), "utf8"));
 
 const webdavNumberingLimitations = [
   "Genau ein bedingtes MOVE verwendet Overwrite: F für den Zielnamen und If-Match für die Quelle. Die Elternkette wird frisch geprüft und das Ergebnis unabhängig zurückgelesen, ohne künstliche Schreib- oder Löschprobe.",
@@ -27,14 +29,14 @@ async function mockBatch(page, config = {}) {
         const ownSequence = ++sequence;
         if (config.previewHold) await new Promise(resolve => { window.__FINISH_BATCH_PREVIEW__ = resolve; window.__BATCH_PREVIEW_HOLDS__.push(resolve); });
         if (config.remoteError) throw { code: "unsupported", message: "Remote-Stapel sind noch nicht umgesetzt" };
-        return { requestId: config.foreignPreview ? "foreign" : args.request.requestId, planId: config.distinctPlans ? "batch-" + ownSequence : "batch-one", rows, ...transport };
+        return { requestId: config.foreignPreview ? "foreign" : args.request.requestId, planId: config.distinctPlans ? "batch-" + ownSequence : "batch-one", rows, limitations: [], ...transport };
       }
       if (command === "execute_batch_rename") {
         if (config.executeHold) await new Promise(resolve => { window.__FINISH_BATCH_EXECUTE__ = resolve; });
         if (config.executeError) throw { code: "outcome_unclear", message: "Die erste Einzelwirkung kann bereits ausgeführt sein" };
-        if (config.report) return { ...config.report, ...transport };
+        if (config.report) return { partiallyRenamed: 0, ...config.report, ...transport };
         const cancelled = config.executeHold;
-        return { ...transport, rows: rows.map((row, index) => ({ ...row, status: cancelled ? "cancelled" : index ? "blocked" : "renamed", message: cancelled ? "Vor Wirkung abgebrochen" : index ? row.message : "Umbenannt" })), renamed: cancelled ? 0 : 1, failedUnchanged: 0, outcomeUnclear: 0, cancelled: cancelled ? 2 : 0 };
+        return { ...transport, rows: rows.map((row, index) => ({ ...row, status: cancelled ? "cancelled" : index ? "blocked" : "renamed", message: cancelled ? "Vor Wirkung abgebrochen" : index ? row.message : "Umbenannt" })), renamed: cancelled ? 0 : 1, partiallyRenamed: 0, failedUnchanged: 0, outcomeUnclear: 0, cancelled: cancelled ? 2 : 0 };
       }
       if (command === "cancel_batch_rename") { window.__FINISH_BATCH_EXECUTE__?.(); return true; }
       return null;
@@ -218,6 +220,24 @@ export async function runBatchRenameCases(runCase) {
     const request = await page.evaluate(() => window.__BATCH_CALLS__.find(call => call.command === "prepare_batch_rename").args.request);
     assert.deepEqual(request.names, ["Alpha.txt", "Beta.txt"]);
     assert.equal(Object.hasOwn(request.options, "numbering"), false);
+    await page.keyboard.press("Escape");
+  });
+  await runCase("Stapelumbenennen · IPC-Vertrag für Vorschau und Bilanz", "?keyboard=1", async page => {
+    await mockBatch(page, { rows: batchWire.preview.rows, report: batchWire.report });
+    const { dialog } = await openBatch(page);
+    await dialog.getByLabel("Präfix", { exact: true }).fill(batchWire.request.options.prefix);
+    await dialog.getByRole("checkbox", { name: "Nummerierung verwenden", exact: true }).check();
+    await dialog.getByRole("button", { name: "Vorschau erstellen", exact: true }).click();
+    const execute = dialog.getByRole("button", { name: "2 Einträge umbenennen", exact: true });
+    await execute.waitFor();
+    const request = await page.evaluate(() => window.__BATCH_CALLS__.find(call => call.command === "prepare_batch_rename").args.request);
+    assert.match(request.requestId, /^[0-9a-f-]{36}$/);
+    assert.equal(request.endpoint.provider, batchWire.request.endpoint.provider);
+    assert.deepEqual(request.names, batchWire.request.names);
+    assert.deepEqual(request.options, batchWire.request.options);
+    await execute.click();
+    await dialog.getByText(/^2 umbenannt · 0 teilweise umbenannt/).waitFor();
+    assert.equal(await dialog.getByText(batchWire.report.rows[1].newName, { exact: true }).count(), 1);
     await page.keyboard.press("Escape");
   });
   for (const theme of ["light", "dark"]) for (const width of [1180, 390]) {

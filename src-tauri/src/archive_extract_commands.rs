@@ -1,7 +1,7 @@
 //! Fenstergebundene Entpackvorbereitung; Bestandsbelege entstehen ausschließlich im Core.
 use crate::{
-    emit_queue_snapshot, enqueue_operation_with_readback, start_queue_worker, with_queue_extension,
-    AppError, AppState, MutexExt,
+    emit_queue_snapshot, start_queue_worker, with_queue_extension_access, AppError, AppState,
+    MutexExt,
 };
 use doppeldecker_core::archive_extract::{
     ArchiveExtractBinding, ArchiveExtractOptions, ArchiveExtractRequest, PreparedArchiveExtract,
@@ -123,7 +123,7 @@ impl ArchiveExtractCache {
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ArchiveRequest {
+pub(crate) struct ArchiveExtractPrepareRequest {
     request_id: String,
     provider: String,
     root: String,
@@ -134,7 +134,7 @@ pub(crate) struct ArchiveRequest {
 }
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ArchivePreview {
+pub(crate) struct ArchiveExtractPrepared {
     request_id: String,
     preparation_id: String,
     binding: ArchiveExtractBinding,
@@ -146,8 +146,8 @@ pub(crate) struct ArchivePreview {
 pub(crate) async fn prepare_archive_extract(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    request: ArchiveRequest,
-) -> Result<ArchivePreview, AppError> {
+    request: ArchiveExtractPrepareRequest,
+) -> Result<ArchiveExtractPrepared, AppError> {
     if request.provider != "local" {
         return Err(AppError::new("unsupported", "Entfernte Archive zuerst in der Archivansicht öffnen; Entpacken verwendet deren geladene Momentaufnahme."));
     }
@@ -207,7 +207,7 @@ pub(crate) async fn prepare_archive_extract(
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ArchiveSelectionRequest {
+pub(crate) struct ArchiveExtractSelectionPrepareRequest {
     request_id: String,
     session_id: String,
     entry_id: Option<String>,
@@ -220,8 +220,8 @@ pub(crate) struct ArchiveSelectionRequest {
 pub(crate) async fn prepare_archive_extract_selection(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    request: ArchiveSelectionRequest,
-) -> Result<ArchivePreview, AppError> {
+    request: ArchiveExtractSelectionPrepareRequest,
+) -> Result<ArchiveExtractPrepared, AppError> {
     crate::archive_upload_commands::validate_target(
         &request.target_provider,
         &request.target_dir,
@@ -294,7 +294,7 @@ fn publish_prepared(
     intent: ArchiveExtractRequest,
     held: PreparedArchiveExtract,
     upload: Option<crate::archive_upload_commands::ArchiveUploadTarget>,
-) -> Result<ArchivePreview, AppError> {
+) -> Result<ArchiveExtractPrepared, AppError> {
     let binding = held.binding()?;
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).map_err(|error| AppError::new("app", error.to_string()))?;
@@ -302,7 +302,7 @@ fn publish_prepared(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let preview = ArchivePreview {
+    let preview = ArchiveExtractPrepared {
         request_id: request_id.clone(),
         preparation_id: id.clone(),
         binding: binding.clone(),
@@ -367,7 +367,7 @@ pub(crate) async fn confirm_archive_extract(
             .held
             .with_options(request.options.clone(), &cancel)?;
         let binding = held.binding()?;
-        let (queue, entry) = with_queue_extension(&state, &owner, || {
+        let (queue, entry) = with_queue_extension_access(&state, &owner, |extension| {
             let mut cache = owner.archive_extract_preparation.lock_recover();
             cache.check_generation(generation)?;
             let result = if let Some(upload) = &pending.upload {
@@ -378,9 +378,8 @@ pub(crate) async fn confirm_archive_extract(
                         expected: Box::new(binding),
                     },
                 );
-                crate::queue_runtime::enqueue_operation_with_profile_bindings(
+                extension.enqueue_with_profile_bindings(
                     &app,
-                    &owner,
                     label,
                     &operation,
                     &upload.profiles,
@@ -390,7 +389,7 @@ pub(crate) async fn confirm_archive_extract(
                     request: Box::new(request),
                     expected: Box::new(binding),
                 };
-                enqueue_operation_with_readback(&app, &owner, label, &operation)?
+                extension.enqueue_with_readback(&app, label, &operation)?
             };
             cache.preparing = None;
             Ok(result)
@@ -418,14 +417,91 @@ pub(crate) fn discard_archive_extract(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn archive_extract_wire_fixture() -> serde_json::Value {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/archive-mutation-wire.json"))
+                .unwrap();
+        fixture["extract"].clone()
+    }
+
+    #[test]
+    fn archive_extract_responses_match_the_browser_wire_fixture() {
+        use doppeldecker_core::{
+            archive_extract::{
+                ArchiveExtractPreview, ArchiveExtractSelection, ArchiveSnapshotSource,
+            },
+            vfs::FileCommitClass,
+        };
+
+        let snapshot = ArchiveSnapshotSource {
+            reference: serde_json::from_value(serde_json::json!({
+                "id": "snapshot-0123456789abcdef0123456789abcdef",
+                "manifest_digest": vec![3; 32],
+                "bytes": 128,
+                "blake3": "1".repeat(64),
+                "created_unix_ms": 42
+            }))
+            .unwrap(),
+            origin: "SFTP · /entfernt/Archiv.zip".into(),
+            profile: doppeldecker_core::RemoteProfileBinding::new(
+                doppeldecker_core::RemoteProfileProtocol::Sftp,
+                "artificial-profile",
+                17,
+            )
+            .unwrap(),
+        };
+        let response = ArchiveExtractPrepared {
+            request_id: "extract-selection-request".into(),
+            preparation_id: "extract-preparation-1".into(),
+            binding: ArchiveExtractBinding {
+                digest: [7; 32],
+                preview: ArchiveExtractPreview {
+                    source_root: PathBuf::new(),
+                    source_path: PathBuf::new(),
+                    snapshot: Some(snapshot),
+                    format: Default::default(),
+                    target_dir: "/private/artificial-extract/content".into(),
+                    selection: ArchiveExtractSelection::Entry {
+                        ordinal: 0,
+                        raw_name: b"A/B/nested.txt".to_vec(),
+                    },
+                    relative_root: "nested.txt".into(),
+                    selection_path: "A/B/nested.txt".into(),
+                    catalog_complete: true,
+                    known_entries: 1,
+                    files: 1,
+                    directories: 0,
+                    source_bytes: 9,
+                    omitted_entries: 0,
+                    issues: vec![],
+                    conflicts: vec![],
+                    type_conflicts: vec![],
+                    conflict_details: vec![],
+                    commit_class: FileCommitClass::Assured,
+                    replace_best_effort: false,
+                    file_flush: true,
+                    directory_flush: true,
+                },
+            },
+            upload_target: Some("FTPS · example.invalid:21 · /remote/Entpackziel".into()),
+            upload_notice: None,
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            archive_extract_wire_fixture()["response"]
+        );
+    }
+
     #[test]
     fn auswahl_request_akzeptiert_camelcase_aber_keine_frontend_quellpfade() {
-        let json = serde_json::json!({"requestId":"request", "sessionId":"session", "entryId":"entry", "targetProvider":"local", "targetDir":"/artificial/target"});
-        let request: ArchiveSelectionRequest = serde_json::from_value(json.clone()).unwrap();
-        assert_eq!(request.entry_id.as_deref(), Some("entry"));
+        let json = archive_extract_wire_fixture()["selectionRequest"].clone();
+        let request: ArchiveExtractSelectionPrepareRequest =
+            serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(request.entry_id.as_deref(), Some("virtual-entry"));
+        assert_eq!(request.target.unwrap().root(), request.target_dir);
         let mut injected = json;
         injected["sourcePath"] = serde_json::json!("/other/archive.zip");
-        assert!(serde_json::from_value::<ArchiveSelectionRequest>(injected).is_err());
+        assert!(serde_json::from_value::<ArchiveExtractSelectionPrepareRequest>(injected).is_err());
     }
     fn pending(id: &str, request_id: &str) -> (tempfile::TempDir, Pending) {
         let temp = tempfile::tempdir().unwrap();
@@ -507,12 +583,13 @@ mod tests {
     }
     #[test]
     fn extract_request_uses_camel_case_and_rejects_client_proofs_and_policy() {
-        let request = serde_json::json!({"requestId":"request-a","provider":"local","root":"/source","sourcePath":"/source/a.zip","targetProvider":"local","targetDir":"/target"});
-        assert!(serde_json::from_value::<ArchiveRequest>(request.clone()).is_ok());
+        let request = archive_extract_wire_fixture()["request"].clone();
+        let parsed: ArchiveExtractPrepareRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(parsed.target.unwrap().root(), parsed.target_dir);
         for field in ["digest", "overwrite", "allowPartial", "binding"] {
             let mut forged = request.clone();
             forged[field] = serde_json::json!(true);
-            assert!(serde_json::from_value::<ArchiveRequest>(forged).is_err());
+            assert!(serde_json::from_value::<ArchiveExtractPrepareRequest>(forged).is_err());
         }
     }
 }

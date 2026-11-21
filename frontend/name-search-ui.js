@@ -1,6 +1,7 @@
 // Namenssuche besitzt einen eigenen Modal-Lease und eigene Lauf-Token. Treffer
 // sind Navigationsziele aus dem Backend, keine Ausführungsbelege für Dateiaktionen.
-import { invoke, listen } from "./tauri-api.js";
+import { listen } from "./tauri-api.js";
+import { cancelNameSearch, startNameSearch } from "./name-search-api.js";
 import { cancelOwnedModal, showOwnedModal } from "./modal.js";
 import { $, escapeHtml, errText } from "./ui-utils.js";
 
@@ -29,7 +30,7 @@ export function createNameSearchUi({ panes, endpoint, revealHit, activate }) {
     context.cancelling = true;
     const clientToken = context.clientToken;
     renderStatus(context);
-    void invoke("cancel_name_search", { clientToken }).catch(error => {
+    void cancelNameSearch(clientToken).catch(error => {
       if (current !== context || context.clientToken !== clientToken) return;
       context.error = `Abbruch konnte nicht übermittelt werden: ${errText(error)}`;
       renderStatus(context);
@@ -164,19 +165,19 @@ export function createNameSearchUi({ panes, endpoint, revealHit, activate }) {
         renderStatus(context);
         return;
       }
-      const started = await invoke("start_name_search", { request: {
+      const started = await startNameSearch({
         side: context.side, endpoint: context.endpoint, sessionGeneration: context.sessionGeneration,
         clientToken, options: { query, caseSensitive: context.caseInput.checked,
           includeHidden: context.hiddenInput.checked },
-      } });
+      });
       // Events können vor der Startantwort eintreffen. Sie besitzen bereits das
       // Clienttoken und dürfen durch die späte Antwort nicht zurückgesetzt werden.
       if (current !== context || context.clientToken !== clientToken) {
-        void invoke("cancel_name_search", { clientToken });
+        void cancelNameSearch(clientToken);
         return;
       }
       context.runId = started.run_id;
-      if (context.cancelling) void invoke("cancel_name_search", { clientToken: context.clientToken });
+      if (context.cancelling) void cancelNameSearch(context.clientToken);
     } catch (error) {
       if (current !== context || context.clientToken !== clientToken) return;
       context.running = false;

@@ -1,14 +1,37 @@
-import { invoke } from "./tauri-api.js";
-import { $, escapeHtml, isEntryNameSafe } from "./ui-utils.js";
+// @ts-check
+
+import { editFileFlag, readFileFlags } from "./file-property-api.js";
+import { $, errText, escapeHtml, isEntryNameSafe } from "./ui-utils.js";
+/** @typedef {import("./file-information.js").FilePropertySnapshot} FilePropertySnapshot */
+/** @typedef {import("./file-property-wire.js").FileFlagKind} FileFlagKind */
+/** @typedef {import("./file-property-wire.js").FileFlagRowWire} FileFlagRowWire */
+/** @typedef {"locked" | "extension"} FlagEditorId */
+/** @typedef {FilePropertySnapshot
+ * & Partial<Record<`${FlagEditorId}Rows`, FileFlagRowWire[]>>
+ * & Partial<Record<`${FlagEditorId}ReadPage`, number>>
+ * & Partial<Record<`${FlagEditorId}Reading`, boolean>>
+ * & Partial<Record<`${FlagEditorId}${"ReadStatus" | "Status"}`, string>>} EditorSnapshot */
+/** @typedef {import("./file-information.js").FilePropertyEditorCallbacks<
+ * EditorSnapshot, {kind: FileFlagKind, enabled: boolean},
+ * import("./file-property-wire.js").FileFlagRowWire>
+ * & {id: FlagEditorId, kind: FileFlagKind, title: string, label: string, actionLabel: string, explanation: string}} EditorOptions */
+
 const PAGE_SIZE = 40;
 
+/** @param {EditorOptions} options */
 export function createFileFlagEditor({ id, kind, title, label, actionLabel, explanation, getCurrent, scopeMatches, isBusy, refresh, applyEdit }) {
   let generation = 0;
+  /** @param {EditorSnapshot} snapshot */
   const names = snapshot => snapshot.entries.filter(isEntryNameSafe).map(entry => entry.name);
+  /**
+   * @template {"Rows" | "ReadPage" | "Reading" | "ReadStatus" | "Status"} Suffix
+   * @param {Suffix} suffix
+   * @returns {`${FlagEditorId}${Suffix}`}
+   */
   const field = suffix => `${id}${suffix}`;
   function html() {
     const snapshot = getCurrent();
-    if (!snapshot.propertyCapabilities?.nativeFlags) return "";
+    if (!snapshot?.propertyCapabilities?.nativeFlags) return "";
     const selected = names(snapshot);
     if (!selected.length) return "";
     const rows = snapshot[field("Rows")] || [];
@@ -33,33 +56,46 @@ export function createFileFlagEditor({ id, kind, title, label, actionLabel, expl
     const selected = names(snapshot);
     if (!selected.length) return;
     const requestGeneration = ++generation;
-    snapshot[field("ReadPage")] = Math.max(0, Math.min(Math.ceil(selected.length / PAGE_SIZE) - 1, page));
+    const readPage = Math.max(0, Math.min(Math.ceil(selected.length / PAGE_SIZE) - 1, page));
+    snapshot[field("ReadPage")] = readPage;
     snapshot[field("Rows")] = []; snapshot[field("Reading")] = true;
     snapshot[field("ReadStatus")] = "Dateieigenschaft wird gelesen …"; refresh();
     try {
-      const rows = await invoke("get_file_flags", { request: { provider: snapshot.provider, root: snapshot.parent,
-        kind, names: selected.slice(snapshot[field("ReadPage")] * PAGE_SIZE, (snapshot[field("ReadPage")] + 1) * PAGE_SIZE) } });
+      const rows = await readFileFlags({ provider: snapshot.provider, root: snapshot.parent,
+        kind, names: selected.slice(readPage * PAGE_SIZE, (readPage + 1) * PAGE_SIZE) });
       if (getCurrent() !== snapshot || generation !== requestGeneration || !scopeMatches()) return;
       snapshot[field("Rows")] = rows; snapshot[field("ReadStatus")] = "";
     } catch (error) {
       if (getCurrent() !== snapshot || generation !== requestGeneration || !scopeMatches()) return;
-      snapshot[field("ReadStatus")] = error.message || String(error);
+      snapshot[field("ReadStatus")] = errText(error) || String(error);
     } finally {
       if (getCurrent() === snapshot && generation === requestGeneration) { snapshot[field("Reading")] = false; refresh(); }
     }
   }
+  /** @param {boolean} enabled */
   async function change(enabled) {
     const snapshot = getCurrent();
-    const report = await applyEdit(id, "change_file_flag", { kind, enabled }, "Dateieigenschaft wird geändert … Abbruch bleibt möglich.");
+    if (!snapshot) return;
+    const report = await applyEdit(
+      id,
+      editFileFlag,
+      { kind, enabled },
+      "Dateieigenschaft wird geändert … Abbruch bleibt möglich.",
+    );
     if (report && getCurrent() === snapshot && scopeMatches()) await load(snapshot[field("ReadPage")] || 0);
   }
+  /** @param {Event} event */
   function click(event) {
+    if (!(event.target instanceof Element)) return false;
     const button = event.target.closest(`button[data-file-flag="${id}"]`);
-    if (!button) return false;
-    if (isBusy() || !scopeMatches()) return true;
-    if (button.hasAttribute("data-flag-page")) void load((getCurrent()[field("ReadPage")] || 0) + Number(button.dataset.flagPage));
-    else if (button.hasAttribute("data-flag-apply")) void change($(`#file-info-${id}`).checked);
-    else if (button.hasAttribute("data-flag-set")) void change(button.dataset.flagSet === "true");
+    if (!(button instanceof HTMLButtonElement)) return false;
+    const snapshot = getCurrent();
+    if (!snapshot || isBusy() || !scopeMatches()) return true;
+    if (button.hasAttribute("data-flag-page")) void load((snapshot[field("ReadPage")] || 0) + Number(button.dataset.flagPage));
+    else if (button.hasAttribute("data-flag-apply")) {
+      const input = $(`#file-info-${id}`);
+      if (input instanceof HTMLInputElement) void change(input.checked);
+    } else if (button.hasAttribute("data-flag-set")) void change(button.dataset.flagSet === "true");
     return true;
   }
   return { html, load, click };

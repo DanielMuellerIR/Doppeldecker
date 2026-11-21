@@ -23,6 +23,7 @@ command = pathlib.Path(sys.argv[0]).name
 with open(os.environ['EVENT_LOG'], 'a') as log:
     log.write(json.dumps([command, sys.argv[1:]]) + '\n')
 if command == 'pgrep': sys.exit(1)
+if command == 'mktemp': os.execv('/usr/bin/mktemp', ['mktemp', *sys.argv[1:]])
 if command == 'ditto':
     shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True)
     sys.exit(0)
@@ -79,7 +80,7 @@ class InstallTransactionTests(unittest.TestCase):
             (target / 'old').write_bytes(b'old version\0unchanged')
         bin_dir = root / 'bin'
         bin_dir.mkdir()
-        for command in ['xcrun', 'codesign', 'spctl', 'pgrep', 'ditto']:
+        for command in ['xcrun', 'codesign', 'spctl', 'pgrep', 'ditto', 'mktemp']:
             executable(bin_dir / command, FAKE)
         if faults.get('SIGNAL_SWAP'):
             # TERM trifft die wartende Shell, während der Helper noch läuft.
@@ -135,10 +136,13 @@ os.execv('/usr/bin/swift', ['swift', *sys.argv[1:]])
                 self.assertEqual((target / 'new').read_text(), 'new version')
                 self.assertIn('(7.8.9)', result.stdout)
                 self.assert_no_transactions(folder)
-                checks = [event for event in map(json.loads, log.read_text().splitlines()) if event[0] in ['xcrun', 'codesign', 'spctl']]
+                events = list(map(json.loads, log.read_text().splitlines()))
+                checks = [event for event in events if event[0] in ['xcrun', 'codesign', 'spctl']]
                 self.assertEqual(len(checks), 9)
                 self.assertTrue(all('Doppeldecker.app' == event[1][-1] for event in checks[:3]))
                 self.assertTrue(all('.Doppeldecker.install.' in event[1][-1] for event in checks[3:6]))
+                first_transaction = next(index for index, event in enumerate(events) if event[0] == 'mktemp')
+                self.assertTrue(all(events.index(check) < first_transaction for check in checks[:3]))
 
     def test_fremde_installationsreste_bleiben_bei_erfolg_erhalten(self):
         result, folder, _, _ = self.run_install(FOREIGN_REMAINDER='1')
@@ -146,10 +150,15 @@ os.execv('/usr/bin/swift', ['swift', *sys.argv[1:]])
         self.assertEqual((folder / '.Doppeldecker.install.foreign/keep').read_text(), 'foreign remainder')
 
     def test_quellpruefung_stoppt_vor_erstem_installationsschreiben(self):
-        result, folder, target, _ = self.run_install(FAIL_CHECK='source-xcrun')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual((target / 'old').read_bytes(), b'old version\0unchanged')
-        self.assert_no_transactions(folder)
+        for gate in ['xcrun', 'codesign', 'spctl']:
+            with self.subTest(gate=gate):
+                result, folder, target, log = self.run_install(FAIL_CHECK='source-' + gate)
+                events = list(map(json.loads, log.read_text().splitlines()))
+                self.assertIn(gate, [command for command, _ in events])
+                self.assertNotIn('mktemp', [command for command, _ in events])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((target / 'old').read_bytes(), b'old version\0unchanged')
+                self.assert_no_transactions(folder)
 
     def test_defekter_stagingstand_ersetzt_keine_vorhandene_app(self):
         result, folder, target, _ = self.run_install(FAIL_CHECK='staged-codesign')

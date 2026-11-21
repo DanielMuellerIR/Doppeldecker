@@ -7,7 +7,7 @@ use crate::bidirectional_commands::{
 use crate::frontend_payload::FrontendQueueSnapshot;
 use crate::{
     emit_queue_snapshot, operation_queue, start_queue_worker, with_queue_extension,
-    with_reserved_operation, AppError, AppState, MutexExt,
+    with_queue_extension_access, with_reserved_operation, AppError, AppState, MutexExt,
 };
 use doppeldecker_core::{
     Cancel, ContentSyncPreview, OperationQueue, PreparedContentSync, Progress, QueueEntry,
@@ -156,7 +156,7 @@ pub(crate) fn discard_content_sync(window: WebviewWindow, state: tauri::State<Ap
 pub(crate) async fn enqueue_content_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    preparation_digest: [u8; 32],
+    preparation_digest: ContentSyncPreparationDigest,
     effects_confirmed: bool,
     removal_phrase: Option<String>,
 ) -> Result<String, AppError> {
@@ -164,7 +164,7 @@ pub(crate) async fn enqueue_content_sync(
         let state = app.state::<AppState>();
         let label = window.label();
         let ws = state.window(label);
-        let (queue, id) = with_queue_extension(&state, &ws, || {
+        let (queue, id) = with_queue_extension_access(&state, &ws, |extension| {
             let mut slot = ws.pending_content_sync.lock_recover();
             let pending = slot
                 .as_ref()
@@ -181,9 +181,8 @@ pub(crate) async fn enqueue_content_sync(
                 removal_phrase.as_deref(),
             )?;
             let mut runs = ws.content_sync_runs.lock_recover();
-            let (queue, entry) = crate::queue_runtime::enqueue_operation_with_profile_bindings(
+            let (queue, entry) = extension.enqueue_with_profile_bindings(
                 &app,
-                &ws,
                 label,
                 &pending.operation,
                 &pending.profile_bindings,
@@ -238,12 +237,15 @@ fn check_confirmation(
     }
     Ok(())
 }
+pub(crate) type ContentSyncQueuePreview = ContentSyncPreview;
+pub(crate) type ContentSyncPreparationDigest = [u8; 32];
+
 #[tauri::command]
 pub(crate) fn content_sync_queue_preview(
     app: tauri::AppHandle,
     window: WebviewWindow,
     operation_id: String,
-) -> Result<ContentSyncPreview, AppError> {
+) -> Result<ContentSyncQueuePreview, AppError> {
     let state = app.state::<AppState>();
     let ws = state.window(window.label());
     let runs = ws.content_sync_runs.lock_recover();
@@ -261,7 +263,7 @@ pub(crate) fn approve_content_sync_queue_entry(
     app: tauri::AppHandle,
     window: WebviewWindow,
     operation_id: String,
-    preparation_digest: [u8; 32],
+    preparation_digest: ContentSyncPreparationDigest,
     effects_confirmed: bool,
     removal_phrase: Option<String>,
 ) -> Result<FrontendQueueSnapshot, AppError> {
@@ -439,6 +441,107 @@ pub(crate) fn queue_endpoint_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn real_mode_previews_match_browser_wire_fixture() {
+        use doppeldecker_core::{
+            sync::SyncExecutionClass, ProviderKind, RealRunPreview, RootIdentity, SftpHostKeyPin,
+            SftpRootIdentity, SftpServerIdentity, SyncPlan,
+        };
+
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/real-mode-wire.json")).unwrap();
+        let local: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/local-sync-wire.json")).unwrap();
+        let content = &wire["content"];
+        let request: PrepareContentSyncRequest =
+            serde_json::from_value(content["request"].clone()).unwrap();
+        assert_eq!(request.source.provider_kind(), ProviderKind::Sftp);
+        assert_eq!(request.target.provider_kind(), ProviderKind::Local);
+        assert_eq!(request.options, SyncOptions::default());
+        let plan: SyncPlan = serde_json::from_value(local["plan"].clone()).unwrap();
+        let target_identity: RootIdentity =
+            serde_json::from_value(local["preview"]["target_identity"].clone()).unwrap();
+        let digest: ContentSyncPreparationDigest = [31; 32];
+        let preview = ContentSyncPreview {
+            execution_class: SyncExecutionClass::BestEffort,
+            source_root: "/".into(),
+            target_root: "/mock/ziel".into(),
+            source_provider: ProviderKind::Sftp,
+            source_identity: RootIdentity::Sftp(SftpRootIdentity {
+                server: SftpServerIdentity {
+                    host: "sftp.example.invalid".into(),
+                    port: 22,
+                    host_key: SftpHostKeyPin {
+                        algorithm: "ssh-ed25519".into(),
+                        sha256: [9; 32],
+                    },
+                    canonical_root: "/daten".into(),
+                    sftp_version: 3,
+                    extensions_digest: [6; 32],
+                },
+                virtual_root: "/".into(),
+                session_generation: 1,
+            }),
+            target_identity: target_identity.clone(),
+            target_provider: ProviderKind::Local,
+            options: request.options,
+            plan: plan.clone(),
+            digest,
+            expires_unix_ms: 4_102_444_800_000,
+            limitations: vec!["Künstlicher Hinweis für den gebundenen Dateisync.".into()],
+            quarantined_replacements: 0,
+            quarantined_removals: 0,
+            quarantine_run: None,
+            restore_probe_ok: false,
+            local_execution: None,
+            irreversible_replacements: 0,
+            irreversible_removals: 0,
+            irreversible_removal_bytes: 0,
+            blocked_removals: 0,
+            removal_confirmation: None,
+            directory_stream_effects: Vec::new(),
+            directory_dacl_effects: Vec::new(),
+            file_dacl_effects: Vec::new(),
+            created_directory_dacl_effects: Vec::new(),
+            created_directory_before_children_effects: Vec::new(),
+        };
+        let mut expected_content = content["preview"].clone();
+        expected_content["target_identity"] = local["preview"]["target_identity"].clone();
+        expected_content["plan"] = local["plan"].clone();
+        assert_eq!(serde_json::to_value(preview).unwrap(), expected_content);
+
+        let normal = &local["preview"];
+        let mut expected_legacy = normal.clone();
+        expected_legacy["plan"] = local["plan"].clone();
+        expected_legacy["prepared_at_unix_ms"] = wire["legacy"]["prepared_at_unix_ms"].clone();
+        expected_legacy["expires_at_unix_ms"] = wire["legacy"]["expires_at_unix_ms"].clone();
+        expected_legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("local_execution");
+        let legacy = RealRunPreview {
+            source_identity: serde_json::from_value(normal["source_identity"].clone()).unwrap(),
+            target_identity,
+            quarantine_identity: serde_json::from_value(normal["quarantine_identity"].clone())
+                .unwrap(),
+            source_listing: serde_json::from_value(normal["source_listing"].clone()).unwrap(),
+            target_listing: serde_json::from_value(normal["target_listing"].clone()).unwrap(),
+            plan,
+            options: SyncOptions::default(),
+            impact: serde_json::from_value(normal["impact"].clone()).unwrap(),
+            plan_digest: [23; 32],
+            confirmation_phrase: "REAL ziel ABC123".into(),
+            scope_warnings: vec!["Künstlicher Bereichshinweis".into()],
+            prepared_at_unix_ms: 4_102_444_200_000,
+            expires_at_unix_ms: 4_102_444_800_000,
+            restore_probe_ok: false,
+            backup_confirmation_required: false,
+            provider_capabilities: None,
+            local_execution: None,
+        };
+        assert_eq!(serde_json::to_value(legacy).unwrap(), expected_legacy);
+    }
+
     #[test]
     fn frontend_request_akzeptiert_profilrevision_und_sync_optionen() {
         let request: PrepareContentSyncRequest = serde_json::from_value(serde_json::json!({

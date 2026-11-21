@@ -4,9 +4,10 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { chromium } from "playwright";
 import { createBrowserCleanup } from "../browser-cleanup.mjs";
+const archiveWire = JSON.parse(await readFile(new URL("./archive-read-wire.json", import.meta.url)));
 const probe = createServer(); probe.listen(0,"127.0.0.1"); await once(probe,"listening"); const port=probe.address().port;probe.close();await once(probe,"close");
 const server=spawn("python3",["tools/mock-ui-server.py","--port",String(port)],{cwd:new URL("../..",import.meta.url),stdio:["ignore","ignore","pipe"]});
 // Das HTTP-Zugriffslog darf den Server bei vielen Szenarien nicht am vollen Pipepuffer blockieren.
@@ -18,7 +19,11 @@ const mock=`
  const original=window.__TAURI__.core.invoke;
  window.__ARCHIVE_CALLS__=[];window.__ARCHIVE_CONFIG__={};window.__ARCHIVE_HOLDS__={open:[],preview:[],list:[]};window.__ARCHIVE_ACTIVE__=0;window.__ARCHIVE_MAX_ACTIVE__=0;
  let sequence=0;
- const row=(rowId,displayName,extra={})=>({rowId,displayName,kind:'file',entryId:rowId,uncompressedBytes:24,duplicateName:false,issues:[],canPreview:true,...extra});
+ const row=(rowId,displayName,extra={})=>{
+  const value={rowId,displayName,kind:'file',entryId:rowId,uncompressedBytes:24,duplicateName:false,issues:[],canPreview:true,...extra};
+  if(value.kind==='directory'){delete value.entryId;delete value.uncompressedBytes;}
+  return value;
+ };
  const issue=(rowId,displayName,message)=>row(rowId,displayName,{kind:'problem',canPreview:false,issues:[{code:'unsupported_type',message}]});
  const roots=()=>[
   row('text','Text.txt'),row('dup1','dup.txt',{duplicateName:true}),row('dup2','dup.txt',{duplicateName:true}),
@@ -29,11 +34,23 @@ const mock=`
   issue('raw','Rohbytes: FF 6E 61 6D 65','Ungültiges UTF-8; Originalbytes bleiben erhalten.'),
   issue('unsafe','../außerhalb.txt','Unsicherer Archivpfad; kein Inhaltslesen.'),
   issue('link','link/','Symlink oder nicht unterstützter Typ.'),
-  row('synthetic-a','a',{entryId:null,kind:'directory',directoryId:'a',canPreview:false}),
+  row('synthetic-a','a',{kind:'directory',directoryId:'a',canPreview:false}),
   row('nfd','e\\u0301.txt'),row('image','Bild.png'),row('html','Seite.html'),row('svg','Bild.svg'),row('unsupported','Groß.bin')
  ];
  window.__ARCHIVE_LISTING__=(sessionId,directoryId,page)=>{
-  let rows=directoryId==='root'?roots():directoryId==='same-dir'?[row('child','child')]:directoryId==='a'?[row('synthetic-b','b',{entryId:null,kind:'directory',directoryId:'ab',canPreview:false})]:directoryId==='ab'?[row('deep-file','file')]:[];
+  if(window.__ARCHIVE_CONFIG__.wireContract){
+   const root=sessionId+':d0', folder=sessionId+':d1';
+   const rootPage=directoryId===root;
+   const breadcrumbs=[{directoryId:root,label:'ZIP-Inhalt'}];
+   if(!rootPage)breadcrumbs.push({directoryId:folder,label:'ordner'});
+   const rows=rootPage?[
+    {rowId:folder,directoryId:folder,displayName:'ordner',kind:'directory',duplicateName:false,canPreview:false,issues:[]},
+    row(sessionId+':e1','[ungültiges UTF-8: FF]',{kind:'problem',uncompressedBytes:1,canPreview:false,issues:[{code:'invalid_utf8',message:'Name enthält ungültige UTF-8-Bytes; keine Aktion verfügbar'}]}),
+   ]:[row(sessionId+':e0','info.txt',{uncompressedBytes:5})];
+   return {sessionId,directoryId,breadcrumbs,page,pageSize:100,totalRows:rows.length,rows,
+    catalog:{format:'zip',complete:true,entryCount:2,displayedEntryCount:2,problemCount:1}};
+  }
+  let rows=directoryId==='root'?roots():directoryId==='same-dir'?[row('child','child')]:directoryId==='a'?[row('synthetic-b','b',{kind:'directory',directoryId:'ab',canPreview:false})]:directoryId==='ab'?[row('deep-file','file')]:[];
   if(window.__ARCHIVE_CONFIG__.pages&&directoryId==='root')rows=Array.from({length:103},(_,i)=>row('page-'+i,'Datei-'+i+'.txt'));
   const crumbs=[{directoryId:'root',label:'Archiv'}];
   if(directoryId!=='root')crumbs.push({directoryId,label:directoryId==='same-dir'?'same/':directoryId});
@@ -45,10 +62,15 @@ const mock=`
   window.__ARCHIVE_CALLS__.push({command,args:structuredClone(args)});
   if(command==='cancel_archive_read'||command==='close_archive_read')return null;
   if(command==='open_archive_read'){
-   const sessionId='archive-session-'+(++sequence);await hold('open',args);
+   const number=++sequence;
+   const wireContract=window.__ARCHIVE_CONFIG__.wireContract;
+   const sessionId=wireContract?'archive-'+(number-1):'archive-session-'+number;
+   await hold('open',args);
    const remote=args.request.endpoint.provider!=='local';
    if(window.__ARCHIVE_CONFIG__.openError)throw {code:'invalid_data',message:'Kein lesbares ZIP-Zentralverzeichnis.'};
-   return {requestId:args.requestId,sessionId,canExtract:!window.__ARCHIVE_CONFIG__.denyExtract,canExtractFile:!window.__ARCHIVE_CONFIG__.denyExtract,origin:remote?(window.__ARCHIVE_CONFIG__.origin||'SFTP · '+args.request.path):null,listing:window.__ARCHIVE_LISTING__(sessionId,'root',0)};
+   const listing=window.__ARCHIVE_LISTING__(sessionId,wireContract?sessionId+':d0':'root',0);
+   if(window.__ARCHIVE_CONFIG__.unknownFormat)listing.catalog.format='rar';
+   return {requestId:args.requestId,sessionId,canExtract:!window.__ARCHIVE_CONFIG__.denyExtract,canExtractFile:!window.__ARCHIVE_CONFIG__.denyExtract,origin:remote?(window.__ARCHIVE_CONFIG__.origin||'SFTP · '+args.request.path):null,listing};
   }
   if(command==='list_archive_directory'){
    await hold('list',args);
@@ -64,6 +86,7 @@ const mock=`
    if(args.entryId==='html'||args.entryId==='svg')content={kind:'text',text:'<script>window.ARCHIVE_PWN=true</script><svg onload="window.ARCHIVE_PWN=true"></svg>'};
    if(args.entryId==='image')content={kind:'image',data_url:window.__ARCHIVE_CONFIG__.brokenImage?'data:image/png;base64,AAAA':'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aV1kAAAAASUVORK5CYII=',width:1,height:1};
    if(args.entryId==='unsupported')content={kind:'unsupported',reason:'Inhalt überschreitet die begrenzte Archivvorschau.'};
+   if(window.__ARCHIVE_CONFIG__.wireContract)return {requestId:args.requestId,sessionId:args.sessionId,entryId:args.entryId,preview:{bytes:5,content:{kind:'text',text:'Hallo'},limitations:[]}};
    return {requestId:args.requestId,sessionId:window.__ARCHIVE_CONFIG__.foreignPreview?'foreign':args.sessionId,entryId:window.__ARCHIVE_CONFIG__.foreignEntry?'foreign':args.entryId,preview:{bytes:24,content,limitations:[]}};
   }finally{window.__ARCHIVE_ACTIVE__--;}
  };
@@ -108,6 +131,44 @@ try {
   await tar.getByText(/Dateilänge und Archivquelle geprüft/).waitFor();
   assert.equal(await tar.getByRole('button',{name:/entpacken/}).count(),0);
   assert.equal(await page.evaluate(()=>window.__ARCHIVE_CALLS__[0].args.request.path),'/artificial/quelle/Archiv.tar');
+  await finish(page,errors);
+ });
+ await test('Öffnen, Ordnerliste und Vorschau entsprechen der Rust-Serialisierung', async () => {
+  const {page,errors}=await pageFor({config:{wireContract:true}});
+  await page.evaluate(() => {
+   const invoke=window.__TAURI__.core.invoke;
+   window.__ARCHIVE_WIRE_TRACE__=[];
+   window.__TAURI__.core.invoke=async (command,args) => {
+    const response=await invoke(command,args);
+    if(['open_archive_read','list_archive_directory','preview_archive_entry'].includes(command)){
+     window.__ARCHIVE_WIRE_TRACE__.push({command,args,response});
+    }
+    return response;
+   };
+  });
+  await open(page);
+  await ready(page);
+  await choose(page,'archive-0:d1');
+  await page.keyboard.press('Enter');
+  await dialog(page).locator('[data-row-id="archive-0:e0"]').waitFor();
+  await preview(page,'archive-0:e0');
+  await dialog(page).getByText('Hallo',{exact:true}).waitFor();
+  const [opened,listed,previewed]=await page.evaluate(()=>window.__ARCHIVE_WIRE_TRACE__);
+  assert.deepEqual(opened.args.request,archiveWire.request);
+  assert.deepEqual(opened.response,{...archiveWire.opened,requestId:opened.args.requestId});
+  assert.deepEqual(listed.args,{sessionId:archiveWire.listing.sessionId,directoryId:archiveWire.listing.directoryId,page:0});
+  assert.deepEqual(listed.response,archiveWire.listing);
+  assert.equal(previewed.args.entryId,archiveWire.previewed.entryId);
+  assert.deepEqual(previewed.response,{...archiveWire.previewed,requestId:previewed.args.requestId});
+  await finish(page,errors);
+ });
+ await test('Unbekanntes Archivformat verwirft die Sitzung und zeigt keine Zeilen', async () => {
+  const {page,errors}=await pageFor({config:{unknownFormat:true}});
+  await open(page);
+  await dialog(page).getByText(/Die Archivantwort passt nicht/).first().waitFor();
+  assert.equal(await list(page).getByRole('option').count(),0);
+  assert.equal(await page.evaluate(()=>window.__ARCHIVE_CALLS__.some(call=>
+   call.command==='close_archive_read'&&call.args.sessionId==='archive-session-1')),true);
   await finish(page,errors);
  });
  await test('Katalog, virtuelle und leere Ordner, explizite Duplikate und unverändertes NFD',async()=>{

@@ -533,12 +533,16 @@ fn percent_encode_path(path: &Path) -> String {
 }
 
 fn local_deletion_time() -> String {
+    // SAFETY: time erlaubt NULL, wenn die Sekunden nur als Rückgabewert
+    // gelesen werden und kein Ausgabezeiger benutzt wird.
     let now = unsafe { libc::time(std::ptr::null_mut()) };
+    // SAFETY: libc::tm enthält auf den unterstützten Plattformen Ganzzahlen
+    // und einen rohen Zeiger. Null ist für alle Felder eine gültige Bitfolge.
     let mut local: libc::tm = unsafe { std::mem::zeroed() };
-    // `localtime_r` schreibt ausschliesslich in unseren Stack-Puffer und ist im
-    // Gegensatz zu `localtime` threadsicher. Bei einem Plattformfehler bleibt eine
-    // gueltige, deutlich erkennbare Fallback-Zeit stehen.
-    if unsafe { libc::localtime_r(&now, &mut local) }.is_null() {
+    // SAFETY: now und local sind getrennte, gültige Stackwerte. localtime_r
+    // liest now und beschreibt nur den während des Aufrufs exklusiven Puffer.
+    let converted = unsafe { libc::localtime_r(&now, &mut local) };
+    if converted.is_null() {
         return "1970-01-01T00:00:00".into();
     }
     format!(
@@ -1252,7 +1256,9 @@ mod tests {
         std::fs::create_dir(&journal_dir).unwrap();
         let path = journal_dir.join("trash-fifo.json");
         let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // SAFETY: name hält den nullterminierten Pfad bis zur Rückkehr.
+        let created = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(created, 0);
         let report = recover_trash_journals(&journal_dir).unwrap();
         assert_eq!(report.errors.len(), 1);
         assert!(std::fs::symlink_metadata(path).is_ok());

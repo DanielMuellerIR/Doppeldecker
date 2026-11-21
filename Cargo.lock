@@ -1486,12 +1486,13 @@ dependencies = [
 
 [[package]]
 name = "doppeldecker"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "cc",
  "doppeldecker-core",
  "getrandom 0.3.4",
  "gtk",
+ "heck 0.5.0",
  "keyring",
  "libc",
  "objc2",
@@ -1499,8 +1500,10 @@ dependencies = [
  "objc2-core-services",
  "objc2-foundation",
  "plist",
+ "quote",
  "serde",
  "serde_json",
+ "syn 2.0.118",
  "tauri",
  "tauri-build",
  "tauri-plugin-updater",
@@ -1512,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "doppeldecker-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "blake3",
  "cc",
@@ -1532,7 +1535,7 @@ dependencies = [
 
 [[package]]
 name = "doppeldecker-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "blake3",
  "filetime",

@@ -88,8 +88,8 @@ pub(crate) fn set_copy_creation_time(
         tv_sec: time.seconds,
         tv_nsec: i64::from(time.nanoseconds),
     };
-    // Der Deskriptor bindet die Änderung an das geöffnete Objekt. fsetattrlist
-    // erwartet für genau ATTR_CMN_CRTIME einen einzelnen nativen timespec.
+    // SAFETY: Der FD bleibt offen, attrlist ist initialisiert und der Puffer
+    // enthält den nativen timespec, den ATTR_CMN_CRTIME bei dieser Länge erwartet.
     if unsafe {
         libc::fsetattrlist(
             fd.as_raw_fd(),

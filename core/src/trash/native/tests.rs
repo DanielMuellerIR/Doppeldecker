@@ -355,7 +355,7 @@ fn echtes_volume_layout_achtet_mount_ownership_und_erhaelt_trash_acl() {
     std::fs::write(&source, b"volume-original").unwrap();
     let expected = mount
         .join(".Trashes")
-        .join(unsafe { libc::geteuid() }.to_string());
+        .join(rustix::process::geteuid().as_raw().to_string());
     let trash = RootHandle::open_nofollow(&expected).unwrap();
     let trash_acl = if std::env::var_os("DOPPELDECKER_NATIVE_TRASH_EXPECT_REJECT").is_some() {
         None
@@ -411,7 +411,7 @@ fn mehrere_volumegruppen_werden_vor_dem_ersten_claim_vollstaendig_vorbereitet() 
             std::fs::read(
                 mount
                     .join(".Trashes")
-                    .join(unsafe { libc::geteuid() }.to_string())
+                    .join(rustix::process::geteuid().as_raw().to_string())
                     .join("native-second.txt")
             )
             .unwrap(),

@@ -1,11 +1,13 @@
-//! Additiver V6-Intent; alte Neighbor-V1–V5-Formate bleiben unverändert.
+//! Dauerhafte Belege für Änderungen an Datei-DACLs im Journalformat V6.
+//! Die Wiederaufnahme älterer dateinaher Staging-Belege nutzt weiterhin V1–V5.
 //! Jede Phase wird atomar und fsync-bestätigt gespeichert. Geschlossene Vollbelege
 //! liegen getrennt vom heißen Ledger und bleiben bis zum dauerhaften Queuecheckpoint.
+use crate::dacl_registry_io::{self, WritePolicy};
 use crate::file_dacl::{FileDaclPlan, FileDaclReport};
 use crate::local_fs::RootHandle;
 use crate::local_staging::StagingOwner;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -132,7 +134,7 @@ impl Intent {
             crate::atomic_file::sibling_candidate(&config.path().join("file-dacl-v6"), "intent")?;
         let name = format!(
             "{PREFIX}{}.json",
-            candidate.file_name().unwrap().to_string_lossy()
+            crate::dacl_registry_io::file_name(&candidate)?.to_string_lossy()
         );
         let path = config.path().join(name);
         // Lease und erste Ledgerregistrierung teilen denselben Registrylock.
@@ -142,7 +144,7 @@ impl Intent {
         let lease = File::from(
             rustix::fs::openat(
                 config.fd(),
-                lease_path(&path).file_name().unwrap(),
+                crate::dacl_registry_io::file_name(&lease_path(&path))?,
                 rustix::fs::OFlags::CREATE
                     | rustix::fs::OFlags::EXCL
                     | rustix::fs::OFlags::RDWR
@@ -253,13 +255,10 @@ fn registry_lock(config: &RootHandle) -> io::Result<File> {
     Ok(file)
 }
 
+const NAMESPACE_LOST: &str = "Datei-DACL-Registry verlor ihren privaten Namensraum";
+
 fn ensure(config: &RootHandle) -> io::Result<()> {
-    if !config.is_current()? || !config.has_exclusive_namespace()? {
-        return Err(io::Error::other(
-            "Datei-DACL-Registry verlor ihren privaten Namensraum",
-        ));
-    }
-    Ok(())
+    dacl_registry_io::ensure_private_namespace(config, NAMESPACE_LOST)
 }
 // Das heiße Ledger enthält keine abgeschlossene Vollplanhistorie. Die Zähler
 // bleiben monoton; eigene Beiträge stehen getrennt in privaten Ownerdateien.
@@ -372,74 +371,27 @@ fn closed_path(config: &RootHandle, owner: &StagingOwner, name: &str) -> io::Res
 fn valid_name(name: &str) -> bool {
     name.starts_with(PREFIX) && name.ends_with(".json") && !name.contains('/') && name != LEDGER
 }
-fn private_parent(config: &RootHandle, path: &Path) -> io::Result<()> {
-    let relative = path
-        .parent()
-        .unwrap()
-        .strip_prefix(config.path())
-        .map_err(io::Error::other)?;
-    let mut held = RootHandle::open_nofollow(config.path())?;
-    if held.identity() != config.identity() {
-        return Err(io::Error::other("Registryordner wurde ausgetauscht"));
-    }
-    for part in relative.components() {
-        let std::path::Component::Normal(name) = part else {
-            return Err(io::Error::other("Ungültiger privater Registryordner"));
-        };
-        match rustix::fs::mkdirat(held.fd(), name, rustix::fs::Mode::from_raw_mode(0o700)) {
-            Ok(()) => rustix::fs::fsync(held.fd())?,
-            Err(rustix::io::Errno::EXIST) => {}
-            Err(error) => return Err(error.into()),
-        }
-        held = RootHandle::open_nofollow(&held.path().join(name))?;
-        if !held.has_exclusive_namespace()? {
-            return Err(io::Error::other(
-                "Registryunterordner verlor privaten Namensraum",
-            ));
-        }
-    }
-    ensure(config)
-}
 fn write_json(
     config: &RootHandle,
     path: &Path,
     value: &impl serde::Serialize,
     create: bool,
 ) -> io::Result<()> {
-    ensure(config)?;
-    private_parent(config, path)?;
-    let vfs = crate::LocalVfs::rooted(config.path())?;
-    if crate::Vfs::anchored_identity(&vfs) != Some(config.identity()) {
-        return Err(io::Error::other("Datei-DACL-Registry wurde ausgetauscht"));
-    }
-    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(io::Error::other(
-            "Einzelner V6-Datensatz überschreitet Größenlimit",
-        ));
-    }
-    crate::atomic_write::atomic_write_vfs_with_mode(
-        &vfs,
+    dacl_registry_io::write_json(
+        config,
         path,
-        &bytes,
-        ".file-dacl-v6-write-",
-        if create {
-            crate::atomic_write::AtomicWriteMode::Create
-        } else {
-            crate::atomic_write::AtomicWriteMode::Replace
+        value,
+        create,
+        &WritePolicy {
+            temp_prefix: ".file-dacl-v6-write-",
+            namespace_lost: NAMESPACE_LOST,
+            registry_replaced: "Datei-DACL-Registry wurde ausgetauscht",
+            record_too_large: "Einzelner V6-Datensatz überschreitet Größenlimit",
         },
-        Some(0o600),
     )
 }
 fn read_json<T: serde::de::DeserializeOwned>(config: &RootHandle, path: &Path) -> io::Result<T> {
-    let mut bytes = Vec::new();
-    crate::local_fs::open_read_beneath(config, path)?
-        .take(64 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(io::Error::other("V6-Datensatz überschreitet Größenlimit"));
-    }
-    serde_json::from_slice(&bytes).map_err(io::Error::other)
+    dacl_registry_io::read_json(config, path, "V6-Datensatz überschreitet Größenlimit")
 }
 fn owner_digest(state: &OwnerState) -> io::Result<[u8; 32]> {
     digest(b"doppeldecker-file-dacl-owner-v6\0", state)
@@ -513,15 +465,7 @@ fn save_ledger(config: &RootHandle, ledger: &mut Ledger) -> io::Result<()> {
     )
 }
 fn remove_exact(config: &RootHandle, path: &Path) -> io::Result<()> {
-    // Nur zuvor in unserem dauerhaft geschriebenen Commit benannte Metadaten.
-    if !path.starts_with(config.path()) || path == config.path() {
-        return Err(io::Error::other("V6-Bereinigung verlässt Registry"));
-    }
-    match crate::local_fs::remove_file_beneath(config, path) {
-        Ok(()) => crate::local_fs::sync_dir_beneath(config, path.parent().unwrap()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
+    crate::dacl_registry_io::remove_exact(config, path, "V6-Bereinigung verlässt Registry")
 }
 fn finish_pending(config: &RootHandle, ledger: &mut Ledger) -> io::Result<()> {
     if let Some(pending) = &ledger.pending {
@@ -538,7 +482,7 @@ fn finish_pending(config: &RootHandle, ledger: &mut Ledger) -> io::Result<()> {
             } else {
                 PathBuf::from(name)
             };
-            let intent = intent.to_str().unwrap();
+            let intent = crate::dacl_registry_io::utf8_file_name(&intent)?;
             if !valid_name(intent)
                 || (path != &config.path().join(name)
                     && path != &closed_path(config, &pending.state.owner, intent)?)
@@ -962,7 +906,7 @@ pub(crate) fn checkpoint(
         if !confirmed && !before {
             continue;
         }
-        let name = path.file_name().unwrap().to_str().unwrap();
+        let name = crate::dacl_registry_io::utf8_file_name(&path)?;
         let checksum = closed_digest(name, &record)?;
         let mut state = load_owner(config, owner)?;
         state.retained_count = state

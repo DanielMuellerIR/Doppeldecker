@@ -1,0 +1,57 @@
+{
+  "resolutions": [
+    { "path": [[97]], "decision": { "decision": "keep_left" } },
+    { "path": [[98], [195, 182]], "decision": { "decision": "keep_both", "primary": "right", "conflict_path": [[98], [99]] } },
+    { "path": [[100]], "decision": { "decision": "skip" } }
+  ],
+  "conflict": {
+    "path": "array",
+    "relative_name": "string",
+    "left": "object",
+    "right": "object",
+    "choices": "array",
+    "skip_blocker": "string|null"
+  },
+  "choice": {
+    "decision": "object",
+    "explanation": "string",
+    "generated_name": "string|null",
+    "blocker": "string|null"
+  },
+  "resume": {
+    "plan": "object",
+    "conflict_details": "array",
+    "confirmation_phrase": "string",
+    "scope_warnings": "array",
+    "expires_at_unix_ms": "number",
+    "backup_confirmation_required": "boolean",
+    "stage_blocker": "string|null",
+    "recovery_preparation_id": "string",
+    "recovery_kind": "string"
+  },
+  "rollback": {
+    "pair_id": "array",
+    "committed_projections": "number",
+    "confirmation_phrase": "string",
+    "expires_at_unix_ms": "number",
+    "recovery_preparation_id": "string",
+    "recovery_kind": "string"
+  },
+  "discard": { "absent": "boolean" },
+  "registeredPair": {
+    "pairId": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+    "pairName": "Quelle ↔ Ziel",
+    "left": { "provider": "local", "root": "/mock/quelle" },
+    "right": { "provider": "sftp", "profileId": "mock_sftp", "profileRevision": 7, "root": "/revisionsgebunden" },
+    "visibleLeftRole": "right"
+  },
+  "forwardPairStatus": {
+    "execution_class": "string",
+    "run_id": "array",
+    "plan": "object",
+    "projections": "array",
+    "baseline_matches_previous": "boolean",
+    "baseline_completion_available": "boolean",
+    "previous_runs": "number"
+  }
+}

@@ -16,19 +16,19 @@ kopieren, verschieben, durchsuchen und synchronisieren. Die Oberfläche ist deut
 
 ## Download
 
-**Aktuelle Version: 1.0.1.**
+**Aktuelle Version: 1.0.2.**
 
 | System | Paket |
 | --- | --- |
-| macOS 14+, Apple Silicon | [Signiertes und notarisiertes DMG](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.1/Doppeldecker_1.0.1_aarch64.dmg) |
-| Linux Mint 22.2 / Ubuntu 24.04, x86_64 | [DEB](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.1/Doppeldecker_1.0.1_amd64.deb) · [AppImage](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.1/Doppeldecker_1.0.1_amd64.AppImage) |
+| macOS 14+, Apple Silicon | [Signiertes und notarisiertes DMG](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.2/Doppeldecker_1.0.2_aarch64.dmg) |
+| Linux Mint 22.2 / Ubuntu 24.04, x86_64 | [DEB](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.2/Doppeldecker_1.0.2_amd64.deb) · [AppImage](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.2/Doppeldecker_1.0.2_amd64.AppImage) |
 
 Unter macOS die App aus dem DMG nach Programme ziehen. Andere Distributionen und
 Intel-Macs sind noch nicht geprüft. **Doppeldecker → Nach Updates suchen …** prüft
 nur auf Wunsch; Download und Installation benötigen eine eigene Bestätigung.
 
-[Pakete und Prüfsummen](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v1.0.1).
-[Änderungen in 1.0.1](docs/release-notes-1.0.1.md).
+[Pakete und Prüfsummen](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v1.0.2).
+[Änderungen in 1.0.2](docs/release-notes-1.0.2.md).
 
 ## Funktionen
 
@@ -93,7 +93,7 @@ cargo build -p doppeldecker-cli --release
 
 Für Browserprüfungen: Node 20+, `pnpm install --frozen-lockfile`,
 `pnpm exec playwright install chromium`, dann `pnpm test:ui`.
-[Build- und Testregeln](AGENTS.md) · [Dokumentationsindex](docs/INDEX.md).
+[Entwicklungsleitfaden](docs/development.md) · [Dokumentationsindex](docs/INDEX.md).
 
 [Roadmap](docs/roadmap.md) · [Offene Aufgaben](backlog.md) · [Änderungen](CHANGELOG.md).
 

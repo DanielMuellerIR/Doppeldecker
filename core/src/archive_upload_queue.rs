@@ -164,7 +164,11 @@ pub(super) fn generate(
                     operation_id,
                     QueueAttention::ArchiveExtractChanged {
                         reason: reason.clone(),
-                        confirmation: format!("ZIP ENTPACKEN {}", short_id(operation_id)),
+                        confirmation: format!(
+                            "{} ENTPACKEN {}",
+                            request.format.name(),
+                            short_id(operation_id)
+                        ),
                         current: Box::new(current),
                     },
                 )?;
@@ -228,13 +232,23 @@ pub(super) fn generate(
                 )?;
                 return Ok(GenerationResult::Cancelled);
             }
-            let label = expected
-                .preview
-                .source_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("ZIP-Auswahl");
-            work.seal_extraction(generated, label.to_owned(), cancel)?
+            let format = request.format.name();
+            let label = if let Some(snapshot) = &request.snapshot {
+                let origin = format!("{format} · {}", snapshot.origin);
+                if origin.len() <= 8192 {
+                    origin
+                } else {
+                    format!("{format}-Momentaufnahme")
+                }
+            } else {
+                request
+                    .source_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{format}-Auswahl"))
+            };
+            work.seal_extraction(generated, label, cancel)?
         }
     };
     queue.append_file_audit(

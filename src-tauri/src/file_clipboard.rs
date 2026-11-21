@@ -636,6 +636,8 @@ mod native {
             }
             // Ein vorhandener Clipboard-Manager darf die Übergabe beim Beenden
             // erhalten. Ohne Manager bleibt der normale GTK-Ownervertrag gültig.
+            // SAFETY: board hält die GtkClipboard-Referenz auf dem GTK-Hauptthread.
+            // GTK akzeptiert NULL bei null Targets als Vorgabe für alle Formate.
             unsafe {
                 gtk::ffi::gtk_clipboard_set_can_store(board.to_glib_none().0, std::ptr::null(), 0);
             }
@@ -950,6 +952,20 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_dateiauswahl_serialisiert_den_browservertrag() {
+        let paths = vec!["/tmp/Fotos A".to_owned()];
+        let clipboard = decode_uris(&file_uris(&paths).unwrap(), true, "Version A".into()).unwrap();
+        let actual = serde_json::to_value(clipboard).unwrap();
+        let contract =
+            serde_json::from_str(include_str!("../../tools/tests/file-clipboard-wire.json"))
+                .unwrap();
+        crate::browser_commands::assert_wire_object(&actual, &contract);
+        assert_eq!(actual["paths"], serde_json::json!(paths));
+        assert_eq!(actual["cut"], true);
+        assert_eq!(actual["version"], "Version A");
+    }
+
     #[test]
     fn grosse_ordnerauswahl_bleibt_vollstaendig_und_geordnet() {
         let paths: Vec<_> = (0..10_000)

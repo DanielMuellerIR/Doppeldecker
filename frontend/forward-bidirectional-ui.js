@@ -12,6 +12,10 @@ function displayPath(path) {
   }).join("/");
 }
 
+/**
+ * @param {import("./bidirectional-wire.js").ForwardBidirectionalPreviewWire} preview
+ * @returns {Promise<import("./bidirectional-wire.js").ForwardBidirectionalConfirmationWire | null>}
+ */
 export function confirmForwardBidirectional(preview, { pairName = "", left, right, visibleRoles = { left: "left", right: "right" }, queued = false } = {}) {
   return new Promise(resolve => showOwnedModal("forward-bidirectional", token => {
     const modal = $("#modal .modal");
@@ -27,8 +31,8 @@ export function confirmForwardBidirectional(preview, { pairName = "", left, righ
     const actionHtml = action => {
       const paths = action.type === "conflict_copy"
         ? `${pathHtml(action.source_path, action.source_side)} → ${pathHtml(action.target_path, action.target_side)}`
-        : `${pathHtml(action.path)}${action.direction ? ` · ${sideLabel(action.direction === "left_to_right" ? "left" : "right")} → ${sideLabel(action.direction === "left_to_right" ? "right" : "left")}` : ""}`;
-      const subtree = action.subtree || [];
+        : `${pathHtml(action.path)}${"direction" in action ? ` · ${sideLabel(action.direction === "left_to_right" ? "left" : "right")} → ${sideLabel(action.direction === "left_to_right" ? "right" : "left")}` : ""}`;
+      const subtree = "subtree" in action ? action.subtree || [] : [];
       return `<li>${escapeHtml(actionLabels[action.type] || "Änderung")}: ${paths}` +
         (subtree.length ? `<ul>${subtree.map(entry => `<li>${pathHtml(entry.source_path)} → ${pathHtml(entry.target_path)}</li>`).join("")}</ul>` : "") + `</li>`;
     };

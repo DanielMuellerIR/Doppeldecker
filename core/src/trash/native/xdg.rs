@@ -85,7 +85,7 @@ pub(super) fn destination(source: &RootHandle, data_home: &DataHome) -> io::Resu
         });
     }
     let mount = mount_root(source)?;
-    let uid = unsafe { libc::geteuid() };
+    let uid = rustix::process::geteuid().as_raw();
     let shared = mount.path().join(".Trash");
     let shared_valid = match statat(mount.fd(), ".Trash", AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat)
@@ -139,7 +139,7 @@ pub(super) fn prepare(
             prepare_volume(
                 &mount
                     .path()
-                    .join(format!(".Trash-{}", unsafe { libc::geteuid() })),
+                    .join(format!(".Trash-{}", rustix::process::geteuid().as_raw())),
                 mount,
             )
         });

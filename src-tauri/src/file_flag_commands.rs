@@ -102,4 +102,41 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn file_property_wire_flags() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/file-property-wire.json"))
+                .unwrap();
+        let fixture = &fixture["flags"];
+        let read: FileFlagReadRequest =
+            serde_json::from_value(fixture["read"]["request"].clone()).unwrap();
+        let edit: FileFlagEditRequest =
+            serde_json::from_value(fixture["edit"]["request"].clone()).unwrap();
+        assert_eq!(read.names, edit.names);
+        assert_eq!(read.kind, FileFlagKind::Locked);
+        assert_eq!(edit.kind, FileFlagKind::Locked);
+        let read = FileFlagRow {
+            name: read.names[0].clone(),
+            state: Some(false),
+            changed: false,
+            code: None,
+            message: String::new(),
+        };
+        let edit = FileFlagRow {
+            name: edit.names[0].clone(),
+            state: Some(edit.enabled),
+            changed: true,
+            code: None,
+            message: "Eigenschaft bestätigt".into(),
+        };
+        assert_eq!(
+            serde_json::to_value([read]).unwrap(),
+            fixture["read"]["rows"]
+        );
+        assert_eq!(
+            serde_json::to_value([edit]).unwrap(),
+            fixture["edit"]["rows"]
+        );
+    }
 }

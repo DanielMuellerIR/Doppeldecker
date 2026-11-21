@@ -127,8 +127,7 @@ export function createContextMenu(actions) {
       items.push({ label: "Duplizieren", action: () => actions.duplicate(side) });
       items.push({ label: "ZIP-Archiv erstellen …", action: () => actions.archivePack(side) });
       items.push({ label: "Ins andere Pane kopieren  (F5)", action: () => actions.transfer("copy") });
-      if (actions.resumableCopy && entries.every(entry => entry.is_file && !entry.is_symlink)
-        && ["local", "webdav"].includes(pane.provider) && actions.pane(side === "left" ? "right" : "left").provider === "local") {
+      if (actions.canResumeCopy(side, entries)) {
         items.push({ label: "Dateiinhalt fortsetzbar kopieren", action: () => actions.resumableCopy(side) });
       }
       items.push({ label: "Ins andere Pane verschieben  (F6)", action: () => actions.transfer("move") });

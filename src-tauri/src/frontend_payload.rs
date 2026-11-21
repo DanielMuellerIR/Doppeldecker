@@ -19,6 +19,14 @@ impl<T: Serialize> Serialize for FrontendPayload<T> {
     }
 }
 
+pub(crate) fn generated_source_display_label(label: &str, is_extraction: bool) -> &str {
+    if is_extraction && label == "ZIP-Auswahl" {
+        "Archivauswahl"
+    } else {
+        label
+    }
+}
+
 fn project_reports(value: &mut Value) {
     match value {
         Value::Object(fields) => {
@@ -50,6 +58,15 @@ fn project_reports(value: &mut Value) {
             for (name, child) in fields {
                 if name == "created_directory_dacl_report" {
                     project_report(child);
+                } else if name == "generated_source" {
+                    let is_extraction =
+                        child.get("kind").and_then(Value::as_str) == Some("zip_extraction");
+                    if let Some(Value::String(label)) = child.get_mut("label") {
+                        let display = generated_source_display_label(label, is_extraction);
+                        if display != label.as_str() {
+                            *label = display.to_owned();
+                        }
+                    }
                 } else {
                     project_reports(child);
                 }
@@ -113,6 +130,26 @@ mod tests {
             let wire = serde_json::to_value(FrontendPayload(value)).unwrap();
             assert_eq!(wire["entries"][0]["generated_source_recovery"], expected);
         }
+    }
+
+    #[test]
+    fn generated_extraction_projection_uses_neutral_legacy_label() {
+        let value = serde_json::json!({"entries": [
+            {"generated_source": {"kind": "zip_extraction", "label": "ZIP-Auswahl"}},
+            {"generated_source": {"kind": "zip_extraction", "label": "TAR · SFTP · /Probe.tar"}},
+            {"generated_source": {"kind": "zip", "label": "ZIP-Auswahl"}}
+        ]});
+        let wire = serde_json::to_value(FrontendPayload(value)).unwrap();
+        let labels = wire["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["generated_source"]["label"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            ["Archivauswahl", "TAR · SFTP · /Probe.tar", "ZIP-Auswahl"]
+        );
     }
 
     fn report() -> CreatedDirectoryDaclReport {
@@ -187,6 +224,73 @@ mod tests {
             std::fs::write(destination, serde_json::to_vec(&wire).unwrap()).unwrap();
         }
         assert_eq!(serde_json::to_value(report).unwrap(), persisted);
+    }
+
+    #[test]
+    fn queue_snapshot_matches_the_browser_wire_fixture() {
+        let id = "generated-11111111111111111111111111111111";
+        let workspace = format!("/mock/generated-sources/{id}");
+        let source_root = format!("{workspace}/content");
+        let operation = serde_json::from_value(serde_json::json!({
+            "type": "ProviderFile",
+            "kind": "Copy",
+            "source": {"provider": "Local", "root": source_root},
+            "target": {"provider": "Smb", "root": "/ziel", "connection": {
+                "host": "smb.example.test", "port": 445, "server_guid": vec![1; 16],
+                "share": "Test", "username": "tester", "domain": "", "requested_root": "/ziel",
+                "password_reference": {"service": "mock", "account": "tester"}
+            }},
+            "items": [format!("{source_root}/neu")],
+            "destination": "/ziel",
+            "overwrite": false,
+            "expected_conflicts": []
+        }))
+        .unwrap();
+        let generated_source = serde_json::from_value(serde_json::json!({
+            "id": id, "manifest_digest": vec![1; 32], "kind": "zip_extraction",
+            "label": "ZIP-Auswahl", "files": 0, "directories": 1, "bytes": 0, "issues": []
+        }))
+        .unwrap();
+        let entry = doppeldecker_core::QueueEntry {
+            generated_source: Some(generated_source),
+            directory_stream_report: Default::default(),
+            directory_dacl_report: Default::default(),
+            file_dacl_report: Default::default(),
+            created_directory_dacl_report: report(),
+            directory_dacl_recovery: false,
+            file_dacl_recovery: false,
+            created_directory_dacl_recovery: true,
+            archive_extract_report: None,
+            operation_id: "mock-1".into(),
+            operation,
+            profile_bindings: vec![],
+            created_unix_ms: 1_800_000_000_000,
+            state: doppeldecker_core::QueueState::Interrupted,
+            attempts: 2,
+            progress: doppeldecker_core::Progress {
+                phase: "interrupted".into(),
+                created_directory_dacl_report: report(),
+                ..Default::default()
+            },
+            attention: None,
+            error: None,
+            error_code: Some(doppeldecker_core::ErrorCode::OutcomeUnclear),
+            temp_recovery_paths: vec![workspace],
+            retained_backup_paths: vec![],
+            file_incomplete: false,
+            recovery_available: false,
+            bidirectional_completion_recovery: None,
+        };
+        let snapshot = doppeldecker_core::QueueSnapshot {
+            entries: vec![entry],
+            ..Default::default()
+        };
+        let payload: FrontendQueueSnapshot = snapshot.into();
+        let wire = serde_json::to_value(payload).unwrap();
+        let expected: Value =
+            serde_json::from_str(include_str!("../../tools/tests/queue-snapshot-wire.json"))
+                .unwrap();
+        assert_eq!(wire, expected);
     }
 
     #[test]

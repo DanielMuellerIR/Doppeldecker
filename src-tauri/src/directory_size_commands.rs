@@ -39,13 +39,18 @@ struct ActiveRun {
     cancel: Cancel,
 }
 
-struct PaneRuntime {
+struct CachedSession {
     identity: EndpointIdentity,
     /// Zusätzlich zur Profil-ID bindet die Arc-Identität die konkrete lebende
     /// Provider-Verbindung. Nach Profiländerung oder Eject kann eine neue Sitzung
     /// wieder bei Generation 1 beginnen und darf dennoch nie den alten Cache nutzen.
     vfs: Arc<dyn Vfs>,
     session: Arc<DirectorySizeSession>,
+}
+
+#[derive(Default)]
+struct PaneRuntime {
+    cache: Option<CachedSession>,
     active: Option<ActiveRun>,
 }
 
@@ -67,41 +72,50 @@ impl Default for DirectorySizeRuntime {
 }
 
 impl DirectorySizeRuntime {
-    fn start(
-        &self,
-        key: PaneKey,
-        identity: EndpointIdentity,
-        vfs: Arc<dyn Vfs>,
-    ) -> (u64, Arc<DirectorySizeSession>, Cancel) {
+    fn reserve(&self, key: PaneKey) -> (u64, Cancel) {
         let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
         let cancel = Cancel::new();
         let mut panes = self.panes.lock_recover();
-        let slot = panes.entry(key).or_insert_with(|| PaneRuntime {
-            identity: identity.clone(),
-            vfs: Arc::clone(&vfs),
-            session: Arc::new(DirectorySizeSession::new(vfs.clone())),
-            active: None,
-        });
-        let same_endpoint = slot.identity == identity
-            && (matches!(identity, EndpointIdentity::Local) || Arc::ptr_eq(&slot.vfs, &vfs));
-        if !same_endpoint {
-            if let Some(active) = slot.active.take() {
-                active.cancel.cancel();
-            }
-            *slot = PaneRuntime {
-                identity,
-                vfs: Arc::clone(&vfs),
-                session: Arc::new(DirectorySizeSession::new(vfs)),
-                active: None,
-            };
-        } else if let Some(active) = slot.active.take() {
-            active.cancel.cancel();
-        }
-        slot.active = Some(ActiveRun {
+        let slot = panes.entry(key).or_default();
+        if let Some(previous) = slot.active.replace(ActiveRun {
             run_id,
             cancel: cancel.clone(),
+        }) {
+            previous.cancel.cancel();
+        }
+        (run_id, cancel)
+    }
+
+    fn bind_session(
+        &self,
+        key: &PaneKey,
+        run_id: u64,
+        identity: EndpointIdentity,
+        vfs: Arc<dyn Vfs>,
+    ) -> Option<Arc<DirectorySizeSession>> {
+        let mut panes = self.panes.lock_recover();
+        let slot = panes.get_mut(key)?;
+        if slot
+            .active
+            .as_ref()
+            .is_none_or(|active| active.run_id != run_id)
+        {
+            return None;
+        }
+        if let Some(cache) = &slot.cache {
+            if cache.identity == identity
+                && (matches!(identity, EndpointIdentity::Local) || Arc::ptr_eq(&cache.vfs, &vfs))
+            {
+                return Some(Arc::clone(&cache.session));
+            }
+        }
+        let session = Arc::new(DirectorySizeSession::new(Arc::clone(&vfs)));
+        slot.cache = Some(CachedSession {
+            identity,
+            vfs,
+            session: Arc::clone(&session),
         });
-        (run_id, Arc::clone(&slot.session), cancel)
+        Some(session)
     }
 
     fn cancel(&self, key: &PaneKey) {
@@ -463,21 +477,50 @@ pub(crate) fn start_directory_sizes(
     request: DirectorySizeRequest,
 ) -> Result<DirectorySizeStarted, AppError> {
     validate_side(&request.side)?;
-    let context =
-        resolve_read_endpoint(&app, &state, &request.endpoint, request.session_generation)?;
     let key = PaneKey {
         window_label: window.label().to_string(),
         side: request.side.clone(),
     };
-    let (run_id, session, cancel) = state.directory_sizes.start(
-        key.clone(),
-        context.identity.clone(),
-        Arc::clone(&context.vfs),
-    );
+    // Die Reservierung folgt der IPC-Reihenfolge. Auch ein noch auf seinen
+    // Endpunkt wartender Start ist dadurch sofort abbrechbar.
+    let (run_id, cancel) = state.directory_sizes.reserve(key.clone());
     let thread_key = key.clone();
     let spawn = std::thread::Builder::new()
         .name(format!("directory-size-{}-{run_id}", request.side))
         .spawn(move || {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let state = app.state::<AppState>();
+            let context = match resolve_read_endpoint(
+                &app,
+                &state,
+                &request.endpoint,
+                request.session_generation,
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    if state.directory_sizes.finish(&thread_key, run_id) {
+                        emit_error(
+                            &window,
+                            &thread_key,
+                            run_id,
+                            request.client_token,
+                            request.endpoint.root(),
+                            error,
+                        );
+                    }
+                    return;
+                }
+            };
+            let Some(session) = state.directory_sizes.bind_session(
+                &thread_key,
+                run_id,
+                context.identity.clone(),
+                Arc::clone(&context.vfs),
+            ) else {
+                return;
+            };
             run_measurement(
                 window, thread_key, request, context, run_id, session, cancel,
             )
@@ -538,20 +581,74 @@ mod tests {
     }
 
     #[test]
-    fn request_akzeptiert_verschachtelte_frontend_feldnamen() {
-        let request: DirectorySizeRequest = serde_json::from_value(serde_json::json!({
-            "side": "right",
-            "endpoint": { "provider": "sftp", "profileId": "p1", "root": "/daten" },
-            "names": ["Fotos"],
-            "sessionGeneration": 7,
-            "recalculate": false,
-            "clientToken": 3
-        }))
-        .unwrap();
+    fn directory_size_requests_match_the_browser_wire_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/directory-size-wire.json"))
+                .unwrap();
+        let local: DirectorySizeRequest = serde_json::from_value(fixture["local"].clone()).unwrap();
+        assert_eq!(local.side, "left");
+        assert_eq!(
+            local.endpoint,
+            BidirectionalEndpointRequest::Local {
+                root: "/mock/quelle".into(),
+            }
+        );
+        assert_eq!(local.names, ["Bilder"]);
+        assert_eq!(local.session_generation, None);
+        assert!(!local.recalculate);
+        assert_eq!(local.client_token, 3);
 
-        assert_eq!(request.side, "right");
-        assert_eq!(request.session_generation, Some(7));
-        assert_eq!(request.client_token, 3);
+        let remote: DirectorySizeRequest =
+            serde_json::from_value(fixture["remote"].clone()).unwrap();
+        assert_eq!(remote.side, "left");
+        assert_eq!(
+            remote.endpoint,
+            BidirectionalEndpointRequest::Sftp {
+                profile_id: "mock_sftp".into(),
+                profile_revision: Some(11),
+                root: "/".into(),
+            }
+        );
+        assert_eq!(remote.names, ["remote"]);
+        assert_eq!(remote.session_generation, Some(1));
+        assert!(!remote.recalculate);
+        assert_eq!(remote.client_token, 4);
+
+        // Serde akzeptiert die beiden Option-Felder auch ohne Wert. Die
+        // Remote-Sitzungsbindung verlangt anschließend weiterhin beides.
+        for provider in ["sftp", "ftps", "webdav", "smb"] {
+            for explicit_null in [false, true] {
+                let mut value = fixture["remote"].clone();
+                value["endpoint"]["provider"] = provider.into();
+                for (object, field) in [("/endpoint", "profileRevision"), ("", "sessionGeneration")]
+                {
+                    let fields = value.pointer_mut(object).unwrap().as_object_mut().unwrap();
+                    if explicit_null {
+                        fields.insert(field.into(), serde_json::Value::Null);
+                    } else {
+                        fields.remove(field);
+                    }
+                }
+                let request: DirectorySizeRequest = serde_json::from_value(value).unwrap();
+                let endpoint = serde_json::to_value(request.endpoint).unwrap();
+                assert_eq!(endpoint["provider"], provider);
+                assert_eq!(endpoint["profileId"], "mock_sftp");
+                assert_eq!(endpoint["profileRevision"], serde_json::Value::Null);
+                assert_eq!(request.session_generation, None);
+            }
+        }
+
+        let mut malformed = fixture["remote"].clone();
+        let fields = malformed["endpoint"].as_object_mut().unwrap();
+        let id = fields.remove("profileId").unwrap();
+        fields.insert("profile_id".into(), id);
+        assert!(serde_json::from_value::<DirectorySizeRequest>(malformed).is_err());
+
+        let mut additional_fields = fixture["local"].clone();
+        additional_fields["endpoint"]["profileId"] = "ignoriert".into();
+        additional_fields["extraField"] = true.into();
+        let request: DirectorySizeRequest = serde_json::from_value(additional_fields).unwrap();
+        assert_eq!(request.endpoint, local.endpoint);
     }
 
     #[test]
@@ -612,13 +709,48 @@ mod tests {
         let first_vfs: Arc<dyn Vfs> = Arc::new(LocalVfs::new());
         let second_vfs: Arc<dyn Vfs> = Arc::new(LocalVfs::new());
 
-        let (_, first_session, _) =
-            runtime.start(key.clone(), identity.clone(), Arc::clone(&first_vfs));
-        let (_, reused_session, _) = runtime.start(key.clone(), identity.clone(), first_vfs);
+        let (first_id, _) = runtime.reserve(key.clone());
+        let first_session = runtime
+            .bind_session(&key, first_id, identity.clone(), Arc::clone(&first_vfs))
+            .unwrap();
+        let (reused_id, _) = runtime.reserve(key.clone());
+        let reused_session = runtime
+            .bind_session(&key, reused_id, identity.clone(), first_vfs)
+            .unwrap();
         assert!(Arc::ptr_eq(&first_session, &reused_session));
 
-        let (_, replaced_session, _) = runtime.start(key, identity, second_vfs);
+        let (replaced_id, _) = runtime.reserve(key.clone());
+        let replaced_session = runtime
+            .bind_session(&key, replaced_id, identity, second_vfs)
+            .unwrap();
         assert!(!Arc::ptr_eq(&first_session, &replaced_session));
+    }
+
+    #[test]
+    fn spaete_endpunktaufloesung_kann_keinen_neuen_lauf_verdraengen() {
+        let runtime = DirectorySizeRuntime::default();
+        let key = PaneKey {
+            window_label: "fenster-1".to_string(),
+            side: "left".to_string(),
+        };
+        let (cancelled_id, cancelled) = runtime.reserve(key.clone());
+        runtime.cancel(&key);
+        let (replaced_id, replaced) = runtime.reserve(key.clone());
+        let (current_id, current) = runtime.reserve(key.clone());
+        let vfs: Arc<dyn Vfs> = Arc::new(LocalVfs::new());
+        for run_id in [cancelled_id, replaced_id] {
+            assert!(runtime
+                .bind_session(&key, run_id, EndpointIdentity::Local, Arc::clone(&vfs))
+                .is_none());
+            assert!(!runtime.finish(&key, run_id));
+        }
+        assert!(cancelled.is_cancelled());
+        assert!(replaced.is_cancelled());
+        assert!(!current.is_cancelled());
+        assert!(runtime
+            .bind_session(&key, current_id, EndpointIdentity::Local, vfs)
+            .is_some());
+        assert!(runtime.finish(&key, current_id));
     }
 
     #[test]

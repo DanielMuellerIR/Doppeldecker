@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use doppeldecker_core::{
     execute_prepared_sftp_queue_entry_effects, prepare_provider_queue_entry,
     prepare_provider_transfer_for_queue, OperationQueue, PreparedProviderRealRun, Progress,
-    QueueEntry, QueueExecutionResult, QueueOperation, SftpQueuePreparation, SyncOptions,
+    QueueEntry, QueueExecutionResult, QueueOperation, RemoteProfileBinding, SftpQueuePreparation,
+    SyncOptions,
 };
 use tauri::{Manager, State, WebviewWindow};
 
@@ -23,14 +24,14 @@ use crate::queue_runtime::QueueTerminalEvent;
 use crate::sftp_commands::KeyringResolver;
 use crate::{
     app_config_dir, emit_queue_snapshot, finish_operation, operation_queue, start_queue_worker,
-    take_pending_for_operation, with_queue_extension, with_reserved_operation, AppError, AppState,
-    MutexExt,
+    take_pending_for_operation, with_queue_extension_access, with_reserved_operation, AppError,
+    AppState, MutexExt, WindowState,
 };
 
 pub(crate) struct PendingProviderRun {
     prepared: PreparedProviderRealRun,
     operation: QueueOperation,
-    pub(crate) profile_bindings: Vec<doppeldecker_core::RemoteProfileBinding>,
+    pub(crate) profile_bindings: Vec<RemoteProfileBinding>,
 }
 
 #[derive(serde::Deserialize)]
@@ -49,72 +50,84 @@ fn audit_path(app: &tauri::AppHandle, label: &str) -> Result<PathBuf, AppError> 
 }
 
 #[tauri::command]
-pub(crate) fn prepare_provider_sync(
+pub(crate) async fn prepare_provider_sync(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    state: State<AppState>,
     request: PrepareProviderSyncRequest,
 ) -> Result<doppeldecker_core::RealRunPreview, AppError> {
-    let label = window.label();
-    let window_state = state.window(label);
-    request.options.validate().map_err(AppError::from)?;
-    crate::bidirectional_commands::validate_endpoint_request_root(&request.source)?;
-    crate::bidirectional_commands::validate_endpoint_request_root(&request.target)?;
-    with_reserved_operation(&app, label, &window_state, || {
-        if window_state.pending_provider_real.lock_recover().is_some() {
-            return Err(AppError::new(
-                "busy",
-                "Es existiert bereits eine Provider-Vorbereitung",
-            ));
-        }
-        let ((source, source_queue, source_profiles), (target, target_queue, target_profiles)) =
-            resolve_validated_registry_pair(
-                &request.source,
-                &request.target,
-                |endpoint| validate_registry_profile(&app, endpoint),
-                |endpoint| resolve_endpoint(&app, &state, endpoint),
-            )?;
-        let profile_bindings =
-            crate::queue_runtime::merge_profile_bindings([source_profiles, target_profiles]);
-        let queue = crate::operation_queue(&app, &window_state, label)?;
-        let source = queue
-            .bind_provider_preparation(&source)
-            .map_err(AppError::from)?;
-        let target = queue
-            .bind_provider_preparation(&target)
-            .map_err(AppError::from)?;
-        let prepared =
-            prepare_provider_transfer_for_queue(&queue, source, target, request.options.clone())
+    let window_state = app.state::<AppState>().window(window.label());
+    let generation = window_state
+        .provider_sync_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let label = window.label();
+        request.options.validate().map_err(AppError::from)?;
+        crate::bidirectional_commands::validate_endpoint_request_root(&request.source)?;
+        crate::bidirectional_commands::validate_endpoint_request_root(&request.target)?;
+        with_reserved_operation(&app, label, &window_state, || {
+            if window_state.pending_provider_real.lock_recover().is_some() {
+                return Err(AppError::new(
+                    "busy",
+                    "Es existiert bereits eine Provider-Vorbereitung",
+                ));
+            }
+            let ((source, source_queue, source_profiles), (target, target_queue, target_profiles)) =
+                resolve_validated_registry_pair(
+                    &request.source,
+                    &request.target,
+                    |endpoint| validate_registry_profile(&app, endpoint),
+                    |endpoint| resolve_endpoint(&app, &state, endpoint),
+                )?;
+            let profile_bindings =
+                crate::queue_runtime::merge_profile_bindings([source_profiles, target_profiles]);
+            let queue = crate::operation_queue(&app, &window_state, label)?;
+            let source = queue
+                .bind_provider_preparation(&source)
                 .map_err(AppError::from)?;
-        let preview = prepared.preview().clone();
-        let operation = QueueOperation::ProviderSync {
-            source: source_queue,
-            target: target_queue,
-            options: request.options,
-            expected_plan: Box::new(preview.plan.clone()),
-        };
-        crate::queue_runtime::store_profile_bound_pending(
-            &app,
-            &state,
-            &window_state.pending_provider_real,
-            &profile_bindings,
-            PendingProviderRun {
-                prepared,
-                operation,
-                profile_bindings: profile_bindings.clone(),
-            },
-        )?;
-        Ok(preview)
+            let target = queue
+                .bind_provider_preparation(&target)
+                .map_err(AppError::from)?;
+            let prepared = prepare_provider_transfer_for_queue(
+                &queue,
+                source,
+                target,
+                request.options.clone(),
+            )
+            .map_err(AppError::from)?;
+            let preview = prepared.preview().clone();
+            let operation = QueueOperation::ProviderSync {
+                source: source_queue,
+                target: target_queue,
+                options: request.options,
+                expected_plan: Box::new(preview.plan.clone()),
+            };
+            crate::queue_runtime::store_profile_bound_pending_for_generation(
+                &app,
+                &state,
+                &window_state.pending_provider_real,
+                &profile_bindings,
+                PendingProviderRun {
+                    prepared,
+                    operation,
+                    profile_bindings: profile_bindings.clone(),
+                },
+                (&window_state.provider_sync_generation, generation),
+            )?;
+            Ok(preview)
+        })
     })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[tauri::command]
 pub(crate) fn discard_provider_sync(window: WebviewWindow, state: State<AppState>) {
-    state
-        .window(window.label())
-        .pending_provider_real
-        .lock_recover()
-        .take();
+    let window_state = state.window(window.label());
+    crate::queue_runtime::discard_sync_preparation(
+        &window_state.pending_provider_real,
+        &window_state.provider_sync_generation,
+    );
 }
 
 fn validate_confirmation(
@@ -166,6 +179,26 @@ pub(crate) fn run_provider_sync(
     Ok(())
 }
 
+fn enqueue_pending_provider(
+    state: &AppState,
+    window_state: &WindowState,
+    prepare_queue: impl FnOnce(&[RemoteProfileBinding]) -> Result<Arc<OperationQueue>, AppError>,
+) -> Result<Arc<OperationQueue>, AppError> {
+    with_queue_extension_access(state, window_state, |extension| {
+        let mut pending = window_state.pending_provider_real.lock_recover();
+        let prepared = pending
+            .as_ref()
+            .ok_or_else(|| AppError::new("app", "Keine Provider-Vorbereitung vorhanden"))?;
+        let (queue, _) = extension.enqueue_with_profile_bindings_using(
+            &prepared.operation,
+            &prepared.profile_bindings,
+            prepare_queue,
+        )?;
+        pending.take();
+        Ok(queue)
+    })
+}
+
 #[tauri::command]
 pub(crate) fn enqueue_provider_sync(
     app: tauri::AppHandle,
@@ -174,26 +207,9 @@ pub(crate) fn enqueue_provider_sync(
 ) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label();
     let window_state = state.window(label);
-    let queue = with_queue_extension(&state, &window_state, || {
-        let mut pending = window_state.pending_provider_real.lock_recover();
-        let operation = &pending
-            .as_ref()
-            .ok_or_else(|| AppError::new("app", "Keine Provider-Vorbereitung vorhanden"))?
-            .operation;
-        let profile_bindings = pending
-            .as_ref()
-            .expect("unmittelbar zuvor geprüft")
-            .profile_bindings
-            .clone();
-        let (queue, _) = crate::queue_runtime::enqueue_operation_with_profile_bindings(
-            &app,
-            &window_state,
-            label,
-            operation,
-            &profile_bindings,
-        )?;
-        pending.take();
-        Ok(queue)
+    let queue = enqueue_pending_provider(&state, &window_state, |bindings| {
+        crate::queue_runtime::ensure_profile_bindings_current(&app, bindings)?;
+        operation_queue(&app, &window_state, label)
     })?;
     emit_queue_snapshot(&app, label, &queue);
     start_queue_worker(app, label.to_owned());
@@ -373,8 +389,112 @@ pub(crate) fn approve_provider_queue_entry(
 
 #[cfg(test)]
 mod tests {
-    use super::PrepareProviderSyncRequest;
+    use super::{enqueue_pending_provider, PendingProviderRun, PrepareProviderSyncRequest};
+    use crate::{AppState, MutexExt};
     use doppeldecker_core::{Compare, MetadataProfile, ProviderKind, SyncMode};
+
+    #[test]
+    fn provider_enqueue_bewahrt_vorbereitung_bis_zum_dauerhaften_queuecommit() {
+        use doppeldecker_core::{
+            prepare_provider_transfer_for_queue, BidirectionalQueueEndpoint, OperationQueue,
+            OperationQueueProcessLock, ProviderEndpoint, QueueOperation, QueueState,
+            RemoteProfileBinding, RemoteProfileProtocol, SyncOptions,
+        };
+        use std::{fs, sync::Arc};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let source = root.join("quelle");
+        let target = root.join("ziel");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        let config = root.join("config");
+        let moved_config = root.join("config-geparkt");
+        let journal = config.join("operations-queue.json");
+        let process_lock = Arc::new(OperationQueueProcessLock::acquire(&journal).unwrap());
+        let queue = Arc::new(
+            OperationQueue::open_with_process_lock(&journal, process_lock.clone()).unwrap(),
+        );
+        let before = fs::read(&journal).unwrap();
+        let options = SyncOptions {
+            compare: Compare::ContentHash,
+            ..SyncOptions::default()
+        };
+        let prepared = prepare_provider_transfer_for_queue(
+            &queue,
+            ProviderEndpoint::local(&source).unwrap(),
+            ProviderEndpoint::local(&target).unwrap(),
+            options.clone(),
+        )
+        .unwrap();
+        let operation = QueueOperation::ProviderSync {
+            source: Box::new(BidirectionalQueueEndpoint::Local {
+                root: source.to_str().unwrap().into(),
+            }),
+            target: Box::new(BidirectionalQueueEndpoint::Local {
+                root: target.to_str().unwrap().into(),
+            }),
+            options,
+            expected_plan: Box::new(prepared.preview().plan.clone()),
+        };
+        let bindings =
+            vec![RemoteProfileBinding::new(RemoteProfileProtocol::Smb, "test", 3).unwrap()];
+        let state = AppState::default();
+        let window = state.window("main");
+        *window.pending_provider_real.lock_recover() = Some(PendingProviderRun {
+            prepared,
+            operation: operation.clone(),
+            profile_bindings: bindings.clone(),
+        });
+
+        fs::rename(&config, &moved_config).unwrap();
+        let result = enqueue_pending_provider(&state, &window, |bound_profiles| {
+            assert_eq!(bound_profiles, bindings);
+            Ok(queue.clone())
+        });
+        fs::rename(&moved_config, &config).unwrap();
+        assert_eq!(result.err().unwrap().code, "outcome_unclear");
+        assert_eq!(fs::read(&journal).unwrap(), before);
+        assert!(queue.snapshot().entries.is_empty());
+        {
+            let pending = window.pending_provider_real.lock_recover();
+            let pending = pending.as_ref().unwrap();
+            assert_eq!(pending.operation, operation);
+            assert_eq!(pending.profile_bindings, bindings);
+        }
+
+        // Die Queue sperrt sich nach Verlust ihrer Ordnerbindung. Der Retry nimmt
+        // dasselbe unveränderte Journal unter der wiederhergestellten Bindung neu auf.
+        let reopened = Arc::new(
+            OperationQueue::open_with_process_lock(&journal, process_lock.clone()).unwrap(),
+        );
+        let queue = enqueue_pending_provider(&state, &window, |bound_profiles| {
+            assert_eq!(bound_profiles, bindings);
+            Ok(reopened)
+        })
+        .unwrap();
+        assert!(window.pending_provider_real.lock_recover().is_none());
+        let committed = queue.snapshot();
+        let [entry] = committed.entries.as_slice() else {
+            panic!("Der Retry muss genau einen Queueeintrag erzeugen");
+        };
+        assert_eq!(entry.operation, operation);
+        assert_eq!(entry.profile_bindings, bindings);
+        assert_eq!(entry.state, QueueState::Pending);
+        assert_eq!(
+            OperationQueue::open_with_process_lock(&journal, process_lock)
+                .unwrap()
+                .snapshot(),
+            committed
+        );
+        assert_eq!(
+            enqueue_pending_provider(&state, &window, |_| panic!("Vorbereitung schon verbraucht"))
+                .err()
+                .unwrap()
+                .code,
+            "app"
+        );
+    }
 
     /// Am riskantesten sind Core-Typen **ohne** eigenes `rename_all` in einer
     /// camelCase-Hülle: `SyncOptions.mtime_tolerance` bleibt snake_case, und genau so

@@ -1,10 +1,26 @@
+// @ts-check
+
 // Passive Dateivorschau. Pfade, Lesegrenzen und Formatprüfung liefert das Backend;
 // kein Inhalt wird als Markup, Frame oder ausführbares Dokument eingesetzt.
 import { invoke } from "./tauri-api.js";
 import { hideModal, replaceModal, showOwnedModal } from "./modal.js";
 import { $, errText, fmtEntrySize, isEntryNameSafe, joinPath } from "./ui-utils.js";
 
+/** @typedef {import("./pane-endpoint.js").PaneEndpointLocation} PaneEndpointLocation */
+/** @typedef {import("./file-preview-wire.js").FilePreviewRequest} FilePreviewRequest */
+/** @typedef {import("./file-preview-wire.js").FilePreviewWire} FilePreviewWire */
+/** @typedef {import("./file-preview-wire.js").PreviewContent} PreviewContent */
+/** @typedef {"left" | "right"} Side */
+
+/** @param {{
+ * panes: Record<Side, PaneEndpointLocation>,
+ * selectedEntries: (side: Side) => {name: string, is_file: boolean, is_symlink: boolean}[],
+ * endpointFor: (pane: PaneEndpointLocation) => FilePreviewRequest["endpoint"],
+ * showDock: (html: string, options: {closable: boolean}) => void,
+ * showError: (label: string, error: unknown) => void
+ * }} dependencies */
 export function createFilePreviewUi({ panes, selectedEntries, endpointFor, showDock, showError }) {
+  /** @param {Side} side */
   function open(side) {
     const pane = panes[side];
     const entries = selectedEntries(side);
@@ -13,10 +29,10 @@ export function createFilePreviewUi({ panes, selectedEntries, endpointFor, showD
       showDock('<span class="pill none">Dateivorschau</span>Bitte genau eine reguläre Datei ohne Symlink auswählen.', { closable: true });
       return;
     }
-    const request = { endpoint: endpointFor(pane), path: joinPath(pane.path, entry.name) };
+    const request = /** @satisfies {FilePreviewRequest} */ ({ endpoint: endpointFor(pane), path: joinPath(pane.path, entry.name) });
     const name = entry.name;
     let closed = false;
-    showOwnedModal("file-preview", token => {
+    showOwnedModal("file-preview", /** @param {symbol} token */ (token) => {
       const close = () => {
         if (!hideModal(token)) return false;
         closed = true;
@@ -26,9 +42,15 @@ export function createFilePreviewUi({ panes, selectedEntries, endpointFor, showD
         if (!close()) return;
         try {
           if (request.endpoint.provider === "local") await invoke("open_path", { path: request.path });
-          else await invoke("open_remote_snapshot", { request: { ...request, mode: "original", verification: "streaming" } });
+          else {
+            const original = /** @satisfies {import("./file-opening-wire.js").OpenRemoteSnapshotRequestWire} */ ({
+              ...request, mode: "original", verification: "streaming",
+            });
+            await invoke("open_remote_snapshot", { request: original });
+          }
         } catch (error) { showError("Öffnen fehlgeschlagen", error); }
       };
+      /** @param {FilePreviewWire | null} result @param {unknown} error */
       const render = (result = null, error = null) => {
         $("#modal .modal").classList.add("file-preview-modal");
         $("#modal-title").textContent = `Vorschau · ${name}`;
@@ -46,7 +68,8 @@ export function createFilePreviewUi({ panes, selectedEntries, endpointFor, showD
           imageError: "Das Bild konnte nicht dekodiert werden. Öffnen mit der System-App bleibt möglich." })) {
           const note = document.createElement("p");
           note.className = "file-preview-note";
-          note.textContent = error ? errText(error) : content?.reason
+          const reason = content?.kind === "unsupported" ? content.reason : null;
+          note.textContent = error ? errText(error) : reason
             || "UTF-8-Text bis 1 MiB, PNG/JPEG bis 8 MiB und 24 Millionen Pixel. Schließen blendet die Vorschau aus; der begrenzte Lesevorgang läuft bis zum Abschluss weiter.";
           body.append(note);
         }
@@ -84,7 +107,11 @@ export function createFilePreviewUi({ panes, selectedEntries, endpointFor, showD
   return { open };
 }
 
-/** Gemeinsame passive Darstellung; Typ und Daten stammen aus der Backendprüfung. */
+/**
+ * Gemeinsame passive Darstellung; Typ und Daten stammen aus der Backendprüfung.
+ * @param {HTMLElement} container
+ * @param {PreviewContent | null | undefined} content
+ */
 export function renderPassivePreviewContent(container, content, { name = "", imageError = "Das Bild konnte nicht dekodiert werden." } = {}) {
   if (content?.kind === "text") {
     const text = document.createElement("pre");

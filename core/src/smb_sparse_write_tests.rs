@@ -217,6 +217,7 @@ fn punch_source_holes(file: &std::fs::File, size: u64, islands: &[(u64, usize)])
                 fp_offset: start as i64,
                 fp_length: (end - start) as i64,
             };
+            // SAFETY: file hält den Deskriptor und hole den beschreibbaren F_PUNCHHOLE-Parameterblock.
             if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &mut hole) } != 0 {
                 return Err(io::Error::last_os_error());
             }

@@ -12,24 +12,23 @@ use doppeldecker_core::{
     list_quarantine_entries_for_target, list_quarantine_runs,
     load_smb_profiles as core_load_profiles, prepare_smb_download, prepare_smb_queue_entry,
     prepare_smb_upload, purge_quarantine_run_for_target, restore_quarantine_entry_for_target,
-    Entry, OperationQueue, Progress, QuarantineEntry, QuarantineRun, QueueEntry,
-    QueueExecutionResult, QueueOperation, RealRunPreview, RemoteCapabilities, RemoteProfileBinding,
+    OperationQueue, Progress, QuarantineEntry, QuarantineRun, QueueEntry, QueueExecutionResult,
+    QueueOperation, RealRunPreview, RemoteCapabilities, RemoteProfileBinding,
     RemoteProfileProtocol, SftpQueueDirection, SftpQueuePreparation, SmbProfile, SmbServerIdentity,
-    SmbVfs, SyncOptions, SyncPlan, VersionedProfile,
+    SmbVfs, VersionedProfile,
 };
 use tauri::{Manager, State, WebviewWindow};
 
 use crate::quarantine_commands::{restore_response, QuarantineRestoreResponse};
 
 use crate::queue_runtime::{
-    cached_remote_connection, enqueue_bound_pending, CachedRemoteConnection, PendingRemoteRealRun,
-    QueueTerminalEvent,
+    cached_remote_connection, enqueue_protocol_sync, CachedRemoteConnection,
+    EnqueueRemoteSyncRequest, PendingRemoteRealRun, QueueTerminalEvent,
 };
 use crate::sftp_commands::KeyringResolver;
 use crate::{
-    app_config_dir, enqueue_operation_with_profile_bindings, start_queue_worker,
-    take_pending_for_operation, with_queue_extension, with_reserved_operation, AppError, AppState,
-    MutexExt,
+    app_config_dir, start_queue_worker, take_pending_for_operation, with_reserved_operation,
+    AppError, AppState, MutexExt,
 };
 use crate::{emit_queue_snapshot, finish_operation, operation_queue, reserve_operation};
 
@@ -180,9 +179,11 @@ pub(crate) async fn save_smb_profile(
                 .map_err(AppError::from)
             },
             || {
-                core_load_profiles(&path)
-                    .map_err(AppError::from)
-                    .map(|profiles| profiles.into_iter().find(|profile| profile.id == id))
+                crate::sftp_commands::load_profile_for_readback(
+                    &path,
+                    doppeldecker_core::load_smb_profiles_versioned,
+                    |profile| profile.id == id,
+                )
             },
             || {
                 state.smb_connections.lock_recover().remove(&id);
@@ -224,13 +225,11 @@ pub(crate) async fn remove_smb_profile(
             &state,
             window.label(),
             || {
-                core_load_profiles(&path)
-                    .map_err(AppError::from)
-                    .map(|profiles| {
-                        profiles
-                            .into_iter()
-                            .find(|profile| profile.id == profile_id)
-                    })
+                crate::sftp_commands::load_profile_for_readback(
+                    &path,
+                    doppeldecker_core::load_smb_profiles_versioned,
+                    |profile| profile.id == profile_id,
+                )
             },
             || {
                 doppeldecker_core::remove_smb_profile_versioned_if_current(
@@ -276,6 +275,21 @@ pub(crate) struct SmbConnectionStatus {
         doppeldecker_core::remote_real_mode::ProviderQuarantineManagementCapabilities,
 }
 
+#[cfg(test)]
+#[test]
+fn connection_profile_wire_smb() {
+    crate::ipc_signature_contract::assert_connection_profile_wire::<SmbProfile, _, _>(
+        "smb",
+        doppeldecker_core::ProviderKind::Smb,
+        |profile_revision, identity, capabilities, quarantine_capabilities| SmbConnectionStatus {
+            profile_revision,
+            identity,
+            capabilities,
+            quarantine_capabilities,
+        },
+    );
+}
+
 #[tauri::command]
 pub(crate) async fn connect_smb_profile(
     app: tauri::AppHandle,
@@ -304,14 +318,7 @@ pub(crate) async fn connect_smb_profile(
     .map_err(|_| AppError::new("app", "SMB-Worker wurde unterbrochen"))?
 }
 
-#[derive(serde::Serialize)]
-pub(crate) struct SmbDirListing {
-    profile_revision: u64,
-    path: String,
-    parent: Option<String>,
-    entries: Vec<Entry>,
-    session_generation: u64,
-}
+pub(crate) type SmbDirListing = crate::browser_commands::RemoteDirListing;
 
 #[tauri::command]
 pub(crate) async fn scan_smb_dir(
@@ -336,31 +343,17 @@ pub(crate) async fn scan_smb_dir(
             || connection.reconnect(),
         )
         .map_err(AppError::from)?;
-        let mut entries = listing.entries;
-        if !show_hidden {
-            entries.retain(|entry| !entry.name.starts_with('.'));
-        }
-        entries.sort_by(|left, right| {
-            right
-                .is_dir
-                .cmp(&left.is_dir)
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-        });
-        let parent = remote_path
-            .parent()
-            .map(|parent| parent.to_string_lossy().into_owned())
-            .filter(|parent| !parent.is_empty());
+        let listing = crate::browser_commands::RemoteDirListing::from_interactive(
+            binding.revision,
+            path,
+            show_hidden,
+            listing,
+        );
         crate::queue_runtime::ensure_profile_bindings_current(
             &app,
             std::slice::from_ref(&binding),
         )?;
-        Ok(SmbDirListing {
-            profile_revision: binding.revision,
-            path,
-            parent,
-            entries,
-            session_generation: listing.session_generation,
-        })
+        Ok(listing)
     })
     .await
     .map_err(|_| AppError::new("app", "SMB-Worker wurde unterbrochen"))?
@@ -661,18 +654,8 @@ pub(crate) async fn run_smb_sync(
     .map_err(|_| AppError::new("app", "SMB-Worker wurde unterbrochen"))?
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct EnqueueSmbRequest {
-    profile_id: String,
-    #[serde(default)]
-    profile_revision: Option<u64>,
-    direction: SftpQueueDirection,
-    local_root: String,
-    remote_root: String,
-    options: SyncOptions,
-    expected_plan: SyncPlan,
-}
+pub(crate) type EnqueueSmbRequest =
+    EnqueueRemoteSyncRequest<doppeldecker_core::SmbConnectionConfig>;
 
 #[tauri::command]
 pub(crate) async fn enqueue_smb_sync(
@@ -684,47 +667,8 @@ pub(crate) async fn enqueue_smb_sync(
         let state = app.state::<AppState>();
         let label = window.label();
         let window_state = state.window(label);
-        let queue = with_queue_extension(&state, &window_state, || {
-            let connection = find_profile(&app, &request.profile_id)?.connection;
-            let requested_operation = QueueOperation::SmbSync {
-                direction: request.direction,
-                connection: Box::new(connection),
-                local_root: request.local_root,
-                remote_root: request.remote_root,
-                options: request.options,
-                expected_plan: Box::new(request.expected_plan),
-            };
-            let mut pending_slot = window_state.pending_smb_real.lock_recover();
-            let bindings = pending_slot
-                .as_ref()
-                .ok_or_else(|| {
-                    AppError::new("app", "Keine SMB-Vorbereitung zum Einreihen vorhanden")
-                })?
-                .profile_bindings
-                .clone();
-            crate::queue_runtime::ensure_pending_profile_binding(
-                &bindings,
-                RemoteProfileProtocol::Smb,
-                &request.profile_id,
-                request.profile_revision,
-            )?;
-            enqueue_bound_pending(
-                &mut pending_slot,
-                &requested_operation,
-                |pending| &pending.operation,
-                "Keine SMB-Vorbereitung zum Einreihen vorhanden",
-                "SMB-Queueanfrage stimmt nicht exakt mit der vorbereiteten Operation überein",
-                |operation| {
-                    enqueue_operation_with_profile_bindings(
-                        &app,
-                        &window_state,
-                        label,
-                        operation,
-                        &bindings,
-                    )
-                    .map(|(queue, _)| queue)
-                },
-            )
+        let queue = enqueue_protocol_sync(&app, label, &state, &window_state, request, |id| {
+            find_profile(&app, id).map(|profile| profile.connection)
         })?;
         emit_queue_snapshot(&app, label, &queue);
         start_queue_worker(app, label.to_owned());

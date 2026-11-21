@@ -321,7 +321,7 @@ mod tests {
             fs::write(&file, b"selected object").unwrap();
             let action = if ownership {
                 AdminMetadataAction::Ownership {
-                    uid: Some(unsafe { libc::geteuid() }),
+                    uid: Some(rustix::process::geteuid().as_raw()),
                     gid: None,
                 }
             } else {

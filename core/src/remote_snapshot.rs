@@ -1215,6 +1215,7 @@ mod tests {
         std::fs::create_dir(&special).unwrap();
         use std::os::unix::ffi::OsStrExt;
         let fifo = std::ffi::CString::new(special.join(MANIFEST).as_os_str().as_bytes()).unwrap();
+        // SAFETY: Der CString bleibt bis zur Rückkehr gültig und benennt nur die Test-FIFO.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         let future = SystemTime::now() + SNAPSHOT_RETENTION + Duration::from_secs(1);
         assert_eq!(

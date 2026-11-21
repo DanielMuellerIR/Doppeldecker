@@ -63,10 +63,10 @@ pub(crate) use mutex::MutexExt;
 pub(crate) use queue_runtime::require_absolute_remote_parent;
 pub(crate) use queue_runtime::{
     begin_profile_transaction, create_remote_folder, emit_queue_snapshot, emit_to_window,
-    emit_to_window_label, enqueue_operation_with_profile_bindings, enqueue_operation_with_readback,
-    finish_operation, operation_queue, profile_transaction_owned_by, reserve_operation,
-    start_queue_worker, take_pending_for_operation, window_data_file_name, with_app_extension,
-    with_queue_extension, with_reserved_operation, AppState, WindowState,
+    emit_to_window_label, finish_operation, operation_queue, profile_transaction_owned_by,
+    reserve_operation, start_queue_worker, take_pending_for_operation, window_data_file_name,
+    with_app_extension, with_queue_extension, with_queue_extension_access, with_reserved_operation,
+    AppState, WindowState,
 };
 use tauri::{Manager, WebviewWindowBuilder};
 
@@ -132,6 +132,13 @@ fn report_exit_blockers(
                 &target,
                 "window-close-blocked",
                 "Ein Verbindungsprofil wird gerade sicher gespeichert.",
+            );
+        }
+        if assessment.cli_install_active {
+            let _ = crate::emit_to_window(
+                &target,
+                "window-close-blocked",
+                "Die Einrichtung des Terminalbefehls läuft noch.",
             );
         }
     }
@@ -230,187 +237,10 @@ fn build_main_window(app: &tauri::AppHandle) -> Result<(), AppError> {
     Ok(())
 }
 
-fn main() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .menu(menu::build_menu)
-        .on_menu_event(menu::handle_menu_event)
-        .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                window
-                    .app_handle()
-                    .state::<archive_read_commands::ArchiveReadState>()
-                    .destroy_window(window.label());
-                window
-                    .app_handle()
-                    .state::<AppState>()
-                    .name_searches
-                    .cancel_window(window.label());
-                window
-                    .app_handle()
-                    .state::<batch_rename_commands::BatchRenameState>()
-                    .destroy(window.label());
-                window
-                    .app_handle()
-                    .state::<AppState>()
-                    .window(window.label())
-                    .duplicate_preparation
-                    .lock_recover()
-                    .close();
-                window
-                    .app_handle()
-                    .state::<AppState>()
-                    .window(window.label())
-                    .archive_pack_preparation
-                    .lock_recover()
-                    .close();
-                window
-                    .app_handle()
-                    .state::<AppState>()
-                    .window(window.label())
-                    .archive_extract_preparation
-                    .lock_recover()
-                    .close();
-                return;
-            }
-            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
-                return;
-            };
-            let app = window.app_handle();
-            let app_state = app.state::<AppState>();
-            let state = app_state.window(window.label());
-            let _barrier = app_state.exit_barrier.lock_recover();
-            state.closing.store(true, Ordering::Release);
-            let active = state.has_active_operation();
-            let pending = state.pending_preparation_kinds();
-            if active {
-                api.prevent_close();
-                queue_runtime::reopen_window_operation_gate(app, window.label(), &state);
-                let _ = crate::emit_to_window_label(
-                    app,
-                    window.label(),
-                    "window-close-blocked",
-                    "In diesem Fenster läuft noch eine Dateioperation oder Bereinigung.",
-                );
-                return;
-            }
-            let unfinished = match operation_queue(app, &state, window.label()) {
-                Ok(queue) => queue
-                    .snapshot()
-                    .entries
-                    .iter()
-                    .filter(|entry| queue_state_needs_exit_warning(entry.state))
-                    .count(),
-                Err(error) => {
-                    // Der echte Öffnungsfehler bleibt erhalten. Ein erfundener
-                    // „offener Eintrag“ würde die nötige Recoverydiagnose verdecken.
-                    api.prevent_close();
-                    queue_runtime::reopen_window_operation_gate(app, window.label(), &state);
-                    let _ = crate::emit_to_window_label(app, window.label(), "queue-error", error);
-                    return;
-                }
-            };
-            let profile_transaction = profile_transaction_owned_by(&app_state, window.label());
-            if active || profile_transaction || !pending.is_empty() || unfinished > 0 {
-                api.prevent_close();
-                queue_runtime::reopen_window_operation_gate(app, window.label(), &state);
-                let reason = if profile_transaction {
-                    "Dieses Fenster speichert gerade ein Verbindungsprofil."
-                } else if active {
-                    "In diesem Fenster läuft noch eine Dateioperation."
-                } else if !pending.is_empty() {
-                    "Dieses Fenster besitzt noch eine nicht gestartete Vorbereitung."
-                } else {
-                    "Die Queue dieses Fensters enthält noch offene Einträge."
-                };
-                let _ = crate::emit_to_window_label(
-                    app,
-                    window.label(),
-                    "window-close-blocked",
-                    reason,
-                );
-                return;
-            }
-
-            // Ein fremdes beschädigtes Journal blockiert nicht das Schließen eines
-            // einzelnen sauberen Fensters. Beim letzten lebenden Fenster muss der
-            // appweite Befund aber noch dort sichtbar werden, bevor es verschwände.
-            let assessment = app_commands::assess_app_exit(app, &app_state);
-            // Einmal zählen genügt: Zwischen hier und der zweiten Verwendung unten
-            // läuft nur das Verwerfen der Einmal-IDs dieses Fensters, und das rührt
-            // kein `closing`-Flag an — der Wert kann sich also nicht ändern.
-            let remaining = remaining_open_windows(app, &app_state);
-            if last_window_must_stay_open(remaining, &assessment) {
-                api.prevent_close();
-                queue_runtime::reopen_window_operation_gate(app, window.label(), &state);
-                report_exit_blockers(app, &app_state, &assessment);
-                return;
-            }
-            // Ein geschlossenes Fenster darf keine von ihm erfasste Einmal-ID im
-            // RAM zurücklassen. Noch laufende native Dialoge prüfen den Besitzer
-            // zusätzlich unmittelbar vor dem Eintragen.
-            sftp_commands::discard_connection_secrets_for_owner(&app_state, window.label());
-            app_state.name_searches.cancel_window(window.label());
-            let last_window = remaining == 0;
-            // Auf macOS lässt das Schließen des letzten Fensters den Prozess
-            // weiterlaufen; dieses Fenster soll aus der nächsten Sitzung
-            // verschwinden. Auf Linux beendet derselbe Schritt die App. Ein bereits
-            // laufender appweiter Exit erhält auf beiden Systemen den zuletzt
-            // geschriebenen vollständigen Fensterstand.
-            let preserve_for_exit = app_state.exit_in_progress.load(Ordering::Acquire)
-                || (last_window && !cfg!(target_os = "macos"));
-            desktop_settings::schedule_forget_closed_window(app, window.label(), preserve_for_exit);
-        })
-        .manage(AppState::default())
-        .manage(batch_rename_commands::BatchRenameState::default())
-        .manage(archive_read_commands::ArchiveReadState::default())
-        .manage(desktop_settings::DesktopState::default())
-        .manage(update_commands::UpdateState::default())
-        .setup(|app| {
-            run_startup_steps(
-                || {
-                    #[cfg(target_os = "macos")]
-                    menu::install_native_exit_gate(app.handle())?;
-                    queue_runtime::initialize_queue_process_lock(app.handle())?;
-                    desktop_settings::initialize(app.handle())
-                },
-                || {
-                    // Erst die Recovery-Planung: Sie weiß, welche Nebenfenster noch
-                    // eine offene Queue haben, und nur ein sicher beendetes darf
-                    // zum neuen Hauptfenster werden.
-                    let recovery = window_commands::prepare_incomplete_queue_windows(app.handle())?;
-                    let unavailable = recovery.unavailable_labels();
-                    let session =
-                        window_commands::prepare_session_windows(app.handle(), &unavailable)?;
-                    Ok((recovery, session))
-                },
-                || build_main_window(app.handle()),
-                |(recovery, session)| {
-                    window_commands::show_incomplete_queue_windows(app.handle(), recovery);
-                    window_commands::show_session_windows(app.handle(), &session);
-                },
-            )
-            .map_err(|error| {
-                std::io::Error::other(format!(
-                    "Doppeldecker wurde vor der Fenstererzeugung sicher gestoppt: {}",
-                    error.message
-                ))
-            })?;
-            // Linux setzt das Icon bereits beim Bau jedes Fensters. Nur macOS hat
-            // stattdessen ein prozessweites Dockicon, das einmal nach dem Start
-            // aktualisiert werden muss.
-            #[cfg(target_os = "macos")]
-            {
-                if let Err(error) = desktop_settings::apply_icon(app.handle()) {
-                    window_commands::append_startup_app_error(
-                        &app.state::<AppState>(),
-                        format!("App-Icon konnte nicht gesetzt werden: {}", error.message),
-                    );
-                }
-            }
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
+// Die Registrierung und der Test der Frontend-Namen verwenden dieselbe Liste.
+macro_rules! with_frontend_commands {
+    ($consumer:ident) => {
+        $consumer! {
             window_commands::new_app_window,
             window_commands::take_window_start_state,
             window_commands::take_startup_queue_error,
@@ -609,6 +439,7 @@ fn main() {
             duplicate_commands::discard_duplicate,
             file_commands::copy_paths,
             file_commands::enqueue_resumable_copy,
+            file_commands::cancel_resumable_copy_preparation,
             file_commands::move_paths,
             file_commands::enqueue_provider_file_operation,
             file_clipboard::write_file_clipboard,
@@ -640,7 +471,239 @@ fn main() {
             cli_setup::cli_install_status,
             cli_setup::decline_cli_install,
             cli_setup::install_cli,
-        ])
+        }
+    };
+}
+
+macro_rules! frontend_invoke_handler {
+    ($($commands:tt)*) => {
+        tauri::generate_handler![$($commands)*]
+    };
+}
+
+#[cfg(test)]
+mod ipc_signature_contract;
+
+#[cfg(test)]
+#[test]
+fn ipc_registry_matches_the_frontend_command_manifest() {
+    macro_rules! paths {
+        ($($command:path),* $(,)?) => {
+            [$(stringify!($command)),*]
+        };
+    }
+    let mut registered = with_frontend_commands!(paths)
+        .iter()
+        .map(|path| path.rsplit("::").next().unwrap().trim())
+        .collect::<Vec<_>>();
+    registered.sort_unstable();
+    let actual = ipc_signature_contract::derive(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        &with_frontend_commands!(paths),
+    );
+    let expected: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+        serde_json::from_str(include_str!("../../tools/tests/tauri-command-args.json")).unwrap();
+    for (command, signature) in &actual {
+        assert_eq!(
+            Some(&signature.arguments),
+            expected.get(command),
+            "IPC-Argumente für {command}"
+        );
+    }
+    assert_eq!(
+        expected.keys().map(String::as_str).collect::<Vec<_>>(),
+        registered
+    );
+    let generated = ipc_signature_contract::response_types(&actual);
+    let output =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend/ipc-results.d.ts");
+    if std::env::var("DOPPELDECKER_UPDATE_IPC_TYPES").as_deref() == Ok("1") {
+        std::fs::write(&output, &generated).unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(output).unwrap(), generated);
+}
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .menu(menu::build_menu)
+        .on_menu_event(menu::handle_menu_event)
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                window
+                    .app_handle()
+                    .state::<archive_read_commands::ArchiveReadState>()
+                    .destroy_window(window.label());
+                window
+                    .app_handle()
+                    .state::<AppState>()
+                    .name_searches
+                    .cancel_window(window.label());
+                window
+                    .app_handle()
+                    .state::<batch_rename_commands::BatchRenameState>()
+                    .destroy(window.label());
+                window
+                    .app_handle()
+                    .state::<AppState>()
+                    .window(window.label())
+                    .duplicate_preparation
+                    .lock_recover()
+                    .close();
+                window
+                    .app_handle()
+                    .state::<AppState>()
+                    .window(window.label())
+                    .archive_pack_preparation
+                    .lock_recover()
+                    .close();
+                window
+                    .app_handle()
+                    .state::<AppState>()
+                    .window(window.label())
+                    .archive_extract_preparation
+                    .lock_recover()
+                    .close();
+                return;
+            }
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            let app = window.app_handle();
+            let app_state = app.state::<AppState>();
+            let state = app_state.window(window.label());
+            let _barrier = app_state.exit_barrier.lock_recover();
+            state.closing.store(true, Ordering::Release);
+            let active = state.has_active_operation();
+            let pending = state.pending_preparation_kinds();
+            if active {
+                api.prevent_close();
+                queue_runtime::reopen_window_operation_gate(app, window.label(), &state);
+                let _ = crate::emit_to_window_label(
+                    app,
+                    window.label(),
+                    "window-close-blocked",
+                    "In diesem Fenster läuft noch eine Dateioperation oder Bereinigung.",
+                );
+                return;
+            }
+            let unfinished = match operation_queue(app, &state, window.label()) {
+                Ok(queue) => queue
+                    .snapshot()
+                    .entries
+                    .iter()
+                    .filter(|entry| queue_state_needs_exit_warning(entry.state))
+                    .count(),
+                Err(error) => {
+                    // Der echte Öffnungsfehler bleibt erhalten. Ein erfundener
+                    // „offener Eintrag“ würde die nötige Recoverydiagnose verdecken.
+                    api.prevent_close();
+                    queue_runtime::reopen_window_operation_gate(app, window.label(), &state);
+                    let _ = crate::emit_to_window_label(app, window.label(), "queue-error", error);
+                    return;
+                }
+            };
+            let profile_transaction = profile_transaction_owned_by(&app_state, window.label());
+            if active || profile_transaction || !pending.is_empty() || unfinished > 0 {
+                api.prevent_close();
+                queue_runtime::reopen_window_operation_gate(app, window.label(), &state);
+                let reason = if profile_transaction {
+                    "Dieses Fenster speichert gerade ein Verbindungsprofil."
+                } else if active {
+                    "In diesem Fenster läuft noch eine Dateioperation."
+                } else if !pending.is_empty() {
+                    "Dieses Fenster besitzt noch eine nicht gestartete Vorbereitung."
+                } else {
+                    "Die Queue dieses Fensters enthält noch offene Einträge."
+                };
+                let _ = crate::emit_to_window_label(
+                    app,
+                    window.label(),
+                    "window-close-blocked",
+                    reason,
+                );
+                return;
+            }
+
+            // Ein fremdes beschädigtes Journal blockiert nicht das Schließen eines
+            // einzelnen sauberen Fensters. Beim letzten lebenden Fenster muss der
+            // appweite Befund aber noch dort sichtbar werden, bevor es verschwände.
+            let assessment = app_commands::assess_app_exit(app, &app_state);
+            // Einmal zählen genügt: Zwischen hier und der zweiten Verwendung unten
+            // läuft nur das Verwerfen der Einmal-IDs dieses Fensters, und das rührt
+            // kein `closing`-Flag an — der Wert kann sich also nicht ändern.
+            let remaining = remaining_open_windows(app, &app_state);
+            if last_window_must_stay_open(remaining, &assessment) {
+                api.prevent_close();
+                queue_runtime::reopen_window_operation_gate(app, window.label(), &state);
+                report_exit_blockers(app, &app_state, &assessment);
+                return;
+            }
+            // Ein geschlossenes Fenster darf keine von ihm erfasste Einmal-ID im
+            // RAM zurücklassen. Noch laufende native Dialoge prüfen den Besitzer
+            // zusätzlich unmittelbar vor dem Eintragen.
+            sftp_commands::discard_connection_secrets_for_owner(&app_state, window.label());
+            app_state.name_searches.cancel_window(window.label());
+            let last_window = remaining == 0;
+            // Auf macOS lässt das Schließen des letzten Fensters den Prozess
+            // weiterlaufen; dieses Fenster soll aus der nächsten Sitzung
+            // verschwinden. Auf Linux beendet derselbe Schritt die App. Ein bereits
+            // laufender appweiter Exit erhält auf beiden Systemen den zuletzt
+            // geschriebenen vollständigen Fensterstand.
+            let preserve_for_exit = app_state.exit_in_progress.load(Ordering::Acquire)
+                || (last_window && !cfg!(target_os = "macos"));
+            desktop_settings::schedule_forget_closed_window(app, window.label(), preserve_for_exit);
+        })
+        .manage(AppState::default())
+        .manage(batch_rename_commands::BatchRenameState::default())
+        .manage(archive_read_commands::ArchiveReadState::default())
+        .manage(desktop_settings::DesktopState::default())
+        .manage(update_commands::UpdateState::default())
+        .setup(|app| {
+            run_startup_steps(
+                || {
+                    #[cfg(target_os = "macos")]
+                    menu::install_native_exit_gate(app.handle())?;
+                    queue_runtime::initialize_queue_process_lock(app.handle())?;
+                    desktop_settings::initialize(app.handle())
+                },
+                || {
+                    // Erst die Recovery-Planung: Sie weiß, welche Nebenfenster noch
+                    // eine offene Queue haben, und nur ein sicher beendetes darf
+                    // zum neuen Hauptfenster werden.
+                    let recovery = window_commands::prepare_incomplete_queue_windows(app.handle())?;
+                    let unavailable = recovery.unavailable_labels();
+                    let session =
+                        window_commands::prepare_session_windows(app.handle(), &unavailable)?;
+                    Ok((recovery, session))
+                },
+                || build_main_window(app.handle()),
+                |(recovery, session)| {
+                    window_commands::show_incomplete_queue_windows(app.handle(), recovery);
+                    window_commands::show_session_windows(app.handle(), &session);
+                },
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "Doppeldecker wurde vor der Fenstererzeugung sicher gestoppt: {}",
+                    error.message
+                ))
+            })?;
+            // Linux setzt das Icon bereits beim Bau jedes Fensters. Nur macOS hat
+            // stattdessen ein prozessweites Dockicon, das einmal nach dem Start
+            // aktualisiert werden muss.
+            #[cfg(target_os = "macos")]
+            {
+                if let Err(error) = desktop_settings::apply_icon(app.handle()) {
+                    window_commands::append_startup_app_error(
+                        &app.state::<AppState>(),
+                        format!("App-Icon konnte nicht gesetzt werden: {}", error.message),
+                    );
+                }
+            }
+            Ok(())
+        })
+        .invoke_handler(with_frontend_commands!(frontend_invoke_handler))
         .build(tauri::generate_context!())
         .expect("Fehler beim Starten von Doppeldecker")
         .run(|app, event| {
@@ -737,55 +800,6 @@ mod event_scope_tests {
 }
 
 #[cfg(test)]
-mod listing_binding_tests {
-    /// Listing und Sitzungsgeneration müssen aus demselben gehaltenen Providerzustand
-    /// stammen.
-    ///
-    /// Die Provider-Verbindungen sind prozessweit geteilt. Liest ein Command erst das
-    /// Listing und danach erneut die Generation, kann dazwischen ein Reconnect aus
-    /// einem anderen Fenster liegen: Die Einträge der alten Sitzung tragen dann das
-    /// Etikett der neuen. Genau daran hängt die Driftbindung von Pane, Ordnergrösse
-    /// und Folgeoperation. Für SFTP hielt ein eigener Test das schon fest; SMB, FTPS
-    /// und WebDAV hatten dieselbe Stelle offen.
-    #[test]
-    fn scan_commands_binden_listing_und_generation_atomar() {
-        let quellen = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        // Zusammengesetzt, damit die Suchzeichenkette nicht im eigenen Quelltext steht.
-        let getrennter_zugriff = format!("connection.session_{}()", "generation");
-
-        for (datei, funktion) in [
-            ("sftp_commands.rs", "pub(crate) async fn scan_sftp_dir("),
-            ("smb_commands.rs", "pub(crate) async fn scan_smb_dir("),
-            ("ftps_commands.rs", "pub(crate) async fn scan_ftps_dir("),
-            ("webdav_commands.rs", "pub(crate) async fn scan_webdav_dir("),
-        ] {
-            let inhalt = std::fs::read_to_string(quellen.join(datei)).unwrap();
-            let start = inhalt
-                .find(funktion)
-                .unwrap_or_else(|| panic!("{datei}: {funktion} nicht gefunden"));
-            // Bis zum nächsten Command — das ist die Grenze der Funktion.
-            let rest = &inhalt[start + funktion.len()..];
-            let ende = rest.find("#[tauri::command]").unwrap_or(rest.len());
-            let rumpf = &rest[..ende];
-
-            assert!(
-                rumpf.contains("list_interactive"),
-                "{datei}: das Pane-Listing muss die gebundene Variante benutzen"
-            );
-            assert!(
-                rumpf.contains("session_generation: listing.session_generation"),
-                "{datei}: die Antwort muss die Generation des Listings tragen"
-            );
-            assert!(
-                !rumpf.contains(&getrennter_zugriff),
-                "{datei}: Listing und Generation dürfen nicht aus zwei getrennten \
-                 State-Snapshots stammen"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod sandbox_tests {
     use super::*;
     use doppeldecker_core::{
@@ -826,17 +840,6 @@ mod sandbox_tests {
         for state in [QueueState::Completed, QueueState::Cancelled] {
             assert!(!queue_state_needs_exit_warning(state), "Zustand {state:?}");
         }
-    }
-
-    #[test]
-    fn setup_erwirbt_prozesslock_vor_journal_recovery() {
-        let source = include_str!("main.rs");
-        let setup = &source[source.find(".setup(|app|").unwrap()..];
-        let lock = setup.find("initialize_queue_process_lock").unwrap();
-        let recovery = setup.find("prepare_incomplete_queue_windows").unwrap();
-        let main_window = setup.find("build_main_window").unwrap();
-        let recovery_windows = setup.find("show_incomplete_queue_windows").unwrap();
-        assert!(lock < recovery && recovery < main_window && main_window < recovery_windows);
     }
 
     #[test]

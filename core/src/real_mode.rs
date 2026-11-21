@@ -1985,7 +1985,7 @@ pub(crate) fn protect_internal_quarantine(vfs: &dyn Vfs, root: &Path) -> io::Res
     let before = vfs.metadata_manifest(root)?;
     if before
         .owner
-        .is_none_or(|owner| owner.uid != unsafe { libc::geteuid() })
+        .is_none_or(|owner| owner.uid != rustix::process::geteuid().as_raw())
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

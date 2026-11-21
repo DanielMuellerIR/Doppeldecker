@@ -436,6 +436,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn permission_ipc_wire_matches_frontend() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/file-property-wire.json"))
+                .unwrap();
+        let permission: PermissionEditRequest =
+            serde_json::from_value(fixture["permissions"]["request"].clone()).unwrap();
+        assert_eq!(permission.request_id, "bound");
+        assert_eq!(permission.provider, "local");
+        assert_eq!(permission.root, "/mock/quelle");
+        assert!(!permission.recursive);
+        assert!(permission.administrator);
+        assert_eq!(permission.profile_id, None);
+        assert_eq!(permission.profile_revision, None);
+        let permission_row = PermissionEditRow {
+            name: permission.names[0].clone(),
+            mode: Some(parse_mode(&permission.mode).unwrap()),
+            changed: true,
+            code: None,
+            message: "Änderung bestätigt".into(),
+        };
+        assert_eq!(
+            serde_json::to_value([permission_row]).unwrap(),
+            fixture["permissions"]["rows"]
+        );
+
+        let owner: OwnerEditRequest =
+            serde_json::from_value(fixture["ownership"]["request"].clone()).unwrap();
+        assert_eq!(owner.request_id, "bound");
+        assert_eq!(owner.provider, "local");
+        assert_eq!(owner.root, "/mock/quelle");
+        assert!(owner.administrator);
+        assert!(owner.group.is_empty());
+        let owner_row = OwnerEditRow {
+            name: owner.names[0].clone(),
+            owner: Some(owner.owner),
+            group: Some("wheel".into()),
+            uid: Some(0),
+            gid: Some(0),
+            special_bits_changed: Some(false),
+            changed: true,
+            code: None,
+            message: "Änderung bestätigt".into(),
+        };
+        assert_eq!(
+            serde_json::to_value([owner_row]).unwrap(),
+            fixture["ownership"]["rows"]
+        );
+
+        let capabilities = get_file_property_capabilities("smb".into()).unwrap();
+        let capabilities = serde_json::to_value(capabilities).unwrap();
+        crate::browser_commands::assert_wire_object(&capabilities, &fixture["capabilities"]);
+        assert_eq!(capabilities["permissions"], false);
+        assert_eq!(capabilities["administration"], false);
+    }
+
+    #[test]
     fn request_accepts_actual_frontend_payload_and_only_three_octal_digits() {
         let request: PermissionEditRequest = serde_json::from_value(serde_json::json!({
             "requestId":"direct", "provider": "local", "root": "/tmp/pane", "names": [" a "], "mode": "640"

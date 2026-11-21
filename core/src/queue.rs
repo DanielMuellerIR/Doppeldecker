@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -44,6 +44,10 @@ use crate::{
 #[path = "queue/forward.rs"]
 mod forward;
 pub use forward::*;
+
+#[path = "queue/journal.rs"]
+mod journal;
+use journal::{read_snapshot_bound, read_snapshot_from_reader};
 
 #[path = "queue/resume_progress.rs"]
 mod resume_progress;
@@ -1048,536 +1052,8 @@ impl OperationQueue {
             }
             Err(error) => return Err(error),
         };
-        if snapshot.version < 40
-            && snapshot
-                .entries
-                .iter()
-                .any(|entry| matches!(entry.operation, QueueOperation::ArchiveUpload { .. }))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Archivphasen benötigen Journalversion 40",
-            ));
-        }
-        // Version 2 ergänzte SFTP, Version 3 FTPS, Version 4 WebDAV, Version 5 SMB
-        // und Version 6 bidirektionale Läufe. Version 8 ergänzt die generische
-        // Provider→Provider-Variante; Version 9 ergänzt interaktive Provider-Dateien,
-        // Version 10 Remote-Löschen und Version 11 rekursive Zielkonfliktpfade.
-        // Version 12 ergänzt den eigenen Attention-Typ `BestEffortCommitDowngrade`.
-        // Version 13 bindet jeden bestätigten Zielkonflikt an Metadaten/Hash und
-        // trennt die Best-Effort-Klassen für neue Namen und Ersetzungen. Version 14
-        // bindet zusätzlich die sichtbare Klasse des Move-Quellabbaus. Version 15
-        // bindet die lokale Best-Effort-Ersetzung getrennt und ausdrücklich.
-        // Version 16 ergänzt geheimnisfreie Profilrevisionen je Queueeintrag.
-        // Version 17 migriert ältere WebDAV-Löschpläne, denen die damals noch
-        // nicht persistierte starke Root-ETag fehlt, in einen sichtbaren und nicht
-        // erneut ausführbaren Fehlerzustand. Version 18 persistiert Fehlercodes
-        // und migriert zusätzlich WebDAV-v17-Pläne mit dem früheren leeren
-        // Server-Header-Digest in denselben fail-closed Zustand. Außerdem
-        // kennzeichnet Version 18 ältere fehlgeschlagene oder unterbrochene
-        // Mutationen ohne damals noch nicht persistierten Fehlercode konservativ
-        // als unklar, damit sie nach dem Upgrade nicht blind wiederholbar werden.
-        // Version 19 stellt FTPS-/WebDAV-Löschpläne mit den früheren
-        // Serveridentitäts-Digests zustandsabhängig auf Neuplanung oder manuelle
-        // Recovery, statt sie unter der neuen Digestbedeutung wieder auszuführen.
-        // Ältere Dokumente besitzen den jeweils neuen Variantentag nicht.
-        // Ältere Dokumente enthalten den jeweils neueren Variantentag per Definition
-        // nicht und lassen sich deshalb ohne Bedeutungsänderung atomar hochstufen.
-        // Version 22 bindet backendseitig vergebene Konfliktkopie-Ziele. Ältere
-        // Executoren dürfen sie nicht als gewöhnliches Skip ausführen.
-        // Version 23 unterscheidet normale lokale Ausführung ausdrücklich von
-        // persistentem Dry-Run; ältere Aufträge werden niemals hochgestuft.
         let source_version = snapshot.version;
-        if source_version < 39
-            && snapshot
-                .entries
-                .iter()
-                .any(|entry| entry.generated_source.is_some())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Altes Queuejournal enthält eine dort nicht erlaubte erzeugte Quelle",
-            ));
-        }
-        if source_version < 38
-            && snapshot
-                .entries
-                .iter()
-                .any(|entry| matches!(entry.operation, QueueOperation::RenameCycleRecovery { .. }))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Altes Queuejournal enthält eine dort nicht erlaubte Namenstausch-Recovery",
-            ));
-        }
-        // Version 24 bindet rekursive interaktive Quellen und deren Auslassungen.
-        // Ein älterer Executor darf den neuen Baumbeleg nicht still ignorieren.
-        // Version 25 erhält Remote-Dateiintents und verlangt nach Reopen eine
-        // frische Best-Effort-Bestätigung für gewöhnliche WebDAV-Additionen.
-        // Version 26 erlaubt die begrenzte lokale Baumquelle für additive WebDAV-Ziele.
-        // Ältere Executoren dürfen die Ordnerintents und diese Wirkungsbindung nicht ignorieren.
-        // Version 27 zeigt auch vor einem Queueauftrag unterbrochene FTPS-Proben
-        // als reine Recovery. Ältere Executoren dürfen sie nicht wiederholen.
-        // Version 28 ergänzt lokale ZIP-Erzeugung samt authentischer Bestandsbindung.
-        // Version 30 bindet Datei-/Unterbaumauswahl; ältere Executoren dürfen sie
-        // niemals als Ganzarchivauftrag ignorieren. Version 29 erhält All als Default.
-        if source_version < 30 && snapshot.entries.iter().any(|entry| {
-            matches!(&entry.operation, QueueOperation::ArchiveExtract { request, expected }
-                if !matches!(request.selection, crate::archive_extract::ArchiveExtractSelection::All)
-                    || !matches!(expected.preview.selection, crate::archive_extract::ArchiveExtractSelection::All))
-        }) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "Altes Queuejournal enthält eine dort nicht unterstützte ZIP-Auswahl"));
-        }
-        // Version 31 erlaubt ausschließlich manifestgebundene interne Snapshotquellen.
-        // Kein älteres Journal darf diese Quellenklasse nachträglich einschleusen.
-        if source_version < 31 && snapshot.entries.iter().any(|entry| {
-            matches!(&entry.operation, QueueOperation::ArchiveExtract { request, expected }
-                if request.snapshot.is_some() || expected.preview.snapshot.is_some())
-                || matches!(&entry.attention, Some(QueueAttention::ArchiveExtractChanged { current, .. }) if current.preview.snapshot.is_some())
-                || entry.archive_extract_report.as_ref().is_some_and(|report| report.preview.snapshot.is_some())
-        }) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Altes Queuejournal enthält eine dort nicht unterstützte Archivmomentaufnahme"));
-        }
-        // Version 32 erweitert nur Snapshotquellen um Ganzarchiv und Unterbaum.
-        // Diese Kombination darf in älteren Journalen auch nicht über eine
-        // Rückfrage oder historische Teilbilanz nachträglich eingeschleust werden.
-        if source_version < 32 && snapshot.entries.iter().any(|entry| {
-            let needs_new_schema = |snapshot: bool, selection: &crate::archive_extract::ArchiveExtractSelection| {
-                snapshot && !matches!(selection, crate::archive_extract::ArchiveExtractSelection::Entry { .. })
-            };
-            matches!(&entry.operation, QueueOperation::ArchiveExtract { request, expected }
-                if needs_new_schema(request.snapshot.is_some(), &request.selection)
-                    || needs_new_schema(expected.preview.snapshot.is_some(), &expected.preview.selection))
-                || matches!(&entry.attention, Some(QueueAttention::ArchiveExtractChanged { current, .. })
-                    if needs_new_schema(current.preview.snapshot.is_some(), &current.preview.selection))
-                || entry.archive_extract_report.as_ref().is_some_and(|report|
-                    needs_new_schema(report.preview.snapshot.is_some(), &report.preview.selection))
-        }) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "Altes Queuejournal enthält einen dort nicht unterstützten Snapshot-Entpackumfang"));
-        }
-        if source_version < 33
-            && snapshot
-                .entries
-                .iter()
-                .any(|entry| matches!(entry.operation, QueueOperation::ContentSync { .. }))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Altes Queuejournal enthält eine dort nicht unterstützte Inhaltssync-Klasse",
-            ));
-        }
-        if source_version < 34
-            && snapshot
-                .entries
-                .iter()
-                .any(|entry| matches!(entry.operation, QueueOperation::BidirectionalForward { .. }))
-        {
-            return Err(io::Error::new(io::ErrorKind::InvalidData,"Altes Queuejournal enthält eine dort nicht unterstützte bidirektionale Forwardklasse"));
-        }
-        // Version 35 bindet objektweite Datei-DACL-Wirkungen samt Aliasstimmen
-        // und Recoverybericht; ältere Executoren dürfen diese Klasse nicht ignorieren.
-        if source_version<35 && snapshot.entries.iter().any(|entry| {
-            entry.file_dacl_recovery || !entry.file_dacl_report.is_empty() || !entry.progress.file_dacl_report.is_empty()
-                || matches!(&entry.operation,QueueOperation::ContentSync{expected_plan,..} if !expected_plan.file_dacl_selections.is_empty() || expected_plan.actions.iter().any(|action|matches!(action,crate::Action::SetFileDacl{..})))
-        }) { return Err(io::Error::new(io::ErrorKind::InvalidData,"Altes Queuejournal enthält eine dort nicht unterstützte objektweite Datei-DACL-Klasse")); }
-        if source_version < 36
-            && snapshot.entries.iter().any(|entry| {
-                entry.created_directory_dacl_recovery
-                    || !entry.created_directory_dacl_report.is_empty()
-                    || !entry.progress.created_directory_dacl_report.is_empty()
-                    || queue_entry_created_payload(entry)
-            })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Altes Queuejournal enthält eine dort nicht unterstützte Neuordner-Rechteklasse",
-            ));
-        }
-        if source_version < 37
-            && snapshot
-                .entries
-                .iter()
-                .any(queue_entry_before_children_payload)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Altes Queuejournal enthält eine dort nicht unterstützte V8-Rechteklasse",
-            ));
-        }
-        for entry in &snapshot.entries {
-            let invalid_original = operation_sync_plan(&entry.operation).is_some_and(|plan| {
-                before_children_plan_payload(plan) && !before_children_class(&entry.operation, plan)
-            });
-            let invalid_preview = matches!(&entry.attention, Some(QueueAttention::PlanChanged { current_plan, .. })
-                if before_children_plan_payload(current_plan) && !before_children_class(&entry.operation, current_plan));
-            let has_rights = before_children_rights_report(&entry.created_directory_dacl_report)
-                || before_children_rights_report(&entry.progress.created_directory_dacl_report);
-            let original_class = operation_sync_plan(&entry.operation)
-                .is_some_and(|plan| before_children_class(&entry.operation, plan));
-            if invalid_original || invalid_preview || (has_rights && !original_class) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "V8 benötigt passenden NativeBestEffort-ContentSync/CreateDir; Rechtebelege behalten ihre ursprüngliche Absicht"));
-            }
-        }
-        for entry in &snapshot.entries {
-            let has_rights = entry.created_directory_dacl_recovery
-                || entry.created_directory_dacl_report.has_rights_effects()
-                || entry
-                    .progress
-                    .created_directory_dacl_report
-                    .has_rights_effects();
-            let has_creation = !entry.created_directory_dacl_report.created.is_empty()
-                || !entry
-                    .progress
-                    .created_directory_dacl_report
-                    .created
-                    .is_empty();
-            if has_rights
-                && !matches!(&entry.operation,QueueOperation::ContentSync{expected_plan,..} if expected_plan.actions.iter().any(created_directory_action))
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Neuordner-Rechtebeleg ohne passende ursprüngliche CreateDir-Absicht",
-                ));
-            }
-            if has_creation && !matches!(entry.operation, QueueOperation::ContentSync { .. }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Historische Neuordneranlage benötigt ihren ursprünglichen Inhaltssync",
-                ));
-            }
-        }
-        if source_version < 41
-            && snapshot
-                .entries
-                .iter()
-                .any(|entry| matches!(entry.operation, QueueOperation::ResumableCopy { .. }))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Fortsetzbare Kopien benötigen Journalversion 41",
-            ));
-        }
-        if source_version < 42
-            && snapshot.entries.iter().any(|entry| match &entry.operation {
-                QueueOperation::ArchiveExtract { request, .. } => !request.format.is_zip(),
-                QueueOperation::ArchiveUpload { generation, .. } => matches!(
-                    generation.as_ref(),
-                    crate::archive_upload::ArchiveGeneration::Extract { request, .. } if !request.format.is_zip()
-                ),
-                _ => false,
-            })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "TAR-Entpackaufträge benötigen Journalversion 42",
-            ));
-        }
-        if source_version < 43 && snapshot.entries.iter().any(|entry| {
-            matches!(&entry.operation, QueueOperation::ResumableCopy { plan, .. } if plan.webdav_endpoint().is_some())
-        }) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Fortsetzbare WebDAV-Downloads benötigen Journalversion 43"));
-        }
-        if source_version < 44 && snapshot.entries.iter().any(|entry| {
-            matches!(&entry.operation, QueueOperation::ResumableCopy { plan, .. } if plan.ftps_endpoint().is_some())
-        }) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Fortsetzbare FTPS-Downloads benötigen Journalversion 44"));
-        }
-        if source_version < 45 && snapshot.entries.iter().any(|entry| {
-            matches!(&entry.operation, QueueOperation::ResumableCopy { plan, .. } if plan.sftp_endpoint().is_some())
-        }) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Fortsetzbare SFTP-Downloads benötigen Journalversion 45"));
-        }
-        let migrated = if matches!(source_version, 1..=39) {
-            for entry in &mut snapshot.entries {
-                if let QueueOperation::File {
-                    destination,
-                    expected_conflicts,
-                    ..
-                } = &mut entry.operation
-                {
-                    for conflict in expected_conflicts {
-                        if !Path::new(conflict).is_absolute() {
-                            *conflict = crate::fileops::path_to_utf8(
-                                &Path::new(destination).join(&*conflict),
-                            )?;
-                        }
-                    }
-                }
-            }
-            if source_version <= 10 {
-                for entry in &mut snapshot.entries {
-                    if let QueueOperation::ProviderFile {
-                        destination,
-                        expected_conflicts,
-                        ..
-                    } = &mut entry.operation
-                    {
-                        for conflict in expected_conflicts {
-                            if !Path::new(conflict).is_absolute() {
-                                *conflict = crate::fileops::path_to_utf8(
-                                    &Path::new(destination).join(&*conflict),
-                                )?;
-                            }
-                        }
-                    }
-                }
-            }
-            if source_version <= 12 {
-                for entry in &mut snapshot.entries {
-                    if let QueueOperation::ProviderFile {
-                        overwrite,
-                        best_effort_commit_expected,
-                        copy_new_best_effort_expected,
-                        replace_best_effort_expected,
-                        ..
-                    } = &mut entry.operation
-                    {
-                        let legacy = best_effort_commit_expected.take();
-                        if *overwrite {
-                            *replace_best_effort_expected = legacy;
-                        } else {
-                            *copy_new_best_effort_expected = legacy;
-                        }
-                    }
-                    // Die alte Bestätigung konnte nicht ausdrücken, welche der
-                    // beiden Wirkungen degradiert war. Sie wird deshalb verworfen;
-                    // der nächste Claim erzeugt bei Bedarf eine eindeutige Phrase.
-                    if matches!(
-                        entry.attention,
-                        Some(QueueAttention::BestEffortCommitDowngrade { .. })
-                    ) {
-                        entry.state = QueueState::Pending;
-                        entry.attention = None;
-                        entry.error = None;
-                        entry.error_code = None;
-                    }
-                }
-            }
-            if source_version <= 14 {
-                for entry in &mut snapshot.entries {
-                    if let QueueOperation::File {
-                        overwrite,
-                        local_replace_best_effort_expected,
-                        ..
-                    } = &mut entry.operation
-                    {
-                        // Alte überschreibende Einträge besitzen keine belastbare
-                        // Sichtbarkeitsbestätigung und müssen beim nächsten Claim
-                        // pausieren. Ohne Überschreiben ist die Klasse eindeutig.
-                        *local_replace_best_effort_expected = (!*overwrite).then_some(false);
-                    }
-                }
-            }
-            if source_version <= 17 {
-                for entry in &mut snapshot.entries {
-                    if matches!(entry.state, QueueState::Failed | QueueState::Interrupted)
-                        && entry.error_code.is_none()
-                    {
-                        // Vor Version 18 blieb vom Executorfehler nur der Text im
-                        // Journal. Daraus lässt sich nachträglich nicht sicher
-                        // ableiten, ob eine Mutation bereits gesendet wurde. Ein
-                        // erneuter Lauf bleibt deshalb bis zur ausdrücklichen
-                        // Prüfung gesperrt; sicher mutationsfreie Pending-Einträge
-                        // und bereits terminale Abschlüsse bleiben unverändert.
-                        entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
-                    }
-                }
-            }
-            if source_version <= 19 {
-                for entry in &mut snapshot.entries {
-                    let QueueOperation::ProviderDelete {
-                        endpoint,
-                        expected_plan,
-                        ..
-                    } = &entry.operation
-                    else {
-                        continue;
-                    };
-                    if !matches!(
-                        endpoint.as_ref(),
-                        BidirectionalQueueEndpoint::Ftps { .. }
-                            | BidirectionalQueueEndpoint::WebDav { .. }
-                    ) {
-                        continue;
-                    }
-                    // Version 18 konnte bereits einen WebDAV-v15..17-Plan mit
-                    // diesem ungültigen ETag-Sentinel stillgelegt haben. Dieser
-                    // Zustand belegt durch Status, Fortschritt und Fehlertext
-                    // getrennt, ob der Plan sicher nie startete oder eine Wirkung
-                    // unklar blieb. Die allgemeinere Schema-Migration darf diese
-                    // schon abgeschlossene Einordnung weder verschärfen noch
-                    // unbrauchbar machen; die nachfolgende Journalvalidierung
-                    // akzeptiert ausschließlich die vollständig passende Form.
-                    let already_classified_legacy_webdav = matches!(
-                        &expected_plan.root_identity,
-                        crate::RootIdentity::WebDav(identity)
-                            if identity.root_etag == LEGACY_UNBOUND_WEBDAV_ETAG
-                    );
-                    if already_classified_legacy_webdav {
-                        continue;
-                    }
-                    // Die älteren WebDAV-Migrationen besitzen einen eigenen,
-                    // ausdrücklich quittierbaren Fehlerzustand. Sie laufen direkt
-                    // danach und dürfen nicht durch die allgemeinere
-                    // Identitätsschema-Migration überschrieben werden.
-                    if source_version <= 17
-                        && matches!(endpoint.as_ref(), BidirectionalQueueEndpoint::WebDav { .. })
-                        && matches!(
-                            &expected_plan.root_identity,
-                            crate::RootIdentity::WebDav(identity)
-                                if identity.root_etag.is_empty()
-                                    || identity.server.server_header_digest
-                                        == *blake3::hash(&[]).as_bytes()
-                        )
-                    {
-                        continue;
-                    }
-                    // Version 19 hatte diesen Zustand nur als deutschen Text plus
-                    // `plan_drift` gespeichert. Beim Öffnen eines bereits von der
-                    // fehlerhaften Migration geschriebenen Journals heben wir exakt
-                    // diesen typisierten Altstand auf `replan_required` an.
-                    if source_version == 19 {
-                        if entry.state == QueueState::Failed
-                            && entry.error_code == Some(crate::ErrorCode::PlanDrift)
-                            && entry.error.as_deref() == Some(LEGACY_REMOTE_IDENTITY_REPLAN_ERROR)
-                        {
-                            entry.error_code = Some(crate::ErrorCode::ReplanRequired);
-                        }
-                        continue;
-                    }
-                    match entry.state {
-                        QueueState::Pending | QueueState::AwaitingConfirmation => {
-                            let safely_unstarted = entry.attempts == 0
-                                && entry.progress == Progress::default()
-                                && entry.error.is_none()
-                                && entry.error_code.is_none()
-                                && entry.temp_recovery_paths.is_empty()
-                                && !entry.recovery_available
-                                && entry.bidirectional_completion_recovery.is_none();
-                            entry.attention = None;
-                            if safely_unstarted {
-                                entry.state = QueueState::Failed;
-                                entry.progress = Progress::default();
-                                entry.error = Some(LEGACY_REMOTE_IDENTITY_REPLAN_ERROR.into());
-                                entry.error_code = Some(crate::ErrorCode::ReplanRequired);
-                            } else {
-                                // Retry setzt einen abgebrochenen Eintrag wieder auf
-                                // Pending und leert seinen Fortschritt, behält aber
-                                // die Versuchszahl. Ein früherer Claim kann bereits
-                                // eine Löschwirkung gehabt haben und darf deshalb
-                                // nie als sicher verwerfbarer Altplan erscheinen.
-                                entry.state = QueueState::Interrupted;
-                                entry.progress.phase = "recovery".into();
-                                entry.progress.current.clear();
-                                entry.error = Some(LEGACY_REMOTE_IDENTITY_UNCLEAR_ERROR.into());
-                                entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
-                            }
-                        }
-                        QueueState::Validating
-                        | QueueState::Running
-                        | QueueState::Failed
-                        | QueueState::Interrupted => {
-                            entry.state = QueueState::Interrupted;
-                            entry.progress.phase = "recovery".into();
-                            entry.progress.current.clear();
-                            entry.attention = None;
-                            entry.error = Some(LEGACY_REMOTE_IDENTITY_UNCLEAR_ERROR.into());
-                            entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
-                            entry.recovery_available = false;
-                            entry.bidirectional_completion_recovery = None;
-                        }
-                        QueueState::Completed | QueueState::Cancelled => {}
-                    }
-                }
-            }
-            if source_version <= 17 {
-                for entry in &mut snapshot.entries {
-                    let QueueOperation::ProviderDelete {
-                        endpoint,
-                        expected_plan,
-                        ..
-                    } = &mut entry.operation
-                    else {
-                        continue;
-                    };
-                    if !matches!(endpoint.as_ref(), BidirectionalQueueEndpoint::WebDav { .. }) {
-                        continue;
-                    }
-                    let crate::RootIdentity::WebDav(identity) = &mut expected_plan.root_identity
-                    else {
-                        continue;
-                    };
-                    let lacks_root_etag = source_version <= 15 && identity.root_etag.is_empty();
-                    let has_legacy_empty_server_digest =
-                        identity.server.server_header_digest == *blake3::hash(&[]).as_bytes();
-                    if lacks_root_etag || has_legacy_empty_server_digest {
-                        // Eine ETag lässt sich weder aus Pfad noch Serveridentität
-                        // ableiten. Der ungültige Sentinel ist ausdrücklich **kein**
-                        // Providerbeleg; er unterscheidet ausschließlich migrierte
-                        // Alteinträge von beschädigten aktuellen Journalen.
-                        identity.root_etag = LEGACY_UNBOUND_WEBDAV_ETAG.into();
-                        match entry.state {
-                            QueueState::Pending | QueueState::AwaitingConfirmation => {
-                                let safely_unstarted = !has_prior_execution_evidence(entry)
-                                    && entry.error.is_none()
-                                    && entry.error_code.is_none();
-                                entry.attention = None;
-                                if safely_unstarted {
-                                    entry.state = QueueState::Failed;
-                                    entry.error = Some(LEGACY_WEBDAV_REPLAN_ERROR.into());
-                                    entry.error_code = Some(crate::ErrorCode::PlanDrift);
-                                } else {
-                                    entry.state = QueueState::Interrupted;
-                                    entry.progress.phase = "recovery".into();
-                                    entry.progress.current.clear();
-                                    entry.error = Some(LEGACY_WEBDAV_UNCLEAR_ERROR.into());
-                                    entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
-                                }
-                                entry.recovery_available = false;
-                                entry.bidirectional_completion_recovery = None;
-                            }
-                            QueueState::Validating
-                            | QueueState::Running
-                            | QueueState::Failed
-                            | QueueState::Interrupted => {
-                                entry.state = QueueState::Interrupted;
-                                entry.progress.phase = "recovery".into();
-                                entry.progress.current.clear();
-                                entry.attention = None;
-                                entry.error = Some(LEGACY_WEBDAV_UNCLEAR_ERROR.into());
-                                entry.error_code = Some(crate::ErrorCode::OutcomeUnclear);
-                                entry.recovery_available = false;
-                                entry.bidirectional_completion_recovery = None;
-                            }
-                            QueueState::Completed | QueueState::Cancelled => {
-                                // Terminale Datenwirkung und ihre Bilanz bleiben
-                                // unverändert. Der Sentinel dient nur dazu, den
-                                // migrierten Ursprung von aktueller Korruption zu
-                                // unterscheiden.
-                            }
-                        }
-                    }
-                }
-            }
-            snapshot.version = QUEUE_JOURNAL_VERSION;
-            true
-        } else if matches!(source_version, 40..=45) {
-            snapshot.version = QUEUE_JOURNAL_VERSION;
-            true
-        } else {
-            false
-        };
-        if snapshot.version != QUEUE_JOURNAL_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Queue-Journalversion {} wird nicht unterstützt (erwartet {})",
-                    snapshot.version, QUEUE_JOURNAL_VERSION
-                ),
-            ));
-        }
+        let migrated = journal::migrate_snapshot(&mut snapshot)?;
         let mut recovered = source_version == QUEUE_JOURNAL_VERSION
             && snapshot.entries.iter().any(|entry| {
                 entry.state == QueueState::Running
@@ -2136,7 +1612,7 @@ impl OperationQueue {
             _process_lock: process_lock,
         };
         if journal_missing {
-            let snapshot = queue.journal.lock().unwrap();
+            let snapshot = queue.lock_queue_state(&queue.journal)?;
             write_snapshot_bound(
                 &queue._process_lock.root,
                 &queue.path,
@@ -2144,7 +1620,7 @@ impl OperationQueue {
                 AtomicWriteMode::Create,
             )?;
         } else if migrated || recovered {
-            let snapshot = queue.journal.lock().unwrap();
+            let snapshot = queue.lock_queue_state(&queue.journal)?;
             write_snapshot_bound(
                 &queue._process_lock.root,
                 &queue.path,
@@ -2173,13 +1649,52 @@ impl OperationQueue {
         Ok(queue)
     }
 
+    // Die RAM-Kopie wird erst nach einem bestätigten Commit ausgetauscht.
+    // Für die Anzeige darf der letzte bekannte Stand erhalten bleiben, auch
+    // wenn ein unterbrochener Zugriff den Plattenstand erst beim Neustart klärt.
+    fn lock_last_known_state<'a, T>(&self, state: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+        state.lock().unwrap_or_else(|poisoned| {
+            self.journal_outcome_unclear.store(true, Ordering::Release);
+            poisoned.into_inner()
+        })
+    }
+
+    fn lock_queue_state<'a, T>(
+        &self,
+        state: &'a Mutex<T>,
+    ) -> io::Result<std::sync::MutexGuard<'a, T>> {
+        state.lock().map_err(|_| {
+            self.journal_outcome_unclear.store(true, Ordering::Release);
+            crate::coded_error(
+                io::ErrorKind::Other,
+                crate::ErrorCode::OutcomeUnclear,
+                "Queue-Zustand nach unterbrochenem Journalzugriff unklar; Wiederanlauf prüfen",
+            )
+        })
+    }
+
     pub fn snapshot(&self) -> QueueSnapshot {
-        let journal = self.journal.lock().unwrap();
+        let journal = self.lock_last_known_state(&self.journal);
         let mut snapshot = journal.clone();
-        if let Some(record) = self.resume_progress.lock().unwrap().as_ref() {
+        if let Some(record) = self.lock_last_known_state(&self.resume_progress).as_ref() {
             record.apply(&mut snapshot);
         }
         snapshot
+    }
+
+    fn journal_for_mutation(&self) -> io::Result<std::sync::MutexGuard<'_, QueueSnapshot>> {
+        let journal = self.lock_queue_state(&self.journal)?;
+        // Ein vergifteter Checkpoint kann von einem unterbrochenen Schreibvorgang
+        // stammen. Auch Mutationen ohne Bezug zur Teilkopie brauchen ein klares Journal.
+        let _resume = self.lock_queue_state(&self.resume_progress)?;
+        if self.journal_outcome_unclear.load(Ordering::Acquire) {
+            return Err(crate::coded_error(
+                io::ErrorKind::Other,
+                crate::ErrorCode::OutcomeUnclear,
+                "Queuejournal ist nicht sicher gebunden",
+            ));
+        }
+        Ok(journal)
     }
 
     /// Bindet eine Vorbereitung an dieses Fensterjournal, ohne den geteilten
@@ -2213,27 +1728,30 @@ impl OperationQueue {
         if !self._process_lock.root.is_current()? {
             return Err(io::Error::other("FTPS-Queueordner wurde ausgetauscht"));
         }
-        if self.journal_outcome_unclear.load(Ordering::SeqCst) {
-            return Err(crate::coded_error(
-                io::ErrorKind::Other,
-                crate::ErrorCode::OutcomeUnclear,
-                "Queuejournal ist nicht sicher gebunden",
-            ));
-        }
+        let journal = self.journal_for_mutation()?;
+        let entry = operation
+            .and_then(|id| {
+                journal
+                    .entries
+                    .iter()
+                    .find(|entry| entry.operation_id == id)
+            })
+            .cloned();
+        drop(journal);
         let operation = match operation {
             Some(operation) => {
-                let snapshot = self.snapshot();
-                if !snapshot.entries.iter().any(|entry| {
-                    entry.operation_id == operation
-                        && (matches!(entry.state, QueueState::Validating | QueueState::Running)
-                            || (matches!(entry.state, QueueState::Interrupted | QueueState::Failed)
-                                && entry.recovery_available
-                                && matches!(entry.operation, QueueOperation::Bidirectional { .. })
-                                && bidirectional_recovery_kind(&entry.operation)
-                                    == crate::bidirectional::BidirectionalRunRecovery::ResumeOrRollback)
-                            || (matches!(entry.state, QueueState::Interrupted | QueueState::Failed)
-                                && (entry.directory_dacl_recovery || entry.file_dacl_recovery || entry.created_directory_dacl_recovery)
-                                && matches!(entry.operation, QueueOperation::ContentSync { .. })))
+                if !entry.is_some_and(|entry| {
+                    matches!(entry.state, QueueState::Validating | QueueState::Running)
+                        || (matches!(entry.state, QueueState::Interrupted | QueueState::Failed)
+                            && entry.recovery_available
+                            && matches!(entry.operation, QueueOperation::Bidirectional { .. })
+                            && bidirectional_recovery_kind(&entry.operation)
+                                == crate::bidirectional::BidirectionalRunRecovery::ResumeOrRollback)
+                        || (matches!(entry.state, QueueState::Interrupted | QueueState::Failed)
+                            && (entry.directory_dacl_recovery
+                                || entry.file_dacl_recovery
+                                || entry.created_directory_dacl_recovery)
+                            && matches!(entry.operation, QueueOperation::ContentSync { .. }))
                 }) {
                     return Err(io::Error::other(
                         "FTPS-Owner benötigt den aktiven Queueeintrag",
@@ -2917,12 +2435,13 @@ impl OperationQueue {
         resolved: &[crate::file_dacl::FileDaclOutcome],
         terminal: bool,
     ) -> io::Result<()> {
-        let snapshot = self.snapshot();
-        let Some(entry) = snapshot
+        let entry = self
+            .journal_for_mutation()?
             .entries
             .iter()
             .find(|entry| entry.operation_id == operation_id)
-        else {
+            .cloned();
+        let Some(entry) = entry else {
             return Ok(());
         };
         if !matches!(&entry.operation, QueueOperation::ContentSync { expected_plan, .. } if expected_plan.actions.iter().any(|action| matches!(action, crate::Action::SetFileDacl { .. })))
@@ -2947,12 +2466,13 @@ impl OperationQueue {
         resolved: &[crate::created_directory_dacl::CreatedDirectoryDaclOutcome],
         terminal: bool,
     ) -> io::Result<()> {
-        let snapshot = self.snapshot();
-        let Some(entry) = snapshot
+        let entry = self
+            .journal_for_mutation()?
             .entries
             .iter()
             .find(|entry| entry.operation_id == operation_id)
-        else {
+            .cloned();
+        let Some(entry) = entry else {
             return Ok(());
         };
         if !matches!(&entry.operation, QueueOperation::ContentSync { expected_plan, .. } if expected_plan.actions.iter().any(created_directory_action))
@@ -3311,7 +2831,11 @@ impl OperationQueue {
     }
 
     fn has_pending_file_dacl(&self, operation_id: &str) -> bool {
-        let planned=self.snapshot().entries.iter().find(|entry|entry.operation_id==operation_id).is_some_and(|entry|matches!(&entry.operation,QueueOperation::ContentSync{expected_plan,..} if expected_plan.actions.iter().any(|action|matches!(action,crate::Action::SetFileDacl{..}))));
+        let Ok(journal) = self.journal_for_mutation() else {
+            return true;
+        };
+        let planned=journal.entries.iter().find(|entry|entry.operation_id==operation_id).is_some_and(|entry|matches!(&entry.operation,QueueOperation::ContentSync{expected_plan,..} if expected_plan.actions.iter().any(|action|matches!(action,crate::Action::SetFileDacl{..}))));
+        drop(journal);
         planned
             && crate::file_dacl_registry::has_open(
                 &crate::local_staging::StagingOwner {
@@ -3324,7 +2848,11 @@ impl OperationQueue {
     }
 
     fn has_pending_created_directory_dacl(&self, operation_id: &str) -> bool {
-        let planned=self.snapshot().entries.iter().find(|entry|entry.operation_id==operation_id).is_some_and(|entry|matches!(&entry.operation,QueueOperation::ContentSync{expected_plan,..} if expected_plan.actions.iter().any(created_directory_action)));
+        let Ok(journal) = self.journal_for_mutation() else {
+            return true;
+        };
+        let planned=journal.entries.iter().find(|entry|entry.operation_id==operation_id).is_some_and(|entry|matches!(&entry.operation,QueueOperation::ContentSync{expected_plan,..} if expected_plan.actions.iter().any(created_directory_action)));
+        drop(journal);
         planned
             && crate::created_directory_dacl_registry::has_open(
                 &crate::local_staging::StagingOwner {
@@ -3337,11 +2865,15 @@ impl OperationQueue {
     }
 
     fn has_pending_directory_dacl(&self, operation_id: &str) -> bool {
-        let planned_dacl = self.snapshot().entries.iter().find(|entry| entry.operation_id == operation_id)
+        let Ok(journal) = self.journal_for_mutation() else {
+            return true;
+        };
+        let planned_dacl = journal.entries.iter().find(|entry| entry.operation_id == operation_id)
             .is_some_and(|entry| matches!(&entry.operation,
                 QueueOperation::ContentSync { expected_plan, .. } if expected_plan.actions.iter().any(|action|
                     matches!(action, crate::Action::SetDirectoryMetadata { metadata, .. }
                         if matches!(metadata.windows_dacl, Some(crate::windows_dacl::WindowsDaclTransfer::DirectoryExact(_)))))));
+        drop(journal);
         planned_dacl
             && crate::local_staging::has_open_directory_dacl_intent_beneath(
                 &crate::local_staging::StagingOwner {
@@ -3570,7 +3102,7 @@ impl OperationQueue {
         paths: &[String],
     ) -> io::Result<()> {
         let recovery = {
-            let journal = self.journal.lock().unwrap();
+            let journal = self.lock_queue_state(&self.journal)?;
             let entry = journal
                 .entries
                 .iter()
@@ -3678,7 +3210,7 @@ impl OperationQueue {
         rolled_back: bool,
     ) -> io::Result<BidirectionalCompletionProof> {
         let recovery = {
-            let journal = self.journal.lock().unwrap();
+            let journal = self.lock_queue_state(&self.journal)?;
             let entry = journal
                 .entries
                 .iter()
@@ -3860,7 +3392,7 @@ impl OperationQueue {
     /// geöffnet oder verändert.
     pub fn finish_bidirectional_completion_recovery(&self, operation_id: &str) -> io::Result<()> {
         let mut completion = {
-            let journal = self.journal.lock().unwrap();
+            let journal = self.lock_queue_state(&self.journal)?;
             let entry = journal
                 .entries
                 .iter()
@@ -4985,7 +4517,13 @@ impl OperationQueue {
     }
 
     pub fn has_runnable(&self) -> bool {
-        let journal = self.journal.lock().unwrap();
+        let Ok(journal) = self.lock_queue_state(&self.journal) else {
+            return false;
+        };
+        if self.resume_progress.is_poisoned() {
+            self.journal_outcome_unclear.store(true, Ordering::Release);
+            return false;
+        }
         !journal.paused
             && !journal
                 .entries
@@ -5133,7 +4671,7 @@ impl OperationQueue {
                 "Der Queue-Journalstand ist nach einem Schreibfehler unklar; Anwendung neu starten und Recovery prüfen",
             ));
         }
-        let mut current = self.journal.lock().unwrap();
+        let mut current = self.lock_queue_state(&self.journal)?;
         if self.journal_outcome_unclear.load(Ordering::Acquire) {
             return Err(crate::coded_error(
                 io::ErrorKind::Other,
@@ -5142,7 +4680,7 @@ impl OperationQueue {
             ));
         }
         let mut next = current.clone();
-        if let Some(record) = self.resume_progress.lock().unwrap().as_ref() {
+        if let Some(record) = self.lock_queue_state(&self.resume_progress)?.as_ref() {
             record.apply(&mut next);
         }
         next.revision = current.revision.checked_add(1).ok_or_else(|| {
@@ -6777,7 +6315,7 @@ fn execute_local_queue_entry_inner(
             crate::resumable_copy::RunContext {
                 sandbox: execution.sandbox.as_deref(),
                 cancel,
-                provider: None,
+                connect: None,
             },
             on_progress,
             pending_completion,
@@ -6884,20 +6422,24 @@ fn execute_resumable_copy(
     on_progress: &mut dyn FnMut(&Progress),
     pending_completion: &mut Option<Box<PendingFileCompletion>>,
 ) -> io::Result<QueueExecutionResult> {
-    use crate::resumable_copy::{CopyCheckpoint, ResumeProvider};
+    use crate::resumable_copy::CopyCheckpoint;
     queue.mark_running(id)?;
-    let (source_provider, audit_operation) = match execution.provider {
-        Some(ResumeProvider::WebDav(_)) => {
+    let (source_provider, audit_operation) = match plan.remote_endpoint() {
+        Some(BidirectionalQueueEndpoint::WebDav { .. }) => {
             (crate::ProviderKind::WebDav, "webdav_resumable_download")
         }
-        Some(ResumeProvider::Ftps(_)) => (crate::ProviderKind::Ftps, "ftps_resumable_download"),
-        Some(ResumeProvider::Sftp(_)) => (crate::ProviderKind::Sftp, "sftp_resumable_download"),
-        None => (crate::ProviderKind::Local, "local_resumable_copy"),
+        Some(BidirectionalQueueEndpoint::Ftps { .. }) => {
+            (crate::ProviderKind::Ftps, "ftps_resumable_download")
+        }
+        Some(BidirectionalQueueEndpoint::Sftp { .. }) => {
+            (crate::ProviderKind::Sftp, "sftp_resumable_download")
+        }
+        _ => (crate::ProviderKind::Local, "local_resumable_copy"),
     };
     let context = ProviderAuditContext {
         source_provider: Some(source_provider),
         target_provider: crate::ProviderKind::Local,
-        execution_class: if execution.provider.is_some() {
+        execution_class: if plan.remote_endpoint().is_some() {
             ProviderAuditExecutionClass::BestEffort
         } else {
             ProviderAuditExecutionClass::Assured
@@ -7345,6 +6887,7 @@ pub fn execute_provider_file_queue_entry_detailed_with_snapshot_store(
     on_progress: &mut dyn FnMut(&Progress),
 ) -> Result<QueueExecutionResult, ProviderFileExecutionFailure> {
     let archive_generation = matches!(&entry.operation, QueueOperation::ArchiveUpload { .. });
+    let resumable = matches!(&entry.operation, QueueOperation::ResumableCopy { .. });
     let ftps_preparation = provider_file_has_ftps_endpoint(&entry.operation);
     let mut actuals = FileOperationActuals::default();
     let mut recovery = None;
@@ -7429,6 +6972,19 @@ pub fn execute_provider_file_queue_entry_detailed_with_snapshot_store(
         Ok(result) => return Ok(result),
         Err(error) => error,
     };
+    if resumable {
+        if let Some(QueueEntry {
+            operation: QueueOperation::ResumableCopy { checkpoint, .. },
+            ..
+        }) = queue
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.operation_id == operation_id)
+        {
+            progress.bytes_done = checkpoint.as_deref().map_or(0, |proof| proof.bytes());
+        }
+    }
     let mut error = failure_with_staging_recovery(queue, &operation_id, &mut actuals, error);
     // Vor der Nutzerwirkung darf ein sauberer Abbruch keine Fehler-/Retry-Zeile
     // erzeugen. Unklare Probenreste und bereits laufende Wirkungen bleiben Fehler.
@@ -7545,18 +7101,15 @@ fn execute_provider_file_queue_entry_inner(
     if let QueueOperation::ResumableCopy { plan, checkpoint } = &entry.operation {
         use crate::resumable_copy::ResumeProvider;
         validate_resumable_copy_profiles(&entry.operation, &entry.profile_bindings)?;
-        let webdav;
-        let ftps;
-        let sftp;
-        let provider = match plan.remote_endpoint() {
+        let connect = || match plan.remote_endpoint() {
             Some(BidirectionalQueueEndpoint::WebDav { connection, .. }) => {
                 crate::webdav::ensure_file_profile_current(
                     &queue.path,
                     &entry.profile_bindings,
                     connection,
                 )?;
-                webdav = WebDavVfs::connect((**connection).clone(), secrets)?;
-                ResumeProvider::WebDav(&webdav)
+                WebDavVfs::connect((**connection).clone(), secrets)
+                    .map(|vfs| ResumeProvider::WebDav(Box::new(vfs)))
             }
             Some(BidirectionalQueueEndpoint::Ftps { connection, .. }) => {
                 crate::ftps::resume::ensure_profile_current(
@@ -7564,8 +7117,8 @@ fn execute_provider_file_queue_entry_inner(
                     &entry.profile_bindings,
                     connection,
                 )?;
-                ftps = FtpsVfs::connect((**connection).clone(), secrets)?;
-                ResumeProvider::Ftps(&ftps)
+                FtpsVfs::connect((**connection).clone(), secrets)
+                    .map(|vfs| ResumeProvider::Ftps(Box::new(vfs)))
             }
             Some(BidirectionalQueueEndpoint::Sftp { connection, .. }) => {
                 crate::sftp::ensure_resume_profile_current(
@@ -7573,15 +7126,13 @@ fn execute_provider_file_queue_entry_inner(
                     &entry.profile_bindings,
                     connection,
                 )?;
-                sftp = Arc::new(SftpVfs::connect((**connection).clone(), secrets)?);
-                ResumeProvider::Sftp(&sftp)
+                SftpVfs::connect((**connection).clone(), secrets)
+                    .map(|vfs| ResumeProvider::Sftp(Arc::new(vfs)))
             }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Provider-Teilkopie benötigt ein WebDAV-, FTPS- oder SFTP-Profil",
-                ))
-            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Provider-Teilkopie benötigt ein WebDAV-, FTPS- oder SFTP-Profil",
+            )),
         };
         return execute_resumable_copy(
             queue,
@@ -7591,7 +7142,7 @@ fn execute_provider_file_queue_entry_inner(
             crate::resumable_copy::RunContext {
                 sandbox: execution.sandbox.as_deref(),
                 cancel,
-                provider: Some(provider),
+                connect: Some(Box::new(connect)),
             },
             on_progress,
             pending_completion,
@@ -10770,7 +10321,7 @@ fn attention_confirmation(attention: &QueueAttention) -> &str {
     }
 }
 
-fn new_operation_id() -> io::Result<String> {
+pub(crate) fn new_operation_id() -> io::Result<String> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
@@ -10812,37 +10363,6 @@ fn read_snapshot(path: &Path) -> io::Result<QueueSnapshot> {
         ));
     }
     read_snapshot_from_reader(file, metadata.len(), MAX_JOURNAL_BYTES)
-}
-
-fn read_snapshot_from_reader(
-    reader: impl Read,
-    advertised_len: u64,
-    max_bytes: u64,
-) -> io::Result<QueueSnapshot> {
-    if advertised_len > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Queue-Journal überschreitet die Größenbegrenzung",
-        ));
-    }
-    let mut data = Vec::with_capacity(usize::try_from(advertised_len).unwrap_or(0));
-    reader.take(max_bytes + 1).read_to_end(&mut data)?;
-    // Die erste Längenprüfung beschreibt nur den Zeitpunkt von `fstat`. Eine
-    // reguläre Datei kann danach über die Grenze wachsen. Das zusätzliche Byte
-    // und diese zweite Prüfung verhindern, dass ein gültiger JSON-Präfix mit
-    // anschließendem, ungelesenem Inhalt als vollständiges Journal gilt.
-    if data.len() as u64 > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Queue-Journal überschreitet die Größenbegrenzung",
-        ));
-    }
-    serde_json::from_slice(&data).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Queue-Journal ist beschädigt: {error}"),
-        )
-    })
 }
 
 impl OperationQueueProcessLock {
@@ -10921,27 +10441,6 @@ fn acquire_process_lock(root: &crate::local_fs::RootHandle) -> io::Result<File> 
         },
     )?;
     Ok(file)
-}
-
-fn read_snapshot_bound(
-    root: &crate::local_fs::RootHandle,
-    path: &Path,
-) -> io::Result<QueueSnapshot> {
-    if !root.is_current()? {
-        return Err(io::Error::other("Queueordner wurde ausgetauscht"));
-    }
-    let file = crate::local_fs::open_read_beneath(root, path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(io::Error::other("Queue-Journal ist keine reguläre Datei"));
-    }
-    let snapshot = read_snapshot_from_reader(file, metadata.len(), MAX_JOURNAL_BYTES)?;
-    if !root.is_current()? {
-        return Err(io::Error::other(
-            "Queueordner wurde während des Readbacks ausgetauscht",
-        ));
-    }
-    Ok(snapshot)
 }
 
 fn write_snapshot_bound(
@@ -11072,6 +10571,41 @@ mod tests {
     }
 
     #[test]
+    fn unterbrochener_journalzugriff_verhindert_neue_wirkungen() {
+        let area = tempfile::tempdir().unwrap();
+        let queue = OperationQueue::open(area.path().join("queue.json")).unwrap();
+        let entry = queue.enqueue(file_operation("probe")).unwrap();
+        assert!(queue.has_runnable());
+        let before = queue.snapshot();
+        let persisted = std::fs::read(&queue.path).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: io::Result<()> =
+                queue.transact_using(|_| panic!("unterbrochener Journalzugriff"), |_, _| Ok(()));
+        }));
+        assert!(result.is_err());
+        let owner_error = queue.ftps_owner(None).err().unwrap();
+        assert_eq!(
+            crate::error_code(&owner_error),
+            crate::ErrorCode::OutcomeUnclear
+        );
+        let checkpoint_error = queue
+            .checkpoint_file_dacl(&entry.operation_id, &[], false)
+            .unwrap_err();
+        assert_eq!(
+            crate::error_code(&checkpoint_error),
+            crate::ErrorCode::OutcomeUnclear
+        );
+        assert_eq!(queue.snapshot().revision, before.revision);
+        assert_eq!(queue.snapshot().entries[0].operation_id, entry.operation_id);
+        assert!(!queue.has_runnable());
+        assert_eq!(
+            crate::error_code(&queue.set_paused(true).unwrap_err()),
+            crate::ErrorCode::OutcomeUnclear
+        );
+        assert_eq!(std::fs::read(&queue.path).unwrap(), persisted);
+    }
+
+    #[test]
     fn queue_schreibt_nach_ordnertausch_nicht_in_den_fremden_configbaum() {
         let area = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(area.path()).unwrap();
@@ -11109,6 +10643,7 @@ mod tests {
                 std::fs::read(area.join("marker")).unwrap(),
                 b"AP16 private queue"
             );
+            // SAFETY: umask nimmt eine gültige Maske. Nur dieses Testkind ändert seine Prozessmaske.
             unsafe {
                 libc::umask(0);
             }
@@ -22479,6 +22014,7 @@ mod tests {
                 assert_eq!(progress.files_done, 0);
                 assert!(!root.join("rechts/gross.bin").exists());
                 // Ein echter SIGKILL im ersten Dateiinhalt führt keine Destruktoren aus.
+                // SAFETY: raise sendet nur an das isolierte Testkind, das diese Funktion ausführt.
                 unsafe {
                     libc::raise(libc::SIGKILL);
                 }

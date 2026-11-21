@@ -1,0 +1,27 @@
+{
+  "snapshot": {
+    "endpoint": { "provider": "ftps", "profileId": "mock_ftps", "profileRevision": 21, "root": "/" },
+    "path": "/remote.txt", "mode": "original", "verification": "streaming"
+  },
+  "comparison": {
+    "left": {
+      "endpoint": { "provider": "local", "root": "/Users/demo/Projekte" },
+      "path": "/Users/demo/Projekte/Reisebericht.md", "name": "Reisebericht.md"
+    },
+    "right": {
+      "endpoint": { "provider": "local", "root": "/Volumes/Backup/Projekte" },
+      "path": "/Volumes/Backup/Projekte/Reisebericht.md", "name": "Reisebericht.md"
+    }
+  },
+  "edit": {
+    "id": "mock-remote-edit",
+    "name": "remote.txt",
+    "endpointLabel": "SFTP · /remote.txt",
+    "dirty": true,
+    "lastOperationId": null,
+    "limitations": ["Pfadbindung als Best Effort"],
+    "replaceBestEffort": true,
+    "saveAvailable": true,
+    "saveBlocker": null
+  }
+}

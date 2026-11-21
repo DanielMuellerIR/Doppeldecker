@@ -9,7 +9,6 @@ use objc2_foundation::{
     NSAppleEventDescriptor as Descriptor, NSAppleEventSendOptions, NSString, NSURL,
 };
 use std::{
-    ffi::c_void,
     io,
     os::fd::{AsRawFd, BorrowedFd},
 };
@@ -22,7 +21,7 @@ const DIRECT: u32 = u32::from_be_bytes(*b"----");
 #[link(name = "CoreServices", kind = "framework")]
 unsafe extern "C" {
     fn AEDeterminePermissionToAutomateTarget(
-        target: *const c_void,
+        target: *const AEDesc,
         event_class: u32,
         event_id: u32,
         ask_user: u8,
@@ -47,9 +46,11 @@ impl NativeFinderComments {
         let target =
             Descriptor::descriptorWithBundleIdentifier(&NSString::from_str("com.apple.finder"));
         // Ohne ausdrückliche Schaltfläche wird nie ein Systemdialog angefordert.
+        // SAFETY: target hält den gültigen Adressdeskriptor für die Dauer der
+        // synchronen Prüfung. Apple Events übernimmt ihn dabei nicht.
         let status = unsafe {
             AEDeterminePermissionToAutomateTarget(
-                target.aeDesc().cast(),
+                target.aeDesc(),
                 CORE,
                 GET,
                 u8::from(self.request_permission),
@@ -117,8 +118,9 @@ fn build_object(
     selector: &Descriptor,
 ) -> io::Result<Retained<Descriptor>> {
     let mut result = MaybeUninit::<AEDesc>::uninit();
-    // Die öffentliche Kodierungsfunktion übernimmt hier keine Eingabedaten.
-    // Erst der fertige Deskriptor wechselt in den Besitz von Cocoa.
+    // SAFETY: Beide Eingabedeskriptoren bleiben während des Aufrufs gültig.
+    // dispose_inputs=false belässt sie beim Aufrufer. result ist separater,
+    // ausgerichteter Speicher für den Ausgabedeskriptor.
     let status = unsafe {
         CreateObjSpecifier(
             wanted,
@@ -134,14 +136,14 @@ fn build_object(
             "Native Objektkodierung fehlgeschlagen (macOS {status})"
         )));
     }
+    // SAFETY: CreateObjSpecifier initialisiert den Ausgabedeskriptor bei noErr.
     let mut result = unsafe { result.assume_init() };
-    // initWithAEDescNoCopy übernimmt den nativen Handle. result darf deshalb
-    // nicht noch einmal mit AEDisposeDesc freigegeben werden.
-    Ok(
-        unsafe {
-            Descriptor::initWithAEDescNoCopy(Descriptor::alloc(), NonNull::from(&mut result))
-        },
-    )
+    // SAFETY: Der initialisierte Deskriptor bleibt während init gültig. Cocoa
+    // übernimmt seinen Handle und gibt ihn frei. Rust darf ihn nicht freigeben.
+    let descriptor = unsafe {
+        Descriptor::initWithAEDescNoCopy(Descriptor::alloc(), NonNull::from(&mut result))
+    };
+    Ok(descriptor)
 }
 fn event(kind: u32, property: &Descriptor, text: Option<&str>) -> Retained<Descriptor> {
     let target =

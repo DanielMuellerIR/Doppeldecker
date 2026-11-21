@@ -222,6 +222,36 @@ fn invalid(message: &str) -> AppError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_session_matches_the_browser_wire_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/window-session-wire.json"))
+                .unwrap();
+        let panes: crate::window_commands::WindowStartState =
+            serde_json::from_value(fixture["session"]["panes"].clone()).unwrap();
+        let remote: crate::window_commands::PaneStartLocation =
+            serde_json::from_value(fixture["remoteStart"].clone()).unwrap();
+        assert!(remote.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(remote).unwrap(),
+            fixture["remoteStart"]
+        );
+        let tabs = super::WindowTabs::from_active(&panes);
+        assert!(tabs.validate(&panes).is_ok());
+        assert_eq!(
+            serde_json::to_value(&tabs.left.tabs[0]).unwrap(),
+            fixture["tab"]
+        );
+        let mut selected = fixture["tab"].clone();
+        let name = fixture["selectedEntry"].clone();
+        selected["anchorName"] = name.clone();
+        selected["cursorName"] = name.clone();
+        selected["selectedNames"] = serde_json::json!([name]);
+        let restored: super::SavedTab = serde_json::from_value(selected.clone()).unwrap();
+        assert!(restored.validate().is_ok());
+        assert_eq!(serde_json::to_value(restored).unwrap(), selected);
+    }
+
     use super::*;
 
     fn panes() -> crate::window_commands::WindowStartState {

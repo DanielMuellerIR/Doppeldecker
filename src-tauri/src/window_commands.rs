@@ -700,25 +700,28 @@ mod tests {
     #[test]
     fn recovery_planung_baut_vor_spaetem_verzeichnisfehler_keine_fenster() {
         let inspected = std::cell::RefCell::new(Vec::new());
-        let result = plan_recovery_entries(
-            [
-                Ok(std::ffi::OsString::from(
-                    "operations-queue-window-erster.json",
-                )),
-                Err(AppError::new("io", "später read_dir-Fehler")),
-            ],
-            |label| {
-                inspected.borrow_mut().push(label.to_owned());
-                Ok(true)
+        let result = crate::run_startup_steps(
+            || Ok(()),
+            || {
+                plan_recovery_entries(
+                    [
+                        Ok(std::ffi::OsString::from(
+                            "operations-queue-window-erster.json",
+                        )),
+                        Err(AppError::new("io", "später read_dir-Fehler")),
+                    ],
+                    |label| {
+                        inspected.borrow_mut().push(label.to_owned());
+                        Ok(true)
+                    },
+                )
             },
+            || panic!("Hauptfenster trotz Recoveryfehler gebaut"),
+            |_| panic!("Recovery-Fenster trotz fehlgeschlagener Planung gebaut"),
         );
 
         assert_eq!(*inspected.borrow(), ["window-erster"]);
         assert_eq!(result.unwrap_err().message, "später read_dir-Fehler");
-        let source = include_str!("window_commands.rs");
-        let planning = &source[source.find("fn plan_recovery_entries").unwrap()
-            ..source.find("fn show_recovery_windows_using").unwrap()];
-        assert!(!planning.contains("build_window"));
     }
 
     #[test]

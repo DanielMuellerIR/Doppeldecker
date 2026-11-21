@@ -1,16 +1,30 @@
-import { invoke } from "./tauri-api.js";
-import { $, escapeHtml, isEntryNameSafe } from "./ui-utils.js";
+// @ts-check
+
+import { editFinderTags, readFinderTags } from "./file-property-api.js";
+import { $, errText, escapeHtml, isEntryNameSafe } from "./ui-utils.js";
 
 const COLORS = ["Ohne Farbe", "Grau", "Grün", "Violett", "Blau", "Gelb", "Rot", "Orange"];
+/** @typedef {import("./file-information.js").FilePropertySnapshot} FilePropertySnapshot */
+/** @typedef {FilePropertySnapshot & {
+ * tagRows?: import("./file-property-wire.js").FinderTagReadRowWire[],
+ * tagReadPage?: number, tagReadStatus?: string, tagReading?: boolean,
+ * tagEditName?: string | null, tagPreviousName?: string | null, tagsStatus?: string
+ * }} EditorSnapshot */
+/** @typedef {import("./file-information.js").FilePropertyEditorCallbacks<
+ * EditorSnapshot, {edit: import("./file-property-wire.js").FinderTagEdit, names: string[]},
+ * import("./file-property-wire.js").FinderTagEditRowWire>} EditorOptions */
+
 const PAGE_SIZE = 40;
 
+/** @param {EditorOptions} options */
 export function createFinderTagEditor({ getCurrent, scopeMatches, isBusy, refresh, applyEdit }) {
   let readGeneration = 0;
+  /** @param {EditorSnapshot} snapshot */
   const names = snapshot => snapshot.entries.filter(isEntryNameSafe).map(entry => entry.name);
 
   function html() {
     const snapshot = getCurrent();
-    if (!snapshot.propertyCapabilities?.tags) return "";
+    if (!snapshot?.propertyCapabilities?.tags) return "";
     const selected = names(snapshot);
     if (!selected.length) return "";
     const page = snapshot.tagReadPage || 0;
@@ -48,14 +62,14 @@ export function createFinderTagEditor({ getCurrent, scopeMatches, isBusy, refres
     snapshot.tagReadStatus = "Tags werden gelesen …";
     refresh();
     try {
-      const rows = await invoke("get_file_finder_tags", { request: { provider: snapshot.provider,
-        root: snapshot.parent, names: selected.slice(snapshot.tagReadPage * PAGE_SIZE, (snapshot.tagReadPage + 1) * PAGE_SIZE) } });
+      const rows = await readFinderTags({ provider: snapshot.provider,
+        root: snapshot.parent, names: selected.slice(snapshot.tagReadPage * PAGE_SIZE, (snapshot.tagReadPage + 1) * PAGE_SIZE) });
       if (getCurrent() !== snapshot || generation !== readGeneration || !scopeMatches()) return;
       snapshot.tagRows = rows;
       snapshot.tagReadStatus = "";
     } catch (error) {
       if (getCurrent() !== snapshot || generation !== readGeneration || !scopeMatches()) return;
-      snapshot.tagReadStatus = error.message || String(error);
+      snapshot.tagReadStatus = errText(error) || String(error);
     } finally {
       if (getCurrent() === snapshot && generation === readGeneration) { snapshot.tagReading = false; refresh(); }
     }
@@ -63,41 +77,53 @@ export function createFinderTagEditor({ getCurrent, scopeMatches, isBusy, refres
 
   function reset() {
     const snapshot = getCurrent();
+    if (!snapshot) return;
     snapshot.tagEditName = null;
     snapshot.tagPreviousName = null;
     const input = $("#file-info-tag-name");
-    if (input) input.value = "";
+    if (input instanceof HTMLInputElement) input.value = "";
     const color = $("#file-info-tag-color");
-    if (color) color.value = "0";
+    if (color instanceof HTMLSelectElement) color.value = "0";
     refresh();
   }
 
+  /** @param {import("./file-property-wire.js").FinderTagEdit} edit @param {string[]} selectedNames */
   async function change(edit, selectedNames) {
     const snapshot = getCurrent();
-    const report = await applyEdit("tags", "change_file_finder_tags", { edit, names: selectedNames },
-      "Finder-Tags werden geändert … Abbruch bleibt möglich.");
+    if (!snapshot) return;
+    const report = await applyEdit(
+      "tags",
+      editFinderTags,
+      { edit, names: selectedNames },
+      "Finder-Tags werden geändert … Abbruch bleibt möglich.",
+    );
     if (!report || getCurrent() !== snapshot || !scopeMatches()) return;
     if (report.every(row => !row.code)) reset();
     await load(snapshot.tagReadPage || 0);
   }
 
+  /** @param {Event} event */
   function click(event) {
+    if (!(event.target instanceof Element)) return false;
     const button = event.target.closest("button");
-    if (!button || !Object.keys(button.dataset).some(key => key.startsWith("tag"))) return false;
-    if (isBusy() || !scopeMatches()) return true;
+    if (!(button instanceof HTMLButtonElement) || !Object.keys(button.dataset).some(key => key.startsWith("tag"))) return false;
     const snapshot = getCurrent();
+    if (!snapshot || isBusy() || !scopeMatches()) return true;
     if (button.hasAttribute("data-tag-page")) { void load((snapshot.tagReadPage || 0) + Number(button.dataset.tagPage)); return true; }
     if (button.hasAttribute("data-tag-reset")) { reset(); return true; }
     if (button.hasAttribute("data-tag-clear")) { void change({ type: "clear" }, names(snapshot)); return true; }
     if (button.hasAttribute("data-tag-save")) {
-      const name = $("#file-info-tag-name").value;
-      if (!name.trim()) { snapshot.tagsStatus = "Bitte einen Tagnamen eingeben."; refresh(); $("#file-info-tag-name").focus(); return true; }
-      void change({ type: "upsert", tag: { name, color: Number($("#file-info-tag-color").value) },
+      const input = $("#file-info-tag-name");
+      const color = $("#file-info-tag-color");
+      if (!(input instanceof HTMLInputElement) || !(color instanceof HTMLSelectElement)) return true;
+      const name = input.value;
+      if (!name.trim()) { snapshot.tagsStatus = "Bitte einen Tagnamen eingeben."; refresh(); $("#file-info-tag-name")?.focus(); return true; }
+      void change({ type: "upsert", tag: { name, color: Number(color.value) },
         previousName: snapshot.tagPreviousName || null }, snapshot.tagEditName ? [snapshot.tagEditName] : names(snapshot));
       return true;
     }
     if (button.hasAttribute("data-tag-clear-legacy")) {
-      const row = snapshot.tagRows[Number(button.dataset.tagClearLegacy)];
+      const row = snapshot.tagRows?.[Number(button.dataset.tagClearLegacy)];
       if (row?.state) void change({ type: "clear_legacy" }, [row.name]);
       return true;
     }
@@ -109,9 +135,13 @@ export function createFinderTagEditor({ getCurrent, scopeMatches, isBusy, refres
     snapshot.tagEditName = row.name;
     snapshot.tagPreviousName = tag.name;
     refresh();
-    $("#file-info-tag-name").value = tag.name;
-    $("#file-info-tag-color").value = String(tag.color);
-    $("#file-info-tag-name").focus();
+    const input = $("#file-info-tag-name");
+    const color = $("#file-info-tag-color");
+    if (color instanceof HTMLSelectElement) color.value = String(tag.color);
+    if (input instanceof HTMLInputElement) {
+      input.value = tag.name;
+      input.focus();
+    }
     return true;
   }
   return { html, load, click };

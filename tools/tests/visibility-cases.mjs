@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { assertFilePropertyWire } from "./file-property-wire.mjs";
 
 export async function runVisibilityCases(runCase) {
   for (const [theme, width] of [["light", 650], ["dark", 390]]) {
@@ -10,11 +11,17 @@ export async function runVisibilityCases(runCase) {
         window.__VISIBILITY_CALLS__ = [];
         window.__HIDDEN_MARKED__ = false;
         window.__TAURI__.core.invoke = async (command, args) => {
-          if (command === "get_file_visibility") return args.request.names.map(name => ({ name, state: {marked:window.__HIDDEN_MARKED__,byName:true},code:null,message:"" }));
+          if (command === "get_file_visibility") {
+            const rows = args.request.names.map(name => ({ name, state: { marked: window.__HIDDEN_MARKED__, byName: true }, code: null, message: "" }));
+            window.__VISIBILITY_WIRE_READ__ ??= { request: structuredClone(args.request), rows };
+            return rows;
+          }
           if (command !== "change_file_visibility") return original(command,args);
           window.__VISIBILITY_CALLS__.push(structuredClone(args.request));
           window.__HIDDEN_MARKED__ = args.request.hidden;
-          return args.request.names.map(name => ({ name,state:{marked:args.request.hidden,byName:true},changed:true,code:null,message:"Markierung bestätigt" }));
+          const rows = args.request.names.map(name => ({ name, state: { marked: args.request.hidden, byName: true }, changed: true, code: null, message: "Markierung bestätigt" }));
+          window.__VISIBILITY_WIRE_EDIT__ ??= { request: structuredClone(args.request), rows };
+          return rows;
         };
       }, theme);
       await page.getByRole("listbox", { name: /Linke Dateiliste/ }).getByRole("option", { name: /Alpha.txt/ }).click();
@@ -34,6 +41,7 @@ export async function runVisibilityCases(runCase) {
       await page.waitForFunction(() => window.__VISIBILITY_CALLS__.length===2);
       await page.waitForFunction(() => !window.__HIDDEN_MARKED__);
       assert.equal(await checkbox.isChecked(),false,"Backend-Rücklesen muss den vorigen Checkboxwert ersetzen");
+      assertFilePropertyWire("visibility", ...await page.evaluate(() => [window.__VISIBILITY_WIRE_READ__, window.__VISIBILITY_WIRE_EDIT__]));
       const calls = await page.evaluate(() => window.__VISIBILITY_CALLS__);
       assert.deepEqual(calls.map(({requestId,...request})=>request),[true,false].map(hidden=>({provider:"local",root:"/mock/quelle",names:["Alpha.txt"],hidden})));
       assert(calls.every(call=>call.requestId));

@@ -375,8 +375,8 @@ pub(crate) async fn save_remote_edit(
                 copy_new_best_effort_expected: if caps.copy_new { Some(false) } else if caps.copy_new_best_effort { Some(true) } else { None },
                 replace_best_effort_expected: class, remove_source_best_effort_expected: None,
             };
-            let (queue, entry) = crate::with_queue_extension(&state, &window_state, || {
-                crate::queue_runtime::enqueue_operation_with_profile_bindings(&app, &window_state, window.label(), &operation, &profiles)
+            let (queue, entry) = crate::with_queue_extension_access(&state, &window_state, |extension| {
+                extension.enqueue_with_profile_bindings(&app, window.label(), &operation, &profiles)
             })?;
             edit.pending = Some(PendingSave { operation_id: entry.operation_id.clone(), bytes, hash, local_version });
             edit.last_operation_id = Some(entry.operation_id.clone());
@@ -416,6 +416,24 @@ pub(crate) fn close_remote_edit(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn remote_edit_response_matches_the_browser_wire_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/file-opening-wire.json")).unwrap();
+        let response = RemoteEditView {
+            id: "mock-remote-edit".into(),
+            name: "remote.txt".into(),
+            endpoint_label: "SFTP · /remote.txt".into(),
+            dirty: true,
+            last_operation_id: None,
+            limitations: vec!["Pfadbindung als Best Effort".into()],
+            replace_best_effort: true,
+            save_available: true,
+            save_blocker: None,
+        };
+        assert_eq!(serde_json::to_value(response).unwrap(), fixture["edit"]);
+    }
 
     #[test]
     fn tiefere_originaldatei_bindet_den_queuezielroot_auf_ihre_eltern() {

@@ -1,25 +1,43 @@
 import { confirmForwardBidirectional } from "./forward-bidirectional-ui.js";
 import { conflictChoiceModal } from "./conflict-dialog.js";
 import { choiceModal } from "./modal.js";
+import { paneEndpoint } from "./pane-endpoint.js";
 import { invoke } from "./tauri-api.js";
 import { escapeHtml } from "./ui-utils.js";
 
-function endpointFromPane(pane) {
-  const endpoint = { provider: pane.provider, root: pane.path };
-  if (pane.provider !== "local") {
-    endpoint.profileId = pane.profileId;
-    endpoint.profileRevision = pane.profileRevision;
+/** @typedef {import("./pane-endpoint.js").PaneEndpointLocation} PaneEndpointLocation */
+/** @typedef {import("./pane-endpoint.js").BidirectionalEndpointRequest} BidirectionalEndpointRequest */
+/** @typedef {import("./bidirectional-wire.js").RegisteredBidirectionalPairWire} RegisteredPair */
+/** @typedef {import("./bidirectional-wire.js").PrepareBidirectionalRequestWire} PrepareRequest */
+/** @typedef {import("./queue-snapshot-wire.js").QueueSnapshotWire["entries"][number]} QueueEntryWire */
+/** @typedef {import("./bidirectional-wire.js").LocalBidirectionalPreviewWire} LocalPreview */
+/** @typedef {import("./bidirectional-wire.js").ForwardBidirectionalPreviewWire} ForwardPreview */
+/** @typedef {import("./bidirectional-wire.js").BidirectionalResumePreviewWire | import("./bidirectional-wire.js").BidirectionalRollbackPreviewWire} RecoveryPreview */
+/** @typedef {import("./bidirectional-wire.js").BidirectionalRecoveryKindWire} RecoveryKind */
+/** @typedef {{operationId: string, recoveryPreparationId: string, recoveryKind: RecoveryKind}} RecoveryIdentity */
+
+/** @param {LocalPreview | ForwardPreview} preview */
+function requireForwardPreview(preview) {
+  if (!("unresolved_digest" in preview)) {
+    throw new Error("Die Backendvorschau enthält keinen gebundenen Forward-Digest");
   }
-  return endpoint;
+  return preview;
 }
 
+/** @param {BidirectionalEndpointRequest} left @param {BidirectionalEndpointRequest} right */
 function sameEndpoint(left, right) {
   return left?.provider === right?.provider
     && left?.root === right?.root
-    && (left?.profileId || null) === (right?.profileId || null)
-    && (left?.profileRevision ?? null) === (right?.profileRevision ?? null);
+    && (left.provider === "local" || right.provider !== "local"
+      && (left.profileId || null) === (right.profileId || null)
+      && (left.profileRevision ?? null) === (right.profileRevision ?? null));
 }
 
+/**
+ * @param {BidirectionalEndpointRequest} visibleLeft
+ * @param {BidirectionalEndpointRequest} visibleRight
+ * @param {RegisteredPair} pair
+ */
 function visiblePairRoles(visibleLeft, visibleRight, pair) {
   if (pair.visibleLeftRole === "left" || pair.visibleLeftRole === "right") {
     return {
@@ -62,8 +80,18 @@ function warningsHtml(preview) {
   return (preview.scope_warnings || []).map(warning => `<p class="real-warning">${escapeHtml(warning)}</p>`).join("");
 }
 
-/** Kapselt ausschließlich Assistent, Bestätigung und Recovery-Bedienung. Alle
- * Snapshots, Digests, Capability-Gates und Mutationen bleiben GUI-frei im Kern. */
+/** Kapselt Assistent, Bestätigung und Recovery-Bedienung.
+ * @param {object} options
+ * @param {{left: PaneEndpointLocation, right: PaneEndpointLocation}} options.panes
+ * @param {() => string} options.syncScope
+ * @param {() => boolean} options.realRunActive
+ * @param {() => boolean} options.running
+ * @param {(label: string) => void} options.startRun
+ * @param {() => void} options.endRun
+ * @param {() => number} [options.dockRevision]
+ * @param {(html: string, state: {closable: boolean}) => void} options.showDock
+ * @param {(label: string, error: unknown) => void} options.showError
+ */
 export function createBidirectionalUi({
   panes,
   syncScope,
@@ -76,6 +104,7 @@ export function createBidirectionalUi({
   showError,
 }) {
   let pendingAction = null;
+  /** @type {RecoveryIdentity | null} */
   let pendingRecovery = null;
   let starting = false;
   let generation = 0;
@@ -93,7 +122,15 @@ export function createBidirectionalUi({
     }
   }
 
+  /**
+   * @param {LocalPreview | ForwardPreview} preview
+   * @param {{left: "left" | "right", right: "left" | "right"}} visibleRoles
+   * @param {() => boolean} current
+   * @param {boolean} [forward]
+   * @param {string | null} [operationId]
+   */
   async function decideConflicts(preview, visibleRoles, current, forward = false, operationId = null) {
+    /** @type {import("./bidirectional-wire.js").ConflictResolutionWire[]} */
     const resolutions = [];
     let conflicts = preview.conflict_details;
     const total = conflicts?.length || 0;
@@ -130,7 +167,7 @@ export function createBidirectionalUi({
       index += 1;
       if (conflicts.length > 1) {
         conflicts = forward
-          ? await invoke("preview_forward_bidirectional_conflicts", { resolutions, expectedUnresolvedDigest: preview.unresolved_digest, operationId })
+          ? await invoke("preview_forward_bidirectional_conflicts", { resolutions, expectedUnresolvedDigest: requireForwardPreview(preview).unresolved_digest, operationId })
           : await invoke("preview_bidirectional_conflicts", { resolutions, expectedPlanDigest: preview.plan.plan_digest });
         if (!current()) return null;
       } else conflicts = [];
@@ -144,6 +181,12 @@ export function createBidirectionalUi({
       && left?.recoveryKind === right?.recoveryKind;
   }
 
+  /**
+   * @param {QueueEntryWire} entry
+   * @param {RecoveryPreview} preview
+   * @param {RecoveryKind} decision
+   * @returns {RecoveryIdentity}
+   */
   function bindRecovery(entry, preview, decision) {
     const identity = {
       operationId: entry.operation_id,
@@ -157,6 +200,7 @@ export function createBidirectionalUi({
     return identity;
   }
 
+  /** @param {RecoveryIdentity | null} [identity] */
   async function discardRecovery(identity = pendingRecovery) {
     if (!identity) return { confirmed: true, hadError: false };
     let hadError = false;
@@ -180,6 +224,7 @@ export function createBidirectionalUi({
     return { confirmed: false, hadError: true };
   }
 
+  /** @param {QueueEntryWire} entry */
   async function recoverForwardEntry(entry) {
     if (entry.bidirectional_completion_recovery) {
       try {
@@ -218,6 +263,7 @@ export function createBidirectionalUi({
     } catch (error) { showError("Bidirektionales Recovery", error); return false; }
   }
 
+  /** @param {QueueEntryWire} entry */
   async function recoverQueueEntry(entry) {
     if (entry.operation.type === "BidirectionalForward") return recoverForwardEntry(entry);
     if (entry.bidirectional_completion_recovery) {
@@ -263,7 +309,7 @@ export function createBidirectionalUi({
     } catch (error) {
       return showError("Bidirektionales Recovery gesperrt", error);
     }
-    if (decision === "resume" && preview.stage_blocker) {
+    if (preview.recovery_kind === "resume" && preview.stage_blocker) {
       const discarded = await discardRecovery(recoveryIdentity);
       if (!discarded.confirmed || discarded.hadError) return;
       return showDock(`<span class="pill delete">Recovery gesperrt</span>${escapeHtml(preview.stage_blocker)}`, { closable: true });
@@ -272,8 +318,8 @@ export function createBidirectionalUi({
       decision === "resume" ? "Bidirektionalen Sync fortsetzen" : "Vorherigen Bestand wiederherstellen",
       `<p>${escapeHtml(entry.operation.pair_name)} · ` +
         `${escapeHtml(entry.operation.left?.root || "links")} ↔ ${escapeHtml(entry.operation.right?.root || "rechts")}</p>` +
-        (decision === "resume" ? impactHtml(preview) : `<p>${preview.committed_projections} bereits ausgeführte Teilprojektion(en) werden rückwärts wiederhergestellt. Vorhandene neuere Ziele werden geschützt.</p>`) +
-        warningsHtml(preview),
+        (preview.recovery_kind === "resume" ? impactHtml(preview) + warningsHtml(preview)
+          : `<p>${preview.committed_projections} bereits ausgeführte Teilprojektion(en) werden rückwärts wiederhergestellt. Vorhandene neuere Ziele werden geschützt.</p>`),
       [{ label: "Abbrechen", value: false, cls: "ghost" },
         { label: decision === "resume" ? "Fortsetzen" : "Wiederherstellung starten", value: true, cls: "danger" }],
     );
@@ -316,10 +362,9 @@ export function createBidirectionalUi({
   }
 
   async function runCurrent(scope, current) {
-    const left = endpointFromPane(panes.left);
-    const right = endpointFromPane(panes.right);
+    const left = paneEndpoint(panes.left);
+    const right = paneEndpoint(panes.right);
     const forward = left.provider !== "local" || right.provider !== "local";
-    const prepareCommand = forward ? "prepare_forward_bidirectional_sync" : "prepare_bidirectional_sync";
     const discardCommand = forward ? "discard_forward_bidirectional_sync" : "discard_bidirectional_sync";
     let recovery = false;
     let pair;
@@ -354,8 +399,13 @@ export function createBidirectionalUi({
         }
       } catch (error) { return showError("Bidirektionales Recovery gesperrt", error); }
     }
-    let request = { ...pair, resolutions: [], ...(forward ? { recovery } : {}) };
-    let actionKey = JSON.stringify(request);
+    /** @type {PrepareRequest} */
+    let request = {
+      pairId: pair.pairId, pairName: pair.pairName,
+      left: pair.left, right: pair.right, resolutions: [],
+    };
+    const requestKey = () => JSON.stringify({ ...request, visibleLeftRole: pair.visibleLeftRole, ...(forward ? { recovery } : {}) });
+    let actionKey = requestKey();
     let preview = pendingAction?.key === actionKey && pendingAction.scope === scope
       ? pendingAction.preview : null;
     async function checkCurrent() {
@@ -363,27 +413,37 @@ export function createBidirectionalUi({
       await discardPendingAction();
       return false;
     }
+    async function prepareCurrentRequest() {
+      preparingForward = forward;
+      try {
+        return forward
+          ? await invoke("prepare_forward_bidirectional_sync", { request: { ...request, recovery } })
+          : await invoke("prepare_bidirectional_sync", { request });
+      } finally {
+        preparingForward = false;
+      }
+    }
     try {
       if (!preview) {
         if (!await discardPendingAction()) {
           throw new Error("Die vorige bidirektionale Backendvorbereitung konnte nicht verworfen werden");
         }
         if (!current()) return;
-        preparingForward = forward;
-        try { preview = await invoke(prepareCommand, { request }); } finally { preparingForward = false; }
-        pendingAction = { key: actionKey, request, preview, scope, forward };
+        preview = await prepareCurrentRequest();
+        pendingAction = { key: actionKey, preview, scope, forward };
       }
       if (!await checkCurrent()) return;
+      if (forward) requireForwardPreview(preview);
       if (preview.plan.conflicts > 0) {
         const resolutions = await decideConflicts(preview, roles, current, forward);
         await invoke(discardCommand);
         pendingAction = null;
         if (!resolutions || !current()) return;
-        request = { ...request, resolutions, expectedUnresolvedDigest: forward ? preview.unresolved_digest : preview.plan.plan_digest };
-        actionKey = JSON.stringify(request);
-        preparingForward = forward;
-        try { preview = await invoke(prepareCommand, { request }); } finally { preparingForward = false; }
-        pendingAction = { key: actionKey, request, preview, scope, forward };
+        request = { ...request, resolutions, expectedUnresolvedDigest: forward ? requireForwardPreview(preview).unresolved_digest : preview.plan.plan_digest };
+        actionKey = requestKey();
+        preview = await prepareCurrentRequest();
+        pendingAction = { key: actionKey, preview, scope, forward };
+        if (forward) requireForwardPreview(preview);
         if (!await checkCurrent()) return;
       }
     } catch (error) {
@@ -393,7 +453,22 @@ export function createBidirectionalUi({
       await discardPendingAction();
       return showDock(`<span class="pill delete">Gesperrt</span>${escapeHtml(preview.stage_blocker)}`, { closable: true });
     }
-    const confirmed = forward ? await confirmForwardBidirectional(preview, { pairName: pair.pairName, left, right, visibleRoles: roles }) : await choiceModal(
+    if (forward) {
+      const confirmed = await confirmForwardBidirectional(requireForwardPreview(preview), { pairName: pair.pairName, left, right, visibleRoles: roles });
+      if (!await checkCurrent()) return;
+      if (!confirmed) {
+        await discardPendingAction();
+        return;
+      }
+      const presentation = dockRevision();
+      try {
+        await invoke("enqueue_forward_bidirectional_sync", confirmed);
+        pendingAction = null;
+        if (current() && dockRevision() === presentation) showDock('<span class="pill copy">Eingereiht</span>Bestätigter bidirektionaler Sync wartet in der Fensterqueue.', { closable: true });
+        return true;
+      } catch (error) { return showError("Bidirektionaler Start", error); }
+    }
+    const confirmed = await choiceModal(
       `Bidirektional · ${pair.pairName}`,
       `<div class="sync-bound-roots"><b>Links:</b> <code>${escapeHtml(left.root)}</code><br>` +
         `<b>Rechts:</b> <code>${escapeHtml(right.root)}</code></div>` + impactHtml(preview) + warningsHtml(preview) +
@@ -405,15 +480,6 @@ export function createBidirectionalUi({
     if (!confirmed) {
       await discardPendingAction();
       return;
-    }
-    if (forward) {
-      const presentation = dockRevision();
-      try {
-        await invoke("enqueue_forward_bidirectional_sync", confirmed);
-        pendingAction = null;
-        if (current() && dockRevision() === presentation) showDock('<span class="pill copy">Eingereiht</span>Bestätigter bidirektionaler Sync wartet in der Fensterqueue.', { closable: true });
-        return true;
-      } catch (error) { return showError("Bidirektionaler Start", error); }
     }
     startRun("Bidirektionaler Sync läuft …");
     try {

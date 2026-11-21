@@ -331,6 +331,7 @@ impl Target {
         let before = check_visible(final_root, final_path, &self.fd)?;
         let desired = before.st_flags | libc::UF_IMMUTABLE;
         if desired != before.st_flags
+            // SAFETY: self.fd bleibt offen und fchflags erhält die Flags als Wert.
             && unsafe { libc::fchflags(self.fd.as_raw_fd(), desired) } != 0
         {
             let error = io::Error::last_os_error();
@@ -370,6 +371,8 @@ impl Target {
             resource_unavailable: Cell::new(false),
         };
         let state = CopyState::new(&context)?;
+        // SAFETY: Beide OwnedFd und der CopyState bleiben beim synchronen
+        // Aufruf gültig. Der registrierte Kontext lebt bis nach dem Drop von state.
         let result = unsafe {
             libc::fcopyfile(
                 source.fd.as_raw_fd(),
@@ -401,6 +404,7 @@ impl Target {
         let desired_flags =
             (current.st_flags & !libc::UF_HIDDEN) | (source.before.st_flags & libc::UF_HIDDEN);
         if desired_flags != current.st_flags
+            // SAFETY: self.fd bleibt offen und fchflags erhält die Flags als Wert.
             && unsafe { libc::fchflags(self.fd.as_raw_fd(), desired_flags) } != 0
         {
             limitations.push(format!(
@@ -489,6 +493,9 @@ extern "C" fn callback(
 ) -> libc::c_int {
     // copyfile ruft synchron auf; Kontext und Quellen bleiben bis zur Rückkehr
     // erhalten. Der Callback allokiert nicht und lässt keine Rust-Panik über FFI.
+    // SAFETY: CopyState registriert ausschließlich einen geliehenen
+    // CopyContext und bindet die Leihe bis zu seinem Drop. Copyfile ruft
+    // synchron auf demselben Thread auf, auf dem der Cell-Kontext lebt.
     let Some(context) = (unsafe { (context as *const CopyContext<'_>).as_ref() }) else {
         return libc::COPYFILE_QUIT;
     };
@@ -498,8 +505,12 @@ extern "C" fn callback(
     if what == libc::COPYFILE_COPY_XATTR
         && matches!(stage, libc::COPYFILE_START | libc::COPYFILE_ERR)
     {
+        // SAFETY: Darwin liefert die gültige errno-Adresse dieses Threads.
+        // Wir kopieren den Wert unmittelbar und speichern den Zeiger nicht.
         let error = unsafe { *libc::__error() };
         let mut name: *const libc::c_char = std::ptr::null();
+        // SAFETY: state stammt aus dem aktiven copyfile-Aufruf. Der Schlüssel
+        // XATTRNAME schreibt einen C-String-Zeiger in den zugehörigen Slot.
         if unsafe {
             libc::copyfile_state_get(
                 state,
@@ -511,6 +522,8 @@ extern "C" fn callback(
         {
             return libc::COPYFILE_SKIP;
         }
+        // SAFETY: Der erfolgreiche Getter lieferte einen Nicht-Null-Zeiger
+        // auf den NUL-terminierten Attributnamen für diesen Callback.
         let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
         if stage == libc::COPYFILE_ERR {
             if is_resource_fork(name) && matches!(error, libc::ENOTSUP | libc::EPERM | libc::EACCES)
@@ -546,6 +559,8 @@ struct CopyState<'a>(
 impl<'a> CopyState<'a> {
     fn new(context: &'a CopyContext<'a>) -> io::Result<Self> {
         let state = Self(
+            // SAFETY: Der Allocator nimmt keine Argumente an. Der Rückgabewert
+            // wird auf Null geprüft und ansonsten allein von CopyState verwaltet.
             unsafe { libc::copyfile_state_alloc() },
             std::marker::PhantomData,
         );
@@ -562,6 +577,9 @@ impl<'a> CopyState<'a> {
                 (context as *const CopyContext<'_>).cast(),
             ),
         ] {
+            // SAFETY: state ist eine lebende Allokation. STATUS_CB erhält den
+            // Funktionszeiger der nativen Signatur, STATUS_CTX den geliehenen
+            // Kontextzeiger. CopyState hält die Kontextleihe bis zur Freigabe.
             if unsafe { libc::copyfile_state_set(state.0, key as u32, pointer) } != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -572,6 +590,8 @@ impl<'a> CopyState<'a> {
 impl Drop for CopyState<'_> {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: Der Zustand stammt aus copyfile_state_alloc, gehört
+            // diesem Wrapper allein und wird genau einmal freigegeben.
             unsafe {
                 libc::copyfile_state_free(self.0);
             }
@@ -584,6 +604,8 @@ mod tests {
     struct Unlock(OwnedFd);
     impl Drop for Unlock {
         fn drop(&mut self) {
+            // SAFETY: Der eigene Test-FD bleibt bis nach Drop offen und die
+            // Nullmaske wird als Wert übergeben.
             unsafe {
                 libc::fchflags(self.0.as_raw_fd(), 0);
             }
@@ -602,6 +624,7 @@ mod tests {
         let source_fd = open_entry(Some(&held), &source).unwrap();
         let _source_cleanup = Unlock(dup(&source_fd).unwrap());
         assert_eq!(
+            // SAFETY: source_fd hält die Testdatei offen; die Flags sind ein Wertargument.
             unsafe { libc::fchflags(source_fd.as_raw_fd(), libc::UF_IMMUTABLE) },
             0
         );
@@ -706,6 +729,7 @@ mod tests {
         let source_file = source.join("file");
         let fd = open_entry(None, &source_file).unwrap();
         assert_eq!(
+            // SAFETY: fd hält die Testdatei offen. fchflags übernimmt keinen FD.
             unsafe {
                 libc::fchflags(
                     fd.as_raw_fd(),

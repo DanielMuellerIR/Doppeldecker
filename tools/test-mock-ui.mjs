@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { forwardConfirmationFixture } from "./tests/forward-confirmation-fixture.mjs";
+import { runForwardBidirectionalCases } from "./tests/forward-bidirectional-cases.mjs";
 import { runBatchRenameCases } from "./tests/batch-rename-cases.mjs";
 import { runFilePreviewCases } from "./tests/file-preview-cases.mjs";
 import { runFinderCommentCases } from "./tests/finder-comment-cases.mjs";
@@ -13,6 +14,7 @@ import { runAdministratorCases } from "./tests/administrator-cases.mjs";
 import { runFileFlagCases } from "./tests/file-flag-cases.mjs";
 import { runVisibilityCases } from "./tests/visibility-cases.mjs";
 import { runFinderTagCases } from "./tests/finder-tag-cases.mjs";
+import { runFavoriteCases } from "./tests/favorite-cases.mjs";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
@@ -20,6 +22,9 @@ import { once } from "node:events";
 import { createBrowserCleanup } from "./browser-cleanup.mjs";
 
 const require = createRequire(import.meta.url);
+const windowSessionWire = JSON.parse(await readFile(new URL("./tests/window-session-wire.json", import.meta.url), "utf8"));
+const fileOpeningWire = JSON.parse(await readFile(new URL("./tests/file-opening-wire.json", import.meta.url), "utf8"));
+const recoveryTrashWire = JSON.parse(await readFile(new URL("./tests/recovery-trash-wire.json", import.meta.url), "utf8"));
 async function freePort() {
   const probe = createServer();
   probe.listen(0, "127.0.0.1");
@@ -60,6 +65,15 @@ if (listOnly) caseArguments.shift();
 const requestedCase = caseArguments.join(" ").trim();
 let matchedRequestedCase = false;
 
+function assertShape(value, shape) {
+  assert.deepEqual(Object.keys(value).sort(), Object.keys(shape).sort());
+  for (const [key, types] of Object.entries(shape)) {
+    const item = value[key];
+    const type = item === null ? "null" : Array.isArray(item) ? "array" : typeof item;
+    assert.ok(types.split("|").includes(type), `${key}: ${type} statt ${types}`);
+  }
+}
+
 async function runCase(name, query, test) {
   // Ein optionaler Namensausschnitt hält neue Gegenbelege gezielt und schnell
   // ausführbar. Ohne Argument läuft unverändert die vollständige Suite.
@@ -91,6 +105,20 @@ async function runCase(name, query, test) {
   } finally {
     await context.close();
   }
+}
+
+async function observeQuarantineWire(page) {
+  await page.evaluate(() => {
+    const invoke = window.__TAURI__.core.invoke;
+    window.__QUARANTINE_WIRE__ = [];
+    window.__TAURI__.core.invoke = async (command, args) => {
+      const result = await invoke(command, args);
+      if (/^(list|restore|purge)_(provider_)?quarantine_/.test(command)) {
+        window.__QUARANTINE_WIRE__.push(structuredClone({ command, args, result }));
+      }
+      return result;
+    };
+  });
 }
 
 async function holdUpdateResponse(page) {
@@ -572,7 +600,7 @@ try {
     });
   }
 
-  await runFilePreviewCases(runCase);
+  await runFilePreviewCases(runCase, assertShape);
   await runBatchRenameCases(runCase);
 
   for (const theme of ["light", "dark"]) for (const key of ["F5", "F6"]) {
@@ -588,6 +616,40 @@ try {
       if (key === "F6") await page.getByText(/Quellbäume mit übersprungenen Einträgen bleiben vollständig erhalten/).waitFor();
     });
   }
+
+  await runCase("File-Transfer-IPC bindet Remote-Profil, Konfliktwahl und Ausführungsklassen", "?remoteFile=1&ftpsConflictChoice=1", async page => {
+    const fixture = JSON.parse(await readFile(new URL("./tests/file-transfer-wire.json", import.meta.url)));
+    await page.evaluate(() => {
+      const original = window.__TAURI__.core.invoke;
+      window.__TRANSFER_WIRE__ = [];
+      window.__TAURI__.core.invoke = async (command, args) => {
+        const reply = await original(command, args);
+        if (["check_provider_file_operation", "enqueue_provider_file_operation"].includes(command)) {
+          window.__TRANSFER_WIRE__.push({ command, args: structuredClone(args), reply: structuredClone(reply) });
+        }
+        return reply;
+      };
+    });
+    await openFtpsConflict(page, "light", "F6");
+    await page.getByRole("dialog").getByRole("button", { name: "Dauerhaft ersetzen", exact: true }).click();
+    await page.waitForFunction(() => window.__TRANSFER_WIRE__.length === 3);
+    const [check, choice, enqueue] = await page.evaluate(() => window.__TRANSFER_WIRE__);
+    const contract = fixture.providerTransfer;
+    assert.deepEqual(check.args, { request: contract.request });
+    assert.deepEqual(choice.args, { request: contract.request, choice: contract.choice });
+    assert.deepEqual(enqueue.args, { request: contract.enqueue });
+    assert.equal(typeof enqueue.reply, "string");
+    for (const call of [check, choice]) {
+      assertShape(call.reply, fixture.preview);
+      assertShape(call.reply.targetCapabilities, fixture.capabilities);
+      if (call.reply.sourceCapabilities) assertShape(call.reply.sourceCapabilities, fixture.capabilities);
+      for (const conflict of call.reply.conflictDetails) {
+        assertShape(conflict, contract.conflict);
+        assertShape(conflict.source, contract.conflictEntry);
+        assertShape(conflict.target, contract.conflictEntry);
+      }
+    }
+  });
 
   for (const theme of ["light", "dark"]) for (const key of ["F5", "F6"]) for (const policy of ["skip", "overwrite", "both", "cancel"]) {
     await runCase(`AP21 ein Remote-Konfliktdialog · ${theme} · ${key} · ${policy}`, "?remoteFile=1&ftpsConflictChoice=1", async page => {
@@ -638,6 +700,14 @@ try {
 
   for (const theme of ["light", "dark"]) for (const drift of [false, true]) {
     await runCase(`Audit Remote-Bearbeitung mit Rückupload · ${theme} · ${drift ? "Drift" : "Erfolg"}`, `?remoteFile=1${drift ? "&remoteEditDrift=1" : ""}`, async page => {
+      await page.evaluate(() => {
+        const invoke = window.__TAURI__.core.invoke;
+        window.__TAURI__.core.invoke = async (command, args) => {
+          const result = await invoke(command, args);
+          if (command === "list_remote_edits") window.__FILE_OPENING_EDIT_LIST__ = result;
+          return result;
+        };
+      });
       await page.setViewportSize({ width: 900, height: 650 });
       await page.evaluate(async theme => { const { setTheme } = await import("/theme.js"); setTheme(theme); }, theme);
       await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
@@ -649,6 +719,7 @@ try {
       await page.locator("#btn-remote-edits").click();
       const dialog = page.getByRole("dialog");
       await dialog.getByText(/dauerhaft ohne Quarantäne/).waitFor();
+      assert.deepEqual(await page.evaluate(() => window.__FILE_OPENING_EDIT_LIST__), [fileOpeningWire.edit]);
       await dialog.getByRole("button", { name: "Zurückspeichern", exact: true }).click();
       if (drift) {
         await dialog.getByText(/Serverdatei wurde inzwischen verändert/).waitFor();
@@ -786,12 +857,16 @@ try {
   });
 
   await runCase("AP02 Copy und Move senden nur die Backendidentität für Beide behalten", "?keyboard=1&conflicts=replace", async page => {
+    const wire = JSON.parse(await readFile(new URL("./tests/file-transfer-wire.json", import.meta.url)));
     await page.evaluate(() => {
       const original = window.__TAURI__.core.invoke;
       window.__AP02_TRANSFER_CALLS__ = [];
+      window.__AP02_TRANSFER_PREVIEWS__ = [];
       window.__TAURI__.core.invoke = async (command, args) => {
         if (["copy_paths", "move_paths"].includes(command)) window.__AP02_TRANSFER_CALLS__.push({ command, args: structuredClone(args.request) });
-        return original(command, args);
+        const result = await original(command, args);
+        if (command === "check_local_file_operation") window.__AP02_TRANSFER_PREVIEWS__.push(structuredClone(result));
+        return result;
       };
     });
     const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
@@ -805,22 +880,24 @@ try {
       await page.waitForFunction(count => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === count, key === "F5" ? 1 : 2);
     }
     const calls = await page.evaluate(() => window.__AP02_TRANSFER_CALLS__);
-    const transfers = calls.filter(call => ["copy_paths", "move_paths"].includes(call.command));
-    assert.equal(transfers.length, 2);
-    for (const call of transfers) {
-      assert.equal(call.args.keepBothPreparationId, "mock-keep-both");
-      assert.equal(call.args.overwrite, false);
-      assert.equal(call.args.keepBothTargets, undefined);
+    assert.deepEqual(calls, ["copy_paths", "move_paths"].map(command => ({command, args: wire.request})));
+    const previews = await page.evaluate(() => window.__AP02_TRANSFER_PREVIEWS__);
+    assert.equal(previews.length, 2);
+    for (const preview of previews) {
+      assertShape(preview, wire.preview);
+      assertShape(preview.targetCapabilities, wire.capabilities);
     }
   });
 
   await runCase("AP02 Erstbaseline zeigt fehlende Seite und sperrt nicht speicherbares Skip", "?bidirectionalConflict=1", async page => {
+    const wire = JSON.parse(await readFile(new URL("./tests/bidirectional-wire.json", import.meta.url)));
     await page.evaluate(() => {
       const original = window.__TAURI__.core.invoke;
       window.__TAURI__.core.invoke = async (command, args) => {
         const result = await original(command, args);
         if (command === "prepare_bidirectional_sync" && !args.request.resolutions.length) {
           const detail = result.conflict_details[0];
+          window.__BIDIRECTIONAL_WIRE__ = structuredClone(detail);
           detail.right = { endpoint: "/Ziel", exists: false, kind: null, size: null, mtime: null };
           detail.choices = detail.choices.filter(choice => choice.decision.decision === "keep_left");
           detail.skip_blocker = "Die Erstbaseline kann den einseitigen Unterschied nicht speichern.";
@@ -833,6 +910,9 @@ try {
     await page.locator("#btn-sync").click();
     const dialog = page.getByRole("dialog", { name: "Konflikt 1 von 1" });
     await dialog.waitFor();
+    const conflict = await page.evaluate(() => window.__BIDIRECTIONAL_WIRE__);
+    assertShape(conflict, wire.conflict);
+    for (const choice of conflict.choices) assertShape(choice, wire.choice);
     assert.match(await dialog.innerText(), /Vorhanden.*Nein/s);
     assert.equal(await dialog.getByRole("button", { name: /^Überspringen/ }).isDisabled(), true);
     assert.equal(await dialog.getByRole("button", { name: /^Beide/ }).count(), 0);
@@ -873,6 +953,54 @@ try {
     assert.equal(state.pending, false);
     assert.equal(state.queue.length, 0);
   });
+
+  for (const simulate of [false, true]) {
+    await runCase(`Lokaler Sync übernimmt Rust-${simulate ? "Plan für die Simulation" : "Vorschau für den bestätigten Start"}`, "", async page => {
+      const wire = JSON.parse(await readFile(new URL("./tests/local-sync-wire.json", import.meta.url)));
+      await page.evaluate(wire => {
+        window.__MOCK_LOCAL_SYNC_WIRE__ = wire;
+        const invoke = window.__TAURI__.core.invoke;
+        const handled = ["plan_sync", "run_sync", "prepare_local_sync", "enqueue_local_sync"];
+        window.__LOCAL_SYNC_WIRE_CALLS__ = [];
+        window.__TAURI__.core.invoke = (command, args) => {
+          if (handled.includes(command)) window.__LOCAL_SYNC_WIRE_CALLS__.push({ command, args: structuredClone(args) });
+          return invoke(command, args);
+        };
+        window.__MOCK_EMIT__("menu", "sync_mode");
+      }, wire);
+      await page.locator("#sync-actions").getByText("Planbeleg.txt", { exact: true }).waitFor();
+
+      await page.locator(simulate ? "#btn-sync-simulate" : "#btn-sync").click();
+      if (!simulate) {
+        const dialog = page.getByRole("dialog", { name: "Lokalen Sync ausführen" });
+        await dialog.getByText(wire.preview.scope_warnings[0], { exact: true }).waitFor();
+        assert.match(await dialog.innerText(), /mockfs.*mockfs/s);
+        assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+        await dialog.getByRole("button", { name: "Dateien hinzufügen", exact: true }).click();
+      }
+      await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+      const state = await page.evaluate(() => ({
+        calls: window.__LOCAL_SYNC_WIRE_CALLS__,
+        operation: window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].operation,
+      }));
+      const plans = state.calls.filter(call => call.command === "plan_sync");
+      assert.ok(plans.length >= (simulate ? 2 : 1));
+      for (const call of plans) assert.deepEqual(call.args, wire.request);
+      assert.deepEqual(state.operation.expected_plan, wire.plan);
+      if (simulate) {
+        assert.equal(state.operation.type, "Sync");
+        assert.deepEqual(state.calls.at(-1), { command: "run_sync", args: {
+          ...wire.request, expectedPlan: wire.plan, simulation: true,
+        } });
+      } else {
+        assert.equal(state.operation.type, "LocalSync");
+        assert.deepEqual(state.calls.find(call => call.command === "prepare_local_sync").args, wire.request);
+        assert.deepEqual(state.calls.at(-1), { command: "enqueue_local_sync", args: {
+          preparationDigest: wire.preview.plan_digest, replacementsConfirmed: true,
+        } });
+      }
+    });
+  }
 
   for (const theme of ["light", "dark"]) {
     await runCase(`AP03 lokale AddOnly-Bestätigung ohne Phrase in ${theme}`, "", async page => {
@@ -1150,7 +1278,8 @@ try {
     await dialog.getByRole("button", { name: "Dateien hinzufügen" }).click();
     await page.waitForFunction(() => window.__MOCK_LOCAL_SYNC_STATE__().calls.some(call => call.command === "approve_local_sync_queue_entry"));
     const approval = await page.evaluate(() => window.__MOCK_LOCAL_SYNC_STATE__().calls.find(call => call.command === "approve_local_sync_queue_entry").args);
-    assert.deepEqual(approval, { operationId: "mock-1", preparationDigest: Array(32).fill(5), replacementsConfirmed: true });
+    const wire = JSON.parse(await readFile(new URL("./tests/queue-approval-wire.json", import.meta.url)));
+    assert.deepEqual(approval, wire.local);
   });
 
   await runCase("AP03 verspätete lokale Enqueue-Antwort erhält den echten Abschluss", "", async page => {
@@ -1500,6 +1629,9 @@ try {
       const entry = await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[1]);
       assert.equal(entry.operation.source.provider, "Sftp");
       assert.equal(entry.operation.destination, "/mock/ziel");
+      const fixture = JSON.parse(await readFile(new URL("./tests/file-transfer-wire.json", import.meta.url)));
+      const intent = await page.evaluate(() => window.__LAST_PROVIDER_FILE_REQUEST__);
+      assert.deepEqual(intent, fixture.providerTransfer.intent);
     });
   }
 
@@ -1606,7 +1738,10 @@ try {
     await left.getByRole("option", { name: /Beta\.txt/ }).click({ modifiers: ["Meta"] });
     await page.keyboard.press("Control+C");
     await page.waitForFunction(() => window.__MOCK_CLIPBOARD__().paths.length === 2);
-    assert.deepEqual((await page.evaluate(() => window.__MOCK_CLIPBOARD__())).paths.sort(), ["/mock/quelle/Alpha.txt", "/mock/quelle/Beta.txt"]);
+    const contract = JSON.parse(await readFile(new URL("./tests/file-clipboard-wire.json", import.meta.url)));
+    const clipboard = await page.evaluate(() => window.__TAURI__.core.invoke("read_file_clipboard"));
+    assertShape(clipboard, contract);
+    assert.deepEqual(clipboard.paths.sort(), ["/mock/quelle/Alpha.txt", "/mock/quelle/Beta.txt"]);
     await left.locator(".path").focus();
     await page.keyboard.press("Control+C");
     assert.equal((await page.evaluate(() => window.__MOCK_CLIPBOARD__())).writes, 1, "Textkopieren darf die Dateiauswahl nicht erneut schreiben.");
@@ -2023,10 +2158,7 @@ try {
     await page.evaluate(() => { window.__MOCK_EMIT__("menu", "compare_files"); });
     await page.waitForFunction(() => window.__MOCK_DESKTOP__().diffCalls.length === 1);
     const [call] = await page.evaluate(() => window.__MOCK_DESKTOP__().diffCalls);
-    assert.equal(call.left.path, "/Users/demo/Projekte/Reisebericht.md");
-    assert.equal(call.right.path, "/Volumes/Backup/Projekte/Reisebericht.md");
-    assert.equal(call.left.name, "Reisebericht.md");
-    assert.equal(call.right.name, "Reisebericht.md");
+    assert.deepEqual(call, fileOpeningWire.comparison);
   });
 
   for (const theme of ["light", "dark"]) {
@@ -2137,13 +2269,7 @@ try {
     await page.keyboard.press("Control+N");
     await page.waitForFunction(() => window.__MOCK_NEW_WINDOWS__().length === 1);
     const [call] = await page.evaluate(() => window.__MOCK_NEW_WINDOWS__());
-    assert.deepEqual(call.left, {
-      provider: "sftp",
-      profileId: "mock_sftp",
-      profileRevision: 11,
-      profileName: "Mock-SFTP",
-      path: "/",
-    });
+    assert.deepEqual(call.left, windowSessionWire.remoteStart);
   });
 
   await runCase("Startup-Queuefehler wird nach der Eventverdrahtung einmal angezeigt", "?startupQueueError=1", async page => {
@@ -2235,11 +2361,12 @@ try {
   });
 
   await runCase("Updates werden nur manuell und zweistufig installiert", "?update=available", async page => {
+    const {update} = JSON.parse(await readFile(new URL("./tests/small-control-wire.json", import.meta.url)));
     assert.deepEqual(await page.evaluate(() => window.__MOCK_UPDATES__()), [],
       "Der Start darf den Updatekanal nicht abfragen.");
     await page.evaluate(() => { void window.__MOCK_EMIT__("menu", "check_updates"); });
     const dialog = page.getByRole("dialog");
-    await dialog.getByText("Update 0.1.124 verfügbar").waitFor();
+    await dialog.getByText(`Update ${update.available.version} verfügbar`).waitFor();
     assert.deepEqual(await page.evaluate(() => window.__MOCK_UPDATES__()), [
       { command: "check_for_update" },
     ]);
@@ -2249,7 +2376,7 @@ try {
     await page.getByText(/Update installiert/).waitFor();
     assert.deepEqual(await page.evaluate(() => window.__MOCK_UPDATES__()), [
       { command: "check_for_update" },
-      { command: "install_update", expectedVersion: "0.1.124" },
+      { command: "install_update", expectedVersion: update.available.version },
     ]);
     assert.match(await page.locator("#dock-summary").innerText(), /beim nächsten Start/);
   });
@@ -3138,6 +3265,8 @@ try {
   });
 
   await runCase("Geräte zeigen freien Speicher, navigieren und werfen gebunden aus", "", async page => {
+    const {mounts} = JSON.parse(await readFile(new URL("./tests/small-control-wire.json", import.meta.url)));
+    assert.deepEqual(await page.evaluate(() => window.__MOCK_MOUNTS__().mounts), mounts.list);
     const devices = page.locator("#device-list .device-item");
     const shares = page.locator("#share-list .device-item");
     await devices.first().waitFor();
@@ -3168,7 +3297,9 @@ try {
     assert.equal(await shares.count(), 1);
     assert.equal(await leftPath.inputValue(), "/mock/quelle");
     const state = await page.evaluate(() => window.__MOCK_MOUNTS__());
-    assert.deepEqual(state.ejects, ["b".repeat(64)]);
+    const id = mounts.list.find(mount => mount.name === "Backup").id;
+    assert.deepEqual(state.ejects, [id]);
+    assert.deepEqual(state.mounts, mounts.list.filter(mount => mount.id !== id));
   });
 
   await runCase("Ausgeworfenes Volume verliert seine alte Pane auch bei Defaultfehler", "?defaultErrorAfterStartup", async page => {
@@ -3468,6 +3599,216 @@ try {
     assert.equal(await rightPane.getAttribute("data-density"), "normal");
   });
 
+  for (const loadError of [false, true]) {
+    await runCase(`Desktop-Einstellungen entsprechen dem Rust-IPC-Vertrag · ${loadError}`, loadError ? "?desktopLoadError" : "", async page => {
+      const contract = JSON.parse(await readFile(new URL("./tests/desktop-preferences-wire.json", import.meta.url)));
+      const { before, after, event, stale, tools, requests, error } = await page.evaluate(async ({ patch, loadError }) => {
+        const {
+          desktopPreferences, diffToolStatus, listenDesktopPreferences, syncNativeTheme, updateDesktopPreferences,
+        } = await import("/desktop-preferences-api.js");
+        const before = await desktopPreferences();
+        const tools = await diffToolStatus();
+        if (loadError) {
+          try {
+            await updateDesktopPreferences(patch);
+          } catch (error) {
+            return { before, tools, error };
+          }
+          throw new Error("Der Mock hat einen Patch trotz Lesefehler angenommen.");
+        }
+        let event;
+        await listenDesktopPreferences(snapshot => { event = snapshot; });
+        const requests = [];
+        const core = window.__TAURI__.core;
+        const invoke = core.invoke;
+        core.invoke = (command, args) => {
+          requests.push([command, args]);
+          return invoke(command, args);
+        };
+        const after = await updateDesktopPreferences(patch);
+        const stale = await updateDesktopPreferences({ theme: "light" }, true);
+        await syncNativeTheme("dark", true);
+        return { before, after, event, stale, tools, requests };
+      }, { patch: contract.patch, loadError });
+      assert.deepEqual(tools, contract.diffToolStatus);
+      if (loadError) {
+        assert.deepEqual(before, contract.failedSnapshot);
+        assert.deepEqual(error, contract.failedSnapshot.loadError);
+      } else {
+        const snapshot = {
+          preferences: contract.patch, revision: before.revision + 1, needsMigration: false, loadError: null,
+        };
+        assert.deepEqual(after, snapshot);
+        assert.deepEqual(event, snapshot);
+        assert.deepEqual(stale, snapshot);
+        assert.deepEqual(requests, [
+          ["update_desktop_preferences", { patch: contract.patch }],
+          ["update_desktop_preferences", { patch: { theme: "light" }, onlyIfUninitialized: true }],
+          ["sync_native_theme", { preference: "dark", dark: true }],
+        ]);
+      }
+    });
+  }
+
+  await runCase("Queue-Snapshot entspricht der Rust-Anzeigeprojektion im Browser-Mock", "?queueWire", async page => {
+    const expected = JSON.parse(await readFile(new URL("./tests/queue-snapshot-wire.json", import.meta.url)));
+    const listed = await page.evaluate(async () => {
+      const { invoke } = await import("/tauri-api.js");
+      return invoke("list_operation_queue");
+    });
+    assert.deepEqual(listed, expected);
+  });
+
+  for (const realEnabled of [false, true]) {
+    await runCase(`Startkontext-IPC prüft Standardpfade und Sandbox · ${realEnabled}`, realEnabled ? "?realEnabled=1" : "", async page => {
+      const contract = JSON.parse(await readFile(new URL("./tests/startup-wire.json", import.meta.url)));
+      const { directories, safety } = await page.evaluate(async () => {
+        const { invoke } = window.__TAURI__.core;
+        return { directories: await invoke("default_dirs"), safety: await invoke("safety_info") };
+      });
+      assertShape(directories, contract.directories);
+      assertShape(safety, contract.safety);
+      assert.deepEqual(directories, { left: "/mock/quelle", right: "/mock/ziel" });
+      assert.equal(safety.real_enabled, realEnabled);
+      assert.equal(safety.sandbox, realEnabled ? "/mock" : null);
+    });
+  }
+
+  await runCase("scan_dir verwendet denselben IPC-Vertrag im Browser-Mock", "?keyboard=1", async page => {
+    const contract = JSON.parse(await readFile(new URL("./tests/scan-dir-wire.json", import.meta.url)));
+    const { requests, visible, all, root, invalid } = await page.evaluate(async () => {
+      const { scanDir } = await import("/scan-dir-api.js");
+      const core = window.__TAURI__.core;
+      const invoke = core.invoke;
+      const requests = [];
+      core.invoke = (command, args) => {
+        requests.push({ command, args });
+        return invoke(command, args);
+      };
+      try {
+        const visible = await scanDir({ path: "/mock/quelle", showHidden: false });
+        const all = await scanDir({ path: "/mock/quelle", showHidden: true });
+        const root = await scanDir({ path: "/", showHidden: false });
+        const invalid = await invoke("scan_dir", { path: "/", show_hidden: false })
+          .then(() => null, error => error.code);
+        return { requests, visible, all, root, invalid };
+      } finally {
+        core.invoke = invoke;
+      }
+    });
+    assert.equal(requests.length, 3);
+    for (const { command, args } of requests) {
+      assert.equal(command, "scan_dir");
+      assertShape(args, contract.request);
+    }
+    for (const listing of [visible, all, root]) {
+      assertShape(listing, contract.listing);
+      for (const entry of listing.entries) assertShape(entry, contract.entry);
+    }
+    assert.ok(visible.entries.length > 0);
+    assert.deepEqual(all.entries.filter(entry => entry.is_hidden).map(entry => entry.name), [".verborgen"]);
+    assert.equal(visible.entries.some(entry => entry.is_hidden), false);
+    assert.equal(root.parent, null);
+    assert.equal(invalid, "invalid_input");
+  });
+
+  await runCase("Mock-IPC prüft Pflichtargumente und toleriert zusätzliche Felder", "", async page => {
+    const result = await page.evaluate(async () => {
+      const { invoke } = window.__TAURI__.core;
+      const invalidRequests = [
+        ["scan_dir", { path: "/" }, "showHidden"],
+        ["scan_dir", { path: 1, showHidden: false }, "path"],
+        ["scan_dir", { path: "/", showHidden: 1 }, "showHidden"],
+        ["discover_sftp_host_key", { host: "test.example", port: 1.5 }, "port"],
+        ["discover_sftp_host_key", { host: "test.example", port: 65536 }, "port"],
+        ["check_local_file_operation", { kind: "copy", destDir: "/", items: [false] }, "items"],
+        ["approve_content_sync_queue_entry", { operationId: "test", effectsConfirmed: true, preparationDigest: [0] }, "preparationDigest"],
+        ["list_quarantine_runs", { target: 1 }, "target"],
+      ];
+      const invalid = [];
+      for (const [command, args, field] of invalidRequests) {
+        const error = await invoke(command, args).then(() => null, error => error);
+        invalid.push(error?.code === "invalid_input" && error.message.includes(field));
+      }
+      const extra = { endpoint: { provider: "sftp", profileId: "fremdes-profil" } };
+      return {
+        invalid,
+        absent: await invoke("list_quarantine_runs"),
+        explicitNull: await invoke("list_quarantine_runs", { target: null }),
+        extra: await invoke("app_version", extra),
+        base: await invoke("app_version"),
+        unknown: await invoke("unbekannter_mock_command", extra).then(() => null, error => error.code),
+      };
+    });
+    assert.deepEqual(result.invalid, Array(8).fill(true));
+    assert.deepEqual(result.absent, result.explicitNull);
+    assert.equal(result.extra, result.base);
+    assert.equal(result.unknown, "mock_unknown_command");
+  });
+
+  await runCase("Remote-Scan bildet die IPC-Antwort aller vier Provider ab", "?unknownSizes", async page => {
+    const contract = JSON.parse(await readFile(new URL("./tests/scan-remote-dir-wire.json", import.meta.url)));
+    const { responses, requests, missingRevision } = await page.evaluate(async () => {
+      const { scanRemoteDir } = await import("/scan-remote-dir-api.js");
+      const core = window.__TAURI__.core;
+      const invoke = core.invoke;
+      const requests = [];
+      core.invoke = (command, args) => {
+        requests.push({ command, args });
+        return invoke(command, args);
+      };
+      try {
+        const responses = [];
+        for (const [provider, profileRevision] of Object.entries({ sftp: 11, ftps: 21, webdav: 31, smb: 41 })) {
+          const listing = await scanRemoteDir(provider, {
+            profileId: `mock_${provider}`, profileRevision, path: "/", showHidden: false,
+          });
+          responses.push({ provider, listing, profileRevision });
+        }
+        const missingRevision = await invoke("scan_sftp_dir", {
+          profileId: "mock_sftp", path: "/", showHidden: false,
+        }).then(() => null, error => error.code);
+        return { responses, requests, missingRevision };
+      } finally {
+        core.invoke = invoke;
+      }
+    });
+    assert.equal(requests.length, 4);
+    for (const [index, { provider, listing, profileRevision }] of responses.entries()) {
+      assert.deepEqual(requests[index].command, `scan_${provider}_dir`);
+      assertShape(requests[index].args, contract.request);
+      assert.equal(requests[index].args.profileRevision, profileRevision);
+      assertShape(listing, { ...contract.listing, ...contract[provider] });
+      assert.equal(listing.parent, null);
+      assert.equal(listing.profile_revision, profileRevision);
+      assert.ok(Number.isSafeInteger(listing.session_generation));
+      assert.ok(listing.entries.length > 0);
+      const entryContract = provider === "sftp"
+        ? { ...contract.entry, size: "number|null" } : contract.entry;
+      for (const entry of listing.entries) assertShape(entry, entryContract);
+      if (contract[`${provider}Security`]) {
+        assert.ok(contract[`${provider}Security`].includes(listing.security));
+      }
+      if (provider === "sftp") {
+        assert.equal(listing.entries.find(entry => entry.name === "Unbekannt.txt").size, null);
+        assert.equal(listing.entries.find(entry => entry.name === "Leer.txt").size, 0);
+      }
+    }
+    assert.equal(missingRevision, "plan_drift");
+  });
+
+  await runCase("Remote-Scan liefert SFTP-Auslassungen mit dem IPC-Feldsatz", "?listingOmissions", async page => {
+    const contract = JSON.parse(await readFile(new URL("./tests/scan-remote-dir-wire.json", import.meta.url)));
+    const { omitted } = await page.evaluate(async () => {
+      const { scanRemoteDir } = await import("/scan-remote-dir-api.js");
+      return scanRemoteDir("sftp", {
+        profileId: "mock_sftp", profileRevision: 11, path: "/", showHidden: false,
+      });
+    });
+    assert.ok(omitted.length > 0);
+    for (const entry of omitted) assertShape(entry, contract.omission);
+  });
+
   await runCase("Darstellungsänderungen überstehen ein langsames Hidden-Listing", "?keyboard=1", async page => {
     await page.evaluate(() => {
       const invoke = window.__TAURI__.core.invoke;
@@ -3500,6 +3841,8 @@ try {
     await pane.getByRole("option", { name: /Schnell\.txt/ }).waitFor();
   });
 
+  const directorySizeWire = JSON.parse(await readFile(new URL("./tests/directory-size-wire.json", import.meta.url)));
+
   await runCase("Lokale Ordnergrößen sind global schaltbar, sichtbar und bei Navigation abgebrochen", "?keyboard=1&sizeDelay=80", async page => {
     // Dieser Fall prüft Berechnung, Abbruch und Sichtbarkeit der Ordnergröße,
     // nicht die separat getestete Plattformvorgabe der Anzeigeeinheit.
@@ -3527,13 +3870,8 @@ try {
 
     let state = await page.evaluate(() => window.__MOCK_DIRECTORY_SIZES__());
     assert.equal(state.calls.length, 1);
-    assert.deepEqual(state.calls[0], {
-      side: "left",
-      endpoint: { provider: "local", root: "/mock/quelle" },
-      names: ["Bilder"],
-      recalculate: false,
-      clientToken: state.calls[0].clientToken,
-    });
+    assert.ok(Number.isInteger(state.calls[0].clientToken));
+    assert.deepEqual(state.calls[0], { ...directorySizeWire.local, clientToken: state.calls[0].clientToken });
 
     // Klick auf einen fertigen Wert ist der ausdrückliche Neulauf und umgeht den
     // Sitzungscache. Danach navigieren wir weg, während dieser Lauf noch arbeitet.
@@ -3608,17 +3946,53 @@ try {
     await folder.getByRole("button", { name: "Größe von remote neu berechnen" }).waitFor();
     assert.equal(await folder.locator(".r-size").innerText(), "8,19 KB");
     state = await page.evaluate(() => window.__MOCK_DIRECTORY_SIZES__());
-    assert.deepEqual(state.calls[0], {
-      side: "left",
-      endpoint: { provider: "sftp", profileId: "mock_sftp", profileRevision: 11, root: "/" },
-      names: ["remote"],
-      sessionGeneration: 1,
-      recalculate: false,
-      clientToken: state.calls[0].clientToken,
-    });
+    assert.ok(Number.isInteger(state.calls[0].clientToken));
+    assert.deepEqual(state.calls[0], { ...directorySizeWire.remote, clientToken: state.calls[0].clientToken });
     await folder.getByRole("button", { name: "Größe von remote neu berechnen" }).click();
     state = await page.evaluate(() => window.__MOCK_DIRECTORY_SIZES__());
     assert.equal(state.calls.at(-1).recalculate, true);
+  });
+
+  await runCase("Ordnergrößen lehnen alte Remote-Bindungen ab", "?sizeDelay=40", async page => {
+    const pane = page.locator('.pane[data-side="left"]');
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    const folder = pane.locator('.row.dir', { hasText: "remote" });
+    await folder.waitFor();
+    const result = await page.evaluate(async request => {
+      const { invoke, listen } = await import("/tauri-api.js");
+      const malformed = await invoke("start_directory_sizes", { request: {
+        ...request, endpoint: { provider: "sftp", root: "/", profile_id: "mock_sftp" },
+      } }).then(() => null, error => error.code);
+      const rejected = [];
+      for (const stale of [
+        { ...request, endpoint: { ...request.endpoint, profileRevision: 10 } },
+        { ...request, sessionGeneration: 2 },
+        { ...request, endpoint: { ...request.endpoint, profileRevision: null } },
+        { ...request, sessionGeneration: null },
+      ]) {
+        const { promise, resolve, reject } = Promise.withResolvers();
+        const stop = await listen("directory-size-error", event => resolve(event.payload));
+        const timeout = setTimeout(() => reject(new Error("Ordnergrößen-Fehlerereignis fehlt")), 3000);
+        try {
+          const [started, event] = await Promise.all([invoke("start_directory_sizes", { request: stale }), promise]);
+          rejected.push({ started, event });
+        } finally {
+          clearTimeout(timeout);
+          stop();
+        }
+      }
+      return { malformed, rejected };
+    }, directorySizeWire.remote);
+    assert.equal(result.malformed, "invalid_input");
+    assert.equal(result.rejected.length, 4);
+    for (const { started, event } of result.rejected) {
+      assert.equal(event.error.code, "plan_drift");
+      assert.equal(event.side, "left");
+      assert.equal(event.parent, "/");
+      assert.equal(event.client_token, directorySizeWire.remote.clientToken);
+      assert.equal(event.run_id, started.run_id);
+    }
+    assert.equal(await folder.locator(".folder-size-value").count(), 0);
   });
 
   await runCase("Informationsdialog erhält Fokus während laufender Größenmessung", "?keyboard=1&sizeDelay=1000", async page => {
@@ -3640,6 +4014,21 @@ try {
   await runFinderTagCases(runCase);
   await runVisibilityCases(runCase);
   await runFileFlagCases(runCase);
+  await runCase("Dateieigenschaften · Admin-Status und Providerfähigkeiten entsprechen dem Rust-IPC-Vertrag", "?keyboard=1", async page => {
+    const fixture = JSON.parse(await readFile(new URL("./tests/file-property-wire.json", import.meta.url)));
+    const { capabilities, status } = await page.evaluate(async () => {
+      const { invoke } = window.__TAURI__.core;
+      return {
+        capabilities: await invoke("get_file_property_capabilities", { provider: "smb" }),
+        status: await invoke("get_metadata_admin_status"),
+      };
+    });
+    assertShape(capabilities, fixture.capabilities);
+    assert.equal(capabilities.permissions, false);
+    assert.equal(capabilities.administration, false);
+    assert.deepEqual(status, fixture.administrator.read);
+  });
+
   await runAdministratorCases(runCase);
   await runFinderCommentCases(runCase);
 
@@ -4615,25 +5004,24 @@ try {
   }
 
   await runCase("Gespeicherte Sync-Aufträge öffnen, bearbeiten und frisch planen", "", async page => {
-    await page.evaluate(() => {
+    const {syncJob} = JSON.parse(await readFile(new URL("./tests/small-control-wire.json", import.meta.url)));
+    await page.evaluate(({ saved, edited }) => {
       const invoke = window.__TAURI__.core.invoke;
       const requests = [];
-      const jobs = [{ id: "job-1", revision: 1, name: "Wöchentlich", direction: "rl",
-        left: { provider: "local", path: "/mock/ablage" }, right: { provider: "local", path: "/mock/ziel" },
-        options: { mode: "Update", compare: "ContentHash", metadata: "Portable", mtime_tolerance: 2, exclude: ["*.keep"] } }];
+      const jobs = [saved];
       window.__SAVED_JOB_REQUESTS__ = requests;
       window.__TAURI__.core.invoke = async (command, args) => {
         if (command === "list_saved_sync_jobs") return structuredClone(jobs);
         if (command === "save_sync_job") {
           requests.push({ command, ...args.request });
-          jobs[0] = { ...args.request, revision: 2 };
+          jobs[0] = edited;
           return structuredClone(jobs[0]);
         }
         if (command === "plan_sync") requests.push({ command, ...args });
         return invoke(command, args);
       };
       window.__MOCK_EMIT__("menu", "sync_mode");
-    });
+    }, syncJob);
     await page.getByRole("button", { name: "Auftrag öffnen …", exact: true }).click();
     const open = page.getByRole("dialog", { name: "Gespeicherte Sync-Aufträge" });
     assert.match(await open.innerText(), /Wöchentlich.*Quelle.*\/mock\/ziel.*Ziel.*\/mock\/ablage/s);
@@ -4656,9 +5044,7 @@ try {
     await edit.getByRole("button", { name: "Änderungen speichern" }).click();
     await page.locator("#sync-job-current").filter({ hasText: "Am Freitag" }).waitFor();
     const saved = await page.evaluate(() => window.__SAVED_JOB_REQUESTS__.find(request => request.command === "save_sync_job"));
-    assert.equal(saved.id, "job-1"); assert.equal(saved.revision, 1);
-    assert.equal(saved.left.path, "/mock/andere-ablage"); assert.equal(saved.direction, "rl");
-    assert.deepEqual(saved.options.exclude, ["*.tmp"]);
+    assert.deepEqual(saved, { command: "save_sync_job", ...syncJob.edited, revision: syncJob.saved.revision });
   });
 
   await runCase("Gespeicherte Sync-Aufträge starten bei fehlendem Ordner keine Planung", "", async page => {
@@ -4995,6 +5381,97 @@ try {
     assert.equal(await list.locator('[role="option"][aria-selected="true"]').count(), 1);
   });
 
+  for (const content of [true, false]) {
+    await runCase(`Realmodus verwendet Rust-Vorschau für ${content ? "gebundenen Dateisync" : "lokale Wirkungsbestätigung"}`, "", async page => {
+      const [wire, local] = await Promise.all([
+        readFile(new URL("./tests/real-mode-wire.json", import.meta.url)).then(JSON.parse),
+        readFile(new URL("./tests/local-sync-wire.json", import.meta.url)).then(JSON.parse),
+      ]);
+      const { local_execution, ...legacy } = local.preview;
+      const previews = {
+        content: { ...wire.content.preview, target_identity: local.preview.target_identity, plan: local.plan },
+        legacy: { ...legacy, ...wire.legacy, plan: local.plan },
+      };
+      await page.evaluate(previews => {
+        window.__MOCK_REAL_MODE_WIRE__ = previews;
+        window.__REAL_MODE_WIRE_CALLS__ = [];
+        const original = window.__TAURI__.core.invoke;
+        window.__TAURI__.core.invoke = (command, args) => {
+          if (["prepare_content_sync", "enqueue_content_sync", "prepare_real_sync", "run_real_sync"].includes(command)) {
+            window.__REAL_MODE_WIRE_CALLS__.push({ command, args: structuredClone(args) });
+          }
+          return original(command, args);
+        };
+      }, previews);
+      if (content) await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+      await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
+      await page.locator(content ? "#btn-sync" : "#btn-real").click();
+      const dialog = page.getByRole("dialog", { name: content ? "Dateisync ausführen" : "Sync ausführen" });
+      const hint = content ? previews.content.limitations[0] : previews.legacy.scope_warnings[0];
+      await dialog.getByText(hint, { exact: true }).waitFor();
+      assert.match(await dialog.innerText(), content ? /sftp\.example\.invalid/ : /mockfs.*mockfs/s);
+      assert.equal(await page.evaluate(() => window.__REAL_MODE_WIRE_CALLS__.length), 1);
+      await dialog.getByRole("button", { name: content ? "Sync bestätigen und starten" : "Sync starten", exact: true }).click();
+      if (content) {
+        await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+        const operation = await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].operation);
+        assert.deepEqual(operation.expected_plan, local.plan);
+        assert.deepEqual(operation.binding_digest, previews.content.digest);
+      } else {
+        await page.waitForFunction(() => document.documentElement.dataset.realConfirmation === "true");
+      }
+      assert.deepEqual(await page.evaluate(() => window.__REAL_MODE_WIRE_CALLS__), content
+        ? [
+          { command: "prepare_content_sync", args: { request: wire.content.request } },
+          { command: "enqueue_content_sync", args: { effectsConfirmed: true, removalPhrase: null, preparationDigest: previews.content.digest } },
+        ]
+        : [
+          { command: "prepare_real_sync", args: local.request },
+          { command: "run_real_sync", args: { effectsConfirmed: true } },
+        ]);
+    });
+  }
+
+  for (const protocol of ["provider", "ftps"]) {
+    await runCase(`Realmodus reicht den Altvertrag für ${protocol} weiter`, "", async page => {
+      const options = { mode: "AddOnly", compare: "SizeAndTime", mtime_tolerance: 2 };
+      const request = protocol === "provider"
+        ? {
+          source: { provider: "sftp", root: "/", profileId: "mock_sftp", profileRevision: 11 },
+          target: { provider: "ftps", root: "/", profileId: "mock_ftps", profileRevision: 21 },
+        }
+        : { profileId: "mock_ftps", profileRevision: 21, direction: "Upload", localRoot: "/mock/quelle", remoteRoot: "/" };
+      await page.evaluate(async ({ protocol, request, options }) => {
+        const { createRealModeUi } = await import("/real-mode-ui.js");
+        const original = window.__TAURI__.core.invoke;
+        window.__REAL_MODE_LEGACY_CALLS__ = [];
+        window.__TAURI__.core.invoke = (command, args) => {
+          if (command === `prepare_${protocol}_sync` || command === `run_${protocol}_sync`) {
+            window.__REAL_MODE_LEGACY_CALLS__.push({ command, args: structuredClone(args) });
+          }
+          return original(command, args);
+        };
+        const remote = { ...request, protocol };
+        const controller = createRealModeUi({
+          syncScope: () => protocol, syncOptions: () => options, mode: () => options.mode,
+          running: () => false, showPlan: () => {}, showDock: () => {}, onProgressStart: () => {},
+          showError: (_title, error) => { window.__REAL_MODE_LEGACY_ERROR__ = String(error); },
+        });
+        void controller.prepareRemotePreview(remote)
+          .then(() => controller.runRemote(remote))
+          .finally(() => controller.finishActive());
+      }, { protocol, request, options });
+      const dialog = page.getByRole("dialog", { name: protocol === "provider" ? "REMOTE↔REMOTE-Sync ausführen" : "FTPS-Sync ausführen" });
+      await dialog.getByRole("button", { name: "Sync starten", exact: true }).click();
+      await page.waitForFunction(protocol => document.documentElement.dataset[`${protocol}Confirmation`] === "true", protocol);
+      assert.deepEqual(await page.evaluate(() => window.__REAL_MODE_LEGACY_CALLS__), [
+        { command: `prepare_${protocol}_sync`, args: { request: { ...request, options } } },
+        { command: `run_${protocol}_sync`, args: { effectsConfirmed: true } },
+      ]);
+      assert.equal(await page.evaluate(() => window.__REAL_MODE_LEGACY_ERROR__), undefined);
+    });
+  }
+
   await runCase("Realmodusbestätigung überlebt die zuvor geplante automatische Vorschau", "", async page => {
     await page.clock.install({ time: new Date("2026-10-19T12:00:00Z") });
     await page.clock.pauseAt(new Date("2026-10-19T12:00:01Z"));
@@ -5311,8 +5788,8 @@ try {
       await dialog.getByRole("button", { name: "Dauerhafte Änderungen bestätigen" }).click();
       await page.waitForFunction(() => window.__MOCK_CONTENT_SYNC_STATE__().calls.some(call => call.command === "approve_content_sync_queue_entry"));
       const approval = await page.evaluate(() => window.__MOCK_CONTENT_SYNC_STATE__().calls.find(call => call.command === "approve_content_sync_queue_entry").args);
-      assert.deepEqual(approval.preparationDigest, Array(32).fill(9));
-      assert.equal(approval.effectsConfirmed, true);
+      const wire = JSON.parse(await readFile(new URL("./tests/queue-approval-wire.json", import.meta.url)));
+      assert.deepEqual(approval, wire.content);
       assert.equal(await page.locator("#queue-popover").isVisible(), true);
     });
   }
@@ -5408,6 +5885,7 @@ try {
           if (mode === "Update") await page.locator("#sync-update").check();
           await page.locator("#btn-sync").click();
           const dialog = page.getByRole("dialog", { name: "Dateisync ausführen" });
+          if (provider === "webdav") await dialog.getByText(direction === "upload" ? "Ziel · WebDAV" : "Quelle · WebDAV", { exact: true }).waitFor();
           await dialog.waitFor();
           assert.match(await dialog.innerText(), /Quelle.*Ziel.*Best Effort/s);
           assert.equal(await dialog.locator("input").count(), 0);
@@ -5560,7 +6038,7 @@ try {
         parent: "/",
         name,
         path: `/${name}`,
-        expectedExecutionClass: provider === "webdav" ? "best_effort" : "assured",
+        expectedExecutionClass: provider === "smb" ? "assured" : "best_effort",
       });
     }
   });
@@ -5776,11 +6254,15 @@ try {
   await runCase("Sitzungsstand speichert nur Endpunkt, Pfad und die wiederhergestellte aktive Pane", "?restoredSide=right", async page => {
     await page.waitForFunction(() => window.__MOCK_DESKTOP__().rememberedWindows.length >= 1);
     const [first] = await page.evaluate(() => window.__MOCK_DESKTOP__().rememberedWindows);
-    assert.deepEqual(Object.keys(first.panes.left).sort(), ["path", "profileId", "profileRevision", "provider"]);
-    assert.deepEqual(Object.keys(first.panes.right).sort(), ["path", "profileId", "profileRevision", "provider"]);
+    assert.deepEqual(first.panes, windowSessionWire.session.panes);
+    const [tab] = first.tabs.left.tabs;
+    assert.equal(first.tabs.left.activeId, tab.id);
+    const selected = windowSessionWire.selectedEntry;
+    assert.deepEqual({ ...tab, id: windowSessionWire.tab.id },
+      { ...windowSessionWire.tab, cursorName: selected, anchorName: selected, selectedNames: [selected] });
     // Die Start-Listings dürfen den Vorgabewert „links" nicht vor dem gelesenen
     // Sitzungswert speichern; der erste gespeicherte Stand trägt bereits „rechts".
-    assert.equal(first.activeSide, "right");
+    assert.equal(first.activeSide, windowSessionWire.session.activeSide);
     assert.equal(await page.locator('.pane[data-side="right"]').evaluate(el => el.classList.contains("active")), true);
     await page.locator('.pane[data-side="left"] .listing').click();
     await page.waitForFunction(() => window.__MOCK_DESKTOP__().rememberedWindows.at(-1).activeSide === "left");
@@ -5860,7 +6342,7 @@ try {
         applyByteUnits: value => { window.__MIGRATION_VALUES__.byteUnits = value; },
         applyLocalFolderSizes: value => { window.__MIGRATION_VALUES__.localFolderSizes = value; },
         applyNetworkDiscovery: value => { window.__MIGRATION_VALUES__.networkDiscovery = value; },
-        currentWindow() {}, legacyPreferences: () => ({ ...window.__MIGRATION_VALUES__ }),
+        rememberWindow() {}, legacyPreferences: () => ({ ...window.__MIGRATION_VALUES__ }),
         showError: (_title, error) => { window.__MIGRATION_ERROR__ = error.message; },
       };
       await createSettingsUi(options).init();
@@ -5893,7 +6375,7 @@ try {
       };
       window.__REVIEW_LATE_SETTINGS__ = createSettingsUi({
         applyByteUnits() {}, applyLocalFolderSizes() {}, applyNetworkDiscovery() {}, applyTheme() {},
-        currentWindow() {}, legacyPreferences: () => ({ theme: "light" }), showError() {},
+        rememberWindow() {}, legacyPreferences: () => ({ theme: "light" }), showError() {},
       });
       window.__REVIEW_LATE_INIT__ = window.__REVIEW_LATE_SETTINGS__.init();
     });
@@ -6168,9 +6650,12 @@ try {
       const left = page.getByRole("listbox", { name: /Linke Dateiliste/ });
       await left.getByRole("option", { name: /Baum/ }).click(); await left.focus(); await page.keyboard.press("F5");
       await page.locator("#queue-count").filter({ hasText: "1" }).waitFor();
+      const fixture = JSON.parse(await readFile(new URL("./tests/file-transfer-wire.json", import.meta.url)));
       const op = await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.at(-1).operation);
       assert.equal(op.source.provider, "Local"); assert.equal(op.target.provider, "WebDav");
       assert.equal(op.copy_new_best_effort_expected, true); assert.equal(op.overwrite, false);
+      assertShape(op.source_tree_expected, fixture.providerTransfer.sourceTree);
+      assertShape(op.source_tree_expected.omitted[0], fixture.providerTransfer.omission);
       assert.equal(op.source_tree_expected.entries, 4); assert.equal(op.source_tree_expected.omitted.length, 1);
       assert.match(await page.locator("#dock-summary").innerText(), /Begrenzter Quellbaum.*ausgelassen/s);
       await page.getByText("Quellgrenzen und Auslassungen anzeigen", { exact: true }).click();
@@ -6500,6 +6985,14 @@ try {
   });
 
   await runCase("Papierkorb lädt beide aktuell gleichen lokalen Panes neu", "?trashDelay=60", async page => {
+    await page.evaluate(() => {
+      const original = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = async (command, args) => {
+        const result = await original(command, args);
+        if (command === "trash_paths") window.__TRASH_RESULT__ = result;
+        return result;
+      };
+    });
     const rightPane = page.locator('.pane[data-side="right"]');
     await rightPane.locator(".path").fill("/mock/quelle");
     await rightPane.locator(".path").press("Enter");
@@ -6514,6 +7007,30 @@ try {
     const scans = (await page.evaluate(() => window.__MOCK_SCAN_CALLS__()))
       .filter(call => call.command === "scan_dir" && call.path === "/mock/quelle");
     assert.ok(scans.length >= 4, "Start, zweite Pane und beide Abschluss-Reloads müssen sichtbar sein.");
+    assert.deepEqual(await page.evaluate(() => window.__TRASH_RESULT__), recoveryTrashWire.trash.complete);
+  });
+
+  await runCase("Papierkorb bilanziert erfolgreiche, fehlgeschlagene und unklare Wirkungen getrennt", "?keyboard=1", async page => {
+    await page.evaluate(partial => {
+      const original = window.__TAURI__.core.invoke;
+      window.__TAURI__.core.invoke = async (command, args) => {
+        if (command !== "trash_paths") return original(command, args);
+        window.__TRASH_ITEMS__ = args.items;
+        return partial;
+      };
+    }, recoveryTrashWire.trash.partial);
+    const left = page.getByRole("listbox", { name: /Linke Dateiliste/ });
+    await left.getByRole("option", { name: /Alpha\.txt/ }).click();
+    await left.getByRole("option", { name: /Beta\.txt/ }).click({ modifiers: ["Meta"] });
+    await left.getByRole("option", { name: /Gamma/ }).click({ modifiers: ["Meta"] });
+    await left.focus();
+    await page.keyboard.press("Control+Backspace");
+    const result = page.locator("#dock-summary");
+    await result.getByText(/1 Objekt\(e\) in den Papierkorb gelegt/).waitFor();
+    await result.getByText(/1 fehlgeschlagen, 1 mit unklarem Ausgang/).waitFor();
+    await result.getByText(/Zugriff verweigert; Wirkung für <Prüfpfad> ungeklärt/).waitFor();
+    assert.deepEqual((await page.evaluate(() => window.__TRASH_ITEMS__)).sort(),
+      ["/mock/quelle/Alpha.txt", "/mock/quelle/Beta.txt", "/mock/quelle/Gamma"]);
   });
 
   await runCase("Native Kopierauslassungen nennen erhaltene Quellen und bleiben in der Queue sichtbar", "", async page => {
@@ -6637,6 +7154,76 @@ try {
     });
     await row.filter({ hasText: "Spätere Datei fehlgeschlagen" }).waitFor();
     assert.doesNotMatch(await row.innerText(), /Übertragung abgeschlossen/);
+  });
+
+  await runCase("Dateiaktionen übernehmen Rust-Verträge und reichen den Löschplan vollständig zurück", "?remoteFile=1", async page => {
+    const wire = JSON.parse(await readFile(new URL("./tests/routine-file-wire.json", import.meta.url)));
+    await page.evaluate(wire => {
+      const invoke = window.__TAURI__.core.invoke;
+      const responses = {
+        provider_folder_contract: wire.folder.contract,
+        create_provider_folder: wire.folder.response,
+        provider_rename_contract: wire.rename.contract,
+        rename_provider_path: wire.rename.response,
+        check_provider_delete: wire.delete.preview,
+      };
+      window.__ROUTINE_FILE_CALLS__ = [];
+      window.__TAURI__.core.invoke = (command, args) => {
+        if (Object.hasOwn(responses, command) || command === "enqueue_provider_delete") {
+          window.__ROUTINE_FILE_CALLS__.push({ command, args: structuredClone(args) });
+        }
+        return Object.hasOwn(responses, command) ? Promise.resolve(responses[command]) : invoke(command, args);
+      };
+    }, wire);
+    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
+    const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
+    const row = list.getByRole("option", { name: /remote\.txt/ });
+    await row.waitFor();
+    await list.focus();
+    await page.evaluate(() => { window.__MOCK_EMIT__("menu", "new_folder"); });
+    const folderDialog = page.getByRole("dialog", { name: "Neuer Ordner" });
+    const folderNotes = folderDialog.getByRole("textbox", { name: "Wirkung und Einschränkungen" });
+    await folderNotes.waitFor();
+    assert.equal(await folderNotes.inputValue(), wire.folder.contract.limitations.join(" "));
+    await folderDialog.locator("#modal-input").fill(wire.folder.request.name);
+    await folderDialog.getByRole("button", { name: "OK", exact: true }).click();
+    await page.getByText("Ordner angelegt", { exact: true }).waitFor();
+    assert.ok((await page.locator("#dock-summary").innerText()).includes(wire.folder.request.name));
+
+    await row.click();
+    await list.focus();
+    await page.keyboard.press("F2");
+    const renameDialog = page.getByRole("dialog", { name: "Umbenennen" });
+    const renameNotes = renameDialog.getByRole("textbox", { name: "Wirkung und Einschränkungen" });
+    await renameNotes.waitFor();
+    assert.ok((await renameNotes.inputValue()).includes(wire.rename.contract.limitations[0]));
+    await renameDialog.locator("#modal-input").fill(wire.rename.request.newName);
+    await renameDialog.getByRole("button", { name: "OK", exact: true }).click();
+    await page.getByText("Umbenannt", { exact: true }).waitFor();
+    assert.ok((await page.locator("#dock-summary").innerText()).includes(wire.rename.request.newName));
+
+    await row.click();
+    await list.focus();
+    await page.keyboard.press("Control+Backspace");
+    const deleteDialog = page.getByRole("dialog", { name: "Dauerhaft löschen" });
+    await deleteDialog.getByText(/1 ausgewählte Einträge, 1 Objekte und 8 Byte/).waitFor();
+    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
+    await deleteDialog.getByRole("button", { name: "Dauerhaft löschen", exact: true }).click();
+    await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length === 1);
+    const operation = await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].operation);
+    assert.deepEqual(operation.expected_plan, wire.delete.preview.plan);
+    const deleteSelection = { endpoint: wire.endpoint, items: wire.delete.items };
+    assert.deepEqual(await page.evaluate(() => window.__ROUTINE_FILE_CALLS__), [
+      { command: "provider_folder_contract", args: { endpoint: wire.endpoint } },
+      { command: "create_provider_folder", args: wire.folder.request },
+      { command: "provider_rename_contract", args: { endpoint: wire.endpoint } },
+      { command: "rename_provider_path", args: { request: wire.rename.request } },
+      { command: "check_provider_delete", args: { request: deleteSelection } },
+      { command: "enqueue_provider_delete", args: { request: {
+        ...deleteSelection, mode: wire.delete.preview.mode, expectedPlan: wire.delete.preview.plan,
+        confirmation: null, effectsConfirmed: true,
+      } } },
+    ]);
   });
 
   await runCase("Remote-Löschen trennt Quarantäne und irreversible Bestätigung", "?remoteFile=1", async page => {
@@ -6878,12 +7465,20 @@ try {
     ["Abbruch", "?remoteFile=1&snapshotDelay=600"],
   ]) {
     await runCase(`Remote-Dateiöffnung bleibt abbrechbar: ${suffix}`, query, async page => {
+      await page.evaluate(() => {
+        const invoke = window.__TAURI__.core.invoke;
+        window.__TAURI__.core.invoke = (command, args) => {
+          if (command === "open_remote_snapshot") window.__FILE_OPENING_SNAPSHOT__ = structuredClone(args.request);
+          return invoke(command, args);
+        };
+      });
       await page.locator('#connection-list [data-protocol="ftps"][data-id="mock_ftps"]').click();
       const list = page.getByRole("listbox", { name: /Linke Dateiliste/ });
       const file = list.getByRole("option", { name: /remote\.txt/ });
       await file.waitFor();
       await file.dblclick();
       await page.locator("#btn-cancel").waitFor({ state: "visible" });
+      assert.deepEqual(await page.evaluate(() => window.__FILE_OPENING_SNAPSHOT__), fileOpeningWire.snapshot);
       assert.equal(await page.locator("#progress").isVisible(), true);
       if (suffix === "Abbruch") await page.keyboard.press("Escape");
       await page.locator("#btn-cancel").waitFor({ state: "hidden" });
@@ -7120,177 +7715,7 @@ try {
     assert.doesNotMatch(text, /Best Effort/, "Die Klasse steht nur als Zusatz, nicht falsch");
   });
 
-  for (const provider of ["sftp", "ftps", "webdav", "smb"]) {
-    await runCase(`Forward-Bidir ${provider} drei Dateien verwendet eigene Fensterqueue`, "", async page => {
-      await page.locator(`#connection-list [data-protocol="${provider}"][data-id="mock_${provider}"]`).click();
-      await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-      await page.getByLabel("In beide Richtungen", { exact: true }).check();
-      await page.locator("#btn-sync").click();
-      const dialog = page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }); await dialog.waitFor();
-      assert.match(await dialog.innerText(), /kein universelles automatisches Rollback/);
-      assert.match(await dialog.innerText(), /eins.txt.*zwei.txt.*drei.txt/s);
-      assert.equal(await dialog.locator("input").count(), 0);
-      await dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
-      await page.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
-      const entries = await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries);
-      assert.equal(entries.length, 1); assert.equal(entries[0].operation.type, "BidirectionalForward"); assert.equal(entries[0].state, "Completed");
-      const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
-      assert.equal(calls.filter(call => call.command === "enqueue_forward_bidirectional_sync").length, 1);
-      assert.deepEqual(calls.find(call => call.command === "enqueue_forward_bidirectional_sync").args.preparationDigest, Array(32).fill(42));
-    });
-  }
-  for (const theme of ["light", "dark"]) {
-    await runCase(`Forward-Bidir Wirkungsdialog Quarantäne und Dauerwirkung bleibt erreichbar: ${theme}`, "?forwardReplace=1", async page => {
-      await page.setViewportSize({ width: 760, height: 480 });
-      await page.evaluate(async theme => { const { setTheme } = await import("/theme.js"); setTheme(theme, false); }, theme);
-      await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-      await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-      await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
-      const dialog = page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }); await dialog.waitFor();
-      assert.match(await dialog.innerText(), /lokalen Quarantäne gesichert/); assert.match(await dialog.innerText(), /dauerhaft ersetzt/);
-      assert.match(await dialog.innerText(), /kein universelles automatisches Rollback/);
-      const start = dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" }); await start.scrollIntoViewIfNeeded();
-      const bounds = await start.boundingBox(); assert.ok(bounds && bounds.y >= 0 && bounds.y + bounds.height <= 480);
-      if (process.env.DOPPELDECKER_SCREENSHOT_DIR) await page.screenshot({ path: `${process.env.DOPPELDECKER_SCREENSHOT_DIR}/forward-${theme}.png` });
-      await page.keyboard.press("Escape");
-      await page.waitForFunction(() => !window.__MOCK_FORWARD_STATE__().pending);
-      assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
-    });
-  }
-  await runCase("Forward-Bidir Startupjournal führt zu frischem Neuabgleich", "?forwardStartup=1", async page => {
-    await page.locator("#btn-queue").click(); await page.getByRole("button", { name: "Neu abgleichen", exact: true }).click();
-    await page.getByRole("dialog", { name: "Neu abgleichen · Forward-Startpaar" }).getByRole("button", { name: "Neu abgleichen", exact: true }).click();
-    await page.getByRole("dialog", { name: "Neu abgeglichenen Sync bestätigen" }).getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
-    await page.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
-    const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
-    assert.deepEqual(calls.find(call => call.command === "prepare_forward_bidirectional_queue_recovery").args.resolutions, []);
-    assert.equal(calls.filter(call => call.command === "approve_forward_bidirectional_queue_entry").length, 1);
-  });
-  await runCase("Forward-Bidir Completionjournal bietet nur Baselineabschluss", "?forwardCompletion=1", async page => {
-    await page.locator("#btn-queue").click();
-    assert.equal(await page.getByRole("button", { name: "Neu abgleichen", exact: true }).count(), 0);
-    await page.getByRole("button", { name: "Abschluss prüfen", exact: true }).click();
-    await page.locator("#dock-summary").filter({ hasText: "Baselineabschluss bestätigt" }).waitFor();
-    const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
-    assert.deepEqual(calls.map(call => call.command), ["finish_forward_bidirectional_queue_completion"]);
-  });
-  await runCase("Forward-Bidir Profilwechsel verwirft alte Konflikt- und Laufvorbereitung", "", async page => {
-    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-    await page.evaluate(() => {
-      const invoke = window.__TAURI__.core.invoke;
-      window.__TAURI__.core.invoke = async (command, args) => {
-        const result = await invoke(command, args);
-        if (command === "prepare_forward_bidirectional_sync") await new Promise(resolve => { window.__RELEASE_FORWARD_PROFILE__ = resolve; });
-        return result;
-      };
-      window.__MOCK_EMIT__("menu", "sync_mode");
-    });
-    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
-    await page.waitForFunction(() => typeof window.__RELEASE_FORWARD_PROFILE__ === "function");
-    await page.evaluate(() => {
-      window.__MOCK_SET_PROFILE_REVISION__("sftp", "mock_sftp", 12);
-      window.__MOCK_EMIT__("connections-updated", { protocol: "sftp", profileId: "mock_sftp", revision: 12, change: "saved" });
-    });
-    await page.evaluate(() => window.__RELEASE_FORWARD_PROFILE__());
-    await page.waitForFunction(() => !window.__MOCK_FORWARD_STATE__().pending);
-    assert.equal(await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).count(), 0);
-    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
-  });
-  await runCase("Forward-Bidir zweites Fenster behält Vorbereitung nach Discard im ersten", "", async page => {
-    const other = await page.context().newPage(); const errors = []; other.on("pageerror", error => errors.push(error.message));
-    try {
-      await other.goto(page.url(), { waitUntil: "networkidle" });
-      await page.evaluate(() => {
-        const original = window.__TAURI__.core.invoke;
-        window.__TAURI__.core.invoke = async (command, args) => {
-          if (command === "prepare_forward_bidirectional_sync") {
-            await new Promise(resolve => { window.__RELEASE_FIRST_FORWARD_PREPARATION__ = resolve; });
-          }
-          return original(command, args);
-        };
-      });
-      for (const target of [page, other]) {
-        await target.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-        await target.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-        await target.getByLabel("In beide Richtungen", { exact: true }).check(); await target.locator("#btn-sync").click();
-      }
-      await page.locator("#btn-sync-close").click();
-      await page.waitForFunction(() => typeof window.__RELEASE_FIRST_FORWARD_PREPARATION__ === "function");
-      await page.evaluate(() => window.__RELEASE_FIRST_FORWARD_PREPARATION__());
-      await page.waitForFunction(() => window.__MOCK_FORWARD_STATE__().calls.some(call => call.command === "discard_forward_bidirectional_sync"));
-      const dialog = other.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }); await dialog.waitFor();
-      await dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
-      await other.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
-      assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
-      assert.equal(await other.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 1);
-      assert.deepEqual(errors, []);
-    } finally { await other.close(); }
-  });
-  await runCase("Forward-Bidir Konfliktentscheidung bleibt an unresolved Digest gebunden", "?bidirectionalConflict=1", async page => {
-    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
-    await page.getByRole("dialog", { name: "Konflikt 1 von 1" }).getByRole("button", { name: "Links behalten", exact: true }).click();
-    await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
-    await page.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
-    const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
-    const preparations = calls.filter(call => call.command === "prepare_forward_bidirectional_sync");
-    assert.equal(preparations.length, 2); assert.equal(preparations[1].args.request.resolutions.length, 1);
-    assert.deepEqual(preparations[1].args.request.expectedUnresolvedDigest, Array(32).fill(41));
-    assert.deepEqual(calls.find(call => call.command === "enqueue_forward_bidirectional_sync").args.preparationDigest, Array(32).fill(43));
-  });
-  await runCase("Forward-Bidir Teilfehler bietet frischen Neuabgleich gegen B0", "?forwardPartial=1", async page => {
-    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
-    await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
-    await page.locator("#dock-summary").filter({ hasText: "B0 bleibt erhalten" }).waitFor();
-    await page.locator("#btn-queue").click();
-    const queue = page.locator("#queue-popover");
-    assert.equal(await queue.getByRole("button", { name: "Erneut versuchen", exact: true }).count(), 0);
-    await queue.getByRole("button", { name: "Neu abgleichen", exact: true }).click();
-    await page.getByRole("dialog", { name: /Neu abgleichen ·/ }).getByRole("button", { name: "Neu abgleichen", exact: true }).click();
-    const dialog = page.getByRole("dialog", { name: "Neu abgeglichenen Sync bestätigen" });
-    assert.match(await dialog.innerText(), /B0 blieb unverändert.*alte Konfliktentscheidungen wurden verworfen/s);
-    assert.equal(await dialog.getByRole("button", { name: "Rollback", exact: true }).count(), 0);
-    await dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
-    await page.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
-    const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
-    assert.deepEqual(calls.find(call => call.command === "prepare_forward_bidirectional_queue_recovery").args.resolutions, []);
-    assert.deepEqual(calls.find(call => call.command === "approve_forward_bidirectional_queue_entry").args.preparationDigest, Array(32).fill(45));
-  });
-  await runCase("Forward-Bidir ungestartete Queuevorbereitung lässt sich sauber verwerfen", "?forwardReopen=1", async page => {
-    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
-    await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
-    await page.locator("#btn-queue").click(); await page.getByRole("button", { name: "Verwerfen", exact: true }).click();
-    await page.getByRole("dialog", { name: "Operation verwerfen" }).getByRole("button", { name: "Fortfahren", exact: true }).click();
-    await page.waitForFunction(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries[0].state === "Cancelled");
-    assert.equal(await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls.some(call => call.command === "approve_forward_bidirectional_queue_entry")), false);
-  });
-  await runCase("Forward-Bidir Reopen verlangt neuen Previewdigest", "?forwardReopen=1", async page => {
-    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
-    await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
-    await page.locator("#btn-queue").click(); await page.getByRole("button", { name: "Plan bestätigen" }).click();
-    const dialog = page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" });
-    assert.match(await dialog.innerText(), /Neue Wirkung nach Neustart: frischer Digest/);
-    await dialog.getByRole("button", { name: "Wirkung beider Seiten bestätigen" }).click();
-    await page.locator("#dock-summary").filter({ hasText: "Bidirektional als Best Effort fertig" }).waitFor();
-    const calls = await page.evaluate(() => window.__MOCK_FORWARD_STATE__().calls);
-    assert.deepEqual(calls.find(call => call.command === "approve_forward_bidirectional_queue_entry").args.preparationDigest, Array(32).fill(44));
-  });
-  await runCase("Forward-Bidir Scopewechsel verwirft verspätete Vorbereitung", "?forwardPrepareDelay=1", async page => {
-    await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "sync_mode"));
-    await page.getByLabel("In beide Richtungen", { exact: true }).check(); await page.locator("#btn-sync").click();
-    await page.locator("#btn-cancel").waitFor({ state: "visible" }); await page.locator("#btn-sync-close").click();
-    await page.waitForFunction(() => window.__MOCK_FORWARD_STATE__().calls.some(call => call.command === "discard_forward_bidirectional_sync") && !window.__MOCK_FORWARD_STATE__().pending && document.querySelector("#btn-cancel").hidden);
-    assert.equal(await page.getByRole("dialog", { name: "Bidirektionalen Sync als Best Effort ausführen" }).count(), 0);
-    assert.equal(await page.evaluate(() => window.__DOPPELDECKER_MOCK_QUEUE__.entries.length), 0);
-  });
+  await runForwardBidirectionalCases(runCase);
 
   await runCase("Bidirektionale Paarvorbereitung bleibt dauerhaft und abbrechbar", "", async page => {
     // Bidirektional ist im Sync-Modus die dritte Richtungsoption.
@@ -7303,6 +7728,9 @@ try {
     const preparation = await page.evaluate(() => window.__MOCK_PREPARATION_ACTIONS__());
     assert.equal(preparation.calls[0]?.command, "register_bidirectional_pair",
       "Die prozessweite Paarregistrierung muss vor jeder Vorbereitung im Backend liegen.");
+    const request = preparation.calls.find(call => call.command === "prepare_bidirectional_sync").args.request;
+    assert.deepEqual(Object.keys(request).sort(), ["left", "pairId", "pairName", "resolutions", "right"]);
+    assert.equal(request.pairId.length, 16);
     assert.equal(await page.evaluate(() => localStorage.getItem("doppeldecker-bidirectional-pairs-v1")), null,
       "localStorage darf keine konkurrierende Paar-ID-Registry mehr sein.");
     await dialog.getByRole("button", { name: "Abbrechen" }).click();
@@ -7465,6 +7893,25 @@ try {
     assert.doesNotMatch(await page.locator("#dock").innerText(), /Neu bestätigt/);
     assert.equal(await page.getByRole("button", { name: "Plan bestätigen" }).count(), 0,
       "Der ältere AwaitingConfirmation-Snapshot darf den terminalen Eventstand nicht ersetzen.");
+  });
+
+  await runCase("Queue-Freigabe meldet eine fehlende bestätigbare Wirkung", "?pendingQueue=1", async page => {
+    await page.evaluate(() => {
+      const entry = window.__DOPPELDECKER_MOCK_QUEUE__.entries[0];
+      entry.state = "AwaitingConfirmation";
+      entry.attention = null;
+      const core = window.__TAURI__.core;
+      const invoke = core.invoke;
+      window.__QUEUE_APPROVAL_CALLS__ = [];
+      core.invoke = (command, args) => {
+        if (command.startsWith("approve_")) window.__QUEUE_APPROVAL_CALLS__.push(command);
+        return invoke(command, args);
+      };
+    });
+    await page.locator("#btn-queue").click();
+    await page.getByRole("button", { name: "Plan bestätigen" }).click();
+    await page.getByText("Für diesen Auftrag fehlt die zu bestätigende Wirkung.").waitFor();
+    assert.deepEqual(await page.evaluate(() => window.__QUEUE_APPROVAL_CALLS__), []);
   });
 
   await runCase("Queue bietet Recovery nur für ein wirklich vorhandenes Laufjournal an", "", async page => {
@@ -7728,7 +8175,12 @@ try {
     await left.click();
     await page.locator(`#connection-list [data-protocol="${provider}"][data-id="mock_${provider}"]`).click();
     await left.getByRole("option", { name: /remote\.txt/ }).click();
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "resumable_copy"));
+    if (provider === "webdav") {
+      await page.evaluate(() => window.__MOCK_EMIT__("menu", "resumable_copy"));
+    } else {
+      await page.keyboard.press("Shift+F10");
+      await page.getByRole("menuitem", { name: "Dateiinhalt fortsetzbar kopieren" }).click();
+    }
     await page.locator("#dock-summary").getByText(message).waitFor();
     const args = await page.evaluate(() => window.__RESUME_REMOTE_REQUEST__);
     assert.equal(args.remoteSource.provider, provider);
@@ -7737,6 +8189,37 @@ try {
     assert.equal(args.remoteSource.root, args.sourceRoot);
     assert.equal(args.targetRoot, "/mock/ziel");
     assert.equal(args.sourcePaths.length, 1);
+  });
+
+  await runCase("Fortsetzbare Kopie bricht die FTPS-Prüfung über die eigene Aktion ab", "?remoteFile=1", async page => {
+    page.setDefaultTimeout(5000);
+    await page.evaluate(() => {
+      const invoke = window.__TAURI__.core.invoke;
+      let requestId;
+      let stop;
+      window.__TAURI__.core.invoke = (command, args) => {
+        if (command === "enqueue_resumable_copy") {
+          requestId = args.requestId;
+          return new Promise((_, reject) => { stop = reject; });
+        }
+        if (command === "cancel_resumable_copy_preparation") {
+          if (!requestId || requestId !== args.requestId) throw new Error("Abbruch betrifft eine andere Anfrage");
+          stop({ code: "interrupted", message: "Downloadvorbereitung abgebrochen" });
+          return Promise.resolve();
+        }
+        return invoke(command, args);
+      };
+    });
+    const left = page.getByRole("listbox", { name: "Linke Dateiliste" });
+    await left.click();
+    await page.locator('#connection-list [data-protocol="ftps"][data-id="mock_ftps"]').click();
+    await left.getByRole("option", { name: /remote\.txt/ }).click();
+    await page.evaluate(() => { void window.__MOCK_EMIT__("menu", "resumable_copy"); });
+    const cancel = page.getByRole("button", { name: "Downloadvorbereitung abbrechen" });
+    await cancel.waitFor();
+    await cancel.press("Enter");
+    await page.locator("#dock-summary").getByText("Downloadvorbereitung abgebrochen", { exact: true }).waitFor();
+    assert.equal(await cancel.count(), 0);
   });
 
   await runCase("Fortsetzbare Kopie zeigt während des SFTP-Laufs den Pauseknopf", "", async page => {
@@ -7912,17 +8395,19 @@ try {
   }
 
   await runCase("Queue-Wirkungsdialog verwirft veralteten Plan bei gleicher Backendphrase", "", async page => {
-    await page.evaluate(() => {
+    const wire = JSON.parse(await readFile(new URL("./tests/queue-approval-wire.json", import.meta.url)));
+    const { plan } = JSON.parse(await readFile(new URL("./tests/local-sync-wire.json", import.meta.url)));
+    const expectedAttention = { ...wire.planChanged, current_plan: plan };
+    await page.evaluate(expectedAttention => {
       const queue = window.__DOPPELDECKER_MOCK_QUEUE__; queue.paused = true;
-      const plan = { copy_count: 1, update_count: 0, metadata_count: 0, delete_count: 0, actions: [] };
-      queue.entries = [{ operation_id: "stale-attention", operation: { type: "Sync", source: "/mock/quelle", target: "/mock/ziel", options: { mode: "AddOnly" }, expected_plan: plan }, state: "AwaitingConfirmation", attempts: 1, progress: {}, attention: { type: "PlanChanged", reason: "Ein neuer Pfad", confirmation: "gleiche-phrase", current_plan: plan } }];
+      queue.entries = [{ operation_id: "stale-attention", operation: { type: "Sync", source: "/mock/quelle", target: "/mock/ziel", options: { mode: "AddOnly" }, expected_plan: expectedAttention.current_plan }, state: "AwaitingConfirmation", attempts: 1, progress: {}, attention: expectedAttention }];
       const invoke = window.__TAURI__.core.invoke;
       window.__TAURI__.core.invoke = async (command, args) => {
         if (command === "approve_queue_entry") window.__QUEUE_EFFECT_ARGS__ = structuredClone(args);
         return invoke(command, args);
       };
       window.__MOCK_EMIT__("queue-updated", structuredClone(queue));
-    });
+    }, expectedAttention);
     await page.locator("#btn-queue").click();
     await page.getByRole("button", { name: "Plan bestätigen" }).click();
     let dialog = page.getByRole("dialog", { name: "Queue-Wirkung bestätigen" });
@@ -7937,7 +8422,7 @@ try {
     await page.getByText(/Die Queue-Rückfrage hat sich seit der Anzeige geändert/).waitFor();
     let state = await page.evaluate(() => ({ entry: window.__DOPPELDECKER_MOCK_QUEUE__.entries[0], args: window.__QUEUE_EFFECT_ARGS__ }));
     assert.equal(state.entry.state, "AwaitingConfirmation");
-    assert.equal(state.args.expectedAttention.current_plan.copy_count, 1);
+    assert.deepEqual(state.args.expectedAttention, expectedAttention);
     assert.equal(state.args.effectsConfirmed, true);
     assert.equal(Object.hasOwn(state.args, "confirmation"), false);
     await page.getByRole("button", { name: "Plan bestätigen" }).click();
@@ -8518,6 +9003,8 @@ try {
     });
 
   await runCase("Quarantäne pausiert für Restore und Purge ihre eigene Elternansicht", "?quarantineData=1", async page => {
+    const wire = JSON.parse(await readFile(new URL("./tests/quarantine-wire.json", import.meta.url)));
+    await observeQuarantineWire(page);
     await page.locator("#btn-quarantine").click();
     let dialog = page.getByRole("dialog", { name: "Quarantäne" });
     await dialog.getByRole("button", { name: "Anzeigen" }).click();
@@ -8545,6 +9032,21 @@ try {
       { command: "restore_quarantine_entry", runId: "run-1", relativePath: "alt.txt" },
       { command: "purge_quarantine_run", runId: "run-1", confirmation: "LEEREN run-1" },
     ]);
+    const calls = await page.evaluate(() => window.__QUARANTINE_WIRE__);
+    const target = wire.localTarget;
+    const listRuns = calls.find(call => call.command === "list_quarantine_runs");
+    const listEntries = calls.find(call => call.command === "list_quarantine_entries");
+    const restoreCall = calls.find(call => call.command === "restore_quarantine_entry");
+    const purgeCall = calls.find(call => call.command === "purge_quarantine_run");
+    assert.deepEqual(listRuns.args, { target });
+    assert.deepEqual(listEntries.args, { target, runId: "run-1" });
+    assert.deepEqual(restoreCall.args, { target, runId: "run-1", relativePath: "alt.txt" });
+    assert.deepEqual(purgeCall.args, { target, runId: "run-1", confirmation: "LEEREN run-1" });
+    assertShape(listRuns.result[0], wire.run);
+    assertShape(listEntries.result[0], wire.entry);
+    assertShape(restoreCall.result, wire.restore);
+    assert.equal(restoreCall.result.outcome, "restored");
+    assert.equal(purgeCall.result, null);
     await dialog.getByRole("button", { name: "Schließen" }).click();
   });
 
@@ -8566,31 +9068,26 @@ try {
 
   await runCase("Wiederherstellung führt den geprüften Auftrag in der Fensterqueue auf", "?quarantineData=1", async page => {
     await page.setViewportSize({ width: 395, height: 710 });
-    await page.evaluate(() => {
-      const entry = {
-        operation_id: "review-copy", operation: { type: "File", kind: "Copy", items: ["/mock/quelle/Alpha.txt"], destination: "/mock/ziel" },
-        state: "Interrupted", error_code: "outcome_unclear", progress: {}, attempts: 1,
-      };
+    await page.evaluate(available => {
       const queue = window.__DOPPELDECKER_MOCK_QUEUE__;
       queue.paused = true;
-      queue.entries = [entry];
+      queue.entries = available.queue.map(({ entry }) => entry);
       queue.revision += 1;
       const original = window.__TAURI__.core.invoke;
       window.__RECOVERY_CALLS__ = [];
       window.__TAURI__.core.invoke = async (command, args) => {
         window.__RECOVERY_CALLS__.push(command);
         if (command !== "inspect_recovery") return original(command, args);
-        return {
-          queue: [{ reason: "outcome_unclear", entry }],
-          trash: { Ok: [{ name: "trash-probe.json", entry_count: null, error: "Prüfjournal nicht lesbar" }] },
-        };
+        return available;
       };
-    });
+    }, recoveryTrashWire.recovery.available);
     await page.locator("#btn-queue").click();
     await page.getByRole("button", { name: "Wiederherstellung …" }).press("Enter");
     const recovery = page.getByRole("dialog", { name: "Wiederherstellung", exact: true });
     await recovery.getByText("Wirkung ungeklärt", { exact: true }).waitFor();
-    await recovery.getByText("trash-probe.json", { exact: true }).waitFor();
+    await recovery.getByText("Journal nicht lesbar: Prüfjournal nicht lesbar", { exact: true }).waitFor();
+    await recovery.getByText("2 protokollierte Einträge · Journal noch vorhanden", { exact: true }).waitFor();
+    await recovery.getByText("1 protokollierte Einträge · Wirkung ungeklärt", { exact: true }).waitFor();
     await recovery.getByText("run-1", { exact: true }).waitFor();
     assert.equal(await recovery.evaluate(element => element.scrollWidth <= element.clientWidth), true);
     await page.keyboard.press("Escape");
@@ -8604,6 +9101,23 @@ try {
     assert.equal(await row.evaluate(element => element.contains(document.activeElement)), true);
     assert.ok((await page.evaluate(() => window.__RECOVERY_CALLS__)).every(command =>
       ["inspect_recovery", "list_operation_queue", "list_quarantine_runs"].includes(command)));
+  });
+
+  await runCase("Wiederherstellung unterscheidet leere und nicht verfügbare Befunde", "", async page => {
+    await page.evaluate(({ empty, unavailable }) => {
+      const original = window.__TAURI__.core.invoke;
+      const overviews = [unavailable, empty];
+      window.__TAURI__.core.invoke = (command, args) => command === "inspect_recovery"
+        ? Promise.resolve(overviews.shift())
+        : original(command, args);
+      void window.__MOCK_EMIT__("menu", "recovery");
+    }, recoveryTrashWire.recovery);
+    const recovery = page.getByRole("dialog", { name: "Wiederherstellung", exact: true });
+    await recovery.getByText("Die Fensterqueue konnte nicht gelesen werden.").waitFor();
+    await recovery.getByText("Papierkorb wird gerade verarbeitet. Erneut aktualisieren.").waitFor();
+    await recovery.getByRole("button", { name: "Aktualisieren" }).click();
+    await recovery.getByText("Keine offenen Befunde.", { exact: true }).waitFor();
+    await recovery.getByText("Keine verbliebenen Papierkorb-Journale.").waitFor();
   });
 
   await runCase("Nur die neueste langsame Quarantäne-Navigation darf rendern", "?quarantineRace=1", async page => {
@@ -8749,6 +9263,8 @@ try {
   });
 
   await runCase("Remote-Quarantäne folgt den getrennten Backend-Capabilities", "", async page => {
+    const wire = JSON.parse(await readFile(new URL("./tests/quarantine-wire.json", import.meta.url)));
+    await observeQuarantineWire(page);
     const right = page.getByRole("listbox", { name: /Rechte Dateiliste/ });
     await right.click();
     await page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]').click();
@@ -8780,11 +9296,14 @@ try {
       "list_provider_quarantine_runs",
       "list_provider_quarantine_entries",
     ]);
-    assert.deepEqual(calls.map(call => call.endpoint), [
-      { provider: "smb", profileId: "mock_smb", profileRevision: 41, root: "/" },
-      { provider: "smb", profileId: "mock_smb", profileRevision: 41, root: "/" },
-      { provider: "smb", profileId: "mock_smb", profileRevision: 41, root: "/" },
-    ]);
+    assert.deepEqual(calls.map(call => call.endpoint), Array(3).fill(wire.remoteEndpoint));
+    const replies = await page.evaluate(() => window.__QUARANTINE_WIRE__);
+    const listRuns = replies.find(call => call.command === "list_provider_quarantine_runs");
+    const listEntries = replies.find(call => call.command === "list_provider_quarantine_entries");
+    assert.deepEqual(listRuns.args, { endpoint: wire.remoteEndpoint });
+    assert.deepEqual(listEntries.args, { endpoint: wire.remoteEndpoint, runId: "smb-run" });
+    assertShape(listRuns.result[0], wire.run);
+    assertShape(listEntries.result[0], wire.entry);
   });
 
   await runCase("Seitenleiste ordnet Geräte, Freigaben und vollständige Favoriten", "", async page => {
@@ -8869,6 +9388,21 @@ try {
     await page.getByRole("listbox", { name: /Linke Dateiliste/ }).waitFor();
     assert.deepEqual(await readOrder(), ["devices", "shares", "favorites"]);
   });
+
+  for (const offer of [false, true]) {
+    await runCase(`LAN-Funde und CLI-Status entsprechen dem Rust-IPC-Vertrag · ${offer}`, offer ? "?cliOffer=1" : "", async page => {
+      const fixture = JSON.parse(await readFile(new URL("./tests/command-read-results.json", import.meta.url)));
+      const { services, status } = await page.evaluate(async () => {
+        const { invoke } = window.__TAURI__.core;
+        return {
+          services: await invoke("discover_network_services"),
+          status: await invoke("cli_install_status"),
+        };
+      });
+      assert.deepEqual(services, fixture.networkServices);
+      assert.deepEqual(status, fixture.cliInstall[offer ? "offer" : "unavailable"]);
+    });
+  }
 
   await runCase("mDNS-Funde füllen nur den bestehenden Verbindungseditor vor", "", async page => {
     const services = page.locator("#network-service-list .network-service");
@@ -8957,187 +9491,7 @@ try {
     });
   }
 
-  await runCase("Seitenleisten-Review alte Favoritenantwort erhält Entfernen", "", async page => {
-    await page.locator("#fav-add").click();
-    await page.locator("#fav-list .fav-item").waitFor();
-    await page.evaluate(() => {
-      const original = window.__TAURI__.core.invoke;
-      let held = false;
-      window.__TAURI__.core.invoke = async (command, args) => {
-        const result = await original(command, args);
-        if (command === "add_favorite" && !held) {
-          held = true;
-          await new Promise(resolve => { window.__SIDEBAR_FAVORITE_RELEASE__ = resolve; });
-        }
-        return result;
-      };
-    });
-    await page.locator("#fav-add").click();
-    await page.waitForFunction(() => typeof window.__SIDEBAR_FAVORITE_RELEASE__ === "function");
-    await page.locator("#fav-list .fav-del").click();
-    await page.locator("#fav-list .fav-item").waitFor({ state: "detached" });
-    await page.evaluate(async () => { window.__SIDEBAR_FAVORITE_RELEASE__(); await new Promise(resolve => setTimeout(resolve, 0)); });
-    assert.equal(await page.locator("#fav-list .fav-item").count(), 0,
-      "Die spätere Antwort einer älteren Änderung darf den bereits entfernten Favoriten nicht wieder anzeigen");
-    assert.deepEqual(await page.evaluate(() => window.__TAURI__.core.invoke("list_favorites")), []);
-  });
-
-  await runCase("Seitenleisten-Review alte Favoritenliste erhält späteres Hinzufügen", "", async page => {
-    await page.addInitScript(() => {
-      Object.defineProperty(window, "__TAURI__", { configurable: true, set(tauri) {
-        const original = tauri.core.invoke;
-        let held = false;
-        tauri.core.invoke = async (command, args) => {
-          const result = await original(command, args);
-          if (command === "list_favorites" && !held) {
-            held = true;
-            await new Promise(resolve => { window.__SIDEBAR_STARTUP_RELEASE__ = resolve; });
-          }
-          return result;
-        };
-        Object.defineProperty(window, "__TAURI__", { configurable: true, writable: true, value: tauri });
-      } });
-    });
-    await page.reload({ waitUntil: "networkidle" });
-    await page.waitForFunction(() => typeof window.__SIDEBAR_STARTUP_RELEASE__ === "function");
-    await page.locator("#fav-add").click();
-    await page.locator("#fav-list .fav-item").waitFor();
-    await page.evaluate(async () => { window.__SIDEBAR_STARTUP_RELEASE__(); await new Promise(resolve => setTimeout(resolve, 0)); });
-    assert.equal(await page.locator("#fav-list .fav-item").count(), 1,
-      "Die ältere Startliste darf den neu hinzugefügten Favoriten nicht ausblenden");
-    assert.equal((await page.evaluate(() => window.__TAURI__.core.invoke("list_favorites"))).length, 1);
-  });
-
-  await runCase("Seitenleisten-Review Favoriten-Readbackfehler nennt die bereits gespeicherte Änderung", "", async page => {
-    await page.evaluate(() => {
-      const original = window.__TAURI__.core.invoke;
-      window.__SIDEBAR_READ_FAVORITES__ = () => original("list_favorites");
-      window.__TAURI__.core.invoke = async (command, args) => {
-        if (command === "list_favorites") throw { code: "io", message: "Gezielter Favoriten-Lesefehler" };
-        return original(command, args);
-      };
-    });
-    await page.locator("#fav-add").click();
-    await page.locator("#dock-summary").filter({ hasText: /Favoriten geändert, Ansicht nicht aktualisiert/ }).waitFor();
-    assert.match(await page.locator("#dock-summary").innerText(), /Gezielter Favoriten-Lesefehler/);
-    assert.equal((await page.evaluate(() => window.__SIDEBAR_READ_FAVORITES__())).length, 1);
-  });
-
-  await runCase("Seitenleisten-Review erster Favoriten-Lesefehler bleibt sichtbar", "", async page => {
-    await page.addInitScript(() => {
-      Object.defineProperty(window, "__TAURI__", { configurable: true, set(tauri) {
-        const original = tauri.core.invoke;
-        tauri.core.invoke = async (command, args) => {
-          if (command === "list_favorites") {
-            window.__SIDEBAR_STARTUP_FAILED__ = true;
-            throw { code: "invalid_data", message: "Gezielte beschädigte Favoritendatei" };
-          }
-          return original(command, args);
-        };
-        Object.defineProperty(window, "__TAURI__", { configurable: true, writable: true, value: tauri });
-      } });
-    });
-    await page.reload({ waitUntil: "networkidle" });
-    await page.waitForFunction(() => window.__SIDEBAR_STARTUP_FAILED__);
-    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)));
-    assert.match(await page.locator("#dock-summary").innerText(), /Favoriten laden.*Gezielte beschädigte Favoritendatei/s,
-      "Ein fehlgeschlagener erster Read darf keine kommentarlos leere Favoritenliste vortäuschen");
-    assert.equal(await page.locator("#fav-list .fav-item").count(), 0);
-  });
-
-  await runCase("Lokale Favoriten hinzufügen und entfernen", "", async page => {
-    await page.locator("#fav-add").click();
-    assert.match(await page.locator("#fav-list").innerText(), /quelle/i);
-    await page.locator("#fav-list .fav-del").click();
-    assert.match(await page.locator("#fav-list").innerText(), /Noch keine Favoriten/);
-  });
-
-  await runCase("Remote-Favorit bindet Provider, Profil und Pfad", "", async page => {
-    const profile = page.locator('#connection-list [data-protocol="sftp"][data-id="mock_sftp"]');
-    await profile.click();
-    await page.locator("#fav-add").click();
-    const favorite = page.locator("#fav-list .fav-item").first();
-    await favorite.waitFor();
-    assert.match(await favorite.getAttribute("title"), /SFTP · \//);
-    assert.equal(await favorite.locator(".side-icon.sftp").count(), 1);
-
-    // Ein Klick navigiert über die gespeicherte Profil-ID wieder in denselben
-    // Remote-Endpoint; erst danach wird der Favorit endpointgenau entfernt.
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "home"));
-    await favorite.click();
-    assert.match(await page.getByRole("textbox").first().getAttribute("title"), /SFTP · Mock-SFTP/);
-    await favorite.locator(".fav-del").click();
-    assert.match(await page.locator("#fav-list").innerText(), /Noch keine Favoriten/);
-  });
-
-  await runCase("Remote-Ordner aller Provider per Drag zu Favoriten", "", async page => {
-    const providers = [
-      ["sftp", "mock_sftp", "SFTP"],
-      ["ftps", "mock_ftps", "FTPS"],
-      ["webdav", "mock_webdav", "WEBDAV"],
-      ["smb", "mock_smb", "SMB"],
-    ];
-    for (const [provider, profileId, titleProvider] of providers) {
-      await page.locator(
-        `#connection-list [data-protocol="${provider}"][data-id="${profileId}"]`,
-      ).click();
-      await page.waitForFunction(
-        provider => {
-          const path = document.querySelector('.pane[data-side="left"] .path');
-          return path?.title?.toLowerCase().includes(provider)
-            && path.value === "/"
-            && document.querySelector('.pane[data-side="left"] .row');
-        },
-        provider,
-      );
-      await page.evaluate(() => {
-        const row = document.querySelector('.pane[data-side="left"] .row');
-        if (!row || row.getAttribute("draggable") !== "true") {
-          throw new Error("Remote-Ordnerzeile ist nicht draggable.");
-        }
-        const dataTransfer = new DataTransfer();
-        row.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer }));
-        const list = document.querySelector("#fav-list");
-        list.dispatchEvent(new DragEvent("dragover", {
-          bubbles: true, cancelable: true, dataTransfer,
-        }));
-        list.dispatchEvent(new DragEvent("drop", {
-          bubbles: true, cancelable: true, dataTransfer,
-        }));
-        row.dispatchEvent(new DragEvent("dragend", { bubbles: true, dataTransfer }));
-      });
-      const favorite = page.locator(`#fav-list .fav-item:has(.side-icon.${provider})`);
-      await favorite.waitFor();
-      assert.equal(await favorite.getAttribute("title"), `${titleProvider} · /remote`);
-      await favorite.click();
-      await page.waitForFunction(
-        provider => {
-          const path = document.querySelector('.pane[data-side="left"] .path');
-          return path?.title?.toLowerCase().includes(provider) && path.value === "/remote";
-        },
-        provider,
-      );
-    }
-    assert.equal(await page.locator("#fav-list .fav-item").count(), providers.length);
-  });
-
-  await runCase("Finder-Favoriten übernehmen ist additiv und bilanziert sichtbar", "", async page => {
-    // Erster Import über den Menüpunkt: der Mock liefert zwei Kandidaten.
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "import_finder_favorites"));
-    await page.locator("#fav-list .fav-item").first().waitFor();
-    const list = await page.locator("#fav-list").innerText();
-    assert.match(list, /Finder-Ordner/);
-    assert.match(list, /quelle/);
-    let dock = await page.locator("#dock-summary").innerText();
-    assert.match(dock, /2 übernommen/);
-    assert.match(dock, /1 kein \(vorhandener\) Ordner, 1 im Finder ausgeblendet/);
-    // Zweiter Import: nichts wird doppelt angelegt, die Bilanz sagt das klar.
-    await page.evaluate(() => window.__MOCK_EMIT__("menu", "import_finder_favorites"));
-    await page.locator("#dock-summary").filter({ hasText: "2 bereits vorhanden" }).waitFor();
-    dock = await page.locator("#dock-summary").innerText();
-    assert.match(dock, /0 übernommen/);
-    assert.equal(await page.locator("#fav-list .fav-item").count(), 2);
-  });
+  await runFavoriteCases(runCase, assertShape);
 
   await runCase("Backup-Hinweis lebt in der Sync-Ansicht und folgt der Profilwahl", "", async page => {
     // Die frühere Dauerwarnung ist aus der Seitenleiste verschwunden.
@@ -9153,6 +9507,21 @@ try {
     await page.locator('#sync-metadata-group input[value="NativeBestEffort"]').check();
     assert.match(await note.innerText(), /native Merkmale/);
     await page.keyboard.press("Escape");
+  });
+
+  await runCase("Verbindungsstatus erhält nach dem Trennen die Revision übriger Sitzungen", "", async page => {
+    const contract = JSON.parse(await readFile(new URL("./tests/active-connection-wire.json", import.meta.url)));
+    const { before, remaining } = await page.evaluate(async () => {
+      const { invoke } = window.__TAURI__.core;
+      await invoke("scan_sftp_dir", { profileId: "mock_sftp", profileRevision: 11, path: "/", showHidden: false });
+      await invoke("scan_smb_dir", { profileId: "mock_smb", profileRevision: 41, path: "/", showHidden: false });
+      const before = await invoke("list_active_connections");
+      const remaining = await invoke("disconnect_remote_profile", { protocol: "sftp", profileId: "mock_sftp", profileRevision: 11 });
+      return { before, remaining };
+    });
+    assert.equal(before.length, 2);
+    for (const connection of [...before, ...remaining]) assertShape(connection, contract);
+    assert.deepEqual(remaining, [{ protocol: "smb", profile_id: "mock_smb", revision: 41 }]);
   });
 
   await runCase("Eject zeigt lebende Sitzung und trennt sie samt Pane-Rückkehr", "", async page => {
@@ -9187,6 +9556,45 @@ try {
       .getByRole("option", { name: /remote/ }).waitFor();
     await page.waitForTimeout(160);
     assert.match(await page.getByRole("textbox").first().getAttribute("title") || "", /SFTP · Mock-SFTP/);
+  });
+
+  await runCase("Verbindungseditoren · öffentliche Identitäten und Einmal-ID entsprechen dem Rust-IPC-Vertrag", "?sftpAgentKeys=1", async page => {
+    const fixture = JSON.parse(await readFile(new URL("./tests/connection-editor-wire.json", import.meta.url)));
+    const requests = Object.entries(fixture).map(([command, { args }]) => [command, args]);
+    const result = await page.evaluate(async requests => {
+      const { invoke } = window.__TAURI__.core;
+      const replies = {};
+      for (const [command, args] of requests) replies[command] = await invoke(command, args);
+      return { replies, pending: window.__MOCK_CONNECTION_STATE__().pendingSecretCount };
+    }, requests);
+    assert.deepEqual(result.replies, Object.fromEntries(Object.entries(fixture).map(([command, { reply }]) => [command, reply])));
+    assert.equal(result.pending, 0);
+  });
+
+  await runCase("Remote-Profile und Verbindungsstatus entsprechen dem Rust-IPC-Vertrag", "", async page => {
+    const fixture = JSON.parse(await readFile(new URL("./tests/connection-profile-wire.json", import.meta.url)));
+    const results = await page.evaluate(async () => {
+      const { connectProfile, listProfiles, removeProfile, saveProfile } = await import("/connection-profile-api.js");
+      const results = {};
+      for (const protocol of ["sftp", "ftps", "webdav", "smb"]) {
+        const listed = await listProfiles(protocol);
+        const [{ revision, ...profile }] = listed;
+        const binding = { profileId: profile.id, profileRevision: revision };
+        const status = await connectProfile(protocol, binding);
+        profile.name = "Wire-Probe";
+        const saved = await saveProfile(protocol, profile, null, revision);
+        const removed = await removeProfile(protocol, { ...binding, profileRevision: saved[0].revision });
+        results[protocol] = { listed, status, saved, removed };
+      }
+      return results;
+    });
+    for (const [protocol, { listed, status, saved, removed }] of Object.entries(results)) {
+      const expected = fixture[protocol];
+      assert.deepEqual(listed, [expected.profile]);
+      assert.deepEqual(status, { ...expected.status, capabilities: fixture.capabilities });
+      assert.deepEqual(saved, [{ ...expected.profile, name: "Wire-Probe", revision: expected.profile.revision + 1 }]);
+      assert.deepEqual(removed, []);
+    }
   });
 
   await runCase("CLI-importiertes Profil erscheint beim nächsten Fensterfokus", "", async page => {
@@ -9360,7 +9768,7 @@ try {
     const state = await page.evaluate(() => window.__MOCK_CONNECTION_STATE__());
     const saved = state.ftpsProfiles.find(profile => profile.name === "Öffentlich");
     assert.equal(saved.connection.certificate_policy, "web_pki");
-    assert.equal(saved.connection.certificate, null);
+    assert.equal(saved.connection.certificate, undefined);
   });
 
   for (const rejected of [false, true]) {
@@ -9384,7 +9792,7 @@ try {
         await dialog.waitFor({ state: "detached" });
         const after = await page.evaluate(() => window.__MOCK_CONNECTION_STATE__());
         assert.equal(after.ftpsProfiles[0].id, "mock_ftps");
-        assert.equal(after.ftpsProfiles[0].connection.certificate, null);
+        assert.equal(after.ftpsProfiles[0].connection.certificate, undefined);
         assert.equal(after.ftpsProfiles[0].connection.certificate_policy, "web_pki");
         assert.deepEqual(after.ftpsProfiles[0].connection.password_reference, before.ftpsProfiles[0].connection.password_reference);
       }
@@ -9472,7 +9880,7 @@ try {
     assert.deepEqual(stored[0].connection.host_key.sha256, Array(32).fill(11));
     assert.deepEqual(
       stored[0].connection.alternate_hosts,
-      [],
+      undefined,
       "Alternativrouten des alten Endpunkts dürfen nicht auf einen neuen Host übergehen.",
     );
     assert.deepEqual(state.secretWrites, [], "Der vorhandene Schlüsselbundverweis muss genügen.");

@@ -1,21 +1,45 @@
+// @ts-check
 // Der Dialog bearbeitet nur Regeln und zeigt Backendzeilen. Ausführbare Namen,
 // Identitäten und die einmalige Freigabe bleiben im fenstergebundenen Backendplan.
 import { invoke, listen } from "./tauri-api.js";
 import { hideModal, showOwnedModal } from "./modal.js";
 import { $, errText, isEntryNameSafe } from "./ui-utils.js";
 
+/** @typedef {import("./batch-rename-wire.js").BatchRenameRequestWire} BatchRenameRequest */
+/** @typedef {import("./batch-rename-wire.js").BatchRenameReportWire} BatchRenameReport */
+/** @typedef {import("./batch-rename-wire.js").BatchRenameProgressWire} BatchRenameProgress */
+/** @typedef {{name: string, safely_decoded?: boolean}} BatchEntry */
+/** @typedef {import("./pane-endpoint.js").PaneEndpointLocation & {
+ *   entries: BatchEntry[], sessionGeneration?: number, navigationRevision: number,
+ *   profileId?: string | null, profileRevision?: number | null,
+ *   tabs?: {active?: {id: string}}
+ * }} BatchPane */
+/** @typedef {{running: boolean, planId: string | null, progress: (payload: BatchRenameProgress) => void}} BatchSession */
+
 const STATUS = { ready: "Bereit", unchanged: "Unverändert", blocked: "Nicht ausführbar", renamed: "Umbenannt", partially_renamed: "Teilweise umbenannt", failed_unchanged: "Fehler · unverändert", outcome_unclear: "Ausgang unklar", cancelled: "Abgebrochen · unverändert" };
 
+/**
+ * @param {{
+ *   panes: Record<"left" | "right", BatchPane>,
+ *   selectedEntries: (side: "left" | "right") => BatchEntry[],
+ *   endpointFor: (pane: import("./pane-endpoint.js").PaneEndpointLocation) => BatchRenameRequest["endpoint"],
+ *   showDock: (html: string, options: {closable: boolean}) => void,
+ *   refreshPanes: (options: {affectedEndpoints: Array<BatchRenameRequest["endpoint"] & {path: string}>}) => unknown,
+ * }} dependencies
+ */
 export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showDock, refreshPanes }) {
+  /** @type {BatchSession | null} */
   let session = null;
   void listen("batch-rename-progress", ({ payload }) => {
     if (session?.running && session.planId === payload.planId) session.progress(payload);
   }).catch(() => {});
 
+  /** @param {"left" | "right"} side */
   function selectedInPaneOrder(side) {
     const selected = new Set(selectedEntries(side));
     return panes[side].entries.filter(entry => selected.has(entry));
   }
+  /** @param {"left" | "right"} side */
   function open(side) {
     const pane = panes[side];
     const selected = selectedInPaneOrder(side);
@@ -26,7 +50,7 @@ export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showD
       return;
     }
     const endpoint = endpointFor(pane);
-    const scopeKeys = ["provider", "profileId", "profileRevision", "sessionGeneration", "path", "navigationRevision"];
+    const scopeKeys = /** @type {const} */ (["provider", "profileId", "profileRevision", "sessionGeneration", "path", "navigationRevision"]);
     const scope = Object.fromEntries(scopeKeys.map(key => [key, pane[key]]));
     const tabId = pane.tabs?.active?.id;
     const scopeMatches = () => {
@@ -35,17 +59,21 @@ export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showD
       return current && current.tabs?.active?.id === tabId && scopeKeys.every(key => current[key] === scope[key])
         && selection.length === selected.length && currentNames.length === names.length && currentNames.every((name, index) => name === names[index]);
     };
-    showOwnedModal("batch-rename", token => {
+    showOwnedModal("batch-rename", /** @param {symbol} token */ (token) => {
       let closed = false;
       let generation = 0;
       let preparing = false;
       let running = false;
       let cancelling = false;
+      /** @type {string | null} */
       let planId = null;
+      /** @type {string | null} */
       let requestId = null;
       let stale = false;
       let completed = false;
+      /** @type {BatchRenameReport["rows"]} */
       let rows = [];
+      /** @type {BatchSession} */
       const ownSession = { running: false, planId: null, progress: payload => { status.textContent = `${payload.done} von ${payload.total} Einträgen geprüft. Bereits erfolgte Namensänderungen bleiben erhalten.`; } };
       session = ownSession;
       $("#modal .modal").classList.add("batch-rename-modal");
@@ -57,6 +85,7 @@ export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showD
       body.append(description);
       const limitations = document.createElement("section"); limitations.className = "batch-rename-limitations";
       limitations.setAttribute("aria-label", "Ausführungsgrenzen"); limitations.hidden = true; body.append(limitations);
+      /** @param {Pick<BatchRenameReport, "executionClass" | "limitations">} value */
       const renderLimitations = value => {
         limitations.replaceChildren();
         limitations.hidden = !value.executionClass && !value.limitations?.length;
@@ -66,6 +95,7 @@ export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showD
           limitations.append(title);
         }
         const messages = value.limitations || [];
+        /** @param {HTMLElement} parent @param {string} message */
         const appendMessage = (parent, message) => { const line = document.createElement("p"); line.textContent = message; parent.append(line); };
         for (const message of messages.slice(0, 2)) appendMessage(limitations, message);
         if (messages.length > 2) {
@@ -77,13 +107,20 @@ export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showD
         }
       };
       const form = document.createElement("div"); form.className = "batch-rename-fields";
-      const fields = {};
-      for (const [key, label] of [["find", "Suchen"], ["replacement", "Ersetzen durch"], ["prefix", "Präfix"], ["suffix", "Suffix"]]) {
+      /** @param {string} label */
+      const addTextField = label => {
         const group = document.createElement("label"); group.textContent = label;
         const input = document.createElement("input"); input.type = "text"; input.className = "modal-input";
         input.maxLength = 4096; input.autocomplete = "off"; input.spellcheck = false;
-        group.append(input); form.append(group); fields[key] = input;
-      }
+        group.append(input); form.append(group);
+        return input;
+      };
+      const fields = {
+        find: addTextField("Suchen"),
+        replacement: addTextField("Ersetzen durch"),
+        prefix: addTextField("Präfix"),
+        suffix: addTextField("Suffix"),
+      };
       body.append(form);
       const extensionLabel = document.createElement("label"); extensionLabel.className = "batch-rename-extension";
       const extension = document.createElement("input"); extension.type = "checkbox"; extension.checked = true;
@@ -100,19 +137,24 @@ export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showD
       numberingLabel.append(numbering, document.createTextNode("Nummerierung verwenden")); numberingGroup.append(numberingLabel);
       const numberingDetails = document.createElement("div"); numberingDetails.hidden = true;
       const numberingForm = document.createElement("div"); numberingForm.className = "batch-rename-numbering-fields";
-      const numberingFields = {};
-      for (const [key, label, value, min, max] of [["start", "Start", 1, 0, 4294967295], ["step", "Schritt", 1, 1, 4294967295], ["minDigits", "Mindeststellen", 3, 1, 20]]) {
+      /** @param {string} label @param {number} value @param {number} min @param {number} max */
+      const addNumberField = (label, value, min, max) => {
         const group = document.createElement("label"); group.textContent = label;
         const input = document.createElement("input"); input.type = "number"; input.className = "modal-input";
-        input.min = min; input.max = max; input.step = 1; input.required = true; input.value = value; input.disabled = true;
-        group.append(input); numberingForm.append(group); numberingFields[key] = input;
-      }
+        input.min = String(min); input.max = String(max); input.step = "1"; input.required = true; input.value = String(value); input.disabled = true;
+        group.append(input); numberingForm.append(group);
+        return input;
+      };
+      const start = addNumberField("Start", 1, 0, 4294967295);
+      const step = addNumberField("Schritt", 1, 1, 4294967295);
+      const minDigits = addNumberField("Mindeststellen", 3, 1, 20);
       const positionLabel = document.createElement("label"); positionLabel.textContent = "Position";
       const position = document.createElement("select"); position.className = "modal-input"; position.disabled = true;
       for (const [value, title] of [["before", "Vor dem Namen"], ["after", "Nach dem Namen"]]) {
         const option = document.createElement("option"); option.value = value; option.textContent = title; position.append(option);
       }
-      numberingFields.position = position; positionLabel.append(position); numberingForm.append(positionLabel); numberingDetails.append(numberingForm);
+      const numberingFields = [start, step, minDigits, position];
+      positionLabel.append(position); numberingForm.append(positionLabel); numberingDetails.append(numberingForm);
       const numberingHelp = document.createElement("p"); numberingHelp.className = "batch-rename-help";
       numberingHelp.textContent = "Die beim Öffnen sichtbare Reihenfolge bestimmt die Nummern. Jede Vorschauzeile zählt, auch nicht ausführbare. Die Nummer steht mit _ vor oder nach dem bearbeiteten Namen; die beibehaltene Dateiendung folgt zuletzt. Mindeststellen werden mit führenden Nullen aufgefüllt.";
       numberingDetails.append(numberingHelp); numberingGroup.append(numberingDetails); body.append(numberingGroup);
@@ -130,11 +172,12 @@ export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showD
       const executeButton = document.createElement("button"); executeButton.className = "btn primary"; executeButton.textContent = "Bereite Einträge umbenennen"; executeButton.disabled = true;
       bar.append(closeButton, previewButton, executeButton);
 
+      /** @param {string | null} id */
       const discard = id => { if (id) void invoke("discard_batch_rename", { planId: id }).catch(() => {}); };
       const updateControls = () => {
         for (const field of [...Object.values(fields), extension, trimOuterSpaces, numbering]) field.disabled = running || stale;
         numberingDetails.hidden = !numbering.checked;
-        for (const field of Object.values(numberingFields)) field.disabled = running || stale || !numbering.checked;
+        for (const field of numberingFields) field.disabled = running || stale || !numbering.checked;
         previewButton.disabled = preparing || running || stale;
         executeButton.hidden = completed;
         executeButton.disabled = preparing || running || stale || !planId || !rows.some(row => row.status === "ready");
@@ -145,7 +188,7 @@ export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showD
         // Das Sperren des gerade betätigten Knopfs kann den Browserfokus auf
         // body zurücksetzen. Escape und Tab müssen im Modal bleiben.
         const modal = $("#modal .modal");
-        if (!modal.contains(document.activeElement) || document.activeElement.matches?.(":disabled")) {
+        if (!modal.contains(document.activeElement) || document.activeElement?.matches(":disabled")) {
           (closeButton.disabled ? tableRegion : closeButton).focus({ preventScroll: true });
         }
       };
@@ -173,7 +216,7 @@ export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showD
         generation += 1; discard(requestId); discard(planId); requestId = null; planId = null; completed = false; rows = []; renderRows();
         status.textContent = "Eingaben geändert. Vor dem Umbenennen die Vorschau erneut erstellen."; updateControls();
       };
-      for (const field of [...Object.values(fields), extension, trimOuterSpaces, numbering, ...Object.values(numberingFields)]) {
+      for (const field of [...Object.values(fields), extension, trimOuterSpaces, numbering, ...numberingFields]) {
         field.addEventListener(field === position ? "change" : "input", invalidate);
       }
       const cancel = async () => {
@@ -205,7 +248,7 @@ export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showD
       closeButton.addEventListener("click", close);
       previewButton.addEventListener("click", async () => {
         if (preparing || running || !checkScope()) return;
-        const invalidNumber = numbering.checked && Object.values(numberingFields).find(field => !field.checkValidity());
+        const invalidNumber = numbering.checked && numberingFields.find(field => !field.checkValidity());
         if (invalidNumber) {
           invalidate(); status.textContent = "Bitte die markierte Nummerierungseingabe korrigieren.";
           invalidNumber.reportValidity(); return;
@@ -214,16 +257,24 @@ export function createBatchRenameUi({ panes, selectedEntries, endpointFor, showD
         const requestGeneration = ++generation;
         const ownRequestId = crypto.randomUUID(); requestId = ownRequestId;
         preparing = true; status.textContent = "Konkrete Namen und Kollisionen werden geprüft …"; updateControls();
-        const options = Object.fromEntries(Object.entries(fields).map(([key, input]) => [key, input.value])); options.preserveExtension = extension.checked;
+        /** @type {BatchRenameRequest["options"]} */
+        const options = {
+          find: fields.find.value,
+          replacement: fields.replacement.value,
+          prefix: fields.prefix.value,
+          suffix: fields.suffix.value,
+          preserveExtension: extension.checked,
+        };
         if (trimOuterSpaces.checked) options.trimOuterSpaces = true;
         if (numbering.checked) options.numbering = {
-          start: numberingFields.start.valueAsNumber,
-          step: numberingFields.step.valueAsNumber,
-          minDigits: numberingFields.minDigits.valueAsNumber,
-          position: position.value,
+          start: start.valueAsNumber,
+          step: step.valueAsNumber,
+          minDigits: minDigits.valueAsNumber,
+          position: position.value === "after" ? "after" : "before",
         };
         try {
-          const preview = await invoke("prepare_batch_rename", { request: { requestId: ownRequestId, endpoint, names, options } });
+          const request = /** @satisfies {BatchRenameRequest} */ ({ requestId: ownRequestId, endpoint, names, options });
+          const preview = await invoke("prepare_batch_rename", { request });
           if (closed || requestGeneration !== generation || !checkScope()) { discard(preview.planId); return; }
           if (preview.requestId !== ownRequestId) { discard(preview.planId); throw new Error("Die Stapelantwort gehört zu einer anderen Anfrage. Bitte neu vorbereiten."); }
           renderLimitations(preview);

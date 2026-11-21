@@ -1,0 +1,7 @@
+{
+  "side": "left",
+  "endpoint": { "provider": "sftp", "root": "/from", "profileId": "mock_sftp", "profileRevision": 11 },
+  "sessionGeneration": 1,
+  "options": { "query": "Remote", "caseSensitive": true, "includeHidden": true },
+  "clientToken": 12
+}

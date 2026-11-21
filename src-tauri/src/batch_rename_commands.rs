@@ -608,6 +608,41 @@ pub(crate) fn discard_batch_rename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stapelvorschau_und_ergebnis_entsprechen_dem_browservertrag() {
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/batch-rename-wire.json")).unwrap();
+        let mut request: PrepareBatchRenameRequest =
+            serde_json::from_value(wire["request"].clone()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        request.endpoint = BidirectionalEndpointRequest::Local {
+            root: root
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let path = validate_request(&request).unwrap();
+        for name in &request.names {
+            std::fs::write(path.join(name), name).unwrap();
+        }
+        let plan =
+            PreparedBatchRename::prepare(&path, &request.names, &request.options, None).unwrap();
+        let preview = BatchRenamePreview {
+            request_id: request.request_id.unwrap(),
+            plan_id: "batch-one".into(),
+            rows: plan.rows().to_vec(),
+            execution_class: None,
+            limitations: Vec::new(),
+        };
+        assert_eq!(serde_json::to_value(preview).unwrap(), wire["preview"]);
+
+        let report = plan.execute(&Cancel::new(), &mut |_, _| {});
+        assert_eq!(serde_json::to_value(report).unwrap(), wire["report"]);
+    }
+
     fn pending(id: &str, root: &std::path::Path) -> PendingBatch {
         std::fs::write(root.join("alt"), b"x").unwrap();
         PendingBatch {

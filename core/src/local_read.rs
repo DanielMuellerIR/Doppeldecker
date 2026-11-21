@@ -776,6 +776,7 @@ mod tests {
         std::os::unix::fs::symlink("Inhalt", tree.join("Link")).unwrap();
         use std::os::unix::ffi::OsStrExt;
         let fifo = std::ffi::CString::new(tree.join("FIFO").as_os_str().as_bytes()).unwrap();
+        // SAFETY: Der CString bleibt bis zur Rückkehr gültig und benennt nur die Test-FIFO.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         std::fs::write(tree.join("Zeile\nUmbruch"), b"auslassen").unwrap();
         #[cfg(target_os = "linux")]

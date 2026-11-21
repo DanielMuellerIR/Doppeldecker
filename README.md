@@ -16,19 +16,19 @@ local and remote files. The interface is currently German-only.
 
 ## Download
 
-**Current release: 1.0.1.**
+**Current release: 1.0.2.**
 
 | System | Package |
 | --- | --- |
-| macOS 14+, Apple Silicon | [Signed and notarized DMG](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.1/Doppeldecker_1.0.1_aarch64.dmg) |
-| Linux Mint 22.2 / Ubuntu 24.04, x86_64 | [DEB](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.1/Doppeldecker_1.0.1_amd64.deb) · [AppImage](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.1/Doppeldecker_1.0.1_amd64.AppImage) |
+| macOS 14+, Apple Silicon | [Signed and notarized DMG](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.2/Doppeldecker_1.0.2_aarch64.dmg) |
+| Linux Mint 22.2 / Ubuntu 24.04, x86_64 | [DEB](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.2/Doppeldecker_1.0.2_amd64.deb) · [AppImage](https://github.com/DanielMuellerIR/Doppeldecker/releases/download/v1.0.2/Doppeldecker_1.0.2_amd64.AppImage) |
 
 On macOS, drag the app from the DMG to Applications. Other distributions and Intel
 Macs are not yet verified. **Doppeldecker → Nach Updates suchen …** checks on
 request; downloading and installing require a separate confirmation.
 
-[Release downloads and checksums](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v1.0.1).
-[Release notes (German)](docs/release-notes-1.0.1.md).
+[Release downloads and checksums](https://github.com/DanielMuellerIR/Doppeldecker/releases/tag/v1.0.2).
+[Release notes (German)](docs/release-notes-1.0.2.md).
 
 ## Features
 
@@ -92,7 +92,7 @@ cargo build -p doppeldecker-cli --release
 
 Browser tests require Node 20+, `pnpm install --frozen-lockfile`,
 `pnpm exec playwright install chromium`, then `pnpm test:ui`.
-[Build and test rules](AGENTS.md) · [Documentation index](docs/INDEX.md).
+[Development guide](docs/development.md) · [Documentation index](docs/INDEX.md).
 
 [Roadmap](docs/roadmap.md) · [Open tasks](backlog.md) · [Changes](CHANGELOG.md).
 

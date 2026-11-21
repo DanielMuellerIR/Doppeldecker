@@ -819,15 +819,17 @@ fn mount_identity(path: &Path) -> std::io::Result<String> {
     if status != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: Der erfolgreiche Aufruf oben hat die Struktur initialisiert und
-    // `f_mntonname` ist laut Darwin-ABI nullterminiert.
+    // SAFETY: Der erfolgreiche Aufruf oben hat die Struktur initialisiert.
     let information = unsafe { information.assume_init() };
     // SAFETY: Darwin definiert `fsid_t` ABI-stabil als zwei direkt aufeinander
     // folgende `i32`; `read_unaligned` stellt keine zusätzliche Ausrichtung voraus.
     let fsid = unsafe {
         std::ptr::read_unaligned(std::ptr::addr_of!(information.f_fsid).cast::<[libc::c_int; 2]>())
     };
-    let mount_point = unsafe { CStr::from_ptr(information.f_mntonname.as_ptr()) }
+    // SAFETY: Darwin liefert f_mntonname nullterminiert. information hält
+    // das eingebettete Array bis zur Verwendung des Namens.
+    let mount_name = unsafe { CStr::from_ptr(information.f_mntonname.as_ptr()) };
+    let mount_point = mount_name
         .to_str()
         .map_err(|_| permission_denied("Mountpunkt ist nicht als UTF-8 darstellbar"))?;
     Ok(format!("darwin:{}:{}:{mount_point}", fsid[0], fsid[1]))
@@ -1549,7 +1551,12 @@ fn run_permission_probe(provider: &Arc<SftpVfs>, guarded: &GuardedRunnerRoot) {
     fs::set_permissions(base.join("sentinel"), fs::Permissions::from_mode(0o644)).unwrap();
     // /tmp kann eine geerbte Gruppe tragen, in der der Testbenutzer kein Mitglied
     // ist. macOS würde setgid dann schon beim Aufbau still entfernen.
-    std::os::unix::fs::chown(base.join("Tree"), None, Some(unsafe { libc::getegid() })).unwrap();
+    std::os::unix::fs::chown(
+        base.join("Tree"),
+        None,
+        Some(rustix::process::getegid().as_raw()),
+    )
+    .unwrap();
     fs::set_permissions(base.join("Tree/file"), fs::Permissions::from_mode(0o4644)).unwrap();
     fs::set_permissions(base.join("Tree"), fs::Permissions::from_mode(0o2755)).unwrap();
     assert_eq!(

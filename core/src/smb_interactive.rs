@@ -154,7 +154,10 @@ impl OrdinarySmb {
             path
         };
         let mut current = self.root.clone();
-        for component in parent.strip_prefix(&self.root).unwrap().components() {
+        let relative = parent
+            .strip_prefix(&self.root)
+            .map_err(|_| invalid("SMB-Elternpfad liegt außerhalb der gebundenen Wurzel"))?;
+        for component in relative.components() {
             current.push(component.as_os_str());
             let entry = self.provider.stat_unchecked(&current)?;
             if !entry.is_dir || entry.is_symlink {

@@ -112,7 +112,9 @@ fn punch_hole(file: &fs::File, offset: u64, length: u64) {
             fp_offset: offset as i64,
             fp_length: length as i64,
         };
-        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &mut hole) };
+        // SAFETY: file bleibt offen. F_PUNCHHOLE erwartet einen Zeiger auf
+        // die bis zur Rückkehr gültige und initialisierte fpunchhole_t.
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &raw mut hole) };
         assert_eq!(
             result,
             0,
@@ -598,10 +600,11 @@ fn native_test_acl() -> Acl {
         fn mbr_uid_to_uuid(id: libc::uid_t, uu: *mut u8) -> libc::c_int;
     }
     let mut qualifier = [0u8; 16];
-    assert_eq!(
-        unsafe { mbr_uid_to_uuid(libc::geteuid(), qualifier.as_mut_ptr()) },
-        0
-    );
+    // SAFETY: qualifier stellt die von mbr_uid_to_uuid verlangten 16
+    // schreibbaren Bytes für die UUID bereit.
+    let status =
+        unsafe { mbr_uid_to_uuid(rustix::process::geteuid().as_raw(), qualifier.as_mut_ptr()) };
+    assert_eq!(status, 0);
     Acl::Nfs4(Nfs4Acl {
         entries: vec![Nfs4AclEntry {
             qualifier,
@@ -807,6 +810,53 @@ fn nicht_utf8_namen_werden_konservativ_ausgelassen() {
             .count(),
         3
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mirror_laesst_zielbaum_mit_uneindeutigem_namen_bereits_im_plan_aus() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    write_file(src.path(), "neu", b"neuer Inhalt");
+    let extra = dst.path().join("extra");
+    fs::create_dir(&extra).unwrap();
+    let invalid = extra.join(OsStr::from_bytes(b"probe-\xff"));
+    fs::write(&invalid, b"roh").unwrap();
+    write_file(&extra, "probe-\u{fffd}", b"echtes Ersatzzeichen");
+
+    let vfs = LocalVfs::new();
+    let options = SyncOptions {
+        compare: Compare::ContentHash,
+        ..opts(SyncMode::Mirror)
+    };
+    let p = plan(&vfs, src.path(), &vfs, dst.path(), &options).unwrap();
+    assert!(p.actions.iter().any(|action| matches!(action, Action::SkipUnsupported { path } if path == "extra/probe-\u{fffd}")));
+    assert!(!p
+        .actions
+        .iter()
+        .any(|action| matches!(action, Action::DeleteDir { .. })));
+    let error = execute(
+        ExecuteRequest {
+            src: &vfs,
+            src_root: src.path(),
+            dst: &vfs,
+            dst_root: dst.path(),
+            plan: &p,
+            safety: &real_with_explicit_delete_permission(),
+        },
+        &Cancel::new(),
+        &mut ignore_progress,
+    )
+    .unwrap_err();
+    assert_eq!(
+        doppeldecker_core::error_code(&error),
+        doppeldecker_core::ErrorCode::MirrorBlocked
+    );
+    assert!(!dst.path().join("neu").exists());
+    assert_eq!(fs::read(invalid).unwrap(), b"roh");
 }
 
 #[test]
@@ -3861,6 +3911,54 @@ fn c2_parent_acl_drift_entwertet_sync_plan_vor_erster_wirkung() {
         doppeldecker_core::ErrorCode::PlanDrift
     );
     assert_eq!(fs::read_dir(dst.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn mirror_kopierfehler_stoppt_vor_geplanter_entfernung() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("quelle");
+    let target = temp.path().join("ziel");
+    let quarantine = temp.path().join("quarantaene/lauf");
+    write_file(&source, "neu", b"neu");
+    write_file(&target, "entfernen", b"alt");
+    let (vfs, mut safety) = marked_sandbox(temp.path());
+    safety.quarantine = Some(quarantine.clone());
+    safety.max_delete_fraction = Some(1.0);
+    let sync_plan = plan(&vfs, &source, &vfs, &target, &hash_opts(SyncMode::Mirror)).unwrap();
+    assert_eq!(sync_plan.copy_count, 1);
+    assert_eq!(sync_plan.delete_count, 1);
+
+    let mut source_changed = false;
+    let mut removal_started = false;
+    let error = execute(
+        ExecuteRequest {
+            src: &vfs,
+            src_root: &source,
+            dst: &vfs,
+            dst_root: &target,
+            plan: &sync_plan,
+            safety: &safety,
+        },
+        &Cancel::new(),
+        &mut |progress| {
+            if progress.phase == "copy" && progress.current == "neu" && !source_changed {
+                write_file(&source, "neu", b"veraendert");
+                source_changed = true;
+            }
+            removal_started |= progress.phase == "quarantine";
+        },
+    )
+    .unwrap_err();
+
+    assert!(source_changed);
+    assert_eq!(
+        doppeldecker_core::error_code(&error),
+        doppeldecker_core::ErrorCode::PlanDrift
+    );
+    assert!(!removal_started);
+    assert_eq!(read_file(&target, "entfernen"), b"alt");
+    assert!(!target.join("neu").exists());
+    assert!(!quarantine.join("entfernen").exists());
 }
 
 #[test]

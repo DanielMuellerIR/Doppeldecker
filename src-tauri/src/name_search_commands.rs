@@ -342,14 +342,74 @@ mod tests {
         assert!(runtime.start("main", 44).is_err());
     }
     #[test]
-    fn frontend_request_akzeptiert_verschachtelte_camelcase_felder() {
-        let request: NameSearchRequest = serde_json::from_value(serde_json::json!({
-            "side": "left", "endpoint": {"provider": "sftp", "root": "/from",
-                "profileId": "test", "profileRevision": 7}, "sessionGeneration": 3,
-            "clientToken": 12, "options": {"query": "txt", "caseSensitive": true, "includeHidden": true}
-        })).unwrap();
-        assert_eq!(request.session_generation, Some(3));
+    fn command_read_results_name_search_started() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/command-read-results.json"))
+                .unwrap();
+        let runtime = NameSearchRuntime::default();
+        let (run_id, _) = runtime.start("main", 12).unwrap();
+        assert_eq!(
+            serde_json::to_value(NameSearchStarted { run_id }).unwrap(),
+            fixture["nameSearchStarted"]
+        );
+    }
+
+    #[test]
+    fn name_search_request_matches_the_browser_wire_fixture() {
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/name-search-wire.json")).unwrap();
+        let request: NameSearchRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(request.side, "left");
+        assert_eq!(request.client_token, 12);
+        let BidirectionalEndpointRequest::Sftp {
+            root,
+            profile_id,
+            profile_revision,
+        } = request.endpoint
+        else {
+            panic!("SFTP-Endpunkt aus dem Browser erwartet")
+        };
+        assert_eq!(root, "/from");
+        assert_eq!(profile_id, "mock_sftp");
+        assert_eq!(profile_revision, Some(11));
+        assert_eq!(request.session_generation, Some(1));
+        assert_eq!(request.options.query, "Remote");
         assert!(request.options.case_sensitive);
         assert!(request.options.include_hidden);
+
+        let binding = doppeldecker_core::RemoteProfileBinding::new(
+            doppeldecker_core::RemoteProfileProtocol::Sftp,
+            profile_id,
+            11,
+        )
+        .unwrap();
+        let require_revision = crate::queue_runtime::ensure_requested_profile_revision;
+        let require_generation = crate::read_endpoint::require_generation;
+        assert!(require_revision(profile_revision, &binding).is_ok());
+        assert!(require_generation(request.session_generation, 1).is_ok());
+        assert_eq!(
+            require_revision(Some(10), &binding).unwrap_err().code,
+            "plan_drift"
+        );
+        assert_eq!(
+            require_generation(request.session_generation, 2)
+                .unwrap_err()
+                .code,
+            "plan_drift"
+        );
+
+        let mut defaulted = wire.clone();
+        defaulted["options"] = serde_json::json!({"query": "Remote"});
+        defaulted["sessionGeneration"] = serde_json::Value::Null;
+        let request: NameSearchRequest = serde_json::from_value(defaulted).unwrap();
+        assert!(!request.options.case_sensitive);
+        assert!(!request.options.include_hidden);
+        assert_eq!(request.session_generation, None);
+
+        for option in ["caseSensitive", "includeHidden"] {
+            let mut invalid = wire.clone();
+            invalid["options"][option] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<NameSearchRequest>(invalid).is_err());
+        }
     }
 }

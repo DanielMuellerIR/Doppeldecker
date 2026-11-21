@@ -311,6 +311,35 @@ mod tests {
     }
 
     #[test]
+    fn saved_sync_job_matches_the_browser_wire_fixture() {
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/small-control-wire.json"))
+                .unwrap();
+        let saved = &wire["syncJob"]["saved"];
+        let edited = &wire["syncJob"]["edited"];
+        let decode = |value: serde_json::Value| -> SaveSyncJobRequest {
+            serde_json::from_value(value).unwrap()
+        };
+        let initial = decode(saved.clone());
+        let mut edit = edited.clone();
+        edit["revision"] = saved["revision"].clone();
+        let edited_request = decode(edit);
+        assert_eq!(initial.id, edited_request.id);
+        assert_eq!(initial.revision, edited_request.revision);
+        let job = SavedSyncJob {
+            id: edited_request.id.unwrap(),
+            revision: edited_request.revision.unwrap() + 1,
+            name: edited_request.name,
+            left: edited_request.left,
+            right: edited_request.right,
+            direction: edited_request.direction,
+            options: edited_request.options,
+        };
+        job.validate().unwrap();
+        assert_eq!(serde_json::to_value(job).unwrap(), *edited);
+    }
+
+    #[test]
     fn damaged_or_oversized_document_is_not_overwritten() {
         let area = tempfile::tempdir().unwrap();
         let path = area.path().join(FILE_NAME);

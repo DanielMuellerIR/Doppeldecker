@@ -1,0 +1,16 @@
+{
+  "nameSearchStarted": { "run_id": 1 },
+  "networkServices": [
+    { "protocol": "smb", "name": "Studio-NAS", "host": "studio-nas.local", "port": 445 },
+    { "protocol": "sftp", "name": "Buildserver", "host": "build.local", "port": 2222 },
+    { "protocol": "webdav", "name": "Cloud", "host": "cloud.local", "port": 8443 }
+  ],
+  "cliInstall": {
+    "installed": { "state": "installed" },
+    "offer": { "state": "offer" },
+    "declined": { "state": "declined" },
+    "conflict": { "state": "conflict" },
+    "outside_applications": { "state": "outside_applications" },
+    "unavailable": { "state": "unavailable" }
+  }
+}

@@ -1,4 +1,5 @@
 import { invoke } from "./tauri-api.js";
+import { paneEndpoint } from "./pane-endpoint.js";
 import { cancelOwnedModal, hideModal, showOwnedModal } from "./modal.js";
 import { conflictChoiceModal } from "./conflict-dialog.js";
 import { bindArchivePackPages, archiveUploadDetailsHtml, archiveIssuesHtml } from "./archive-pack-ui.js";
@@ -70,10 +71,25 @@ export async function chooseArchiveExtractConflicts(preview, signal = null) {
     ],
   });
 }
+/** @typedef {import("./archive-mutation-wire.js").ArchivePane} ArchivePane */
+/** @typedef {import("./archive-mutation-wire.js").ArchivePaneSide} ArchivePaneSide */
+/** @typedef {import("./archive-mutation-wire.js").ArchiveExtractPreparedWire} ArchiveExtractPreparedWire */
+
+/** @param {{
+ * panes: Record<ArchivePaneSide, ArchivePane>, activeSide: () => ArchivePaneSide,
+ * selectedEntries: (side: ArchivePaneSide) => {name: string, is_file?: boolean, is_symlink?: boolean, safely_decoded?: boolean}[],
+ * blocked: () => boolean, showDock: (message: string, options: {closable: boolean}) => void,
+ * showError: (title: string, error: unknown) => void
+ * }} dependencies */
 export function createArchiveExtractUi({ panes, activeSide, selectedEntries, blocked, showDock, showError }) {
   let current = null;
-  const snapshot = side => ({ side, tabId: panes[side].tabs?.active?.id, ...Object.fromEntries(keys.map(key => [key, panes[side][key]])) });
+  /** @param {ArchivePaneSide} side */
+  const snapshot = side => {
+    const { provider, profileId, profileRevision, sessionGeneration, path, navigationRevision, tabs } = panes[side];
+    return { side, tabId: tabs?.active?.id, provider, profileId, profileRevision, sessionGeneration, path, navigationRevision };
+  };
   const matches = scope => panes[scope.side].tabs?.active?.id === scope.tabId && keys.every(key => panes[scope.side][key] === scope[key]);
+  /** @param {string | null | undefined} id */
   const discard = id => { if (id) void invoke("discard_archive_extract", { preparationId: id }).catch(() => {}); };
   function finish(context) {
     if (context.closed) return;
@@ -100,6 +116,10 @@ export function createArchiveExtractUi({ panes, activeSide, selectedEntries, blo
     }
     return false;
   }
+  /**
+   * @param {ArchivePaneSide} side
+   * @param {ArchiveExtractPreparedWire | null} prepared
+   */
   function open(side = activeSide(), prepared = null) {
     if (blocked()) { if (prepared) discard(prepared.preparationId); return; }
     const entries = selectedEntries(side);
@@ -108,7 +128,9 @@ export function createArchiveExtractUi({ panes, activeSide, selectedEntries, blo
       showError("Archiv entpacken", new Error("Bitte genau eine reguläre Archivdatei auswählen.")); return;
     }
     if (current) finish(current);
-    const context = { source: snapshot(side), target: snapshot(side === "left" ? "right" : "left"), name: entries[0].name,
+    const targetSide = side === "left" ? "right" : "left";
+    const targetEndpoint = paneEndpoint(panes[targetSide]);
+    const context = { source: snapshot(side), target: snapshot(targetSide), name: entries[0].name,
       requestId: prepared?.requestId || crypto.randomUUID(), closed: false, stale: false, busy: true, preparationId: prepared?.preparationId || null };
     current = context;
     context.token = showOwnedModal("archive-extract", token => {
@@ -155,11 +177,16 @@ export function createArchiveExtractUi({ panes, activeSide, selectedEntries, blo
       context.timer = setInterval(() => check(context), 250);
       void (async () => {
         try {
-          const response = prepared || await invoke("prepare_archive_extract", { request: { requestId: context.requestId,
-            provider: context.source.provider, root: context.source.path, sourcePath: joinPath(context.source.path, context.name),
-            targetProvider: context.target.provider, targetDir: context.target.path,
-            ...(context.target.provider !== "local" ? { target: { provider: context.target.provider, root: context.target.path,
-              profileId: context.target.profileId, profileRevision: context.target.profileRevision } } : {}) } });
+          let response = prepared;
+          if (!response) {
+            const request = /** @satisfies {import("./archive-mutation-wire.js").ArchiveExtractPrepareRequest} */ ({
+              requestId: context.requestId, provider: context.source.provider, root: context.source.path,
+              sourcePath: joinPath(context.source.path, context.name),
+              targetProvider: targetEndpoint.provider, targetDir: targetEndpoint.root,
+              ...(targetEndpoint.provider !== "local" ? { target: targetEndpoint } : {}),
+            });
+            response = await invoke("prepare_archive_extract", { request });
+          }
           if (!check(context)) { discard(response.preparationId); return; }
           if (response.requestId !== context.requestId) { discard(response.preparationId); throw new Error("Die Entpackantwort gehört zu einer anderen Anfrage. Bitte neu öffnen."); }
           context.preparationId = response.preparationId; context.preview = response.binding.preview; context.uploadTarget = response.uploadTarget;

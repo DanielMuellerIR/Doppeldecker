@@ -2,12 +2,27 @@ import { hideModal, showOwnedModal } from "./modal.js";
 import { invoke } from "./tauri-api.js";
 import { $, escapeHtml } from "./ui-utils.js";
 
+/** @typedef {import("./saved-sync-job-wire.js").SyncJobDraftWire} SyncJobDraftWire */
+/** @typedef {import("./saved-sync-job-wire.js").SyncJobEndpointWire} SyncJobEndpointWire */
+/** @typedef {import("./saved-sync-job-wire.js").SavedSyncJobWire} SavedSyncJobWire */
+/** @typedef {{name: string, existing: SavedSyncJobWire | null}} SyncJobChoice */
+
 const modeLabels = { AddOnly: "Fehlendes hinzufügen", Update: "Vorhandenes aktualisieren", Mirror: "Spiegeln" };
 
+/** @param {{
+ * capture: () => SyncJobDraftWire | null,
+ * load: (job: SavedSyncJobWire) => Promise<boolean>,
+ * describeEndpoint: (endpoint: SyncJobEndpointWire) => string,
+ * running: () => boolean,
+ * showError: (title: string, error: unknown) => void,
+ * showDock: (message: string, options: {closable: boolean}) => void,
+ * }} dependencies */
 export function createSyncJobsUi({ capture, load, describeEndpoint, running, showError, showDock }) {
+  /** @type {SavedSyncJobWire | null} */
   let current = null;
   let busy = false;
 
+  /** @param {SyncJobDraftWire} job */
   function endpointsHtml(job) {
     const [source, target] = job.direction === "rl" ? [job.right, job.left] : [job.left, job.right];
     return `<dl class="sync-job-endpoints"><dt>Quelle</dt><dd>${escapeHtml(describeEndpoint(source))}</dd>` +
@@ -15,6 +30,7 @@ export function createSyncJobsUi({ capture, load, describeEndpoint, running, sho
       `<dt>Wirkung</dt><dd>${modeLabels[job.options.mode]}</dd></dl>`;
   }
 
+  /** @param {SavedSyncJobWire} job */
   function markCurrent(job) {
     current = job;
     const label = $("#sync-job-current");
@@ -23,6 +39,7 @@ export function createSyncJobsUi({ capture, load, describeEndpoint, running, sho
     $("#sync-job-save").textContent = "Auftrag bearbeiten …";
   }
 
+  /** @param {SavedSyncJobWire[]} jobs @returns {Promise<SavedSyncJobWire | null>} */
   function selectJob(jobs) {
     return new Promise(resolve => showOwnedModal("sync-job-open", token => {
       $("#modal-title").textContent = "Gespeicherte Sync-Aufträge";
@@ -56,6 +73,7 @@ export function createSyncJobsUi({ capture, load, describeEndpoint, running, sho
     }));
   }
 
+  /** @param {SyncJobDraftWire} draft @returns {Promise<SyncJobChoice | null>} */
   function nameJob(draft) {
     return new Promise(resolve => showOwnedModal("sync-job-save", token => {
       $("#modal-title").textContent = current ? "Sync-Auftrag bearbeiten" : "Sync-Auftrag speichern";
@@ -116,8 +134,12 @@ export function createSyncJobsUi({ capture, load, describeEndpoint, running, sho
         if (!draft) return;
         const choice = await nameJob(draft);
         if (!choice) return;
-        const { id, revision } = choice.existing || {};
-        const job = await invoke("save_sync_job", { request: { ...draft, name: choice.name, id, revision } });
+        const id = choice.existing?.id;
+        const revision = choice.existing?.revision;
+        const request = /** @satisfies {import("./saved-sync-job-wire.js").SaveSyncJobRequestWire} */ ({
+          ...draft, name: choice.name, id, revision,
+        });
+        const job = await invoke("save_sync_job", { request });
         markCurrent(job);
         showDock(`<span class="pill ok">Sync-Auftrag gespeichert</span>${escapeHtml(job.name)}`, { closable: true });
       } catch (error) {

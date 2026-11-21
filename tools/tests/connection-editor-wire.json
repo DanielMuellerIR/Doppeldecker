@@ -1,0 +1,74 @@
+{
+  "discover_sftp_host_key": {
+    "args": {
+      "host": "sftp.mock.test",
+      "port": 22
+    },
+    "reply": {
+      "algorithm": "ssh-ed25519",
+      "sha256": [11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11]
+    }
+  },
+  "discover_ftps_certificate": {
+    "args": {
+      "host": "ftps.mock.test",
+      "port": 21
+    },
+    "reply": {
+      "sha256": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+    }
+  },
+  "verify_ftps_certificate": {
+    "args": {
+      "host": "ftps.mock.test",
+      "port": 21
+    },
+    "reply": {
+      "sha256": [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
+    }
+  },
+  "discover_webdav_certificate": {
+    "args": {
+      "origin": "https://dav.mock.test"
+    },
+    "reply": {
+      "sha256": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    }
+  },
+  "discover_smb_server": {
+    "args": {
+      "host": "smb.mock.test",
+      "port": 445
+    },
+    "reply": {
+      "server_guid": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+      "dialect": 785,
+      "encryption_capable": true,
+      "signing_required": true
+    }
+  },
+  "list_sftp_agent_keys": {
+    "reply": [
+      {
+        "comment": "Asynchroner Testschlüssel",
+        "algorithm": "ssh-ed25519",
+        "sha256": [23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23]
+      }
+    ]
+  },
+  "capture_connection_secret": {
+    "args": {
+      "protocol": "sftp",
+      "profileId": "mock_sftp"
+    },
+    "reply": {
+      "secretId": "mock-pending-secret-1"
+    }
+  },
+  "discard_connection_secret": {
+    "args": {
+      "secretId": "mock-pending-secret-1"
+    },
+    "reply": null
+  }
+}

@@ -6,8 +6,8 @@ use doppeldecker_core::{fileops, FileQueueKind, LocalVfs, QueueOperation};
 use tauri::{Manager, WebviewWindow};
 
 use crate::{
-    emit_queue_snapshot, enqueue_operation_with_readback, start_queue_worker, with_queue_extension,
-    AppError, AppState, MutexExt,
+    emit_queue_snapshot, start_queue_worker, with_queue_extension_access, AppError, AppState,
+    MutexExt,
 };
 
 struct PreparedDuplicate {
@@ -192,7 +192,7 @@ pub(crate) async fn confirm_duplicate(
         let state = app.state::<AppState>();
         let label = window.label();
         let window_state = state.window(label);
-        let (queue, entry) = with_queue_extension(&state, &window_state, || {
+        let (queue, entry) = with_queue_extension_access(&state, &window_state, |extension| {
             let mut slot = window_state.duplicate_preparation.lock_recover();
             let pending = slot.bound(&preparation_id)?;
             fileops::verify_keep_both_targets(
@@ -217,7 +217,7 @@ pub(crate) async fn confirm_duplicate(
                 local_replace_best_effort_expected: Some(false),
                 local_copy_new_best_effort_expected: None,
             };
-            let result = enqueue_operation_with_readback(&app, &window_state, label, &operation)?;
+            let result = extension.enqueue_with_readback(&app, label, &operation)?;
             slot.pending = None;
             Ok(result)
         })?;
@@ -372,11 +372,40 @@ mod tests {
         }
     }
     #[test]
-    fn verschachtelte_duplizierpayloads_akzeptieren_genau_frontendschreibweise() {
-        let request =
-            serde_json::json!({"provider":"local", "root":"/quelle", "items":["/quelle/A"]});
-        assert!(serde_json::from_value::<DuplicateRequest>(request).is_ok());
-        let forged = serde_json::json!({"provider":"local", "root":"/quelle", "items":["/quelle/A"], "targets":["/fremd"]});
+    fn duplicate_preview_matches_the_browser_wire_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/duplicate-wire.json")).unwrap();
+        let request: DuplicateRequest =
+            serde_json::from_value(fixture["local"]["request"].clone()).unwrap();
+        assert_eq!(request.provider, "local");
+        assert_eq!(request.root, "/mock/quelle");
+        assert_eq!(request.items, ["/mock/quelle/Alpha.txt"]);
+
+        let preview = DuplicatePreview {
+            supported: true,
+            preparation_id: Some("0123456789abcdef0123456789abcdef".into()),
+            parent: request.root,
+            mappings: vec![DuplicateMapping {
+                source_name: "Alpha.txt".into(),
+                target_name: "Alpha (Kopie 20261121T000000Z 0123abcd).txt".into(),
+            }],
+            blockers: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(preview).unwrap(),
+            fixture["local"]["response"]
+        );
+
+        let remote = serde_json::from_value(fixture["remote"]["request"].clone()).unwrap();
+        let (preview, pending) = prepare(remote).unwrap();
+        assert!(pending.is_none());
+        assert_eq!(
+            serde_json::to_value(preview).unwrap(),
+            fixture["remote"]["response"]
+        );
+
+        let mut forged = fixture["local"]["request"].clone();
+        forged["targets"] = serde_json::json!(["/fremd"]);
         assert!(serde_json::from_value::<DuplicateRequest>(forged).is_err());
     }
 }

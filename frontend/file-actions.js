@@ -1,13 +1,34 @@
-import { conflictChoiceModal } from "./conflict-dialog.js";
 // Interaktive Standard-Dateiaktionen. Der Controller hält keinen eigenen Pane-Zustand;
 // er erhält den jeweils aktuellen Zustand und die sichere Backendbrücke von außen.
 
+import { createFileTransfer } from "./file-transfer.js";
+import { paneEndpoint } from "./pane-endpoint.js";
 import { invoke } from "./tauri-api.js";
 import { choiceModal, promptModal } from "./modal.js";
-import { escapeHtml, isEntryNameSafe, joinPath, errCode, sourceReadReport } from "./ui-utils.js";
+import { escapeHtml, isEntryNameSafe, joinPath, errCode } from "./ui-utils.js";
 
-export function createFileActions({ panes, activeSide, running, enqueueBlocked = running, loadPane, showDock, showError, dockRevision = () => 0 }) {
+const resumableProtocols = new Map([["webdav", "WebDAV"], ["ftps", "FTPS"], ["sftp", "SFTP"]]);
+
+/** @typedef {"left" | "right"} PaneSide */
+/** @typedef {import("./pane-endpoint.js").PaneEndpointLocation & {
+ * profileId?: string | null, profileRevision?: number | null, navigationRevision: number
+ * }} FileActionLocation */
+/** @typedef {{name: string, is_file?: boolean, is_symlink?: boolean, safely_decoded?: boolean}} FileActionEntry */
+/** @typedef {FileActionLocation & {sel: Set<number>, cursor: number, entries: FileActionEntry[]}} FileActionPane */
+
+/** @param {{
+ * panes: Record<PaneSide, FileActionPane>, activeSide: () => PaneSide, running: () => boolean,
+ * enqueueBlocked?: () => boolean,
+ * loadPane: (side: PaneSide, path: string, options: {passive: boolean, push: boolean, keepSelName: string | null, preserveView?: boolean}) => Promise<unknown>,
+ * showDock: (message: string, options: {closable: boolean}) => void,
+ * showDownloadPreparation: (message: string, cancel: () => Promise<null>) => () => void,
+ * showError: (context: string, error: unknown, options?: {foldDetails: boolean}) => void,
+ * dockRevision?: () => number
+ * }} dependencies */
+export function createFileActions({ panes, activeSide, running, enqueueBlocked = running, loadPane, showDock, showDownloadPreparation, showError, dockRevision = () => 0 }) {
   let actionGeneration = 0;
+  let downloadPreparing = false;
+  const transfer = createFileTransfer({ paneEndpoint, actionIsCurrent, running, showDock, showError, dockRevision });
 
   function directMutationBlocked(action) {
     if (!running()) return false;
@@ -19,17 +40,19 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
 
   /** Ein Dateiaktions-Scope ist ein unveränderliches Abbild genau der Pane, die
    * der Nutzer gesehen hat. Nur Navigation entwertet die Absicht; ein passiver
-   * Refresh während eines Queueabschlusses besitzt dieselbe Navigationsrevision. */
+   * Refresh während eines Queueabschlusses besitzt dieselbe Navigationsrevision.
+   * @param {PaneSide} side
+   */
   function paneScope(side) {
     const pane = panes[side];
-    return Object.freeze({
+    return /** @type {Readonly<FileActionLocation & {side: PaneSide}>} */ (Object.freeze({
       side,
       navigationRevision: pane.navigationRevision,
       provider: pane.provider,
       profileId: pane.profileId,
       profileRevision: pane.profileRevision,
       path: pane.path,
-    });
+    }));
   }
 
   function sameScope(scope) {
@@ -80,7 +103,9 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
     return action.generation === actionGeneration && action.scopes.every(sameScope);
   }
 
-  /** Auswahl der Pane; ohne Mehrfachauswahl gilt der Eintrag unter dem Cursor. */
+  /** Auswahl der Pane; ohne Mehrfachauswahl gilt der Eintrag unter dem Cursor.
+   * @param {PaneSide} side
+   */
   function selectedEntries(side) {
     const pane = panes[side];
     const indices = pane.sel.size
@@ -91,6 +116,7 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
     return indices.map((index) => pane.entries[index]).filter(Boolean);
   }
 
+  /** @param {PaneSide} side @param {string} action */
   function safeSelectedEntries(side, action) {
     const entries = selectedEntries(side);
     if (entries.some((entry) => !isEntryNameSafe(entry))) {
@@ -98,18 +124,9 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
         `<span class="pill delete">Unsicherer Dateiname</span>${escapeHtml(action)} ist für Namen ohne eindeutige UTF-8-Abbildung gesperrt. Der Eintrag bleibt unverändert.`,
         { closable: true },
       );
-      return [];
+      return null;
     }
     return entries;
-  }
-
-  function paneEndpoint(scope) {
-    const endpoint = { provider: scope.provider, root: scope.path };
-    if (scope.provider !== "local") {
-      endpoint.profileId = scope.profileId;
-      endpoint.profileRevision = scope.profileRevision;
-    }
-    return endpoint;
   }
 
   async function refreshBothPanes(context) {
@@ -163,27 +180,44 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
     const source = paneScope(side);
     const target = paneScope(destinationSide);
     const entries = safeSelectedEntries(side, kind === "copy" ? "Kopieren" : "Verschieben");
+    if (!entries) return;
     return transfer(kind, source, target, entries.map(entry => joinPath(source.path, entry.name)),
       beginAction([source, target]));
+  }
+
+  function canResumeCopy(side, entries) {
+    const source = panes[side];
+    const target = panes[side === "left" ? "right" : "left"];
+    return (source.provider === "local" || resumableProtocols.has(source.provider))
+      && target.provider === "local"
+      && entries.length > 0 && entries.every(entry => entry.is_file && !entry.is_symlink);
   }
 
   async function resumableCopy(side = activeSide()) {
     if (enqueueBlocked()) return;
     const source = paneScope(side);
     const target = paneScope(side === "left" ? "right" : "left");
-    const entries = selectedEntries(side);
-    const remoteProtocol = { webdav: "WebDAV", ftps: "FTPS", sftp: "SFTP" }[source.provider];
-    if (!(source.provider === "local" || remoteProtocol) || target.provider !== "local"
-      || !entries.length || entries.some(entry => !entry.is_file || entry.is_symlink)) {
+    const entries = safeSelectedEntries(side, "Fortsetzbares Kopieren");
+    if (!entries) return;
+    if (!canResumeCopy(side, entries)) {
       showDock('<span class="pill none">Fortsetzbar kopieren</span>Wähle reguläre Dateien lokal, über WebDAV, FTPS oder SFTP. Öffne im anderen Pane einen lokalen Zielordner.', { closable: true });
       return;
     }
-    if (!safeSelectedEntries(side, "Fortsetzbares Kopieren").length) return;
+    const remoteProtocol = resumableProtocols.get(source.provider);
+    let finishPreparation;
+    let requestId;
     if (remoteProtocol) {
+      if (downloadPreparing) return;
+      downloadPreparing = true;
+      const clientId = crypto.randomUUID();
+      requestId = clientId;
       const check = source.provider !== "webdav"
         ? "Der Server berechnet die Prüfsumme der gesamten Datei."
         : "Die Dateiversion und ein kurzer Bytebereich werden geprüft.";
-      showDock(`<span class="pill copy">${remoteProtocol} · Fortsetzbarer Download</span> ${check}`, { closable: true });
+      finishPreparation = showDownloadPreparation(
+        `<span class="pill copy">${remoteProtocol} · Fortsetzbarer Download</span> ${check}`,
+        () => invoke("cancel_resumable_copy_preparation", { requestId: clientId }),
+      );
     }
     const revision = dockRevision();
     try {
@@ -191,14 +225,23 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
         sourceRoot: source.path,
         sourcePaths: entries.map(entry => joinPath(source.path, entry.name)),
         targetRoot: target.path,
-        ...(remoteProtocol ? { remoteSource: paneEndpoint(source) } : {}),
+        ...(remoteProtocol ? { remoteSource: paneEndpoint(source), requestId } : {}),
       });
       if (revision === dockRevision()) {
         const selection = entries.length === 1 ? "Eine Datei" : `${entries.length} Dateien`;
         showDock(`<span class="pill copy">Fortsetzbare Kopie</span>${selection} eingereiht.`, { closable: true });
       }
     } catch (error) {
-      showError("Kopieren", error);
+      if (remoteProtocol && errCode(error) === "interrupted") {
+        if (revision === dockRevision()) showDock('<span class="pill none">Downloadvorbereitung abgebrochen</span>', { closable: true });
+      } else {
+        showError("Kopieren", error);
+      }
+    } finally {
+      if (finishPreparation) {
+        finishPreparation();
+        downloadPreparing = false;
+      }
     }
   }
 
@@ -271,285 +314,18 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
     return remaining === 0 && !unchangedMove;
   }
 
-  /** Rückgabe: `true` eingereiht, `"skipped"` Quelle ist der Zielordner,
-   * für Finder-Drops ein Sperrgrund/Fehler, sonst `undefined` bei Abbruch/Drift. */
-  async function transfer(kind, source, target, items, action, onEnqueued, generated = null) {
-    const destDir = target.path;
-    if (!generated && (!items.length || !destDir)) return;
-    const sameEndpoint = source.provider === target.provider
-      && source.profileId === target.profileId
-      && destDir === source.path;
-    if (!generated && sameEndpoint) {
-      showDock('<span class="pill delete">Quelle und Ziel sind derselbe Ordner</span>', { closable: true });
-      return "skipped";
-    }
-
-    let overwrite = false;
-    let expectedConflicts = [];
-    let keepBothPreparationId = null;
-    let conflictPreparationId = null;
-    let copyNewBestEffortExpected;
-    let replaceBestEffortExpected;
-    let removeSourceBestEffortExpected;
-    const bestEffortNotes = [];
-    let sourceReport = {summary:"",details:""};
-    const addBestEffortNotes = (notes, fallback) => {
-      const values = notes?.length ? notes : [fallback];
-      for (const note of values) {
-        if (note && !bestEffortNotes.includes(note)) bestEffortNotes.push(note);
-      }
-    };
-    const providerOperation = generated ? {
-      kind: "copy", source: { provider: "local", root: "" }, target: { provider: "local", root: "" },
-      items: [], destination: "", generatedOperationId: generated.operationId,
-    } : {
-      kind,
-      source: paneEndpoint(source),
-      target: paneEndpoint(target),
-      items,
-      destination: destDir,
-    };
-    const providerTransfer = Boolean(generated) || source.provider !== "local" || target.provider !== "local";
-    // Finder-Drops ergänzen ihre Gruppenbilanz, bevor sie den konkreten Grund
-    // anzeigen. Eine zweite allgemeine Dockmeldung würde ihn sonst überschreiben.
-    function blocked(blockerHtml) {
-      if (!action.endpointOnly) showDock(blockerHtml, { closable: true });
-      return { blockerHtml };
-    }
-    function preparationWasCancelled(error) {
-      if (errCode(error) !== "interrupted") return false;
-      if (actionIsCurrent(action)) showDock('<span class="pill none">Abgebrochen</span>Die Datei-Vorbereitung wurde beendet.', { closable: true });
-      return true;
-    }
-    let intentAttempted = false;
-    async function enqueueIntent() {
-      if (!actionIsCurrent(action)) return;
-      showDock('<span class="pill copy">Weitere Übertragung</span>Die Queue prüft Verbindung, Fähigkeiten und Konflikte vor der Ausführung. Vorhandene Ziele werden nicht ersetzt. Neuanlegen kann als Best Effort ohne atomaren Kollisionsschutz erfolgen.'
-        + (source.provider === "sftp" || target.provider === "sftp" ? ' SFTP-Dateiaktionen laufen als Best Effort: Pfadbefehle sind nicht atomar an den Pane-Root gebunden. Ein unbemerkter gleichzeitiger Elternpfadtausch kann auch außerhalb des gewählten Bereichs im selben Serverkonto wirken.' : '')
-        + (kind === "move" ? ' Passende SFTP-Panes derselben Verbindung verwenden gewöhnliches Rename. Sonst wird die Quelle nach vollständiger Zielkopie und frischem Readback entfernt; die Entfernung kann dauerhaft sein.' : ''), { closable: true });
-      intentAttempted = true;
-      const id = await invoke("enqueue_provider_file_intent", { request: providerOperation });
-      onEnqueued?.(id);
-      return true;
-    }
-    try {
-      if (providerTransfer && running()) {
-        if (generated) throw new Error("Ein anderer Auftrag läuft. Die offene Archivquelle bleibt erhalten; Konflikte anschließend erneut prüfen.");
-        return await enqueueIntent();
-      }
-      let preview = providerTransfer
-        ? await invoke("check_provider_file_operation", { request: providerOperation })
-        : await invoke("check_local_file_operation", { kind, items, destDir });
-      if (!actionIsCurrent(action)) return;
-      let preparedConflictPolicy = null;
-      async function prepareConflictPolicy(policy) {
-        const prepared = await invoke("check_provider_file_operation", {
-          request: providerOperation,
-          choice: { id: preview.conflictPreparationId, policy },
-        });
-        if (!actionIsCurrent(action)) return false;
-        preview = prepared;
-        preparedConflictPolicy = policy;
-        return true;
-      }
-      let selectedConflictChoice = null;
-      const conflictChoices = value => {
-        const canReplace = value.targetCapabilities.replace || value.targetCapabilities.replaceBestEffort;
-        const bestEffort = !value.targetCapabilities.replace && value.targetCapabilities.replaceBestEffort;
-        return [
-          { label: "Überspringen", value: "skip", explanation: "Vorhandene Ziele und übersprungene Move-Quellen bleiben erhalten. Nur übrige Einträge werden übertragen." },
-          ...(canReplace ? [{ label: bestEffort ? "Dauerhaft ersetzen" : "Ersetzen", value: "overwrite", danger: true,
-            explanation: bestEffort ? "Die angezeigten Zieldateien werden ohne Quarantäne dauerhaft ersetzt (Best Effort). Ein unklarer Ausgang wird nicht automatisch wiederholt."
-              : "Zieldateien durch die Quelle ersetzen. Ordner werden zusammengeführt; zusätzliche Zielinhalte bleiben erhalten." }] : []),
-          { label: "Beide behalten", value: "both", wide: true, disabled: !value.keepBothPreparationId,
-            explanation: value.keepBothPreparationId ? `Neue Namen: ${value.keepBothNames.join("; ")}` : value.keepBothBlocker || "Für diese Auswahl nicht verfügbar." },
-        ];
-      };
-      if (preview?.requiresConflictChoice) {
-        let preparation;
-        selectedConflictChoice = await conflictChoiceModal({
-          title: kind === "copy" ? "Konflikte beim Kopieren" : "Konflikte beim Verschieben",
-          conflicts: preview.conflictDetails,
-          choices: [
-            { label: "Überspringen", value: "skip", explanation: "Vorhandene Ziele und übersprungene Move-Quellen bleiben erhalten." },
-            { label: "Ersetzen", value: "overwrite", disabled: true, explanation: "Verfügbarkeit wird geprüft …" },
-            { label: "Beide behalten", value: "both", disabled: true, wide: true, explanation: "Neue Namen werden vorbereitet …" },
-          ],
-          sourceReadLimitations: preview.sourceReadLimitations || [],
-          note: `${preview.conflicts.length} Konflikt(e). Die Entscheidung gilt für die gesamte Auswahl.`,
-          loadChoices: () => {
-            preparation = prepareConflictPolicy("inspect");
-            return preparation.then(current => current ? ({ choices: conflictChoices(preview), replacementBlockers: preview.targetCapabilities.blockers || [] }) : null);
-          },
-        });
-        if (!actionIsCurrent(action) || selectedConflictChoice == null) return;
-        // Die laufende Vorbereitung hält die Fensterschranke. Erst nach ihrem
-        // Ende kann die endgültige Entscheidung gebunden werden.
-        await preparation?.catch(() => {});
-        if (!actionIsCurrent(action)) return;
-        if (selectedConflictChoice === "skip") {
-          if (!await prepareConflictPolicy("skip")) return;
-        }
-      }
-      for (;;) {
-        bestEffortNotes.length = 0;
-        copyNewBestEffortExpected = undefined;
-        replaceBestEffortExpected = undefined;
-        removeSourceBestEffortExpected = undefined;
-        if (preview) {
-          sourceReport = sourceReadReport(preview.sourceReadLimitations, preview.sourceTree);
-          // Diese beiden Werte stammen ausschließlich aus der sichtbaren Vorschau.
-          // Der zweite Backend-Probelauf darf sie nicht selbst auf Best Effort
-          // hochsetzen, weil das eine nie angezeigte Bestätigung wäre.
-          copyNewBestEffortExpected = !preview.targetCapabilities.copyNew
-            && preview.targetCapabilities.copyNewBestEffort;
-          replaceBestEffortExpected = false;
-        }
-        if (preview && !preview.skipOnly && !preview.targetCapabilities.copyNew
-          && !preview.targetCapabilities.copyNewBestEffort) {
-          return blocked(
-            `<span class="pill none">Kopieren gesperrt</span>${escapeHtml(preview.targetCapabilities.blockers.join("; "))}`,
-          );
-        }
-        if (preview && !preview.skipOnly && !preview.targetCapabilities.copyNew
-          && preview.targetCapabilities.copyNewBestEffort) {
-          // Best Effort ist ein reguläres Ergebnis: Die konkrete Einschränkung wird
-          // in der Einreih-Meldung sichtbar, ohne eine modale Frage je Übertragung.
-          addBestEffortNotes(
-            preview.targetCapabilities.limitations,
-            "ohne atomaren Kollisionsschutz beim Commit",
-          );
-        }
-        const selectedReplacementUnavailable = preparedConflictPolicy === "overwrite"
-          && !preview.targetCapabilities.replace && !preview.targetCapabilities.replaceBestEffort;
-        if (providerTransfer && preview && !preview.skipOnly && !selectedReplacementUnavailable && preview.sourceRemovalRequired !== false && kind === "move") {
-          const sourceCapabilities = preview.sourceCapabilities;
-          if (!sourceCapabilities?.removeSource
-            && !sourceCapabilities?.removeSourceBestEffort) {
-            return blocked(
-              '<span class="pill none">Verschieben gesperrt</span>Die Zielkopie wäre möglich, aber die Quellentfernung ist für diese Verbindung nicht gebunden. Es erfolgt kein stiller Copy-Fallback.',
-            );
-          }
-          removeSourceBestEffortExpected = !sourceCapabilities.removeSource
-            && sourceCapabilities.removeSourceBestEffort;
-          if (removeSourceBestEffortExpected) {
-            addBestEffortNotes(
-              sourceCapabilities.limitations,
-              "Quelle wird nach frischem Readback einzeln entfernt",
-            );
-          }
-        }
-        if (kind === "move" && preview?.sourceRemovalRequired === false && !preview.skipOnly) {
-          addBestEffortNotes(["Quellbäume mit übersprungenen Einträgen bleiben vollständig erhalten."], "Quelle bleibt wegen übersprungener Einträge erhalten");
-        }
-        const conflicts = preview?.conflicts
-          || await invoke("check_conflicts", { items, destDir });
-        if (!actionIsCurrent(action)) return;
-        expectedConflicts = conflicts.slice();
-        conflictPreparationId = preview.conflictPreparationId;
-        if (conflicts.length) {
-          const canReplace = preview.targetCapabilities.replace || preview.targetCapabilities.replaceBestEffort;
-          const bestEffortReplace = !preview.targetCapabilities.replace && preview.targetCapabilities.replaceBestEffort;
-          const choices = [
-            { label: "Überspringen", value: "skip", explanation: "Vorhandene Ziele bleiben unverändert. Nur die übrigen Einträge werden übertragen; übersprungene Move-Quellen bleiben erhalten." },
-            ...(canReplace ? [{ label: bestEffortReplace ? "Dauerhaft ersetzen" : "Ersetzen", value: "overwrite", danger: true,
-              explanation: bestEffortReplace
-                ? "Die angezeigten Zieldateien werden ohne Quarantäne unwiederbringlich verworfen (Best Effort). Ein unklarer Ausgang wird nicht automatisch wiederholt."
-                : "Die angezeigten Zieldateien durch die Quelle ersetzen. Ordner werden zusammengeführt; zusätzliche Zielinhalte bleiben erhalten." }] : []),
-            { label: "Beide behalten", value: "both", wide: true, disabled: !preview.keepBothPreparationId,
-              explanation: preview.keepBothPreparationId
-                ? `Die Quelle unter den angezeigten neuen Namen übertragen. Bei Ordnern wird die vorbereitete ausgewählte Kopie daneben angelegt. Neue Namen: ${preview.keepBothNames.join("; ")}`
-                : preview.keepBothBlocker || "Für diese Auswahl ist kein kollisionsfreier Commit gebunden." },
-          ];
-          const choice = selectedConflictChoice || (preparedConflictPolicy === "skip" ? "skip" : await conflictChoiceModal({
-            title: kind === "copy" ? "Konflikte beim Kopieren" : "Konflikte beim Verschieben",
-            conflicts: preview.conflictDetails, choices,
-            replacementBlockers: canReplace ? [] : (preview.targetCapabilities.blockers || []),
-            sourceReadLimitations: preview.sourceReadLimitations || [],
-            note: `${conflicts.length} Konflikt(e). Die Entscheidung gilt für die gesamte Auswahl. Quelle und Ziel werden unmittelbar vor der Ausführung erneut geprüft.`,
-          }));
-          if (!actionIsCurrent(action) || choice == null) return;
-          if (preparedConflictPolicy !== null && preparedConflictPolicy !== "inspect" && choice !== preparedConflictPolicy) {
-            if (!await prepareConflictPolicy(choice)) return;
-            continue;
-          }
-          overwrite = choice === "overwrite";
-          if (choice === "both") keepBothPreparationId = preview.keepBothPreparationId;
-          replaceBestEffortExpected = overwrite && bestEffortReplace;
-          if (overwrite && bestEffortReplace) addBestEffortNotes([], "Altversion ohne Quarantäne dauerhaft ersetzt");
-        }
-        break;
-      }
-
-    } catch (error) {
-      if (preparationWasCancelled(error)) return;
-      if (providerTransfer && !generated && !intentAttempted && errCode(error) === "busy") {
-        try { return await enqueueIntent(); }
-        catch (enqueueError) { error = enqueueError; }
-      }
-      if (actionIsCurrent(action) && action.endpointOnly) return { error };
-      if (actionIsCurrent(action)) showError("Fehler", error);
-      return;
-    }
-
-    try {
-      // Zwischen Vorschau, Konfliktdialog und Mutation kann beliebig viel Zeit
-      // liegen. Unmittelbar vor dem schreibenden Command gilt deshalb dieselbe
-      // Scope-Prüfung noch einmal.
-      if (!actionIsCurrent(action)) return;
-      const presentation = dockRevision();
-      if (providerTransfer) {
-        const id = await invoke("enqueue_provider_file_operation", {
-          request: {
-            ...providerOperation,
-            overwrite,
-            expectedConflicts,
-            keepBothPreparationId,
-            conflictPreparationId,
-            copyNewBestEffortExpected,
-            replaceBestEffortExpected,
-            ...(removeSourceBestEffortExpected === undefined
-              ? {}
-              : { removeSourceBestEffortExpected }),
-          },
-        });
-        onEnqueued?.(id);
-      } else {
-        const id = await invoke(kind === "copy" ? "copy_paths" : "move_paths", { request: {
-          items, destDir, overwrite, expectedConflicts, keepBothPreparationId, conflictPreparationId, replaceBestEffortExpected,
-        } });
-        onEnqueued?.(id);
-      }
-      // Der erfolgreiche Queuecommit bleibt auch bei späterer Zielnavigation
-      // eingereiht. Nur die alte Dockanzeige entfällt; die Dropbilanz zählt ihn.
-      // Ein Worker kann schon vor der IPC-Antwort Fortschritt oder Abschluss
-      // melden. Dessen neuere Anzeige darf nicht wieder „Eingereiht“ werden.
-      if (!actionIsCurrent(action) || dockRevision() !== presentation) return true;
-      const bestEffortDetail = bestEffortNotes
-        .map(note => ` · Best Effort: ${note}`)
-        .join("");
-      showDock(
-        `<span class="pill copy">Eingereiht</span>${generated ? escapeHtml(generated.label) + " · Upload fortgesetzt" : items.length + " Eintrag/Einträge"} · Queue arbeitet persistent in Reihenfolge${sourceReport.summary ? ` · ${sourceReport.summary}` : ""}${escapeHtml(bestEffortDetail)}${sourceReport.details}`,
-        { closable: true },
-      );
-      return true;
-    } catch (error) {
-      if (preparationWasCancelled(error)) return;
-      if (actionIsCurrent(action) && action.endpointOnly) return { error };
-      if (actionIsCurrent(action)) showError("Fehler", error);
-    }
-  }
-
   async function trashSelection() {
     if (directMutationBlocked("Löschen")) return;
     const side = activeSide();
     const scope = paneScope(side);
     const action = beginAction([scope]);
     const entries = safeSelectedEntries(side, "Papierkorb");
-    if (!entries.length) return;
+    if (!entries?.length) return;
     const items = entries.map((entry) => joinPath(scope.path, entry.name));
     if (scope.provider !== "local") {
-      const operation = { endpoint: paneEndpoint(scope), items };
+      const operation = /** @satisfies {import("./routine-file-wire.js").ProviderDeleteRequestWire} */ ({
+        endpoint: paneEndpoint(scope), items,
+      });
       try {
         const preview = await invoke("check_provider_delete", { request: operation });
         if (!actionIsCurrent(action)) return;
@@ -587,15 +363,14 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
           }
         }
         if (!actionIsCurrent(action)) return;
-        await invoke("enqueue_provider_delete", {
-          request: {
-            ...operation,
-            mode: preview.mode,
-            expectedPlan: preview.plan,
-            confirmation,
-            effectsConfirmed: true,
-          },
+        const request = /** @satisfies {import("./routine-file-wire.js").EnqueueProviderDeleteRequestWire} */ ({
+          ...operation,
+          mode: preview.mode,
+          expectedPlan: preview.plan,
+          confirmation,
+          effectsConfirmed: true,
         });
+        await invoke("enqueue_provider_delete", { request });
         if (!actionIsCurrent(action)) return;
         const label = preview.mode === "quarantine"
           ? "Doppeldecker-Quarantäne"
@@ -654,6 +429,7 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
       );
       return;
     }
+    /** @type {import("./routine-file-wire.js").RenameInteractionContractWire} */
     let contract = { kind: "existing" };
     if (scope.provider !== "local") {
       try {
@@ -688,14 +464,13 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
         // Ausführungsklasse. Das Frontend zeigt es nur an und erfindet keine
         // eigene Providerlogik: Eine Kollision ist keine Ausnahme, sondern ein
         // sichtbares Ergebnis ohne Mutation.
-        const report = await invoke("rename_provider_path", {
-          request: {
-            endpoint: paneEndpoint(scope),
-            path,
-            newName: name,
-            ...(contract.kind === "confirmed" ? { expectedExecutionClass: contract.execution_class } : {}),
-          },
+        const request = /** @satisfies {import("./routine-file-wire.js").RenameProviderPathRequestWire} */ ({
+          endpoint: paneEndpoint(scope),
+          path,
+          newName: name,
+          ...(contract.kind === "confirmed" ? { expectedExecutionClass: contract.execution_class } : {}),
         });
+        const report = await invoke("rename_provider_path", { request });
         if (report.outcome === "collision") {
           // Dieselbe dreiwertige Auskunft wie im CLI: Ordner, Datei oder (bei
           // einer erst serverseitig erkannten späten Kollision) unbestimmt.
@@ -779,13 +554,13 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
       // reine AddOnly-Mutation). Remote geht immer als vollständiger Endpunkt an
       // EIN Backend-Kommando; das Frontend kennt keine providerspezifischen Commands.
       if (!actionIsCurrent(action)) return;
-      const report = scope.provider === "local"
-        ? await invoke("create_folder", { parent: scope.path, name })
-        : await invoke("create_provider_folder", {
+      const report = contract?.execution_class
+        ? await invoke("create_provider_folder", {
           endpoint: paneEndpoint(scope),
           name,
           expectedExecutionClass: contract.execution_class,
-        });
+        })
+        : await invoke("create_folder", { parent: scope.path, name });
       const path = typeof report === "string" ? report : report.path;
       const notes = typeof report === "string" ? [] : report.limitations || [];
       showDock(
@@ -808,6 +583,7 @@ export function createFileActions({ panes, activeSide, running, enqueueBlocked =
 
   return {
     resumableCopy,
+    canResumeCopy,
     resumeGeneratedUpload,
     capturePasteTarget: paneScope,
     pastePaths,

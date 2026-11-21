@@ -1,0 +1,111 @@
+{
+  "listing": {
+    "breadcrumbs": [
+      {
+        "directoryId": "archive-0:d0",
+        "label": "ZIP-Inhalt"
+      },
+      {
+        "directoryId": "archive-0:d1",
+        "label": "ordner"
+      }
+    ],
+    "catalog": {
+      "complete": true,
+      "displayedEntryCount": 2,
+      "entryCount": 2,
+      "format": "zip",
+      "problemCount": 1
+    },
+    "directoryId": "archive-0:d1",
+    "page": 0,
+    "pageSize": 100,
+    "rows": [
+      {
+        "canPreview": true,
+        "displayName": "info.txt",
+        "duplicateName": false,
+        "entryId": "archive-0:e0",
+        "issues": [],
+        "kind": "file",
+        "rowId": "archive-0:e0",
+        "uncompressedBytes": 5
+      }
+    ],
+    "sessionId": "archive-0",
+    "totalRows": 1
+  },
+  "opened": {
+    "canExtract": true,
+    "canExtractFile": true,
+    "listing": {
+      "breadcrumbs": [
+        {
+          "directoryId": "archive-0:d0",
+          "label": "ZIP-Inhalt"
+        }
+      ],
+      "catalog": {
+        "complete": true,
+        "displayedEntryCount": 2,
+        "entryCount": 2,
+        "format": "zip",
+        "problemCount": 1
+      },
+      "directoryId": "archive-0:d0",
+      "page": 0,
+      "pageSize": 100,
+      "rows": [
+        {
+          "canPreview": false,
+          "directoryId": "archive-0:d1",
+          "displayName": "ordner",
+          "duplicateName": false,
+          "issues": [],
+          "kind": "directory",
+          "rowId": "archive-0:d1"
+        },
+        {
+          "canPreview": false,
+          "displayName": "[ungültiges UTF-8: FF]",
+          "duplicateName": false,
+          "entryId": "archive-0:e1",
+          "issues": [
+            {
+              "code": "invalid_utf8",
+              "message": "Name enthält ungültige UTF-8-Bytes; keine Aktion verfügbar"
+            }
+          ],
+          "kind": "problem",
+          "rowId": "archive-0:e1",
+          "uncompressedBytes": 1
+        }
+      ],
+      "sessionId": "archive-0",
+      "totalRows": 2
+    },
+    "origin": null,
+    "requestId": "open",
+    "sessionId": "archive-0"
+  },
+  "previewed": {
+    "entryId": "archive-0:e0",
+    "preview": {
+      "bytes": 5,
+      "content": {
+        "kind": "text",
+        "text": "Hallo"
+      },
+      "limitations": []
+    },
+    "requestId": "preview",
+    "sessionId": "archive-0"
+  },
+  "request": {
+    "endpoint": {
+      "provider": "local",
+      "root": "/artificial/quelle"
+    },
+    "path": "/artificial/quelle/Archiv.zip"
+  }
+}

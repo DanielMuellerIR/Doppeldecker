@@ -1,7 +1,8 @@
 //! Orchestrierung eines bestätigten Plans einschließlich aller Preflight-Prüfungen.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use crate::atomic_file::sync_parent;
@@ -594,9 +595,98 @@ fn execute_with_stats(
         ..Default::default()
     };
 
+    let ControlFlow::Continue(copy) = execute_copy_phase(
+        request,
+        quarantine_run_proof,
+        cancel,
+        &mut prog,
+        stats,
+        on_progress,
+    )?
+    else {
+        return Ok(());
+    };
+
+    // Erst sämtliche Streamkopien bestätigen; danach dürfen Stream- und
+    // Dateientfernungen beginnen. Ordnerrechte und -zeiten folgen weiterhin zuletzt.
+    for removals in [false, true] {
+        if !super::directory_streams::execute_directory_streams(
+            super::directory_streams::DirectoryStreamExecution {
+                request,
+                created: &copy.created_directory_proofs,
+                removals,
+            },
+            cancel,
+            &mut prog,
+            stats,
+            on_progress,
+        )? {
+            return finish_cancelled(stats, &mut prog, on_progress);
+        }
+    }
+
+    if execute_removal_phase(
+        request,
+        quarantine_run_proof,
+        cancel,
+        &mut prog,
+        stats,
+        on_progress,
+    )?
+    .is_break()
+    {
+        return Ok(());
+    }
+    if execute_final_metadata(request, &copy, cancel, &mut prog, stats, on_progress)?.is_break() {
+        return Ok(());
+    }
+
+    prog.phase = "done".into();
+    prog.current.clear();
+    on_progress(&prog);
+    if let Some(run_root) = quarantine_run {
+        validate_anchor_identity(src, dst, safety)?;
+        let binding = quarantine_binding.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Quarantäneabschluss besitzt keine Laufbindung",
+            )
+        })?;
+        verify_sync_quarantine_run(dst, run_root, binding)?;
+        complete_quarantine_run(dst, run_root)?;
+        verify_sync_quarantine_run(dst, run_root, binding)?;
+    }
+    Ok(())
+}
+
+struct CopyPhase<'a> {
+    pending_modes: Vec<PendingMode<'a>>,
+    early_completed_directories: HashSet<String>,
+    before_children_keys:
+        BTreeMap<String, crate::created_directory_dacl::CreatedDirectoryEffectKey>,
+    created_directory_proofs: BTreeMap<String, super::SyncTargetProof>,
+}
+
+fn execute_copy_phase<'a>(
+    request: ExecuteRequest<'a>,
+    quarantine_run_proof: Option<&super::SyncTargetProof>,
+    cancel: &Cancel,
+    prog: &mut Progress,
+    stats: &mut SyncStats,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> io::Result<ControlFlow<(), CopyPhase<'a>>> {
+    let ExecuteRequest {
+        src,
+        src_root,
+        dst,
+        dst_root,
+        plan,
+        safety,
+    } = request;
+    let dry = safety.is_dry_run();
     let mut early_completed_directories = HashSet::new();
-    let mut before_children_keys = std::collections::BTreeMap::new();
-    let mut created_directory_proofs = std::collections::BTreeMap::new();
+    let mut before_children_keys = BTreeMap::new();
+    let mut created_directory_proofs = BTreeMap::new();
     // Phase 1: erst ALLE nicht löschenden Aktionen. Dadurch kann ein später Lesefehler
     // niemals dazu führen, dass bereits Zielobjekte entfernt wurden, obwohl Kopien fehlen.
     for action in &plan.actions {
@@ -604,7 +694,7 @@ fn execute_with_stats(
             continue;
         }
         if cancel.is_cancelled() {
-            return finish_cancelled(stats, &mut prog, on_progress);
+            return finish_cancelled_phase(stats, prog, on_progress);
         }
         if !dry {
             validate_anchor_identity(src, dst, safety)?;
@@ -653,11 +743,11 @@ fn execute_with_stats(
                                     prog.created_directory_dacl_report = stats.created_directory_dacl_report.as_ref().clone();
                                     prog.current = path.clone();
                                     prog.phase = "directory_created".into();
-                                    on_progress(&prog);
+                                    on_progress(prog);
                                 }
                                 if cancel.is_cancelled() {
                                     receipt.abandon()?;
-                                    return finish_cancelled(stats, &mut prog, on_progress);
+                                    return finish_cancelled_phase(stats, prog, on_progress);
                                 }
                                 sync_parent(directory_vfs, &target)?;
                                 let mut transaction = match receipt.begin_before_children(selection) {
@@ -681,7 +771,7 @@ fn execute_with_stats(
                                 }
                                 if cancel.is_cancelled() {
                                     transaction.abandon_prepared()?;
-                                    return finish_cancelled(stats, &mut prog, on_progress);
+                                    return finish_cancelled_phase(stats, prog, on_progress);
                                 }
                                 let result = transaction.apply();
                                 stats.created_directory_dacl_report.merge(&transaction.report());
@@ -689,7 +779,7 @@ fn execute_with_stats(
                                 prog.phase = "directory_rights_before_children".into();
                                 // Der synchrone Queuefortschritt bestätigt Applied dauerhaft,
                                 // bevor finish alle Handles und den Anlageintent abschließt.
-                                on_progress(&prog);
+                                on_progress(prog);
                                 let paths = transaction.recovery_paths();
                                 if let Err(error) = result {
                                     if !transaction.report().has_rights_effects() {
@@ -704,14 +794,14 @@ fn execute_with_stats(
                                 }
                                 if cancel.is_cancelled() {
                                     stats.temp_recovery_paths.extend(paths);
-                                    return finish_cancelled(stats, &mut prog, on_progress);
+                                    return finish_cancelled_phase(stats, prog, on_progress);
                                 }
                                 match transaction.finish() {
                                     Ok(report) => stats.created_directory_dacl_report.merge(&report),
                                     Err(error) => { stats.temp_recovery_paths.extend(paths); return Err(error); }
                                 }
                                 prog.created_directory_dacl_report = stats.created_directory_dacl_report.as_ref().clone();
-                                on_progress(&prog);
+                                on_progress(prog);
                                 // Kein vorgezogener Metadatenabschluss: Kinder und normale
                                 // postorder-mtime bleiben weiterhin auszuführen.
                                 prog.phase = "copy".into();
@@ -766,13 +856,13 @@ fn execute_with_stats(
                                         stats.created_directory_dacl_report.as_ref().clone();
                                     prog.current = path.clone();
                                     prog.phase = "directory_created".into();
-                                    on_progress(&prog);
+                                    on_progress(prog);
                                 }
 
                                 if cancel.is_cancelled() {
                                     receipt.abandon()?;
                                     drop(receipt);
-                                    return finish_cancelled(stats, &mut prog, on_progress);
+                                    return finish_cancelled_phase(stats, prog, on_progress);
                                 }
                                 sync_parent(directory_vfs, &target)?;
                                 // Vor der ersten normalen Metadatenmutation darf eine
@@ -880,7 +970,7 @@ fn execute_with_stats(
                                     prog.created_directory_dacl_report =
                                         stats.created_directory_dacl_report.as_ref().clone();
                                     prog.phase = "directory_metadata_applied".into();
-                                    on_progress(&prog);
+                                    on_progress(prog);
                                 }
 
                                 // Auch eine legitim ausgelassene Zeit ist abschließend
@@ -888,7 +978,7 @@ fn execute_with_stats(
                                 early_completed_directories.insert(path.clone());
                                 if cancel.is_cancelled() {
                                     receipt.abandon()?;
-                                    return finish_cancelled(stats, &mut prog, on_progress);
+                                    return finish_cancelled_phase(stats, prog, on_progress);
                                 }
                                 if usable {
                                     if let Some(omission) = validate_created_empty_source(
@@ -903,7 +993,7 @@ fn execute_with_stats(
                                     }
                                     if cancel.is_cancelled() {
                                         receipt.abandon()?;
-                                        return finish_cancelled(stats, &mut prog, on_progress);
+                                        return finish_cancelled_phase(stats, prog, on_progress);
                                     }
                                     let mut transaction = match receipt.begin(selection) {
                                         Ok(transaction) => transaction,
@@ -945,7 +1035,7 @@ fn execute_with_stats(
                                     prog.created_directory_dacl_report =
                                         stats.created_directory_dacl_report.as_ref().clone();
                                     prog.current = path.clone();
-                                    on_progress(&prog);
+                                    on_progress(prog);
                                     let paths = transaction.recovery_paths();
                                     if let Err(error) = result {
                                         if !transaction.report().has_rights_effects() {
@@ -966,7 +1056,7 @@ fn execute_with_stats(
                                     }
                                     if cancel.is_cancelled() {
                                         stats.temp_recovery_paths.extend(paths);
-                                        return finish_cancelled(stats, &mut prog, on_progress);
+                                        return finish_cancelled_phase(stats, prog, on_progress);
                                     }
                                     match transaction.finish() {
                                         Ok(report) => {
@@ -979,7 +1069,7 @@ fn execute_with_stats(
                                     }
                                     prog.created_directory_dacl_report =
                                         stats.created_directory_dacl_report.as_ref().clone();
-                                    on_progress(&prog);
+                                    on_progress(prog);
                                 } else {
                                     let omission = receipt.omission();
                                     drop(receipt);
@@ -1035,7 +1125,7 @@ fn execute_with_stats(
                 metadata,
             } => {
                 prog.current = path.clone();
-                on_progress(&prog);
+                on_progress(prog);
                 if dry {
                     // Nur simulieren: Fortschritt vorspulen, nichts schreiben.
                     prog.bytes_done = prog
@@ -1061,7 +1151,7 @@ fn execute_with_stats(
                             safety,
                         },
                         cancel,
-                        &mut prog,
+                        prog,
                         on_progress,
                     )? {
                         CopyResult::Complete {
@@ -1099,7 +1189,7 @@ fn execute_with_stats(
                         }
                         CopyResult::Cancelled { recovery_paths } => {
                             stats.temp_recovery_paths.extend(recovery_paths);
-                            return finish_cancelled(stats, &mut prog, on_progress);
+                            return finish_cancelled_phase(stats, prog, on_progress);
                         }
                     }
                 }
@@ -1108,7 +1198,7 @@ fn execute_with_stats(
                     .bytes_copied
                     .saturating_add(size.saturating_add(planned_fork_bytes(metadata.as_ref())));
                 prog.files_done = prog.files_done.saturating_add(1);
-                on_progress(&prog);
+                on_progress(prog);
             }
             Action::UpdateFile {
                 path,
@@ -1125,7 +1215,7 @@ fn execute_with_stats(
                 metadata,
             } => {
                 prog.current = path.clone();
-                on_progress(&prog);
+                on_progress(prog);
                 if dry {
                     prog.bytes_done = prog
                         .bytes_done
@@ -1150,7 +1240,7 @@ fn execute_with_stats(
                             safety,
                         },
                         cancel,
-                        &mut prog,
+                        prog,
                         on_progress,
                     )? {
                         CopyResult::Complete {
@@ -1188,7 +1278,7 @@ fn execute_with_stats(
                         }
                         CopyResult::Cancelled { recovery_paths } => {
                             stats.temp_recovery_paths.extend(recovery_paths);
-                            return finish_cancelled(stats, &mut prog, on_progress);
+                            return finish_cancelled_phase(stats, prog, on_progress);
                         }
                     }
                 }
@@ -1204,7 +1294,7 @@ fn execute_with_stats(
                         stats.irreversible_replacements.saturating_add(1);
                 }
                 prog.files_done = prog.files_done.saturating_add(1);
-                on_progress(&prog);
+                on_progress(prog);
             }
             Action::CreateHardlink {
                 path,
@@ -1221,7 +1311,7 @@ fn execute_with_stats(
                 metadata,
             } => {
                 prog.current = path.clone();
-                on_progress(&prog);
+                on_progress(prog);
                 if !dry {
                     let expected_target =
                         target_size.map(|size| (size, *target_mtime, *target_mode));
@@ -1252,7 +1342,7 @@ fn execute_with_stats(
                         stats.irreversible_replacements.saturating_add(1);
                 }
                 prog.files_done = prog.files_done.saturating_add(1);
-                on_progress(&prog);
+                on_progress(prog);
             }
             Action::SkipSymlink { .. }
             | Action::SkipConflict { .. }
@@ -1303,11 +1393,11 @@ fn execute_with_stats(
 
     for pending in pending_modes.iter().filter(|pending| !pending.is_dir) {
         if cancel.is_cancelled() {
-            return finish_cancelled(stats, &mut prog, on_progress);
+            return finish_cancelled_phase(stats, prog, on_progress);
         }
         prog.phase = "metadata".into();
         prog.current = pending.path.to_string();
-        on_progress(&prog);
+        on_progress(prog);
         if let Some(reason) = apply_pending_mode(pending, &request)? {
             crate::content_sync::record_normal_mode_omission(
                 &mut stats.metadata_report,
@@ -1319,31 +1409,31 @@ fn execute_with_stats(
         }
     }
 
-    // Erst sämtliche Streamkopien bestätigen; danach dürfen Stream- und
-    // Dateientfernungen beginnen. Ordnerrechte und -zeiten folgen weiterhin zuletzt.
-    for removals in [false, true] {
-        if !super::directory_streams::execute_directory_streams(
-            super::directory_streams::DirectoryStreamExecution {
-                request: ExecuteRequest {
-                    src,
-                    src_root,
-                    dst,
-                    dst_root,
-                    plan,
-                    safety,
-                },
-                created: &created_directory_proofs,
-                removals,
-            },
-            cancel,
-            &mut prog,
-            stats,
-            on_progress,
-        )? {
-            return finish_cancelled(stats, &mut prog, on_progress);
-        }
-    }
+    Ok(ControlFlow::Continue(CopyPhase {
+        pending_modes,
+        early_completed_directories,
+        before_children_keys,
+        created_directory_proofs,
+    }))
+}
 
+fn execute_removal_phase(
+    request: ExecuteRequest<'_>,
+    quarantine_run_proof: Option<&super::SyncTargetProof>,
+    cancel: &Cancel,
+    prog: &mut Progress,
+    stats: &mut SyncStats,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> io::Result<ControlFlow<()>> {
+    let ExecuteRequest {
+        src,
+        src_root,
+        dst,
+        dst_root,
+        plan,
+        safety,
+    } = request;
+    let dry = safety.is_dry_run();
     // Phase 2: Überzählige Zielobjekte nach allen erfolgreichen Dateiübertragungen
     // und Datei-Metadaten entfernen. Ordner-Metadaten folgen nach dieser Phase.
     // In der App bedeutet „entfernen" ein Verschieben in die laufbezogene Quarantäne.
@@ -1365,7 +1455,7 @@ fn execute_with_stats(
                 },
             )?;
             if cancelled {
-                return finish_cancelled(stats, &mut prog, on_progress);
+                return finish_cancelled_phase(stats, prog, on_progress);
             }
         }
     }
@@ -1381,7 +1471,7 @@ fn execute_with_stats(
             continue;
         }
         if cancel.is_cancelled() {
-            return finish_cancelled(stats, &mut prog, on_progress);
+            return finish_cancelled_phase(stats, prog, on_progress);
         }
         match action {
             Action::DeleteFile {
@@ -1488,16 +1578,42 @@ fn execute_with_stats(
         }
     }
 
+    Ok(ControlFlow::Continue(()))
+}
+
+fn execute_final_metadata(
+    request: ExecuteRequest<'_>,
+    copy: &CopyPhase<'_>,
+    cancel: &Cancel,
+    prog: &mut Progress,
+    stats: &mut SyncStats,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> io::Result<ControlFlow<()>> {
+    let ExecuteRequest {
+        src,
+        src_root,
+        dst,
+        dst_root,
+        plan,
+        safety,
+    } = request;
+    let CopyPhase {
+        pending_modes,
+        early_completed_directories,
+        before_children_keys,
+        ..
+    } = copy;
+    let dry = safety.is_dry_run();
     // Erst nach den letzten Kind-Renames die endgültigen Ordnerrechte, ACLs und
     // Zeitstempel setzen. Sonst sperrt etwa 0555 die eigene Mirror-Entfernung, und
     // ein späteres Quarantäne-Rename würde die bestätigte Ordner-mtime wieder ändern.
     for pending in pending_modes.iter().filter(|pending| pending.is_dir) {
         if cancel.is_cancelled() {
-            return finish_cancelled(stats, &mut prog, on_progress);
+            return finish_cancelled_phase(stats, prog, on_progress);
         }
         prog.phase = "metadata".into();
         prog.current = pending.path.to_string();
-        on_progress(&prog);
+        on_progress(prog);
         if let Some(reason) = apply_pending_mode(pending, &request)? {
             crate::content_sync::record_normal_mode_omission(
                 &mut stats.metadata_report,
@@ -1523,11 +1639,11 @@ fn execute_with_stats(
                 continue;
             };
             if cancel.is_cancelled() {
-                return finish_cancelled(stats, &mut prog, on_progress);
+                return finish_cancelled_phase(stats, prog, on_progress);
             }
             prog.phase = "metadata".into();
             prog.current = path.clone();
-            on_progress(&prog);
+            on_progress(prog);
             if let Some(reason) = apply_directory_time(path, *expected, &request)? {
                 crate::content_sync::record_mtime_omission(
                     &mut stats.metadata_report,
@@ -1577,11 +1693,11 @@ fn execute_with_stats(
     let mut updated_directories = HashSet::new();
     for pending in pending_directories {
         if cancel.is_cancelled() {
-            return finish_cancelled(stats, &mut prog, on_progress);
+            return finish_cancelled_phase(stats, prog, on_progress);
         }
         prog.phase = "metadata".into();
         prog.current = pending.path.to_string();
-        on_progress(&prog);
+        on_progress(prog);
         if !dry {
             validate_anchor_identity(src, dst, safety)?;
             let source_path = checked_join(src_root, pending.path)?;
@@ -1654,7 +1770,7 @@ fn execute_with_stats(
                     );
                     prog.created_directory_dacl_report =
                         stats.created_directory_dacl_report.as_ref().clone();
-                    on_progress(&prog);
+                    on_progress(prog);
                 }
             }
             if let Some(reason) = omitted_mtime {
@@ -1692,7 +1808,7 @@ fn execute_with_stats(
             continue;
         };
         if cancel.is_cancelled() {
-            return finish_cancelled(stats, &mut prog, on_progress);
+            return finish_cancelled_phase(stats, prog, on_progress);
         }
         if dry {
             continue;
@@ -1724,7 +1840,7 @@ fn execute_with_stats(
                         path,
                         issue,
                     );
-                    on_progress(&prog);
+                    on_progress(prog);
                     continue;
                 }
                 return Err(error);
@@ -1744,7 +1860,7 @@ fn execute_with_stats(
             stats.metadata_updated = stats.metadata_updated.saturating_add(1);
         }
         prog.file_dacl_report = stats.file_dacl_report.clone();
-        on_progress(&prog);
+        on_progress(prog);
         let paths = transaction.recovery_paths();
         if let Err(error) = applied {
             if transaction.report().is_empty() {
@@ -1762,7 +1878,7 @@ fn execute_with_stats(
         }
         if cancel.is_cancelled() {
             stats.temp_recovery_paths.extend(paths);
-            return finish_cancelled(stats, &mut prog, on_progress);
+            return finish_cancelled_phase(stats, prog, on_progress);
         }
         match transaction.finish() {
             Ok(report) => stats.file_dacl_report.merge(&report),
@@ -1772,7 +1888,7 @@ fn execute_with_stats(
             }
         }
         prog.file_dacl_report = stats.file_dacl_report.clone();
-        on_progress(&prog);
+        on_progress(prog);
     }
 
     // Die dauerhaft gebundene DACL ist die letzte Wirkung: auch alle mtime- und
@@ -1793,7 +1909,7 @@ fn execute_with_stats(
             continue;
         };
         if cancel.is_cancelled() {
-            return finish_cancelled(stats, &mut prog, on_progress);
+            return finish_cancelled_phase(stats, prog, on_progress);
         }
         if dry {
             continue;
@@ -1813,7 +1929,7 @@ fn execute_with_stats(
                         path,
                         issue,
                     );
-                    on_progress(&prog);
+                    on_progress(prog);
                     continue;
                 }
                 return Err(error);
@@ -1841,7 +1957,7 @@ fn execute_with_stats(
         }
         prog.directory_dacl_report = stats.directory_dacl_report.clone();
         // Der synchrone Queuecallback sichert den Wirkungsbeleg vor dem Intentabbau.
-        on_progress(&prog);
+        on_progress(prog);
         let recovery_paths = transaction.recovery_paths();
         if let Err(error) = applied {
             stats.temp_recovery_paths.extend(recovery_paths);
@@ -1859,7 +1975,7 @@ fn execute_with_stats(
         }
         if cancel.is_cancelled() {
             stats.temp_recovery_paths.extend(recovery_paths);
-            return finish_cancelled(stats, &mut prog, on_progress);
+            return finish_cancelled_phase(stats, prog, on_progress);
         }
         match transaction.finish() {
             Ok(report) => {
@@ -1873,25 +1989,10 @@ fn execute_with_stats(
             }
         }
         prog.directory_dacl_report = stats.directory_dacl_report.clone();
-        on_progress(&prog);
+        on_progress(prog);
     }
 
-    prog.phase = "done".into();
-    prog.current.clear();
-    on_progress(&prog);
-    if let Some(run_root) = quarantine_run {
-        validate_anchor_identity(src, dst, safety)?;
-        let binding = quarantine_binding.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Quarantäneabschluss besitzt keine Laufbindung",
-            )
-        })?;
-        verify_sync_quarantine_run(dst, run_root, binding)?;
-        complete_quarantine_run(dst, run_root)?;
-        verify_sync_quarantine_run(dst, run_root, binding)?;
-    }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
 fn apply_pending_mode(
@@ -2459,6 +2560,16 @@ fn finish_cancelled(
     prog.phase = "cancelled".into();
     on_progress(prog);
     Ok(())
+}
+
+// Fortschritt noch in der Phase melden, solange ihre Transaktionsbelege gehalten sind.
+fn finish_cancelled_phase<T>(
+    stats: &mut SyncStats,
+    prog: &mut Progress,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> io::Result<ControlFlow<(), T>> {
+    finish_cancelled(stats, prog, on_progress)?;
+    Ok(ControlFlow::Break(()))
 }
 
 fn preflight_file_dacl(

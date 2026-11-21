@@ -25,11 +25,13 @@ use doppeldecker_core::{
 };
 use tauri::{Manager, State, WebviewWindow};
 
-use crate::queue_runtime::{PendingBidirectionalQueueRun, QueueTerminalEvent};
+use crate::queue_runtime::{
+    PendingBidirectionalQueueRun, QueueExtension, QueueTerminalEvent, WindowState,
+};
 use crate::{
     app_config_dir, emit_queue_snapshot, finish_operation, operation_queue, reserve_operation,
-    start_queue_worker, take_pending_for_operation, with_queue_extension, AppError, AppState,
-    MutexExt,
+    start_queue_worker, take_pending_for_operation, with_queue_extension,
+    with_queue_extension_access, AppError, AppState, MutexExt,
 };
 
 pub(crate) struct PendingBidirectionalRun {
@@ -1047,7 +1049,9 @@ mod endpoint_request_tests {
         std::fs::write(area.path().join("marker"), b"pair-fifo-v1").unwrap();
         let fifo =
             std::ffi::CString::new(area.path().join("pairs.json").as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // SAFETY: fifo hält den nullterminierten Pfad bis mkfifo zurückkehrt.
+        let created = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+        assert_eq!(created, 0);
         let name = "bidirectional_commands::endpoint_request_tests::registry_fifo_child";
         let binary = std::env::current_exe().unwrap();
         let list = Command::new(&binary)
@@ -1361,25 +1365,6 @@ mod endpoint_request_tests {
         .unwrap();
 
         assert!(error.to_string().contains("profileId"));
-    }
-
-    #[test]
-    fn queue_freigabe_verlangt_nur_die_zugehoerige_queue_vorbereitung() {
-        let source = include_str!("bidirectional_commands.rs");
-        // Der bestehende Strukturtest in `queue_runtime.rs` sucht den echten
-        // Command über diesen Namen. Die Fragmente bleiben hier absichtlich
-        // getrennt, damit unser Test nicht selbst als vermeintlicher Command gilt.
-        let command_start = ["pub(crate) fn approve_bidirectional_", "queue_entry("].concat();
-        let command = source
-            .rsplit(&command_start)
-            .next()
-            .unwrap()
-            .split("#[tauri::command]")
-            .next()
-            .unwrap();
-
-        assert!(command.contains("pending_bidirectional_queue"));
-        assert!(!command.contains("pending_bidirectional_rollback"));
     }
 
     #[test]
@@ -2181,9 +2166,349 @@ pub(crate) async fn prepare_bidirectional_sync(
     .map_err(|_| AppError::new("app", "Bidirektionaler Vorbereitungsworker wurde unterbrochen"))?
 }
 
+fn enqueue_pending_bidirectional(
+    state: &AppState,
+    window_state: &WindowState,
+    validate_profiles: impl FnOnce(&[doppeldecker_core::RemoteProfileBinding]) -> Result<(), AppError>,
+    open_queue: impl FnOnce() -> Result<std::sync::Arc<OperationQueue>, AppError>,
+    enqueue: impl FnOnce(
+        &QueueExtension<'_>,
+        &QueueOperation,
+        &[doppeldecker_core::RemoteProfileBinding],
+    ) -> Result<(std::sync::Arc<OperationQueue>, QueueEntry), AppError>,
+    finish_transition: impl FnOnce(&PreparedLocalBidirectionalRun) -> Result<(), AppError>,
+) -> Result<std::sync::Arc<OperationQueue>, AppError> {
+    with_queue_extension_access(state, window_state, |extension| {
+        let mut pending = window_state.pending_bidirectional.lock_recover();
+        let prepared = pending
+            .as_mut()
+            .ok_or_else(|| AppError::new("app", "Keine bidirektionale Vorbereitung vorhanden"))?;
+        let operation = prepared.operation.clone().ok_or_else(|| {
+            AppError::new(
+                "app",
+                "Eine Resume-Vorbereitung kann nicht als neuer Queue-Lauf eingereiht werden",
+            )
+        })?;
+        validate_profiles(&prepared.profile_bindings)?;
+        let queue = if let Some(operation_id) = &prepared.enqueued_operation_id {
+            let queue = open_queue()?;
+            let exact_pending = queue.snapshot().entries.iter().any(|entry| {
+                entry.operation_id == *operation_id
+                    && entry.operation == operation
+                    && entry.profile_bindings == prepared.profile_bindings
+                    && entry.state == QueueState::Pending
+            });
+            if !exact_pending {
+                return Err(AppError::new(
+                    "outcome_unclear",
+                    "Der bereits bewiesene bidirektionale Queueeintrag besitzt nicht mehr den erwarteten Zustand",
+                ));
+            }
+            queue
+        } else {
+            reserve_operation(window_state)?;
+            match enqueue(extension, &operation, &prepared.profile_bindings) {
+                Ok((queue, entry)) => {
+                    prepared.enqueued_operation_id = Some(entry.operation_id);
+                    queue
+                }
+                Err(error) => {
+                    window_state.active_cancel.lock_recover().take();
+                    return Err(error);
+                }
+            }
+        };
+        // Erst der bewiesene Queuecommit erlaubt, das mutationslose Laufjournal zu
+        // entfernen. Scheitert die Entfernung vor ihrer Wirkung, halten Pending-Slot
+        // und Reservierung den Eintrag bis zum duplikatfreien Retry fest.
+        finish_transition(&prepared.prepared)?;
+        pending.take();
+        window_state.active_cancel.lock_recover().take();
+        Ok(queue)
+    })
+}
+
+#[cfg(test)]
+fn prepare_bidirectional_for_queue_test(
+    root: &Path,
+    queue: &OperationQueue,
+) -> (PendingBidirectionalRun, PathBuf) {
+    let left = root.join("links");
+    let right = root.join("rechts");
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
+    let baseline_path = root.join("state/pair.json");
+    let journal_path = baseline_path.with_extension("run.json");
+    let pair_id = PairId([42; 16]);
+    let pair_name = "Queue-Übergang";
+    let prepared =
+        doppeldecker_core::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+            queue, pair_id, pair_name, &left, &right, &baseline_path, &[], None,
+        )
+        .unwrap();
+    let operation = QueueOperation::Bidirectional {
+        pair_id,
+        pair_name: pair_name.to_owned(),
+        left: Box::new(BidirectionalQueueEndpoint::Local {
+            root: left.to_string_lossy().into_owned(),
+        }),
+        right: Box::new(BidirectionalQueueEndpoint::Local {
+            root: right.to_string_lossy().into_owned(),
+        }),
+        baseline_path: baseline_path.to_string_lossy().into_owned(),
+        resolutions: Vec::new(),
+        expected_baseline_digest: prepared.preview().plan.baseline_digest,
+        expected_plan_digest: prepared.preview().plan.plan_digest,
+    };
+    (
+        PendingBidirectionalRun {
+            prepared,
+            operation: Some(operation),
+            profile_bindings: Vec::new(),
+            recovery_operation_id: None,
+            recovery_preparation_id: None,
+            enqueued_operation_id: None,
+        },
+        journal_path,
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn bidirektionaler_queueuebergang_erhaelt_vorbereitung_bis_zum_duplikatfreien_retry() {
+    use std::sync::Arc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let queue =
+        Arc::new(OperationQueue::open(temp.path().join("config/operations-queue.json")).unwrap());
+    let (prepared, journal_path) = prepare_bidirectional_for_queue_test(temp.path(), &queue);
+    let operation = prepared.operation.clone().unwrap();
+    let journal = std::fs::read(&journal_path).unwrap();
+    let state = AppState::default();
+    let window = state.window("main");
+    *window.pending_bidirectional.lock_recover() = Some(prepared);
+
+    let error = enqueue_pending_bidirectional(
+        &state,
+        &window,
+        |_| Ok(()),
+        || panic!("Für den Erstversuch gibt es keinen früheren Queuebeweis"),
+        |_, _, _| Err(AppError::new("io", "Queue konnte nicht geschrieben werden")),
+        |_| panic!("Ohne Queuebeweis darf die Journalentfernung nicht beginnen"),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.code, "io");
+    assert!(queue.snapshot().entries.is_empty());
+    assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+    assert!(window.active_cancel.lock_recover().is_none());
+    assert!(!window
+        .pending_bidirectional
+        .lock_recover()
+        .as_ref()
+        .unwrap()
+        .queue_transition_active());
+
+    let error = enqueue_pending_bidirectional(
+        &state,
+        &window,
+        |_| Ok(()),
+        || panic!("Nach fehlgeschlagenem Queuecommit muss neu eingereiht werden"),
+        |_, operation, bindings| {
+            let entry = queue
+                .enqueue_reconciled_with_profile_bindings(operation.clone(), bindings.to_vec())
+                .map_err(AppError::from)?;
+            Ok((queue.clone(), entry))
+        },
+        |_| {
+            assert_eq!(queue.snapshot().entries.len(), 1);
+            assert!(window.active_cancel.lock_recover().is_some());
+            Err(AppError::new(
+                "io",
+                "Laufjournal konnte nicht entfernt werden",
+            ))
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.code, "io");
+    assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+    assert!(window.active_cancel.lock_recover().is_some());
+    let before_retry = queue.snapshot();
+    let [entry] = before_retry.entries.as_slice() else {
+        panic!("Es muss genau einen bewiesenen Queueeintrag geben");
+    };
+    assert_eq!(entry.operation, operation);
+    assert_eq!(entry.state, QueueState::Pending);
+    assert_eq!(
+        window
+            .pending_bidirectional
+            .lock_recover()
+            .as_ref()
+            .unwrap()
+            .enqueued_operation_id
+            .as_deref(),
+        Some(entry.operation_id.as_str()),
+    );
+
+    window
+        .closing
+        .store(true, std::sync::atomic::Ordering::Release);
+    let error = enqueue_pending_bidirectional(
+        &state,
+        &window,
+        |_| panic!("Schließendes Fenster darf keinen Übergang beginnen"),
+        || panic!("Schließendes Fenster darf den Queuebeweis nicht laden"),
+        |_, _, _| panic!("Schließendes Fenster darf nicht einreihen"),
+        |_| panic!("Schließendes Fenster darf das Laufjournal nicht entfernen"),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.code, "busy");
+    assert_eq!(queue.snapshot(), before_retry);
+    assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
+    assert!(window.active_cancel.lock_recover().is_some());
+    window
+        .closing
+        .store(false, std::sync::atomic::Ordering::Release);
+
+    enqueue_pending_bidirectional(
+        &state,
+        &window,
+        |_| Ok(()),
+        || Ok(queue.clone()),
+        |_, _, _| panic!("Der Retry darf keinen zweiten Queueeintrag erzeugen"),
+        |prepared| prepared.finish_enqueue_transition().map_err(AppError::from),
+    )
+    .unwrap();
+    let after_retry = queue.snapshot();
+    assert_eq!(after_retry.entries.len(), 1);
+    assert_eq!(after_retry.entries[0].operation_id, entry.operation_id);
+    assert_eq!(after_retry.entries[0].state, QueueState::Pending);
+    assert!(!journal_path.exists());
+    assert!(window.pending_bidirectional.lock_recover().is_none());
+    assert!(window.active_cancel.lock_recover().is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn bidirectional_wire_uses_byte_paths_and_flattened_recovery_previews() {
+    use crate::browser_commands::assert_wire_object;
+    use doppeldecker_core::bidirectional::{
+        BidirectionalConflictChoice, BidirectionalConflictView,
+    };
+    use doppeldecker_core::conflict_view::ConflictEntryView;
+
+    let wire: serde_json::Value =
+        serde_json::from_str(include_str!("../../tools/tests/bidirectional-wire.json")).unwrap();
+    let resolutions: Vec<ConflictResolution> =
+        serde_json::from_value(wire["resolutions"].clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&resolutions).unwrap(),
+        wire["resolutions"]
+    );
+    let conflict = BidirectionalConflictView {
+        path: resolutions[1].path.clone(),
+        relative_name: "b/ö".into(),
+        left: ConflictEntryView::absent("Links".into()),
+        right: ConflictEntryView::absent("Rechts".into()),
+        choices: vec![BidirectionalConflictChoice {
+            decision: resolutions[1].decision.clone(),
+            explanation: "Beide Fassungen erhalten.".into(),
+            generated_name: Some("c".into()),
+            blocker: None,
+        }],
+        skip_blocker: None,
+    };
+    let encoded = serde_json::to_value(conflict).unwrap();
+    assert_wire_object(&encoded, &wire["conflict"]);
+    assert_wire_object(&encoded["choices"][0], &wire["choice"]);
+    assert_eq!(encoded["path"], wire["resolutions"][1]["path"]);
+    assert_eq!(
+        encoded["choices"][0]["decision"],
+        wire["resolutions"][1]["decision"]
+    );
+
+    let pair_wire = &wire["registeredPair"];
+    let pair_id: PairId = serde_json::from_value(pair_wire["pairId"].clone()).unwrap();
+    let pair = RegisteredBidirectionalPair {
+        pair_id,
+        pair_name: "Quelle ↔ Ziel".into(),
+        left: BidirectionalEndpointRequest::Local {
+            root: "/mock/quelle".into(),
+        },
+        right: BidirectionalEndpointRequest::Sftp {
+            profile_id: "mock_sftp".into(),
+            profile_revision: Some(7),
+            root: "/revisionsgebunden".into(),
+        },
+        visible_left_role: EndpointSide::Right,
+    };
+    let pair_response = serde_json::to_value(pair).unwrap();
+    assert_eq!(pair_response, *pair_wire);
+    let mut request = pair_response;
+    let fields = request.as_object_mut().unwrap();
+    fields.remove("visibleLeftRole");
+    fields.insert("resolutions".into(), wire["resolutions"].clone());
+    fields.insert(
+        "expectedUnresolvedDigest".into(),
+        serde_json::to_value([9_u8; 32]).unwrap(),
+    );
+    let prepared_request: PrepareBidirectionalRequest = serde_json::from_value(request).unwrap();
+    assert_eq!(prepared_request.pair_id, pair_id);
+    assert_eq!(prepared_request.resolutions, resolutions);
+    assert_eq!(prepared_request.expected_unresolved_digest, Some([9; 32]));
+
+    let temp = tempfile::tempdir().unwrap();
+    let queue = OperationQueue::open(temp.path().join("config/operations-queue.json")).unwrap();
+    let (pending, _) = prepare_bidirectional_for_queue_test(temp.path(), &queue);
+    let status = serde_json::to_value(
+        doppeldecker_core::bidirectional::forward::ForwardBidirectionalJournalStatus {
+            execution_class: "best_effort_forward".into(),
+            run_id: [12; 16],
+            plan: pending.prepared.preview().plan.clone(),
+            projections: Vec::new(),
+            baseline_matches_previous: false,
+            baseline_completion_available: true,
+            previous_runs: 0,
+        },
+    )
+    .unwrap();
+    assert_wire_object(&status, &wire["forwardPairStatus"]);
+    assert_eq!(status["run_id"].as_array().unwrap().len(), 16);
+    assert_eq!(status["baseline_completion_available"], true);
+    let resume = serde_json::to_value(BidirectionalRecoveryPreview {
+        preview: pending.prepared.preview(),
+        recovery_preparation_id: "resume-beleg".into(),
+        recovery_kind: BidirectionalRecoveryKind::Resume,
+    })
+    .unwrap();
+    assert_wire_object(&resume, &wire["resume"]);
+    assert_eq!(resume["recovery_kind"], "resume");
+    assert_eq!(resume["plan"]["plan_digest"].as_array().unwrap().len(), 32);
+
+    let rollback = serde_json::to_value(BidirectionalRecoveryPreview {
+        preview: LocalBidirectionalRollbackPreview {
+            pair_id: PairId([42; 16]),
+            committed_projections: 2,
+            confirmation_phrase: "ROLLBACK".into(),
+            expires_at_unix_ms: 123,
+        },
+        recovery_preparation_id: "rollback-beleg".into(),
+        recovery_kind: BidirectionalRecoveryKind::Rollback,
+    })
+    .unwrap();
+    assert_wire_object(&rollback, &wire["rollback"]);
+    assert_eq!(rollback["recovery_kind"], "rollback");
+    let discard =
+        serde_json::to_value(BidirectionalRecoveryDiscardStatus { absent: true }).unwrap();
+    assert_wire_object(&discard, &wire["discard"]);
+    assert_eq!(discard["absent"], true);
+}
+
 #[tauri::command]
-pub(crate) fn discard_bidirectional_sync(
-    window: WebviewWindow,
+pub(crate) fn discard_bidirectional_sync<R: tauri::Runtime>(
+    window: WebviewWindow<R>,
     state: State<AppState>,
 ) -> Result<(), AppError> {
     let window_state = state.window(window.label());
@@ -2208,6 +2533,62 @@ pub(crate) fn discard_bidirectional_sync(
     Ok(())
 }
 
+#[cfg(test)]
+#[test]
+fn bidirektionales_discard_erhaelt_vorbereitung_bis_zur_journalentfernung() {
+    use serde_json::{json, Value};
+    use std::fs;
+    use tauri::ipc::{CallbackFn, InvokeBody};
+    use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets};
+
+    let temp = tempfile::tempdir().unwrap();
+    let queue = OperationQueue::open(temp.path().join("config/operations-queue.json")).unwrap();
+    let (prepared, journal_path) = prepare_bidirectional_for_queue_test(temp.path(), &queue);
+    let journal = fs::read(&journal_path).unwrap();
+    let state = AppState::default();
+    let window = state.window("main");
+    *window.pending_bidirectional.lock_recover() = Some(prepared);
+    let app = mock_builder()
+        .manage(state)
+        .invoke_handler(tauri::generate_handler![discard_bidirectional_sync])
+        .build(mock_context(noop_assets()))
+        .unwrap();
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let discard = || {
+        get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "discard_bidirectional_sync".into(),
+                callback: CallbackFn(0),
+                error: CallbackFn(1),
+                url: "tauri://localhost".parse().unwrap(),
+                body: InvokeBody::Json(json!({})),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.into(),
+            },
+        )
+    };
+
+    let saved_journal = journal_path.with_extension("gesichert");
+    fs::rename(&journal_path, &saved_journal).unwrap();
+    fs::create_dir(&journal_path).unwrap();
+    let error: Value = discard().expect_err("Ein Verzeichnis ist kein Laufjournal");
+    assert!(matches!(
+        error["code"].as_str(),
+        Some("io" | "permission_denied")
+    ));
+    assert_eq!(fs::read(&saved_journal).unwrap(), journal);
+    assert!(window.pending_bidirectional.lock_recover().is_some());
+
+    fs::remove_dir(&journal_path).unwrap();
+    fs::rename(&saved_journal, &journal_path).unwrap();
+    assert!(discard().is_ok());
+    assert!(!journal_path.exists());
+    assert!(window.pending_bidirectional.lock_recover().is_none());
+}
+
 #[tauri::command]
 pub(crate) fn enqueue_bidirectional_sync(
     app: tauri::AppHandle,
@@ -2216,63 +2597,16 @@ pub(crate) fn enqueue_bidirectional_sync(
 ) -> Result<FrontendQueueSnapshot, AppError> {
     let label = window.label();
     let window_state = state.window(label);
-    let queue = with_queue_extension(&state, &window_state, || {
-        let mut pending = window_state.pending_bidirectional.lock_recover();
-        let prepared = pending
-            .as_mut()
-            .ok_or_else(|| AppError::new("app", "Keine bidirektionale Vorbereitung vorhanden"))?;
-        let operation = prepared.operation.clone().ok_or_else(|| {
-            AppError::new(
-                "app",
-                "Eine Resume-Vorbereitung kann nicht als neuer Queue-Lauf eingereiht werden",
-            )
-        })?;
-        crate::queue_runtime::ensure_profile_bindings_current(&app, &prepared.profile_bindings)?;
-        let queue = if let Some(operation_id) = &prepared.enqueued_operation_id {
-            let queue = operation_queue(&app, &window_state, label)?;
-            let exact_pending = queue.snapshot().entries.iter().any(|entry| {
-                entry.operation_id == *operation_id
-                    && entry.operation == operation
-                    && entry.profile_bindings == prepared.profile_bindings
-                    && entry.state == QueueState::Pending
-            });
-            if !exact_pending {
-                return Err(AppError::new(
-                    "outcome_unclear",
-                    "Der bereits bewiesene bidirektionale Queueeintrag besitzt nicht mehr den erwarteten Zustand",
-                ));
-            }
-            queue
-        } else {
-            reserve_operation(&window_state)?;
-            match crate::queue_runtime::enqueue_operation_with_profile_bindings(
-                &app,
-                &window_state,
-                label,
-                &operation,
-                &prepared.profile_bindings,
-            ) {
-                Ok((queue, entry)) => {
-                    prepared.enqueued_operation_id = Some(entry.operation_id);
-                    queue
-                }
-                Err(error) => {
-                    window_state.active_cancel.lock_recover().take();
-                    return Err(error);
-                }
-            }
-        };
-        // Erst der bewiesene Queuecommit erlaubt, das mutationslose Laufjournal zu
-        // entfernen. Scheitert die Entfernung vor ihrer Wirkung, halten Pending-Slot
-        // und Reservierung den Eintrag bis zum duplikatfreien Retry fest.
-        prepared
-            .prepared
-            .finish_enqueue_transition()
-            .map_err(AppError::from)?;
-        pending.take();
-        window_state.active_cancel.lock_recover().take();
-        Ok(queue)
-    })?;
+    let queue = enqueue_pending_bidirectional(
+        &state,
+        &window_state,
+        |bindings| crate::queue_runtime::ensure_profile_bindings_current(&app, bindings),
+        || operation_queue(&app, &window_state, label),
+        |extension, operation, bindings| {
+            extension.enqueue_with_profile_bindings(&app, label, operation, bindings)
+        },
+        |prepared| prepared.finish_enqueue_transition().map_err(AppError::from),
+    )?;
     emit_queue_snapshot(&app, label, &queue);
     start_queue_worker(app, label.to_owned());
     Ok(queue.snapshot().into())
@@ -2688,34 +3022,21 @@ pub(crate) fn approve_bidirectional_queue_entry(
     let label = window.label().to_owned();
     let window_state = state.window(&label);
     let queue = operation_queue(&app, &window_state, &label)?;
-    crate::queue_runtime::ensure_queue_pending_current_or_reset(
-        &app,
-        &label,
-        &queue,
-        &window_state.pending_bidirectional_queue,
-        &operation_id,
-        |pending| &pending.profile_bindings,
-        |pending| pending.prepared.operation_id(),
-    )?;
-    let (cancel, prepared, ()) = take_pending_for_operation(
+    let (cancel, prepared) = reserve_bidirectional_queue_approval(
         &state,
         &window_state,
-        &window_state.pending_bidirectional_queue,
-        "Bidirektionale Queue-Vorbereitung fehlt im RAM",
-        |prepared| {
-            if prepared.prepared.operation_id() != operation_id {
-                return Err(AppError::new(
-                    "app",
-                    "Bidirektionale Queue-Vorbereitung gehört zu einem anderen Eintrag",
-                ));
-            }
-            if !effects_confirmed {
-                return Err(AppError::new(
-                    "confirmation_mismatch",
-                    "Die angezeigte bidirektionale Wirkung wurde nicht bestätigt",
-                ));
-            }
-            Ok(())
+        &operation_id,
+        effects_confirmed,
+        |slot| {
+            crate::queue_runtime::ensure_queue_pending_current_or_reset(
+                &app,
+                &label,
+                &queue,
+                slot,
+                &operation_id,
+                |pending| &pending.profile_bindings,
+                |pending| pending.prepared.operation_id(),
+            )
         },
     )?;
     let profile_bindings = prepared.profile_bindings;
@@ -2786,6 +3107,209 @@ pub(crate) fn approve_bidirectional_queue_entry(
         });
     });
     Ok(queue.snapshot().into())
+}
+
+fn reserve_bidirectional_queue_approval(
+    state: &AppState,
+    window: &WindowState,
+    operation_id: &str,
+    effects_confirmed: bool,
+    ensure_current: impl FnOnce(
+        &std::sync::Mutex<Option<PendingBidirectionalQueueRun>>,
+    ) -> Result<(), AppError>,
+) -> Result<(doppeldecker_core::Cancel, PendingBidirectionalQueueRun), AppError> {
+    let slot = &window.pending_bidirectional_queue;
+    ensure_current(slot)?;
+    let (cancel, prepared, ()) = take_pending_for_operation(
+        state,
+        window,
+        slot,
+        "Bidirektionale Queue-Vorbereitung fehlt im RAM",
+        |prepared| {
+            if prepared.prepared.operation_id() != operation_id {
+                return Err(AppError::new(
+                    "app",
+                    "Bidirektionale Queue-Vorbereitung gehört zu einem anderen Eintrag",
+                ));
+            }
+            if !effects_confirmed {
+                return Err(AppError::new(
+                    "confirmation_mismatch",
+                    "Die angezeigte bidirektionale Wirkung wurde nicht bestätigt",
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    Ok((cancel, prepared))
+}
+
+#[cfg(test)]
+#[test]
+fn bidirektionale_queue_freigabe_verbraucht_nur_passende_queue_vorbereitung() {
+    use doppeldecker_core::{
+        BinaryRelativePath, Cancel, ConflictDecision, KeychainSecretReference,
+        OperationQueueProcessLock, SecretResolver, SecretString,
+    };
+    use std::{fs, io, sync::Arc};
+
+    struct NoSecrets;
+    impl SecretResolver for NoSecrets {
+        fn resolve(&self, _: &KeychainSecretReference) -> io::Result<SecretString> {
+            panic!("Der lokale Queue-Test darf keine Zugangsdaten auflösen");
+        }
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let queue_path = root.join("config/operations-queue.json");
+    let process_lock = Arc::new(OperationQueueProcessLock::acquire(&queue_path).unwrap());
+    let queue = OperationQueue::open_with_process_lock(queue_path, process_lock.clone()).unwrap();
+    let baseline = root.join("rollback/pair.json");
+    let left = root.join("left");
+    let right = root.join("right");
+    fs::create_dir(&left).unwrap();
+    fs::create_dir(&right).unwrap();
+    fs::write(left.join("bericht.txt"), b"links").unwrap();
+    fs::write(right.join("bericht.txt"), b"rechts").unwrap();
+    let conflict_name = "bericht-rechts-rollback.txt";
+    let resolutions = vec![ConflictResolution {
+        path: BinaryRelativePath(vec![b"bericht.txt".to_vec()]),
+        decision: ConflictDecision::KeepBoth {
+            primary: EndpointSide::Left,
+            conflict_path: BinaryRelativePath(vec![conflict_name.as_bytes().to_vec()]),
+        },
+    }];
+    let pair_id = PairId([45; 16]);
+    let pair_name = "Rollbackpaar";
+    let prepared =
+        doppeldecker_core::bidirectional::prepare_local_bidirectional_with_decisions_bound_for_queue(
+            &queue, pair_id, pair_name, &left, &right, &baseline, &resolutions, None,
+        ).unwrap();
+    let preview = prepared.preview();
+    let rollback_entry = queue
+        .enqueue_claimed(QueueOperation::Bidirectional {
+            pair_id,
+            pair_name: pair_name.into(),
+            left: Box::new(BidirectionalQueueEndpoint::Local {
+                root: left.to_str().unwrap().into(),
+            }),
+            right: Box::new(BidirectionalQueueEndpoint::Local {
+                root: right.to_str().unwrap().into(),
+            }),
+            baseline_path: baseline.to_str().unwrap().into(),
+            resolutions,
+            expected_baseline_digest: preview.plan.baseline_digest,
+            expected_plan_digest: preview.plan.plan_digest,
+        })
+        .unwrap();
+    let phrase = preview.confirmation_phrase.clone();
+    let run = prepared.confirm(&phrase, true).unwrap();
+    queue.mark_running(&rollback_entry.operation_id).unwrap();
+
+    // Die erste Projektion sichert die rechte Variante lokal. Der erst danach
+    // entdeckte Konfliktname auf der Gegenseite unterbricht den Gesamtlauf.
+    let blocked_name = right.join(conflict_name);
+    fs::write(&blocked_name, b"kuenstliche Kollision").unwrap();
+    assert!(run.execute(&Cancel::new(), &mut |_| {}).is_err());
+    fs::remove_file(blocked_name).unwrap();
+    queue
+        .interrupt_bidirectional(
+            &rollback_entry.operation_id,
+            Progress::default(),
+            "Kollision nach einer Teilprojektion",
+        )
+        .unwrap();
+    let rollback = prepare_local_bidirectional_rollback_for_queue_operation(
+        &queue,
+        &rollback_entry.operation_id,
+        pair_name,
+        &left,
+        &right,
+        &baseline,
+    )
+    .unwrap();
+    assert_eq!(rollback.preview().committed_projections, 1);
+
+    let state = AppState::default();
+    let rollback_window = state.window("main");
+    *rollback_window
+        .pending_bidirectional_rollback
+        .lock_recover() = Some(PendingBidirectionalRollback {
+        prepared: rollback,
+        recovery_operation_id: rollback_entry.operation_id.clone(),
+        recovery_preparation_id: "rollback-beleg".into(),
+        profile_bindings: Vec::new(),
+    });
+    let approve = |window: &WindowState, id, confirmed| {
+        reserve_bidirectional_queue_approval(&state, window, id, confirmed, |_| Ok(()))
+    };
+    let before = queue.snapshot();
+    let error = approve(&rollback_window, &rollback_entry.operation_id, true)
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "app");
+    assert!(error.message.contains("Queue-Vorbereitung fehlt"));
+    assert_eq!(queue.snapshot(), before);
+    assert!(rollback_window.active_cancel.lock_recover().is_none());
+
+    let matching_root = root.join("matching");
+    fs::create_dir(&matching_root).unwrap();
+    let matching_window = state.window("window-matching");
+    let matching_queue = OperationQueue::open_with_process_lock(
+        root.join("config/operations-queue-window-matching.json"),
+        process_lock,
+    )
+    .unwrap();
+    let (mut direct, _) = prepare_bidirectional_for_queue_test(&matching_root, &matching_queue);
+    let operation = direct.operation.take().unwrap();
+    direct.prepared.discard().unwrap();
+    drop(direct);
+    let matching = matching_queue.enqueue_claimed(operation).unwrap();
+    let BidirectionalQueuePreparation::Ready(prepared) =
+        prepare_bidirectional_queue_entry(&matching_queue, matching.clone(), Arc::new(NoSecrets))
+            .unwrap()
+    else {
+        panic!("Die nach Plan gebundene Queue-Vorbereitung fehlt");
+    };
+    *matching_window.pending_bidirectional_queue.lock_recover() =
+        Some(PendingBidirectionalQueueRun {
+            prepared: *prepared,
+            profile_bindings: Vec::new(),
+        });
+    assert_eq!(
+        approve(&matching_window, "anderer-eintrag", true)
+            .err()
+            .unwrap()
+            .code,
+        "app"
+    );
+    assert_eq!(
+        approve(&matching_window, &matching.operation_id, false)
+            .err()
+            .unwrap()
+            .code,
+        "confirmation_mismatch"
+    );
+    assert!(matching_window.active_cancel.lock_recover().is_none());
+    let matching_before = matching_queue.snapshot();
+
+    let (_, prepared) = approve(&matching_window, &matching.operation_id, true).unwrap();
+    assert_eq!(prepared.prepared.operation_id(), matching.operation_id);
+    assert!(matching_window
+        .pending_bidirectional_queue
+        .lock_recover()
+        .is_none());
+    assert!(matching_window.active_cancel.lock_recover().is_some());
+    assert!(rollback_window.active_cancel.lock_recover().is_none());
+    let rollback = rollback_window
+        .pending_bidirectional_rollback
+        .lock_recover();
+    let rollback = rollback.as_ref().unwrap();
+    assert_eq!(rollback.recovery_operation_id, rollback_entry.operation_id);
+    assert_eq!(rollback.recovery_preparation_id, "rollback-beleg");
+    assert_eq!(queue.snapshot(), before);
+    assert_eq!(matching_queue.snapshot(), matching_before);
 }
 
 #[tauri::command]

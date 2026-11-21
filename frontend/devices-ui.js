@@ -1,6 +1,8 @@
 import { invoke } from "./tauri-api.js";
 import { $, escapeHtml, fmtEntrySize } from "./ui-utils.js";
 
+/** @typedef {import("./system-mount-wire.js").SystemMountWire} SystemMountWire */
+
 const KIND_LABELS = {
   internal: "Intern",
   external: "Extern",
@@ -19,9 +21,11 @@ function pathWithin(path, root) {
  * einzige Auswurf-Eingabe; Pfad und Anzeigename dienen ausschließlich Navigation
  * beziehungsweise Erklärung und können keinen Systembefehl frei zusammensetzen. */
 export function createDevicesUi({ activeSide, disablePane, panes, setPaneLocation, showDock, showError }) {
+  /** @type {SystemMountWire[]} */
   let mounts = [];
   let loadGeneration = 0;
 
+  /** @param {string} selector @param {SystemMountWire[]} visibleMounts @param {string} emptyText */
   function renderMountList(selector, visibleMounts, emptyText) {
     const list = $(selector);
     if (!list) return;
@@ -79,6 +83,7 @@ export function createDevicesUi({ activeSide, disablePane, panes, setPaneLocatio
     }
   }
 
+  /** @param {SystemMountWire} mount */
   async function eject(mount) {
     try {
       mounts = await invoke("eject_system_mount", { id: mount.id });

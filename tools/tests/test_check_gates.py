@@ -92,13 +92,13 @@ class GateSelectionTests(unittest.TestCase):
         selected = [
             name
             for name, _command in CHECK_GATES.select_gates(
-                [], ["test-tools", "test-ui", "pnpm-install"]
+                [], ["check-ipc", "test-tools", "test-ui", "pnpm-install"]
             )
         ]
 
         self.assertEqual(
             selected,
-            ["fmt", "test-core", "test-cli", "test-tauri", "clippy", "fuzz-check"],
+            ["fmt", "test-core", "test-cli", "test-tauri", "clippy", "fuzz-check", "test-fuzz-seeds"],
         )
 
 
@@ -113,14 +113,15 @@ class GateCoverageTests(unittest.TestCase):
 
     def test_fuzz_gate_uebersetzt_auch_die_tests_der_fuzz_kiste(self) -> None:
         # Ohne `--all-targets` waehlt `cargo check` nur Lib und Bins. `fuzz/` liegt
-        # ausserhalb des Workspace, also faellt `fuzz/tests/seed_corpus.rs` sonst
-        # durch jedes Gate und die versionierten Seeds veralten unbemerkt.
+        # ausserhalb des Workspace und seine Targets werden dort nicht geprüft.
         self.assertIn("--all-targets", self.gate("fuzz-check"))
         self.assertIn("--locked", self.gate("fuzz-check"))
 
-    def test_seed_regressionstest_existiert_ueberhaupt(self) -> None:
-        seeds = ROOT / "fuzz" / "tests" / "seed_corpus.rs"
-        self.assertTrue(seeds.is_file(), "Der Seed-Regressionstest der Fuzz-Kiste fehlt")
+    def test_fuzz_seed_gate_runs_the_assertions(self) -> None:
+        command = self.gate("test-fuzz-seeds")
+        self.assertEqual(command[:2], ["cargo", "test"])
+        self.assertIn("--locked", command)
+        self.assertEqual(command[command.index("--test") + 1], "seed_corpus")
 
 
 class SelfCollectionTests(unittest.TestCase):

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { chromium } from "playwright";
 import { createBrowserCleanup } from "../browser-cleanup.mjs";
 
@@ -19,8 +19,10 @@ const server = spawn("python3", ["tools/mock-ui-server.py", "--port", String(por
 });
 const cleanup = createBrowserCleanup(server);
 const url = `http://127.0.0.1:${port}`;
+const duplicateWire = JSON.parse(await readFile(new URL("./duplicate-wire.json", import.meta.url)));
 const mock = `
 (() => {
+  const wire = ${JSON.stringify(duplicateWire)};
   const original = window.__TAURI__.core.invoke;
   window.__DUP_CALLS__ = [];
   window.__DUP_CONFIG__ = {};
@@ -29,11 +31,12 @@ const mock = `
     window.__DUP_CALLS__.push({command, args});
     if (command === "prepare_duplicate") {
       if (window.__DUP_CONFIG__.hold) await new Promise(resolve => { window.__DUP_RELEASE__ = resolve; });
-      if (args.request.provider !== "local") return {supported:false, blockers:["Remote-Duplikate sind noch nicht verfügbar; normale Kopieraktionen bleiben erreichbar."], mappings:[]};
-      return { supported:true, preparationId:"bound-duplicate-1", parent:args.request.root,
+      if (args.request.provider !== "local") return wire.remote.response;
+      if (window.__DUP_CONFIG__.useWireFixture) return wire.local.response;
+      return { ...wire.local.response, parent:args.request.root,
         mappings:args.request.items.map(path => ({sourceName:path.split("/").pop(), targetName:(window.__DUP_CONFIG__.long ? "SehrLangerName".repeat(18) : path.split("/").pop()) + " (Kopie exakt).txt"})) };
     }
-    if (args.preparationId !== "bound-duplicate-1") throw new Error("Ungebundene Namen");
+    if (args.preparationId !== wire.local.response.preparationId) throw new Error("Ungebundene Namen");
     if (command === "discard_duplicate") return null;
     if (window.__DUP_CONFIG__.drift) throw {code:"plan_drift", message:"Quelle oder Duplikatname hat sich geändert; bitte neu vorbereiten"};
     return "duplicate-operation-1";
@@ -62,6 +65,34 @@ try {
     await page.evaluate(async theme => { const {setTheme} = await import("/theme.js"); setTheme(theme); }, theme);
     return {page, errors};
   }
+  {
+    const {page, errors} = await pageFor();
+    await page.getByRole("listbox", {name:/Linke Dateiliste/}).getByRole("option", {name:/Alpha.txt/}).click();
+    await page.evaluate(() => {
+      window.__DUP_CONFIG__.useWireFixture = true;
+      window.__MOCK_EMIT__("menu", "duplicate");
+    });
+    const dialog = page.getByRole("dialog");
+    const {request, response} = duplicateWire.local;
+    await dialog.getByText(response.parent, {exact:true}).waitFor();
+    for (const mapping of response.mappings) {
+      await dialog.getByRole("cell", {name:mapping.sourceName, exact:true}).waitFor();
+      await dialog.getByRole("cell", {name:mapping.targetName, exact:true}).waitFor();
+    }
+    assert.deepEqual(await page.evaluate(() => window.__DUP_CALLS__), [
+      {command:"prepare_duplicate", args:{request}},
+    ]);
+    await dialog.getByRole("button", {name:"Duplizieren", exact:true}).click();
+    await page.getByText("Duplizieren eingereiht", {exact:true}).waitFor();
+    const binding = {preparationId:response.preparationId};
+    assert.deepEqual(await page.evaluate(() => window.__DUP_CALLS__), [
+      {command:"prepare_duplicate", args:{request}},
+      {command:"confirm_duplicate", args:binding},
+      {command:"discard_duplicate", args:binding},
+    ]);
+    assert.deepEqual(errors, []);
+    await page.close();
+  }
   for (const theme of ["light", "dark"]) {
     const {page, errors} = await pageFor(theme);
     const list = page.getByRole("listbox", {name:/Linke Dateiliste/});
@@ -86,7 +117,7 @@ try {
     await page.getByText("Duplizieren eingereiht", {exact:true}).waitFor();
     const calls = await page.evaluate(() => window.__DUP_CALLS__);
     assert.equal(calls[0].args.request.items.length, 2);
-    assert.deepEqual(calls[1], {command:"confirm_duplicate", args:{preparationId:"bound-duplicate-1"}});
+    assert.deepEqual(calls[1], {command:"confirm_duplicate", args:{preparationId:duplicateWire.local.response.preparationId}});
     assert.deepEqual(errors, []);
     assert.deepEqual(await page.evaluate(() => window.__DOPPELDECKER_MOCK_ERRORS__), []);
     await page.close();
@@ -100,7 +131,7 @@ try {
     await page.keyboard.press("Escape");
     await page.waitForFunction(() => window.__DUP_CALLS__.length === 2);
     assert.deepEqual(await page.evaluate(() => window.__DUP_CALLS__[1]),
-      {command:"discard_duplicate", args:{preparationId:"bound-duplicate-1"}});
+      {command:"discard_duplicate", args:{preparationId:duplicateWire.local.response.preparationId}});
     await row.click();
     await page.keyboard.press("ControlOrMeta+d");
     await page.getByRole("dialog").getByRole("button", {name:"Duplizieren", exact:true}).waitFor();
@@ -140,11 +171,11 @@ try {
     await page.evaluate(() => window.__MOCK_EMIT__("menu", "duplicate"));
     await page.getByText("Duplizieren nicht verfügbar", {exact:true}).waitFor();
     const calls = await page.evaluate(() => window.__DUP_CALLS__);
-    assert.equal(calls[0].args.request.provider, "sftp");
-    assert.equal(calls.length, 1);
+    assert.ok((await page.locator("#dock-summary").innerText()).includes(duplicateWire.remote.response.blockers[0]));
+    assert.deepEqual(calls, [{command:"prepare_duplicate", args:{request:duplicateWire.remote.request}}]);
     await page.close();
   }
-  console.log("ok  Duplizieren: beide Themes, konkrete Mehrfachzuordnung, Fokusfalle, Menü/Kürzel, Abbruch, Drift, Navigation und Remote-Backendvertrag");
+  console.log("ok  Duplizieren: Rust-Wire-Fixture, beide Themes, konkrete Mehrfachzuordnung, Fokusfalle, Menü/Kürzel, Abbruch, Drift, Navigation und Remote-Backendvertrag");
 } finally {
   await cleanup.close();
 }

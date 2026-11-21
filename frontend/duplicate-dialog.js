@@ -1,6 +1,7 @@
 import { hideModal, showOwnedModal } from "./modal.js";
 import { $, escapeHtml } from "./ui-utils.js";
 
+/** @param {import("./duplicate-wire.js").DuplicatePreviewWire} preview */
 export function duplicateDialog(preview) {
   return new Promise(resolve => {
     showOwnedModal("duplicate", token => {

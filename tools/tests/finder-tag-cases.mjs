@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { assertFilePropertyWire } from "./file-property-wire.mjs";
 
 async function setup(page, theme = "light") {
   await page.evaluate(async theme => {
@@ -9,7 +10,9 @@ async function setup(page, theme = "light") {
     window.__TAURI__.core.invoke = async (command, args) => {
       if (command === "get_file_finder_tags") {
         window.__TAG_CALLS__.push({ command, ...args });
-        return args.request.names.map(name => ({ name, state: structuredClone(window.__TAG_STATE__), code: null, message: "" }));
+        const rows = args.request.names.map(name => ({ name, state: structuredClone(window.__TAG_STATE__), code: null, message: "" }));
+        window.__TAG_WIRE_READ__ ??= { request: structuredClone(args.request), rows };
+        return rows;
       }
       if (command !== "change_file_finder_tags") return original(command, args);
       window.__TAG_CALLS__.push({ command, ...args });
@@ -22,9 +25,11 @@ async function setup(page, theme = "light") {
         if (edit.type === "clear_legacy" || edit.type === "clear") state.legacyColor = 0;
         if (edit.type === "clear") state.tags = [];
       }
-      return args.request.names.map(name => ({ name, changed: false,
+      const rows = args.request.names.map(name => ({ name, changed: false,
         code: window.__TAG_UNCLEAR__ ? "outcome_unclear" : null,
         message: window.__TAG_UNCLEAR__ ? "Tagänderung <img src=x> unklar; prüfen" : "Tags bestätigt" }));
+      window.__TAG_WIRE_EDIT__ ??= { request: structuredClone(args.request), rows };
+      return rows;
     };
   }, theme);
   const pane = page.getByRole("listbox", { name: /Linke Dateiliste/ });
@@ -55,6 +60,7 @@ export async function runFinderTagCases(runCase) {
       await dialog.getByRole("button", { name: "Tag speichern", exact: true }).click();
       await dialog.getByText("Fertig ü · Grün", { exact: true }).waitFor();
       await dialog.getByRole("region", { name: "Ergebnis der Finder-Tagänderung" }).getByText("1 von 1 bestätigt · Seite 1 von 1", { exact: true }).waitFor();
+      assertFilePropertyWire("tags", ...await page.evaluate(() => [window.__TAG_WIRE_READ__, window.__TAG_WIRE_EDIT__]));
       const edits = await page.evaluate(() => window.__TAG_CALLS__.filter(call => call.command === "change_file_finder_tags"));
       assert.deepEqual(edits[0].request.edit, { type: "upsert", tag: { name: "Fertig ü", color: 2 }, previousName: "Projekt <b>" });
       assert.deepEqual(edits[0].request.names, ["Alpha.txt"]);

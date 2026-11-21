@@ -98,4 +98,45 @@ mod tests {
             .visibility
         );
     }
+
+    #[test]
+    fn file_property_wire_visibility() {
+        use doppeldecker_core::file_properties::VisibilityState;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/file-property-wire.json"))
+                .unwrap();
+        let fixture = &fixture["visibility"];
+        let read: VisibilityReadRequest =
+            serde_json::from_value(fixture["read"]["request"].clone()).unwrap();
+        let edit: VisibilityEditRequest =
+            serde_json::from_value(fixture["edit"]["request"].clone()).unwrap();
+        assert_eq!(read.names, edit.names);
+        let read = VisibilityReadRow {
+            name: read.names[0].clone(),
+            state: Some(VisibilityState {
+                marked: false,
+                by_name: true,
+            }),
+            code: None,
+            message: String::new(),
+        };
+        let edit = VisibilityEditRow {
+            name: edit.names[0].clone(),
+            state: Some(VisibilityState {
+                marked: edit.hidden,
+                by_name: true,
+            }),
+            changed: true,
+            code: None,
+            message: "Markierung bestätigt".into(),
+        };
+        assert_eq!(
+            serde_json::to_value([read]).unwrap(),
+            fixture["read"]["rows"]
+        );
+        assert_eq!(
+            serde_json::to_value([edit]).unwrap(),
+            fixture["edit"]["rows"]
+        );
+    }
 }

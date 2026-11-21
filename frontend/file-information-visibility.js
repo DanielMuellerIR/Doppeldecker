@@ -1,15 +1,28 @@
-import { invoke } from "./tauri-api.js";
-import { $, escapeHtml, isEntryNameSafe } from "./ui-utils.js";
+// @ts-check
+
+import { editVisibility, readVisibility } from "./file-property-api.js";
+import { $, errText, escapeHtml, isEntryNameSafe } from "./ui-utils.js";
+
+/** @typedef {import("./file-information.js").FilePropertySnapshot} FilePropertySnapshot */
+/** @typedef {FilePropertySnapshot & {
+ * visibilityRows?: import("./file-property-wire.js").VisibilityReadRowWire[],
+ * visibilityReadPage?: number, visibilityReadStatus?: string, visibilityReading?: boolean, visibilityStatus?: string
+ * }} EditorSnapshot */
+/** @typedef {import("./file-information.js").FilePropertyEditorCallbacks<
+ * EditorSnapshot, {hidden: boolean},
+ * import("./file-property-wire.js").VisibilityEditRowWire>} EditorOptions */
 
 const PAGE_SIZE = 40;
 
+/** @param {EditorOptions} options */
 export function createVisibilityEditor({ getCurrent, scopeMatches, isBusy, refresh, applyEdit }) {
   let generation = 0;
+  /** @param {EditorSnapshot} snapshot */
   const names = snapshot => snapshot.entries.filter(isEntryNameSafe).map(entry => entry.name);
 
   function html() {
     const snapshot = getCurrent();
-    if (!snapshot.propertyCapabilities?.visibility) return "";
+    if (!snapshot?.propertyCapabilities?.visibility) return "";
     const selected = names(snapshot);
     if (!selected.length) return "";
     const rows = snapshot.visibilityRows || [];
@@ -43,33 +56,44 @@ export function createVisibilityEditor({ getCurrent, scopeMatches, isBusy, refre
     snapshot.visibilityReadStatus = "Sichtbarkeit wird gelesen …";
     refresh();
     try {
-      const rows = await invoke("get_file_visibility", { request: { provider: snapshot.provider,
-        root: snapshot.parent, names: selected.slice(snapshot.visibilityReadPage * PAGE_SIZE, (snapshot.visibilityReadPage + 1) * PAGE_SIZE) } });
+      const rows = await readVisibility({ provider: snapshot.provider,
+        root: snapshot.parent, names: selected.slice(snapshot.visibilityReadPage * PAGE_SIZE, (snapshot.visibilityReadPage + 1) * PAGE_SIZE) });
       if (getCurrent() !== snapshot || generation !== requestGeneration || !scopeMatches()) return;
       snapshot.visibilityRows = rows;
       snapshot.visibilityReadStatus = "";
     } catch (error) {
       if (getCurrent() !== snapshot || generation !== requestGeneration || !scopeMatches()) return;
-      snapshot.visibilityReadStatus = error.message || String(error);
+      snapshot.visibilityReadStatus = errText(error) || String(error);
     } finally {
       if (getCurrent() === snapshot && generation === requestGeneration) { snapshot.visibilityReading = false; refresh(); }
     }
   }
 
+  /** @param {boolean} hidden */
   async function change(hidden) {
     const snapshot = getCurrent();
-    const report = await applyEdit("visibility", "change_file_visibility", { hidden },
-      "Sichtbarkeit wird geändert … Abbruch bleibt möglich.");
+    if (!snapshot) return;
+    const report = await applyEdit(
+      "visibility",
+      editVisibility,
+      { hidden },
+      "Sichtbarkeit wird geändert … Abbruch bleibt möglich.",
+    );
     if (report && getCurrent() === snapshot && scopeMatches()) await load(snapshot.visibilityReadPage || 0);
   }
 
+  /** @param {Event} event */
   function click(event) {
+    if (!(event.target instanceof Element)) return false;
     const button = event.target.closest("button");
-    if (!button || !Object.keys(button.dataset).some(key => key.startsWith("visibility"))) return false;
-    if (isBusy() || !scopeMatches()) return true;
-    if (button.hasAttribute("data-visibility-page")) void load((getCurrent().visibilityReadPage || 0) + Number(button.dataset.visibilityPage));
-    else if (button.hasAttribute("data-visibility-apply")) void change($("#file-info-hidden").checked);
-    else if (button.hasAttribute("data-visibility-set")) void change(button.dataset.visibilitySet === "true");
+    if (!(button instanceof HTMLButtonElement) || !Object.keys(button.dataset).some(key => key.startsWith("visibility"))) return false;
+    const snapshot = getCurrent();
+    if (!snapshot || isBusy() || !scopeMatches()) return true;
+    if (button.hasAttribute("data-visibility-page")) void load((snapshot.visibilityReadPage || 0) + Number(button.dataset.visibilityPage));
+    else if (button.hasAttribute("data-visibility-apply")) {
+      const input = $("#file-info-hidden");
+      if (input instanceof HTMLInputElement) void change(input.checked);
+    } else if (button.hasAttribute("data-visibility-set")) void change(button.dataset.visibilitySet === "true");
     return true;
   }
   return { html, load, click };

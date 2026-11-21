@@ -115,6 +115,10 @@ fn drift(message: &str) -> io::Error {
     crate::real_mode::plan_drift(message)
 }
 
+fn pause_requested(cancel: &Cancel, error: &io::Error) -> bool {
+    cancel.is_cancelled() && crate::error_code(error) == ErrorCode::Interrupted
+}
+
 fn unclear(message: &str, stage: &Path, target: &Path) -> io::Error {
     crate::error::with_recovery_paths(
         coded_error(io::ErrorKind::Other, ErrorCode::OutcomeUnclear, message),
@@ -264,14 +268,7 @@ pub(crate) fn prepare_ftps_resume_copies(
     }
     let identity = vfs.identity();
     prepare_copies(sources, Path::new(root), target_root, sandbox, |source| {
-        if cancel.is_cancelled() {
-            return Err(coded_error(
-                io::ErrorKind::Interrupted,
-                ErrorCode::Interrupted,
-                "FTPS-Vorbereitung unterbrochen",
-            ));
-        }
-        let (version, _) = vfs.bind_resume_file(source)?;
+        let (version, _) = vfs.bind_resume_file(source, cancel)?;
         Ok(PreparedSource::Ftps(Box::new(FtpsResumeSource {
             version,
             endpoint: endpoint.clone(),
@@ -323,7 +320,7 @@ fn prepare_copies<'a>(
     check_target_root(&dst)?;
     let target_identity = root_identity_beneath(&dst, dst.path())?;
     let mut names = std::collections::HashSet::<PathBuf>::new();
-    let mut plans = Vec::with_capacity(sources.len());
+    let mut paths = Vec::with_capacity(sources.len());
     for path in sources {
         if crate::validate_file_operation_root(parent(path)?)? != source_root {
             return Err(input(
@@ -356,6 +353,13 @@ fn prepare_copies<'a>(
                 ),
             ));
         }
+        paths.push((source, target));
+    }
+    if paths.len() > 1 {
+        check_target_name_collisions(&dst, &paths)?;
+    }
+    let mut plans = Vec::with_capacity(paths.len());
+    for (source, target) in paths {
         let prepared = bind_source(&source)?;
         let mut plan = ResumeCopyPlan {
             source,
@@ -403,6 +407,55 @@ fn prepare_copies<'a>(
         plans.push(plan);
     }
     Ok(plans)
+}
+
+fn check_target_name_collisions(root: &RootHandle, paths: &[(PathBuf, PathBuf)]) -> io::Result<()> {
+    let path = root.path().join(format!(
+        "{STAGE_PREFIX}{}",
+        crate::queue::new_operation_id()?
+    ));
+    let stage = root.create_private_stage(&path)?;
+    let stage_id = root_identity_beneath(&stage, &path)?;
+    let mut created = Vec::with_capacity(paths.len());
+    // Das Zielvolume entscheidet über die Gleichheit, etwa für Unicode und APFS.
+    // Die Probe verwendet ausschließlich leere Dateien unter einem privaten FD.
+    let result = paths.iter().try_for_each(|(_, target)| {
+        let name = target.file_name().ok_or_else(|| input("Zielname fehlt"))?;
+        match openat(
+            stage.fd(),
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(_) => {
+                created.push(name);
+                Ok(())
+            }
+            Err(rustix::io::Errno::EXIST) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Mehrere ausgewählte Quellen ergeben am Ziel denselben Namen: {}",
+                    name.to_string_lossy()
+                ),
+            )),
+            Err(error) => Err(error.into()),
+        }
+    });
+    let mut cleaned = true;
+    for name in created {
+        cleaned &= unlinkat(stage.fd(), name, AtFlags::empty()).is_ok();
+    }
+    if !cleaned || remove_empty_stage(root, path.clone(), &stage_id).is_err() {
+        return Err(crate::error::with_recovery_paths(
+            coded_error(
+                io::ErrorKind::Other,
+                ErrorCode::OutcomeUnclear,
+                "Zielnamenprobe konnte nicht vollständig entfernt werden.",
+            ),
+            &[path.to_string_lossy().into_owned()],
+        ));
+    }
+    result
 }
 
 impl ResumeCopyPlan {
@@ -569,14 +622,13 @@ fn open_payload(stage: &RootHandle, create: bool, sealed: bool) -> io::Result<Fi
 pub(crate) struct RunContext<'a> {
     pub(crate) sandbox: Option<&'a Path>,
     pub(crate) cancel: &'a Cancel,
-    pub(crate) provider: Option<ResumeProvider<'a>>,
+    pub(crate) connect: Option<Box<dyn FnOnce() -> io::Result<ResumeProvider> + 'a>>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ResumeProvider<'a> {
-    WebDav(&'a WebDavVfs),
-    Ftps(&'a FtpsVfs),
-    Sftp(&'a Arc<SftpVfs>),
+pub(crate) enum ResumeProvider {
+    WebDav(Box<WebDavVfs>),
+    Ftps(Box<FtpsVfs>),
+    Sftp(Arc<SftpVfs>),
 }
 
 enum ActiveSource<'a> {
@@ -603,14 +655,19 @@ enum ActiveSource<'a> {
 }
 
 impl<'a> ActiveSource<'a> {
-    fn bind(plan: &'a ResumeCopyPlan, context: &RunContext<'a>) -> io::Result<Self> {
+    fn bind(
+        plan: &'a ResumeCopyPlan,
+        provider: Option<&'a ResumeProvider>,
+        sandbox: &Option<PathBuf>,
+        cancel: &Cancel,
+    ) -> io::Result<Self> {
         let source = if let Some(binding) = plan.webdav.as_deref() {
-            let Some(ResumeProvider::WebDav(vfs)) = context.provider else {
+            let Some(ResumeProvider::WebDav(vfs)) = provider else {
                 return Err(input("Auftrag benötigt seine WebDAV-Verbindung"));
             };
             Self::WebDav { binding, vfs }
         } else if let Some(binding) = plan.ftps.as_deref() {
-            let Some(ResumeProvider::Ftps(vfs)) = context.provider else {
+            let Some(ResumeProvider::Ftps(vfs)) = provider else {
                 return Err(input("Auftrag benötigt seine FTPS-Verbindung"));
             };
             if vfs.identity() != binding.identity {
@@ -618,7 +675,7 @@ impl<'a> ActiveSource<'a> {
                     "FTPS-Serveridentität hat sich geändert. Teilkopie bleibt erhalten.",
                 ));
             }
-            let (version, bound) = vfs.bind_resume_file(&plan.source)?;
+            let (version, bound) = vfs.bind_resume_file(&plan.source, cancel)?;
             if version != binding.version {
                 return Err(drift("FTPS-Dateiinhalt oder Quellversion hat sich geändert. Teilkopie bleibt erhalten."));
             }
@@ -629,7 +686,7 @@ impl<'a> ActiveSource<'a> {
                 reader: None,
             }
         } else if let Some(binding) = plan.sftp.as_deref() {
-            let Some(ResumeProvider::Sftp(vfs)) = context.provider else {
+            let Some(ResumeProvider::Sftp(vfs)) = provider else {
                 return Err(input("Auftrag benötigt seine SFTP-Verbindung"));
             };
             if vfs.identity() != binding.identity {
@@ -637,7 +694,7 @@ impl<'a> ActiveSource<'a> {
                     "SFTP-Serveridentität hat sich geändert. Teilkopie bleibt erhalten.",
                 ));
             }
-            let (version, bound) = vfs.bind_resume_file(&plan.source, context.cancel)?;
+            let (version, bound) = vfs.bind_resume_file(&plan.source, cancel)?;
             if version != binding.version {
                 return Err(drift("SFTP-Dateiinhalt oder Quellversion hat sich geändert. Teilkopie bleibt erhalten."));
             }
@@ -648,7 +705,7 @@ impl<'a> ActiveSource<'a> {
                 reader: None,
             }
         } else {
-            crate::fileops::guard(&context.sandbox.map(Path::to_path_buf), &plan.source)?;
+            crate::fileops::guard(sandbox, &plan.source)?;
             let root = RootHandle::open_nofollow(parent(&plan.source)?)?;
             if plan.source_root.as_ref() != Some(&root_identity_beneath(&root, root.path())?) {
                 return Err(drift("Quellordner hat sich geändert. Teilkopie prüfen."));
@@ -725,6 +782,33 @@ impl<'a> ActiveSource<'a> {
     }
 
     fn verify_complete(&mut self, file: &mut File, cancel: &Cancel) -> io::Result<()> {
+        if let Self::Ftps {
+            binding,
+            bound,
+            reader,
+            ..
+        } = self
+        {
+            if let Some(source) = bound.take() {
+                // Leere Dateien brauchen ebenfalls RETR. Bei älteren Vollbelegen
+                // den letzten Bytebereich lesen, da REST am EOF nicht überall geht.
+                let size = binding.version.size;
+                let offset = size.saturating_sub(1);
+                *reader = Some(source.open_at(offset)?);
+                if size > 0 {
+                    let mut actual = [0; 1];
+                    let mut expected = [0; 1];
+                    read_bound_suffix(reader, &mut actual, cancel)?;
+                    file.seek(SeekFrom::Start(offset))?;
+                    file.read_exact(&mut expected)?;
+                    if actual != expected {
+                        return Err(drift(
+                            "Der letzte FTPS-Dateiabschnitt weicht von der Teilkopie ab.",
+                        ));
+                    }
+                }
+            }
+        }
         let (protocol, size, expected, reader) = match self {
             Self::Ftps {
                 binding, reader, ..
@@ -773,14 +857,25 @@ fn read_bound_suffix(
     let reader = reader
         .as_mut()
         .ok_or_else(|| input("Gebundener Datenkanal fehlt"))?;
-    for bytes in buffer.chunks_mut(64 * 1024) {
+    let mut remaining = buffer;
+    while !remaining.is_empty() {
         if cancel.is_cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "Download pausiert",
             ));
         }
-        reader.read_exact(bytes)?;
+        let limit = remaining.len().min(64 * 1024);
+        match reader.read(&mut remaining[..limit]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Download endete vor der bestätigten Größe",
+                ))
+            }
+            Ok(read) => remaining = &mut remaining[read..],
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
@@ -985,7 +1080,22 @@ pub(crate) fn execute_with_source(
             "Am Ziel ist dieser Name bereits belegt.",
         ));
     }
-    let mut source = ActiveSource::bind(plan, &context)?;
+    let paused = |bytes| CopyOutcome {
+        paused: true,
+        bytes,
+        recovery: checkpoint.map(|_| stage_path.to_string_lossy().into_owned()),
+    };
+    let saved = checkpoint.map_or(0, CopyCheckpoint::bytes);
+    if cancel.is_cancelled() {
+        return Ok(paused(saved));
+    }
+    let provider = context.connect.map(|connect| connect()).transpose()?;
+    let mut source = match ActiveSource::bind(plan, provider.as_ref(), &sandbox, cancel) {
+        Err(error) if pause_requested(cancel, &error) => {
+            return Ok(paused(saved));
+        }
+        result => result?,
+    };
 
     let (stage, stage_id, mut file, file_id, mut written, digest, sealed) = match checkpoint {
         Some(CopyCheckpoint::Bytes {
@@ -1067,7 +1177,7 @@ pub(crate) fn execute_with_source(
         recovery: Some(stage_path.to_string_lossy().into_owned()),
     };
     let mut hash = match verify_prefix(source.local_file(), &mut file, written, digest, cancel) {
-        Err(error) if error.kind() == io::ErrorKind::Interrupted && cancel.is_cancelled() => {
+        Err(error) if pause_requested(cancel, &error) => {
             return Ok(paused(written));
         }
         result => result?,
@@ -1087,29 +1197,28 @@ pub(crate) fn execute_with_source(
         };
         let mut buffer = vec![0; chunk];
         let mut confirmed = written;
+        let mut confirmed_digest = digest;
+        let ftps = plan.ftps.is_some();
         while written < plan.bytes && !cancel.is_cancelled() {
             let len = (plan.bytes - written).min(chunk as u64) as usize;
             match source.read_chunk(plan, written, &mut buffer[..len], cancel) {
-                Err(error)
-                    if error.kind() == io::ErrorKind::Interrupted && cancel.is_cancelled() =>
-                {
-                    break
-                }
+                Err(error) if pause_requested(cancel, &error) => break,
                 result => result?,
             };
             file.write_all(&buffer[..len])?;
             hash.update(&buffer[..len]);
             written += len as u64;
-            if written - confirmed >= CHECKPOINT_BYTES {
+            if written - confirmed >= CHECKPOINT_BYTES && (!ftps || written < plan.bytes) {
                 if plan.remote_endpoint().is_none() {
                     source.verify(plan)?;
                 }
                 file.sync_all()?;
+                confirmed_digest = *hash.finalize().as_bytes();
                 persist(CopyCheckpoint::Bytes {
                     stage: stage_id.clone(),
                     file_id,
                     written,
-                    digest: *hash.finalize().as_bytes(),
+                    digest: confirmed_digest,
                     sealed: false,
                 })?;
                 confirmed = written;
@@ -1122,18 +1231,23 @@ pub(crate) fn execute_with_source(
         }
         if !cancel.is_cancelled() {
             match source.verify_complete(&mut file, cancel) {
-                Err(error)
-                    if error.kind() == io::ErrorKind::Interrupted && cancel.is_cancelled() => {}
+                Err(error) if pause_requested(cancel, &error) => {}
                 result => result?,
             }
+        }
+        let sealed = !cancel.is_cancelled();
+        let mut checkpoint_digest = *hash.finalize().as_bytes();
+        if ftps && !sealed && written == plan.bytes {
+            written = confirmed;
+            checkpoint_digest = confirmed_digest;
         }
         file.sync_all()?;
         persist(CopyCheckpoint::Bytes {
             stage: stage_id.clone(),
             file_id,
             written,
-            digest: *hash.finalize().as_bytes(),
-            sealed: !cancel.is_cancelled(),
+            digest: checkpoint_digest,
+            sealed,
         })?;
     }
     if cancel.is_cancelled() {
@@ -1269,7 +1383,7 @@ mod tests {
             RunContext {
                 sandbox,
                 cancel,
-                provider: None,
+                connect: None,
             },
             persist,
             progress,
@@ -1297,6 +1411,52 @@ mod tests {
             .collect();
         std::fs::write(&src, &data).unwrap();
         (temp, src, dst, data)
+    }
+
+    #[test]
+    fn resumable_copy_batch_uses_target_name_equality() {
+        let (_temp, source, target, _) = fixture();
+        let paths = [
+            (source.clone(), target.join("probe.txt")),
+            (source, target.join("PROBE.txt")),
+        ];
+        std::fs::write(&paths[0].1, b"canary").unwrap();
+        let folds_case = paths[1].1.exists();
+        std::fs::remove_file(&paths[0].1).unwrap();
+        let target = RootHandle::open_nofollow(&target).unwrap();
+        let result = check_target_name_collisions(&target, &paths);
+        if folds_case {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        } else {
+            result.unwrap();
+        }
+        assert!(std::fs::read_dir(target.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn resumable_copy_does_not_retry_a_paused_sftp_reader() {
+        struct InterruptedReader(Cancel, bool);
+        impl Read for InterruptedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                assert!(
+                    !self.0.is_cancelled(),
+                    "Der SFTP-Reader ist nach der Unterbrechung nicht wiederverwendbar"
+                );
+                if self.1 {
+                    self.0.cancel();
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.1 = true;
+                buffer[0] = 0x5a;
+                Ok(1)
+            }
+        }
+        let cancel = Cancel::new();
+        let mut reader: Option<Box<dyn Read + Send>> =
+            Some(Box::new(InterruptedReader(cancel.clone(), false)));
+        let error = read_bound_suffix(&mut reader, &mut [0; 2], &cancel).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(cancel.is_cancelled());
     }
 
     #[test]

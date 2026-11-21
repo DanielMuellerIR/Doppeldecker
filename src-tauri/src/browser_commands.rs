@@ -22,6 +22,46 @@ pub(crate) struct DirListing {
     entries: Vec<BrowserEntry>,
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct RemoteDirListing {
+    profile_revision: u64,
+    path: String,
+    parent: Option<String>,
+    entries: Vec<doppeldecker_core::Entry>,
+    session_generation: u64,
+}
+
+impl RemoteDirListing {
+    pub(crate) fn from_interactive(
+        profile_revision: u64,
+        path: String,
+        show_hidden: bool,
+        listing: doppeldecker_core::vfs::RemoteInteractiveDirectoryListing,
+    ) -> Self {
+        let mut entries = listing.entries;
+        if !show_hidden {
+            entries.retain(|entry| !entry.name.starts_with('.'));
+        }
+        entries.sort_by(|left, right| {
+            right
+                .is_dir
+                .cmp(&left.is_dir)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        let parent = Path::new(&path)
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .filter(|parent| !parent.is_empty());
+        Self {
+            profile_revision,
+            path,
+            parent,
+            entries,
+            session_generation: listing.session_generation,
+        }
+    }
+}
+
 /// Pane-Eintrag samt Aussage, ob der angezeigte Name den echten Dateisystemnamen
 /// eindeutig wiedergibt. Bei lokalen Nicht-UTF-8-Namen ist `Entry::name` nur eine
 /// verlustbehaftete Anzeige und darf deshalb nie wieder zu einem Pfad zusammengesetzt
@@ -84,9 +124,30 @@ pub(crate) fn default_dirs() -> Result<DefaultDirs, AppError> {
     })
 }
 
+#[cfg(test)]
+#[test]
+fn standardverzeichnisse_serialisieren_beide_pane_pfade() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../tools/tests/startup-wire.json")).unwrap();
+    let value = serde_json::to_value(DefaultDirs {
+        left: "/mock/quelle".into(),
+        right: "/mock/ziel".into(),
+    })
+    .unwrap();
+    assert_wire_object(&value, &fixture["directories"]);
+    assert_eq!(value["left"], "/mock/quelle");
+    assert_eq!(value["right"], "/mock/ziel");
+}
+
 #[tauri::command]
-pub(crate) fn scan_dir(path: String, show_hidden: bool) -> Result<DirListing, AppError> {
-    let absolute = std::fs::canonicalize(expand_home_path(&path))
+pub(crate) async fn scan_dir(path: String, show_hidden: bool) -> Result<DirListing, AppError> {
+    tauri::async_runtime::spawn_blocking(move || scan_local_directory(&path, show_hidden))
+        .await
+        .map_err(|error| AppError::new("app", error.to_string()))?
+}
+
+fn scan_local_directory(path: &str, show_hidden: bool) -> Result<DirListing, AppError> {
+    let absolute = std::fs::canonicalize(expand_home_path(path))
         .map_err(|error| AppError::new("app", format!("{path}: {error}")))?;
     let mut entries = LocalVfs::new()
         .list_display_entries(&absolute)
@@ -175,14 +236,18 @@ pub(crate) fn spawn_detached(command: &mut Command) -> std::io::Result<()> {
 }
 
 #[tauri::command]
-pub(crate) fn open_path(path: String) -> Result<(), AppError> {
-    let path = validate_openable_file(&expand_home_path(&path))?;
-    spawn_detached(&mut system_open_command(&path)?).map_err(|error| {
-        AppError::new(
-            "app",
-            format!("System-App konnte nicht gestartet werden: {error}"),
-        )
+pub(crate) async fn open_path(path: String) -> Result<(), AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = validate_openable_file(&expand_home_path(&path))?;
+        spawn_detached(&mut system_open_command(&path)?).map_err(|error| {
+            AppError::new(
+                "app",
+                format!("System-App konnte nicht gestartet werden: {error}"),
+            )
+        })
     })
+    .await
+    .map_err(|error| AppError::new("app", error.to_string()))?
 }
 
 #[derive(Clone, Copy, serde::Deserialize)]
@@ -388,6 +453,34 @@ pub(crate) struct DiffToolAvailability {
     id: DiffTool,
     available: bool,
     detail: String,
+}
+
+#[cfg(test)]
+#[test]
+fn desktop_preferences_wire_matches_diff_tool_status_fixture() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tools/tests/desktop-preferences-wire.json"
+    ))
+    .unwrap();
+    let expected = fixture["diffToolStatus"].as_array().unwrap();
+    let tools = [DiffTool::Xcode, DiffTool::Fastra, DiffTool::Bbedit];
+    assert_eq!(expected.len(), tools.len());
+    let statuses: Vec<_> = tools
+        .into_iter()
+        .zip(expected)
+        .map(|(id, entry)| DiffToolAvailability {
+            id,
+            available: entry["available"].as_bool().unwrap(),
+            detail: entry["detail"].as_str().unwrap().into(),
+        })
+        .collect();
+    assert_eq!(
+        serde_json::to_value(statuses).unwrap(),
+        fixture["diffToolStatus"]
+    );
+    for page in fixture["enums"]["ProjectPage"].as_array().unwrap() {
+        assert!(serde_json::from_value::<ProjectPage>(page.clone()).is_ok());
+    }
 }
 
 fn diff_program(tool: DiffTool) -> (&'static str, &'static [&'static str]) {
@@ -784,7 +877,134 @@ fn compare_files_blocking(
 }
 
 #[cfg(test)]
+pub(crate) fn assert_wire_object(value: &serde_json::Value, shape: &serde_json::Value) {
+    use serde_json::Value;
+
+    let value = value.as_object().unwrap();
+    let shape = shape.as_object().unwrap();
+    assert_eq!(value.len(), shape.len(), "Felder weichen vom Vertrag ab");
+    for (key, expected) in shape {
+        let actual = match value
+            .get(key)
+            .unwrap_or_else(|| panic!("Vertragsfeld {key} fehlt"))
+        {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        };
+        assert!(
+            expected
+                .as_str()
+                .unwrap()
+                .split('|')
+                .any(|kind| kind == actual),
+            "{key}: erwartet {expected}, erhalten {actual}"
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn remote_dir_wire_contract() -> serde_json::Value {
+    serde_json::from_str(include_str!("../../tools/tests/scan-remote-dir-wire.json")).unwrap()
+}
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_listing_keeps_bound_generation_and_wire_shape() {
+        use super::{assert_wire_object, remote_dir_wire_contract, RemoteDirListing};
+        use doppeldecker_core::{LocalVfs, Vfs};
+
+        let area = tempfile::tempdir().unwrap();
+        std::fs::create_dir(area.path().join("zulu")).unwrap();
+        for name in ["A.txt", "B.txt", ".hidden"] {
+            std::fs::write(area.path().join(name), b"file").unwrap();
+        }
+        let local = LocalVfs::new()
+            .list_complete(&area.path().canonicalize().unwrap())
+            .unwrap();
+        let listing = RemoteDirListing::from_interactive(
+            11,
+            "/remote".into(),
+            false,
+            doppeldecker_core::vfs::RemoteInteractiveDirectoryListing {
+                entries: local.entries.into_iter().map(|row| row.entry).collect(),
+                session_generation: 7,
+            },
+        );
+        let value = serde_json::to_value(listing).unwrap();
+        let contract = remote_dir_wire_contract();
+        assert_wire_object(&value, &contract["listing"]);
+        for entry in value["entries"].as_array().unwrap() {
+            assert_wire_object(entry, &contract["entry"]);
+        }
+        assert_eq!(value["profile_revision"], 11);
+        assert_eq!(value["session_generation"], 7);
+        assert_eq!(value["parent"], "/");
+        assert_eq!(
+            value["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["zulu", "A.txt", "B.txt"]
+        );
+    }
+
+    #[test]
+    fn scan_dir_ipc_matches_the_frontend_and_mock_contract() {
+        use super::{assert_wire_object, scan_dir};
+        use serde_json::{json, Value};
+        use tauri::ipc::{CallbackFn, InvokeBody};
+        use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets};
+
+        let contract: Value =
+            serde_json::from_str(include_str!("../../tools/tests/scan-dir-wire.json")).unwrap();
+        let app = mock_builder()
+            .invoke_handler(tauri::generate_handler![scan_dir])
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let invoke = |body| {
+            get_ipc_response(
+                &webview,
+                tauri::webview::InvokeRequest {
+                    cmd: "scan_dir".into(),
+                    callback: CallbackFn(0),
+                    error: CallbackFn(1),
+                    url: "tauri://localhost".parse().unwrap(),
+                    body: InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.into(),
+                },
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("probe.txt"), b"probe").unwrap();
+        let request = json!({"path":root, "showHidden":false});
+        assert_wire_object(&request, &contract["request"]);
+        let listing: Value = invoke(request).unwrap().deserialize().unwrap();
+        assert_wire_object(&listing, &contract["listing"]);
+        let entries = listing["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_wire_object(&entries[0], &contract["entry"]);
+        assert_eq!(entries[0]["name"], "probe.txt");
+        for invalid in [
+            json!({"path":root}),
+            json!({"path":root,"show_hidden":false}),
+            json!({"path":root,"showHidden":"false"}),
+        ] {
+            assert!(invoke(invalid).is_err());
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn scan_dir_filters_native_hidden_flags_and_preserves_display_facts() {
@@ -802,7 +1022,7 @@ mod tests {
         )
         .unwrap();
         assert!(rows[0].changed);
-        let visible = scan_dir(root.to_string_lossy().into_owned(), false).unwrap();
+        let visible = scan_local_directory(&root.to_string_lossy(), false).unwrap();
         assert_eq!(
             visible
                 .entries
@@ -811,7 +1031,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["normal"]
         );
-        let all = scan_dir(root.to_string_lossy().into_owned(), true).unwrap();
+        let all = scan_local_directory(&root.to_string_lossy(), true).unwrap();
         assert_eq!(all.entries.len(), 3);
         assert_eq!(
             all.entries.iter().filter(|entry| entry.is_hidden).count(),
@@ -838,6 +1058,26 @@ mod tests {
             full.verification,
             doppeldecker_core::SnapshotVerification::FullReadback
         );
+    }
+
+    #[test]
+    fn file_opening_requests_match_the_browser_wire_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/file-opening-wire.json")).unwrap();
+        let snapshot: OpenRemoteSnapshotRequest =
+            serde_json::from_value(fixture["snapshot"].clone()).unwrap();
+        assert!(validate_snapshot_request(&snapshot).is_ok());
+        assert!(matches!(snapshot.mode, RemoteOpenMode::Original));
+        assert_eq!(
+            snapshot.verification,
+            doppeldecker_core::SnapshotVerification::Streaming
+        );
+        let comparison: CompareFilesRequest =
+            serde_json::from_value(fixture["comparison"].clone()).unwrap();
+        for file in [comparison.left, comparison.right] {
+            assert!(validate_diff_path(file.endpoint.root(), &file.path).is_ok());
+            assert_eq!(file.name, "Reisebericht.md");
+        }
     }
 
     #[test]
@@ -885,7 +1125,7 @@ mod tests {
         std::fs::write(temp.path().join(&unsafe_name), b"roh").unwrap();
         std::fs::write(temp.path().join("\u{fffd}"), b"utf8").unwrap();
 
-        let listing = scan_dir(temp.path().to_string_lossy().into_owned(), true).unwrap();
+        let listing = scan_local_directory(&temp.path().to_string_lossy(), true).unwrap();
         let collisions: Vec<_> = listing
             .entries
             .iter()

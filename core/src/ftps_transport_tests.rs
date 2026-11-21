@@ -462,6 +462,7 @@ fn retr_erhaelt_datenfehler_und_verlorene_kontrollantwort() {
         // Der eigene Datensocket wird gezielt mit RST beendet; die Kontrollseite
         // fällt unabhängig ohne Abschlussantwort. Keine echten Server betroffen.
         assert_eq!(
+            // SAFETY: data hält den Socket offen, linger ist für die angegebene Größe lesbar.
             unsafe {
                 libc::setsockopt(
                     data.as_raw_fd(),

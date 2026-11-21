@@ -49,6 +49,31 @@ export function createOperationUi({ planSummaryHtml, setRunning, captureEndpoint
     if (options.showList) $("#btn-toggle-list").hidden = false;
   }
 
+  function showDownloadPreparation(summaryHtml, cancel) {
+    const button = $("#btn-cancel-resume-preparation");
+    const close = $("#btn-dock-close");
+    showDock(summaryHtml);
+    button.textContent = "Downloadvorbereitung abbrechen";
+    button.disabled = false;
+    button.hidden = false;
+    close.hidden = true;
+    button.onclick = async () => {
+      button.disabled = true;
+      button.textContent = "Abbruch angefordert …";
+      try {
+        await cancel();
+      } catch {
+        button.disabled = false;
+        button.textContent = "Downloadvorbereitung abbrechen";
+      }
+    };
+    return () => {
+      button.onclick = null;
+      button.hidden = true;
+      close.hidden = false;
+    };
+  }
+
   function setLocked(locked) {
     $("#app").classList.toggle("operation-running", locked);
     // Der Lauf besitzt seinen vorbereiteten Plan. Nur dessen Bedienelemente
@@ -148,5 +173,5 @@ export function createOperationUi({ planSummaryHtml, setRunning, captureEndpoint
     return finished;
   }
 
-  return { acceptEvent, bindContext, dockRevision: () => dockRevision, end, setLocked, showDock, startFile, startSync, update };
+  return { acceptEvent, bindContext, dockRevision: () => dockRevision, end, setLocked, showDock, showDownloadPreparation, startFile, startSync, update };
 }

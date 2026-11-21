@@ -1,4 +1,5 @@
 import { invoke } from "./tauri-api.js";
+import { paneEndpoint } from "./pane-endpoint.js";
 import { cancelOwnedModal, showOwnedModal } from "./modal.js";
 import { renderPassivePreviewContent } from "./file-preview.js";
 import { $, errText, fmtEntrySize, isEntryNameSafe, joinPath } from "./ui-utils.js";
@@ -20,6 +21,18 @@ const button = (text, action, className = "btn ghost") => {
   return node;
 };
 
+/** @typedef {import("./archive-mutation-wire.js").ArchivePane} ArchivePane */
+/** @typedef {import("./archive-mutation-wire.js").ArchivePaneSide} ArchivePaneSide */
+/** @typedef {import("./archive-mutation-wire.js").ArchiveExtractPreparedWire} ArchiveExtractPreparedWire */
+/** @typedef {import("./archive-read-wire.js").ArchiveRowWire} ArchiveRow */
+/** @typedef {{openRequestId: string, sessionId: string | null}} ArchiveReadIdentity */
+
+/** @param {{
+ * panes: Record<ArchivePaneSide, ArchivePane>,
+ * selectedEntries: (side: ArchivePaneSide) => {name: string, is_file?: boolean, is_symlink?: boolean, safely_decoded?: boolean}[],
+ * showDock: (message: string, options: {closable: boolean}) => void, blocked?: () => boolean,
+ * extractSelectionReady?: ((side: ArchivePaneSide, response: ArchiveExtractPreparedWire) => void) | null
+ * }} dependencies */
 export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked = () => false, extractSelectionReady = null }) {
   let current = null;
   const live = context => current === context && !context.closed;
@@ -30,9 +43,11 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
       && pane.tabs?.active?.id === context.tabId
       && selected.length === 1 && selected[0].name === context.name;
   };
+  /** @param {string | null | undefined} requestId */
   const cancelRequest = requestId => {
     if (requestId) void invoke("cancel_archive_read", { requestId }).catch(() => {});
   };
+  /** @param {ArchiveReadIdentity} context */
   const closeBackend = (context, sessionId = context.sessionId) => {
     void invoke("close_archive_read", { openRequestId: context.openRequestId, sessionId: sessionId || null }).catch(() => {});
   };
@@ -43,6 +58,7 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
       cancelRequest(context.read.requestId);
     }
   }
+  /** @param {string | null | undefined} id */
   const discardExtract = id => { if (id) void invoke("discard_archive_extract", { preparationId: id }).catch(() => {}); };
   function cancelExtract(context) {
     if (context.extract) discardExtract(context.extract.requestId);
@@ -91,7 +107,8 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
     context.previous.disabled = busy || context.stale || !context.listingData || context.listingData.page === 0;
     context.next.disabled = busy || context.stale || !context.listingData
       || (context.listingData.page + 1) * context.listingData.pageSize >= context.listingData.totalRows;
-    context.previewButton.disabled = busy || context.stale || Boolean(context.read) || !context.selected?.canPreview;
+    context.previewButton.disabled = busy || context.stale || Boolean(context.read)
+      || !context.selected?.canPreview || !context.selected.entryId;
     for (const node of context.breadcrumbs.querySelectorAll("button")) node.disabled = busy || context.stale || node.dataset.current === "true";
     if (context.wholeExtractButton) context.wholeExtractButton.disabled = busy || context.stale || !context.canExtract;
     if (context.fileExtractButton) context.fileExtractButton.disabled = busy || context.stale || !context.canExtractFile;
@@ -117,18 +134,27 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
       context.preview.insertBefore(context.fileExtractButton, context.preview.children[1] || null);
     }
   }
+  /** @param {"entry" | "all" | "subtree"} kind */
   async function prepareSelection(context, kind) {
     if (!ensureScope(context) || !(kind === "entry" ? context.canExtractFile : context.canExtract) || context.opening || context.listing || context.extract) return;
     const targetSide = context.side === "left" ? "right" : "left";
     const target = panes[targetSide];
+    const endpoint = paneEndpoint(target);
     const targetScope = Object.fromEntries(scopeKeys.map(key => [key, target[key]]));
     const tabId = target.tabs?.active?.id;
     const targetMatches = () => panes[targetSide].tabs?.active?.id === tabId && scopeKeys.every(key => panes[targetSide][key] === targetScope[key]);
     const work = { requestId: crypto.randomUUID(), targetMatches };
-    const entryId = kind === "entry" ? context.selected?.entryId : null;
-    const directoryId = kind === "all" ? context.listingData?.breadcrumbs[0]?.directoryId
-      : kind === "subtree" ? context.listingData?.directoryId : null;
-    if (!entryId && !directoryId) { context.error = "Die Archivauswahl ist nicht mehr verfügbar. Bitte erneut öffnen."; renderState(context); return; }
+    /** @type {import("./archive-read-wire.js").ArchiveRowWire | null} */
+    const selected = context.selected;
+    /** @type {import("./archive-read-wire.js").ArchiveListingWire | null} */
+    const listing = context.listingData;
+    /** @type {string | null} */
+    const sessionId = context.sessionId;
+    const entryId = kind === "entry" ? selected?.entryId : null;
+    const directoryId = kind === "all" ? listing?.breadcrumbs[0]?.directoryId
+      : kind === "subtree" ? listing?.directoryId : null;
+    const selection = entryId ? { entryId } : directoryId ? { directoryId } : null;
+    if (!selection || !sessionId) { context.error = "Die Archivauswahl ist nicht mehr verfügbar. Bitte erneut öffnen."; renderState(context); return; }
     context.extract = work;
     context.error = null;
     cancelPreview(context);
@@ -138,11 +164,12 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
       if (context.read) await context.read.settled;
       const validTarget = () => !work.invalid && targetMatches();
       if (!ensureScope(context) || context.extract !== work || !validTarget()) { discardExtract(work.requestId); return; }
-      const response = await invoke("prepare_archive_extract_selection", { request: { requestId: work.requestId,
-        sessionId: context.sessionId, ...(entryId ? { entryId } : { directoryId }),
-        targetProvider: targetScope.provider, targetDir: targetScope.path,
-        ...(targetScope.provider !== "local" ? { target: { provider: targetScope.provider, root: targetScope.path,
-          profileId: targetScope.profileId, profileRevision: targetScope.profileRevision } } : {}) } });
+      const request = /** @satisfies {import("./archive-mutation-wire.js").ArchiveExtractSelectionPrepareRequest} */ ({
+        requestId: work.requestId, sessionId, ...selection,
+        targetProvider: endpoint.provider, targetDir: endpoint.root,
+        ...(endpoint.provider !== "local" ? { target: endpoint } : {}),
+      });
+      const response = await invoke("prepare_archive_extract_selection", { request });
       if (!ensureScope(context) || context.extract !== work || !validTarget()) { discardExtract(response.preparationId); return; }
       if (response.requestId !== work.requestId) { discardExtract(response.preparationId); throw new Error("Die Entpackantwort gehört zu einer anderen Anfrage."); }
       context.extract = null;
@@ -197,6 +224,7 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
   function protocolError(context) {
     invalidate(context, "Die Archivantwort passt nicht zur aktuellen Sitzung. Bitte das Archiv erneut öffnen.");
   }
+  /** @param {import("./archive-read-wire.js").ArchiveListingWire} listing */
   function acceptListing(context, listing, expectedDirectory, expectedPage) {
     if (listing.sessionId !== context.sessionId || (expectedDirectory && listing.directoryId !== expectedDirectory)
       || listing.page !== expectedPage || listing.rows.length > 100) { protocolError(context); return; }
@@ -247,8 +275,11 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
     context.pageLabel.textContent = `Seite ${listing.page + 1} von ${pages} · ${listing.totalRows.toLocaleString("de-DE")} Zeilen`;
     showSelection(context);
   }
+  /** @param {string} directoryId @param {number} page */
   async function navigate(context, directoryId, page) {
     if (!ensureScope(context) || context.opening || context.listing || context.extract) return;
+    const sessionId = context.sessionId;
+    if (typeof sessionId !== "string") return;
     cancelPreview(context);
     context.selected = null;
     showSelection(context);
@@ -257,7 +288,7 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
     context.list.focus({ preventScroll: true });
     renderState(context);
     try {
-      const listing = await invoke("list_archive_directory", { sessionId: context.sessionId, directoryId, page });
+      const listing = await invoke("list_archive_directory", { sessionId, directoryId, page });
       if (!ensureScope(context) || revision !== context.navigationRevision) return;
       acceptListing(context, listing, directoryId, page);
     } catch (error) {
@@ -271,22 +302,27 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
   }
   async function previewSelection(context) {
     if (!ensureScope(context) || context.opening || context.listing || context.extract || context.read || !context.selected?.canPreview) return;
+    const sessionId = context.sessionId;
+    /** @type {ArchiveRow} */
     const row = context.selected;
-    const read = { requestId: crypto.randomUUID(), revision: ++context.previewRevision, entryId: row.entryId, cancelled: false };
+    const { entryId } = row;
+    if (typeof sessionId !== "string" || !entryId) return;
+    const read = { requestId: crypto.randomUUID(), revision: ++context.previewRevision, entryId, cancelled: false };
     read.settled = new Promise(resolve => { read.resolve = resolve; });
     context.read = read;
     context.error = null;
     context.list.focus({ preventScroll: true });
     renderState(context);
     try {
-      const response = await invoke("preview_archive_entry", { requestId: read.requestId, sessionId: context.sessionId, entryId: read.entryId });
+      const response = await invoke("preview_archive_entry", { requestId: read.requestId, sessionId, entryId });
       if (!ensureScope(context) || read.cancelled || read.revision !== context.previewRevision || context.selected?.rowId !== row.rowId) return;
       if (response.requestId !== read.requestId || response.sessionId !== context.sessionId || response.entryId !== read.entryId) { protocolError(context); return; }
       const preview = response.preview;
       context.preview.replaceChildren(element("h3", "archive-read-preview-title", row.displayName));
       context.preview.append(element("p", "archive-read-note", `${fmtEntrySize(preview.bytes)} · ${context.tar ? "Dateilänge und Archivquelle geprüft" : "Inhalt vollständig geprüft"}${preview.content.kind === "image" ? ` · ${preview.content.width} × ${preview.content.height} Pixel` : ""}`));
       if (!renderPassivePreviewContent(context.preview, preview.content, { name: row.displayName })) {
-        context.preview.append(element("p", "archive-read-note", preview.content.reason || "Keine passive Vorschau verfügbar."));
+        const reason = preview.content.kind === "unsupported" ? preview.content.reason : null;
+        context.preview.append(element("p", "archive-read-note", reason || "Keine passive Vorschau verfügbar."));
       }
       if (preview.limitations?.length) context.preview.append(element("p", "archive-read-note", preview.limitations.join(" ")));
       appendFileAction(context);
@@ -300,7 +336,7 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
       renderState(context);
     }
   }
-  function open(side) {
+  function open(side, { extractAll = false } = {}) {
     if (blocked()) return;
     const entries = selectedEntries(side);
     if (entries.length !== 1 || !entries[0].is_file || entries[0].is_symlink || !isEntryNameSafe(entries[0])) {
@@ -372,9 +408,10 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
       }, 250);
       void (async () => {
         try {
-          const endpoint = { provider: context.scope.provider, root: context.scope.path,
-            ...(context.scope.provider === "local" ? {} : { profileId: context.scope.profileId, profileRevision: context.scope.profileRevision }) };
-          const response = await invoke("open_archive_read", { requestId: context.openRequestId, request: { endpoint, path: joinPath(context.scope.path, context.name) } });
+          const request = /** @satisfies {import("./archive-read-wire.js").ArchiveOpenRequest} */ ({
+            endpoint: paneEndpoint(context.scope), path: joinPath(context.scope.path, context.name),
+          });
+          const response = await invoke("open_archive_read", { requestId: context.openRequestId, request });
           if (!ensureScope(context)) { if (response.sessionId) closeBackend(context, response.sessionId); return; }
           const format = response.listing.catalog?.format;
           if (response.requestId !== context.openRequestId || response.listing.sessionId !== response.sessionId || !formatLabels.has(format)) { if (response.sessionId) closeBackend(context, response.sessionId); protocolError(context); return; }
@@ -386,12 +423,16 @@ export function createArchiveReadUi({ panes, selectedEntries, showDock, blocked 
           context.origin.hidden = !response.origin;
           context.origin.textContent = response.origin ? `Momentaufnahme von ${response.origin}. Änderungen am Remoteoriginal verändern diese Ansicht nicht. ${context.canExtractFile ? "Entpacken verwendet diese geladenen Bytes und den Zielordner der anderen Pane." : "Diese Ansicht bleibt lesend."}` : "";
           acceptListing(context, response.listing, null, 0);
+          if (extractAll && !context.canExtract) {
+            context.error = "Das ganze Archiv kann nicht entpackt werden. Der lesbare Inhalt bleibt zur Ansicht verfügbar.";
+          }
         } catch (error) {
           if (ensureScope(context)) context.error = errText(error);
         } finally {
           context.opening = false;
           renderState(context);
         }
+        if (extractAll) await prepareSelection(context, "all");
       })();
       return { focusTarget: context.closeButton, onEscape: () => close(context) };
     });

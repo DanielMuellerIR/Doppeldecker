@@ -32,7 +32,7 @@ impl ClaimRun {
         )?;
         let stat = fstat(&fd)?;
         if from_stat(&stat).file_type != 0o100000
-            || stat.st_uid != unsafe { libc::geteuid() }
+            || stat.st_uid != rustix::process::geteuid().as_raw()
             || stat.st_mode & 0o077 != 0
             || !acl_safe(crate::acl::read_fd(&fd)?.as_ref(), true)
         {
@@ -49,7 +49,7 @@ impl ClaimRun {
         let journal = decode(&data)?;
         if journal_parent != journal.journal_parent
             || name != OsStr::new(&format!("trash-{}.json", journal.run_id))
-            || journal.effective_uid != unsafe { libc::geteuid() }
+            || journal.effective_uid != rustix::process::geteuid().as_raw()
         {
             return Err(denied("Journalpfad, Namensraum oder UID passen nicht"));
         }
@@ -532,7 +532,7 @@ impl LegacyJournal {
         let stat = fstat(&fd)?;
         let object = from_stat(&stat);
         if object.file_type != 0o100000
-            || stat.st_uid != unsafe { libc::geteuid() }
+            || stat.st_uid != rustix::process::geteuid().as_raw()
             || stat.st_mode & 0o077 != 0
             || !acl_safe(crate::acl::read_fd(&fd)?.as_ref(), true)
         {

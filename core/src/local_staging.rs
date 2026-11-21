@@ -5111,9 +5111,11 @@ mod tests {
                 scoped.sync_dir(target.parent().unwrap()).unwrap();
             }
         }
+        // SAFETY: getpid liefert die PID dieses isolierten Testkindes.
         assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGKILL) }, 0);
         loop {
             // SIGKILL wird asynchron zugestellt; keine reguläre Destruktorphase.
+            // SAFETY: pause benötigt keine Zeiger und wartet im isolierten Testkind auf das Signal.
             unsafe {
                 libc::pause();
             }

@@ -97,15 +97,19 @@ Ein laufender Absturz startet die Erzeugung nicht automatisch neu.
 ## Dateiinhalt fortsetzbar kopieren
 
 **Befehle → Dateiinhalt fortsetzbar kopieren** und das Kontextmenü arbeiten mit
-regulären lokalen Dateien aus einem Ordner. Die Gegenpane zeigt einen lokalen
-Ordner mit eigenem Namensraum und atomarem Neuanlegen. Jeder Name wird vor dem
-Einreihen geprüft. Ein belegter Name verhindert das Einreihen der Auswahl. Die
+regulären Dateien aus einem Ordner lokal oder über kompatible WebDAV-, FTPS- und
+SFTP-Verbindungen. Die Gegenpane zeigt einen lokalen Ordner mit eigenem Namensraum
+und atomarem Neuanlegen. Belegte Namen und Namenskollisionen nach den Regeln des
+Zielvolumes verhindern das Einreihen der Auswahl. Die
 Queue übernimmt die Auswahl in einem Journalcommit und führt jede Datei als
 eigenen Auftrag. Es werden Dateiinhalt, Änderungszeit und Unix-Basisrechte
 übernommen. Gemeinsam beschreibbare Ziele und Ziele ohne atomare
 Neuanlage nutzen den gewöhnlichen Kopierweg.
 Erweiterte Metadaten wie ACLs, Resource Forks und Hardlink-Beziehungen gehören
 zum gewöhnlichen Kopierweg.
+
+**Downloadvorbereitung abbrechen** beendet die Prüfung vor dem Einreihen. Eine
+bereits laufende Serverabfrage kann bis zur Antwort oder zum Timeout brauchen.
 
 **Kopie pausieren** sichert den bestätigten Abschnitt. In der Fensterqueue zeigen
 **Fortsetzen** und **Teilkopie verwerfen …** die Entscheidungen auch nach einem
@@ -119,7 +123,8 @@ geschriebene Bytezahl samt BLAKE3. Fortsetzen prüft den bestätigten Abschnitt 
 beiden offenen Dateien und kopiert ab der belegten Grenze. Der endgültige
 Zielname erhält nur den geprüften Inhalt per atomarem No-Replace. Nach dem
 Prozessende zwischen Commit und Queue-Abschluss belegt die App die vorhandene
-Fassung anhand ihrer Dateiidentität und Prüfsumme. Verwerfen entfernt nur
+Fassung anhand ihrer Dateiidentität und Prüfsumme. Dafür genügt das lokale Ziel.
+Verwerfen entfernt nur
 identifizierte Arbeitsdaten. Ist der mögliche Zielcommit ungeklärt, zeigt die
 Queue Arbeits- und Zielpfad zur Prüfung und hält den Auftrag bis zur Bestätigung
 offen.
@@ -212,7 +217,7 @@ Ein Dateipräfix, das Alter oder ein parsebares Journal genügen deshalb nicht f
 automatische Löschung oder Verschiebung. Eigene laufende Writes dürfen nur mit
 dem bei exklusiver Anlage gehaltenen Besitzbeleg bereinigen. Nach einem Crash
 bleiben unbelegte Reste erhalten. Diese bewusste Aufbewahrung hat keine
-zeitgesteuerte Bereinigung; [Prüfung und Grenze](code-review-2026-10-19-konfigurationsreste.md).
+zeitgesteuerte Bereinigung; [Prüfung und Grenze](history/code-review-2026-10-19-konfigurationsreste.md).
 
 ## Konflikte und Bedienung
 

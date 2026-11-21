@@ -1664,8 +1664,9 @@ fn ftps_ordnerkopie_laesst_symlink_und_spezialdatei_ohne_inhaltsprobe_aus() {
     std::os::unix::fs::symlink(root.join("outside.txt"), source_root.join("empty/link")).unwrap();
     let fifo =
         std::ffi::CString::new(source_root.join("empty/fifo").as_os_str().as_bytes()).unwrap();
-    // SAFETY: CString lebt bis nach dem Aufruf; der Pfad liegt im eigenen Testbaum.
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    // SAFETY: fifo hält den nullterminierten Pfad bis zur Rückkehr.
+    let created = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+    assert_eq!(created, 0);
     let queue = OperationQueue::open(root.join("config/queue.json")).unwrap();
     queue
         .enqueue(QueueOperation::ProviderFile {
@@ -2104,6 +2105,7 @@ struct FaultControl {
     retr_observer: std::sync::Mutex<Option<MutationObserver>>,
     retr_payload_override: std::sync::Mutex<Option<Vec<u8>>>,
     drop_retr_completion: std::sync::atomic::AtomicBool,
+    enable_resume: std::sync::atomic::AtomicBool,
     unique_overrides: std::sync::Mutex<std::collections::HashMap<String, String>>,
     deny_retr: std::sync::atomic::AtomicBool,
     reject_probe_mkdir: std::sync::atomic::AtomicBool,
@@ -2128,6 +2130,7 @@ struct FaultControl {
     lose_stou_name: std::sync::atomic::AtomicBool,
     lose_stou_completion: std::sync::atomic::AtomicBool,
     rmd_drop_after: std::sync::Mutex<Option<bool>>,
+    acknowledge_delete_without_effect: std::sync::Mutex<Option<String>>,
     rename_noreplace: std::sync::atomic::AtomicBool,
     directory_only_noreplace: std::sync::atomic::AtomicBool,
     enable_stou: std::sync::atomic::AtomicBool,
@@ -2216,6 +2219,7 @@ fn fault_ftp_server_transport(
         retr_observer: std::sync::Mutex::new(None),
         retr_payload_override: std::sync::Mutex::new(None),
         drop_retr_completion: std::sync::atomic::AtomicBool::new(false),
+        enable_resume: std::sync::atomic::AtomicBool::new(false),
         unique_overrides: std::sync::Mutex::new(Default::default()),
         deny_retr: std::sync::atomic::AtomicBool::new(false),
         reject_probe_mkdir: std::sync::atomic::AtomicBool::new(false),
@@ -2236,6 +2240,7 @@ fn fault_ftp_server_transport(
         lose_stou_name: std::sync::atomic::AtomicBool::new(false),
         lose_stou_completion: std::sync::atomic::AtomicBool::new(false),
         rmd_drop_after: std::sync::Mutex::new(None),
+        acknowledge_delete_without_effect: std::sync::Mutex::new(None),
         rename_noreplace: std::sync::atomic::AtomicBool::new(false),
         directory_only_noreplace: std::sync::atomic::AtomicBool::new(false),
         enable_stou: std::sync::atomic::AtomicBool::new(false),
@@ -2328,6 +2333,7 @@ fn fault_session_transport(
     let mut data_listener: Option<TcpListener> = None;
     let mut protected_data = false;
     let mut mode_facts_selected = false;
+    let mut restart_offset = 0;
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -2433,7 +2439,7 @@ fn fault_session_transport(
             }
             "FEAT" => {
                 format!(
-                    "211-Features\r\n MLST Type;Size;Modify;Unique;{}\r\n UTF8\r\n{}211 End\r\n",
+                    "211-Features\r\n MLST Type;Size;Modify;Unique;{}\r\n UTF8\r\n{}{}211 End\r\n",
                     if state.require_mode_selection.load(Ordering::SeqCst) {
                         "unix.mode;"
                     } else {
@@ -2443,8 +2449,31 @@ fn fault_session_transport(
                         " MFMT\r\n"
                     } else {
                         ""
+                    },
+                    if state.enable_resume.load(Ordering::SeqCst) {
+                        " REST STREAM\r\n HASH SHA-256*;\r\n"
+                    } else {
+                        ""
                     }
                 )
+            }
+            "OPTS HASH SHA-256" if state.enable_resume.load(Ordering::SeqCst) => {
+                "200 SHA-256 accepted\r\n".into()
+            }
+            value if value.starts_with("HASH ") && state.enable_resume.load(Ordering::SeqCst) => {
+                use sha2::{Digest, Sha256};
+                let path = fault_path(&cwd, &value[5..]);
+                let contents = state.contents.lock().unwrap();
+                let bytes = &contents[&path];
+                format!(
+                    "213 SHA-256 0-{} {:x} {path}\r\n",
+                    bytes.len(),
+                    Sha256::digest(bytes)
+                )
+            }
+            value if value.starts_with("REST ") && state.enable_resume.load(Ordering::SeqCst) => {
+                restart_offset = value[5..].parse().unwrap();
+                "350 Restart marker accepted\r\n".into()
             }
             value if value.starts_with("SITE CHMOD ") => {
                 if !state.accept_chmod.load(Ordering::SeqCst) {
@@ -2627,7 +2656,8 @@ fn fault_session_transport(
                     .unwrap()
                     .clone()
                     .unwrap_or(content);
-                if data.write_all(&content).is_err() {
+                let offset = std::mem::take(&mut restart_offset);
+                if data.write_all(&content[offset..]).is_err() {
                     return;
                 }
                 drop(data);
@@ -2692,7 +2722,15 @@ fn fault_session_transport(
                     }
                     continue;
                 }
-                fault_remove_entry(&mut fs, &path);
+                if state
+                    .acknowledge_delete_without_effect
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    != Some(path.as_str())
+                {
+                    fault_remove_entry(&mut fs, &path);
+                }
                 if fault == Some(true) {
                     return;
                 }
@@ -2700,8 +2738,16 @@ fn fault_session_transport(
             }
             value if value.starts_with("DELE ") => {
                 let path = fault_path(&cwd, &value[5..]);
-                fault_remove_entry(&mut state.fs.lock().unwrap(), &path);
-                state.contents.lock().unwrap().remove(&path);
+                if state
+                    .acknowledge_delete_without_effect
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    != Some(path.as_str())
+                {
+                    fault_remove_entry(&mut state.fs.lock().unwrap(), &path);
+                    state.contents.lock().unwrap().remove(&path);
+                }
                 "250 File removed\r\n".into()
             }
             value if value.starts_with("RNFR ") => {
@@ -4003,6 +4049,65 @@ fn ftps_proben_lesen_beide_roots_auch_nach_fehlern() {
 }
 
 #[test]
+fn ftps_probe_meldet_arbeitsfehler_und_fehlgeschlagenes_aufraeumen() {
+    let (port, control) = fault_ftp_server(&[]);
+    {
+        let mut fs = control.fs.lock().unwrap();
+        fs.get_mut("/").unwrap().insert("pane".into(), true);
+        fs.insert("/pane".into(), Default::default());
+    }
+    let (vfs, _intent_config, _intent_queue) = owned_vfs(fault_config(port));
+    let fixture = Arc::downgrade(&control);
+    *control.mutation_observer.lock().unwrap() = Some(Arc::new(move |command| {
+        let fixture = fixture.upgrade().unwrap();
+        if let Some(path) = command.strip_prefix("MKD ") {
+            // Eine ungültige Änderungszeit lässt erst das Listing nach der Anlage scheitern.
+            fixture
+                .mtime_overrides
+                .lock()
+                .unwrap()
+                .insert(path.into(), "invalid".into());
+        } else if let Some(path) = command.strip_prefix("RMD ") {
+            // Der Bestand ist wieder lesbar, aber der Server lehnt RMD am gefüllten Ordner ab.
+            fixture.mtime_overrides.lock().unwrap().remove(path);
+            fixture
+                .fs
+                .lock()
+                .unwrap()
+                .get_mut(path)
+                .unwrap()
+                .insert("behalten.txt".into(), false);
+        }
+    }));
+
+    let error = vfs
+        .probe_directory_create_capability_at(Path::new("/pane"))
+        .unwrap_err();
+    assert_eq!(error_code(&error), ErrorCode::OutcomeUnclear);
+    let message = error.to_string();
+    assert!(
+        message.contains("FTPS-MLSD-Änderungszeit ist ungültig"),
+        "{message}"
+    );
+    assert!(
+        message.contains("FTP-/FTPS-Pfad oder Aktion wurde abgelehnt"),
+        "{message}"
+    );
+    assert!(!vfs.capabilities().exclusive_directory_create);
+
+    let mutations = control.mutations.lock().unwrap();
+    let [mkdir, rmdir] = mutations.as_slice() else {
+        panic!("Erwartet je einen MKD- und RMD-Aufruf, erhalten: {mutations:?}");
+    };
+    let probe_path = mkdir.strip_prefix("MKD ").unwrap();
+    assert!(probe_path.starts_with("/pane/.doppeldecker-mkdir-probe-"));
+    assert_eq!(rmdir.strip_prefix("RMD "), Some(probe_path));
+    assert!(doppeldecker_core::error::recovery_paths(&error)
+        .iter()
+        .any(|path| path == probe_path));
+}
+
+#[test]
 fn ftps_proben_bleiben_parallel_und_alte_antworten_geben_nichts_frei() {
     let (port, control) = fault_ftp_server(&["behalten.txt"]);
     let config = FtpsConnectionConfig {
@@ -5229,6 +5334,86 @@ fn wait_for_server(port: u16) {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("lokaler FTP-Testserver startete nicht");
+}
+
+#[test]
+fn ftp_loeschpfade_bestaetigen_abwesenheit_im_elternlisting() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for (directory, command) in [(false, "DELE /pane/entry"), (true, "RMD /pane/entry")] {
+        for acknowledge_only in [false, true] {
+            let (port, control) = fault_ftp_server(&[]);
+            control.enable_stou.store(true, Ordering::SeqCst);
+            {
+                let mut fs = control.fs.lock().unwrap();
+                fs.get_mut("/").unwrap().insert("pane".into(), true);
+                fs.insert(
+                    "/pane".into(),
+                    [("entry".into(), directory), ("neighbor".into(), false)].into(),
+                );
+                if directory {
+                    fs.insert("/pane/entry".into(), Default::default());
+                }
+            }
+            let pane = Path::new("/pane");
+            let (vfs, _area, _queue) = owned_vfs(fault_config(port));
+            assert!(
+                vfs.probe_permanent_delete_capability_at(pane)
+                    .unwrap()
+                    .permanent_delete
+            );
+            control.mutations.lock().unwrap().clear();
+            let readback = Arc::new(AtomicBool::new(false));
+            let seen_readback = readback.clone();
+            let server = Arc::downgrade(&control);
+            *control.listing_observer.lock().unwrap() = Some(Arc::new(move |path| {
+                if path == "/pane"
+                    && server
+                        .upgrade()
+                        .unwrap()
+                        .mutations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|mutation| mutation == command)
+                {
+                    seen_readback.store(true, Ordering::SeqCst);
+                }
+            }));
+            if acknowledge_only {
+                *control.acknowledge_delete_without_effect.lock().unwrap() =
+                    Some("/pane/entry".into());
+            }
+
+            let result = if directory {
+                vfs.remove_dir(&pane.join("entry"))
+            } else {
+                vfs.remove_file(&pane.join("entry"))
+            };
+
+            if acknowledge_only {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error_code(&error),
+                    ErrorCode::OutcomeUnclear,
+                    "{command}: {error}"
+                );
+                assert!(doppeldecker_core::error::recovery_paths(&error)
+                    .iter()
+                    .any(|path| path == "/pane/entry"));
+            } else {
+                result.unwrap();
+            }
+            assert!(
+                readback.load(Ordering::SeqCst),
+                "{command}: Elternlisting fehlt nach dem Löschversuch"
+            );
+            assert_eq!(*control.mutations.lock().unwrap(), [command]);
+            let fs = control.fs.lock().unwrap();
+            assert_eq!(fs["/pane"].contains_key("entry"), acknowledge_only);
+            assert!(fs["/pane"].contains_key("neighbor"));
+        }
+    }
 }
 
 #[test]
@@ -7982,6 +8167,143 @@ fn metadata_case(
     }
     let (vfs, area, queue) = owned_vfs(config);
     (vfs, area, queue, control)
+}
+
+#[test]
+fn fortsetzbares_ftps_verlangt_retr_abschluss_auch_bei_altem_vollbeleg() {
+    use doppeldecker_core::resumable_copy::CopyCheckpoint;
+    use doppeldecker_core::{
+        save_ftps_profile_versioned, FtpsProfile, RemoteProfileBinding, RemoteProfileProtocol,
+    };
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::Ordering;
+
+    for bytes in [Vec::new(), vec![0x5a; 8 * 1024 * 1024]] {
+        let (vfs, config, queue, control) = metadata_case(true, false, false);
+        control.enable_resume.store(true, Ordering::SeqCst);
+        control
+            .fs
+            .lock()
+            .unwrap()
+            .get_mut("/")
+            .unwrap()
+            .insert("probe.bin".into(), false);
+        control
+            .contents
+            .lock()
+            .unwrap()
+            .insert("/probe.bin".into(), bytes.clone());
+        let identity = vfs.identity();
+        let mut connection = fault_config(identity.port);
+        connection.host = identity.host;
+        connection.transport_security = identity.transport_security;
+        connection.certificate = identity.certificate;
+        connection.certificate_policy = Some(FtpsCertificatePolicy::PinnedCertificate);
+        drop(vfs);
+        let endpoint = BidirectionalQueueEndpoint::Ftps {
+            connection: Box::new(connection.clone()),
+            root: "/".into(),
+        };
+        let profile_path = config.path().join("ftps-profiles.json");
+        let profile = save_ftps_profile_versioned(
+            &profile_path,
+            FtpsProfile {
+                id: "probe".into(),
+                name: "Probe".into(),
+                connection,
+            },
+        )
+        .unwrap();
+        let binding =
+            RemoteProfileBinding::new(RemoteProfileProtocol::Ftps, "probe", profile.revision)
+                .unwrap();
+        let source = endpoint.connect(Arc::new(TestSecrets)).unwrap();
+        let target_area = private_area();
+        let target = std::fs::canonicalize(target_area.path()).unwrap();
+        let target_file = target.join("probe.bin");
+        let plans = source
+            .prepare_remote_resumable_copies(
+                &endpoint,
+                &[PathBuf::from("/probe.bin")],
+                &target,
+                None,
+                &Cancel::new(),
+            )
+            .unwrap();
+        let id = queue
+            .enqueue_resumable_copies(plans, &[binding])
+            .unwrap()
+            .remove(0);
+        control.drop_retr_completion.store(true, Ordering::SeqCst);
+        assert!(execute_fault_move(&queue).is_err());
+        assert!(!target_file.exists());
+        let mut snapshot = queue.snapshot();
+        let entry = &mut snapshot.entries[0];
+        assert_eq!(entry.progress.bytes_done, 0);
+        let QueueOperation::ResumableCopy {
+            checkpoint: Some(checkpoint),
+            ..
+        } = &mut entry.operation
+        else {
+            panic!("Unvollständiger Transfer braucht den Startbeleg");
+        };
+        let CopyCheckpoint::Bytes {
+            written,
+            digest,
+            sealed,
+            ..
+        } = checkpoint.as_mut()
+        else {
+            panic!("Vor dem Transfer muss der Arbeitsordner gebunden sein");
+        };
+        assert_eq!((*written, *sealed), (0, false));
+
+        // Altes Journal: alle Bytes gesichert, aber ohne positive RETR-Antwort.
+        *written = bytes.len() as u64;
+        *digest = *blake3::hash(&bytes).as_bytes();
+        entry.progress.bytes_done = *written;
+        let journal = config.path().join("operations-queue.json");
+        drop(queue);
+        std::fs::write(&journal, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let queue = OperationQueue::open(&journal).unwrap();
+        queue.retry(&id).unwrap();
+        assert!(execute_fault_move(&queue).is_err());
+        assert!(!target_file.exists());
+        assert_eq!(control.retr_paths.lock().unwrap().len(), 2);
+
+        control.drop_retr_completion.store(false, Ordering::SeqCst);
+        queue.retry(&id).unwrap();
+        execute_fault_move(&queue).unwrap();
+        assert_eq!(std::fs::read(&target_file).unwrap(), bytes);
+
+        // Der Ziel-Rename war dauerhaft, aber der Queueabschluss ging verloren.
+        // Der ursprüngliche Inode bleibt installiert, selbst ohne Profil.
+        let installed_inode = std::fs::metadata(&target_file).unwrap().ino();
+        let QueueOperation::ResumableCopy {
+            checkpoint: Some(checkpoint),
+            ..
+        } = &mut snapshot.entries[0].operation
+        else {
+            unreachable!();
+        };
+        let CopyCheckpoint::Bytes { sealed, .. } = checkpoint.as_mut() else {
+            unreachable!();
+        };
+        *sealed = true;
+        drop(queue);
+        std::fs::remove_file(profile_path).unwrap();
+        std::fs::write(&journal, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let queue = OperationQueue::open(&journal).unwrap();
+        queue.retry(&id).unwrap();
+        execute_fault_move(&queue).unwrap();
+        assert_eq!(queue.snapshot().entries[0].state, QueueState::Completed);
+        assert_eq!(
+            std::fs::metadata(&target_file).unwrap().ino(),
+            installed_inode
+        );
+        assert_eq!(std::fs::read(target_file).unwrap(), bytes);
+        assert_eq!(control.retr_paths.lock().unwrap().len(), 3);
+    }
 }
 
 #[test]

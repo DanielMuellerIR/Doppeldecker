@@ -1104,9 +1104,10 @@ fn sftp_baum_downloads_binden_tatsaechliche_lokale_volumeklasse_und_neustart() {
         std::fs::read(root.join(".doppeldecker-metadata-test")).unwrap(),
         b"doppeldecker-metadata-e2e-v1\n"
     );
-    assert_eq!(std::fs::symlink_metadata(&root).unwrap().uid(), unsafe {
-        libc::geteuid()
-    });
+    assert_eq!(
+        std::fs::symlink_metadata(&root).unwrap().uid(),
+        rustix::process::geteuid().as_raw()
+    );
     let root = root.canonicalize().unwrap();
     let server = Server::tree();
     tree_file(

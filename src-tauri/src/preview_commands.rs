@@ -65,6 +65,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dateivorschau_verwendet_dieselbe_wireform_wie_die_browserfaelle() {
+        use doppeldecker_core::preview::{FilePreview, PreviewContent};
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/tests/file-preview-wire.json")).unwrap();
+        let request: FilePreviewRequest =
+            serde_json::from_value(fixture["request"].clone()).unwrap();
+        validate_request(&request).unwrap();
+        assert_eq!(request.path, "/remote.txt");
+        for (kind, content) in [
+            (
+                "text",
+                PreviewContent::Text {
+                    text: "Probe".into(),
+                },
+            ),
+            (
+                "image",
+                PreviewContent::Image {
+                    data_url: "data:image/png;base64,AA==".into(),
+                    width: 1,
+                    height: 1,
+                },
+            ),
+            (
+                "unsupported",
+                PreviewContent::Unsupported {
+                    reason: "Kein passives Format".into(),
+                },
+            ),
+        ] {
+            let preview = serde_json::to_value(FilePreview {
+                bytes: 5,
+                content,
+                limitations: vec![],
+            })
+            .unwrap();
+            crate::browser_commands::assert_wire_object(&preview, &fixture["response"]);
+            crate::browser_commands::assert_wire_object(&preview["content"], &fixture[kind]);
+            assert_eq!(preview["content"]["kind"], kind);
+        }
+    }
+
+    #[test]
     fn preview_request_liest_camelcase_und_prueft_pfade_vor_providerzugriff() {
         let request: FilePreviewRequest = serde_json::from_value(serde_json::json!({
             "endpoint": { "provider": "sftp", "profileId": "test", "profileRevision": 11, "root": "/daten" },

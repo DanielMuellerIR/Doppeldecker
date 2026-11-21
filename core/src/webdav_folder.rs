@@ -179,7 +179,8 @@ impl WebDavVfs {
             if observed_parents.len() != parents.len()
                 || observed_parents.is_empty()
                 || observed_parents[..observed_parents.len() - 1] != parents[..parents.len() - 1]
-                || observed_parents.last().unwrap().remote != parents.last().unwrap().remote
+                || observed_parents.last().map(|parent| &parent.remote)
+                    != parents.last().map(|parent| &parent.remote)
             {
                 return Err(drift(
                     "WebDAV-Vorfahren änderten sich nach der Ordneranlage",

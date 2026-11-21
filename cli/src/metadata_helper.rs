@@ -81,7 +81,10 @@ mod native {
             if bytes.is_null() || length == 0 || length > 32 * 1024 * 1024 {
                 return error("invalid_input", "Administratorauftrag zu groß oder leer");
             }
-            execute(unsafe { std::slice::from_raw_parts(bytes.cast(), length) })
+            // SAFETY: macos-admin.m übergibt bytes und Länge derselben NSData.
+            // Der native Arbeitsblock hält die NSData bis zur Rückkehr am Leben.
+            let request = unsafe { std::slice::from_raw_parts(bytes.cast(), length) };
+            execute(request)
         })
         .unwrap_or_else(|_| {
             error(
@@ -97,7 +100,10 @@ mod native {
         if id.is_null() {
             return;
         }
-        let Ok(id) = unsafe { CStr::from_ptr(id) }.to_str() else {
+        // SAFETY: Der native Aufrufer hält den NSString, dessen UTF8String
+        // nullterminiert ist und bis zur Rückkehr des Callbacks lesbar bleibt.
+        let id = unsafe { CStr::from_ptr(id) };
+        let Ok(id) = id.to_str() else {
             return;
         };
         if id.len() > 128 {
@@ -115,7 +121,10 @@ mod native {
     }
     unsafe extern "C" fn release(pointer: *mut c_char) {
         if !pointer.is_null() {
-            drop(unsafe { CString::from_raw(pointer) });
+            // SAFETY: Der native Aufrufer gibt den von perform per into_raw
+            // übertragenen Zeiger unverändert und genau einmal zurück.
+            let reply = unsafe { CString::from_raw(pointer) };
+            drop(reply);
         }
     }
     unsafe extern "C" {
@@ -126,6 +135,9 @@ mod native {
         ) -> i32;
     }
     pub fn run() -> i32 {
+        // SAFETY: Die drei C-ABI-Funktionen leben so lange wie der Prozess.
+        // macos-admin.m koppelt sie an die oben dokumentierten Puffer- und
+        // Eigentumsverträge und registriert sie vor dem Start des XPC-Listeners.
         unsafe { dd_admin_helper_run(perform, cancel, release) }
     }
 
@@ -152,6 +164,7 @@ mod native {
             )
             .unwrap();
             let id = CString::new(request.request_id.clone()).unwrap();
+            // SAFETY: id hält den nullterminierten Speicher bis nach cancel.
             unsafe {
                 cancel(id.as_ptr());
             }

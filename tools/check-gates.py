@@ -64,6 +64,7 @@ FAILURE_TAIL_LINES = 25
 GATES: list[tuple[str, list[str]]] = [
     ("fmt", ["cargo", "fmt", "--all", "--", "--check"]),
     ("pnpm-install", ["pnpm", "install", "--frozen-lockfile"]),
+    ("check-ipc", ["pnpm", "check:ipc"]),
     (
         "test-tools",
         [
@@ -86,11 +87,6 @@ GATES: list[tuple[str, list[str]]] = [
     # sich eine Core-Schnittstelle ändert. `--locked` macht zusätzlich sichtbar,
     # wenn `fuzz/Cargo.lock` nicht mehr zu den Abhängigkeiten des Kerns passt —
     # genau diese Abweichung war am 2026-08-19 unbemerkt entstanden.
-    # `--all-targets` ist nicht kosmetisch: Ohne den Schalter waehlt `cargo check`
-    # nur Lib und Bins, und `fuzz/tests/seed_corpus.rs` wird nie uebersetzt. Genau
-    # dieser Test haelt fest, dass die versionierten Seeds unter `fuzz/seeds/`
-    # schema- und digestgueltig bleiben; ohne ihn faellt eine Schemaaenderung erst
-    # bei einem echten Fuzz-Lauf mit unbrauchbaren Seeds auf.
     (
         "fuzz-check",
         [
@@ -102,12 +98,18 @@ GATES: list[tuple[str, list[str]]] = [
             "--all-targets",
         ],
     ),
+    # Erst der Testlauf prüft Schema und Digests der versionierten Seeds.
+    (
+        "test-fuzz-seeds",
+        ["cargo", "test", "--manifest-path", "fuzz/Cargo.toml", "--locked", "--test", "seed_corpus"],
+    ),
     ("test-ui", ["pnpm", "test:ui"]),
 ]
 
 # Auch ein Teilgate muss seine eigenen Laufzeitvoraussetzungen herstellen. Die
 # Tooltests parsen die CI-YAML-Datei mit dem gelockten Node-Paket ``yaml``.
 GATE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "check-ipc": ("pnpm-install",),
     "test-tools": ("pnpm-install",),
     "test-ui": ("pnpm-install",),
 }

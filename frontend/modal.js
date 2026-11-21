@@ -368,7 +368,9 @@ export function executionChoiceModal(title, bodyHtml, options = {}) {
   ], options);
 }
 
-/** Texteingabe mit Enter zum Bestätigen und Escape über die zentrale Abbruchaktion. */
+/** Texteingabe mit Enter zum Bestätigen und Escape über die zentrale Abbruchaktion.
+ * @returns {Promise<string | null>}
+ */
 export function promptModal(title, initialValue, { parentToken = null, description = null, inputLabel = null, copyableDescription = false } = {}) {
   return new Promise((resolve) => {
     const token = enqueueRenderedModal("prompt", token => {

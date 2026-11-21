@@ -1,0 +1,33 @@
+{
+  "localTarget": "/mock/ziel",
+  "remoteEndpoint": { "provider": "smb", "profileId": "mock_smb", "profileRevision": 41, "root": "/" },
+  "run": {
+    "id": "string",
+    "created_unix_ms": "number",
+    "expires_unix_ms": "number",
+    "target_root": "string",
+    "state": "string",
+    "status": "string",
+    "items_total": "number",
+    "items_available": "number",
+    "items_restorable": "number",
+    "items_manual_recovery": "number",
+    "items_restored": "number",
+    "items_recovery_pending": "number",
+    "entries_available": "number",
+    "bytes_available": "number"
+  },
+  "entry": {
+    "relative_path": "string",
+    "is_dir": "boolean",
+    "reason": "string",
+    "restored": "boolean",
+    "available": "boolean",
+    "automatic_restore_available": "boolean",
+    "manual_recovery_required": "boolean",
+    "recovery_pending": "boolean",
+    "entries": "number",
+    "bytes": "number"
+  },
+  "restore": { "path": "string", "outcome": "string" }
+}

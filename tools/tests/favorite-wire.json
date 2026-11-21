@@ -1,0 +1,13 @@
+{
+  "providers": ["local", "sftp", "ftps", "webdav", "smb"],
+  "local": { "name": "string", "path": "string", "provider": "string" },
+  "remote": { "name": "string", "path": "string", "provider": "string", "profile_id": "string" },
+  "finderImport": {
+    "favorites": "array",
+    "added": "number",
+    "skipped_existing": "number",
+    "skipped_missing": "number",
+    "skipped_hidden": "number",
+    "skipped_unreadable": "number"
+  }
+}
